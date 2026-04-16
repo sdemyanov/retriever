@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import re
 import sqlite3
-import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -17,23 +18,55 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "retriever_tools.py"
 BUNDLER_PATH = REPO_ROOT / "skills" / "tool-template" / "bundle_retriever_tools.py"
+TOOL_TEMPLATE_PATH = REPO_ROOT / "skills" / "tool-template" / "tool-template.md"
 
+retriever_tools = None
+TOOL_BYTES = b""
 
-def ensure_bundled_tool() -> None:
-    subprocess.run(["python3", str(BUNDLER_PATH)], check=True, cwd=REPO_ROOT)
-
-
-def load_tool_module():
-    spec = importlib.util.spec_from_file_location("retriever_tools_under_test", TOOL_PATH)
+def load_python_module(path: Path, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-ensure_bundled_tool()
-retriever_tools = load_tool_module()
-TOOL_BYTES = TOOL_PATH.read_bytes()
+def assert_bundled_tooling_current() -> None:
+    if not TOOL_PATH.exists():
+        raise AssertionError(
+            f"Missing generated bundle at {TOOL_PATH}. Run ./build.sh to regenerate the bundle and checksum before running tests."
+        )
+
+    bundler = load_python_module(BUNDLER_PATH, "retriever_bundler_under_test")
+    expected_text = bundler.bundle_source(TOOL_PATH.parent / "src")
+    current_text = TOOL_PATH.read_text(encoding="utf-8")
+    if current_text != expected_text:
+        raise AssertionError(
+            "Generated retriever_tools.py is stale relative to skills/tool-template/src. "
+            "Run ./build.sh to regenerate the bundle and checksum before running tests."
+        )
+
+    checksum_match = re.search(
+        r"^- source checksum \(SHA256\): `([0-9a-f]{64})`$",
+        TOOL_TEMPLATE_PATH.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if checksum_match is None:
+        raise AssertionError(f"Could not find the canonical source checksum line in {TOOL_TEMPLATE_PATH}.")
+
+    expected_sha = hashlib.sha256(expected_text.encode("utf-8")).hexdigest()
+    if checksum_match.group(1) != expected_sha:
+        raise AssertionError(
+            "tool-template.md has a stale source checksum for the generated bundle. "
+            "Run ./build.sh to regenerate the bundle and checksum before running tests."
+        )
+
+
+def setUpModule() -> None:
+    global retriever_tools, TOOL_BYTES
+    assert_bundled_tooling_current()
+    retriever_tools = load_python_module(TOOL_PATH, "retriever_tools_under_test")
+    TOOL_BYTES = TOOL_PATH.read_bytes()
 
 
 class RetrieverToolsRegressionTests(unittest.TestCase):
@@ -473,7 +506,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             )
         )
 
-    def write_production_fixture(self) -> Path:
+    def write_production_fixture(self, *, loadfile_volume_prefix: str | None = None) -> Path:
         production_root = self.root / "Synthetic_Production"
         data_dir = production_root / "DATA"
         text_dir = production_root / "TEXT" / "TEXT001"
@@ -482,8 +515,31 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         for directory in (data_dir, text_dir, image_dir, native_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        (text_dir / "PDX000001.txt").write_text("Parent production memo\nDiscuss attachment handling.\n", encoding="utf-8")
-        (text_dir / "PDX000003.txt").write_text("Child attachment memo\nContains follow-up details.\n", encoding="utf-8")
+        loadfile_root = (loadfile_volume_prefix or production_root.name).strip()
+
+        def loadfile_path(*parts: str) -> str:
+            return ".\\" + "\\".join([loadfile_root, *parts])
+
+        (text_dir / "PDX000001.txt").write_text(
+            (
+                "From: Elena Steven <elena@example.com>\n"
+                "To: Harry Montoro <harry@example.com>\n"
+                "Date: Tue, 14 Apr 2026 10:32:00 +0000\n"
+                "Subject: Attachment Handling\n\n"
+                "Parent production memo\n"
+                "Discuss attachment handling.\n"
+            ),
+            encoding="utf-8",
+        )
+        (text_dir / "PDX000003.txt").write_text(
+            (
+                "From: Review Team\n"
+                "Sent: 04/14/2026 09:00 AM\n\n"
+                "Case status update\n"
+                "Contains follow-up details.\n"
+            ),
+            encoding="utf-8",
+        )
         (text_dir / "PDX000004.txt").write_text("Native-backed production doc\nUse native preview first.\n", encoding="utf-8")
 
         self.write_tiff_fixture(image_dir / "PDX000001.tif", (255, 0, 0))
@@ -495,9 +551,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         headers = ["Begin Bates", "End Bates", "Begin Attachment", "End Attachment", "Text Precedence", "FILE_PATH"]
         rows = [
-            ["PDX000001", "PDX000002", "PDX000001", "PDX000003", r".\Synthetic_Production\TEXT\TEXT001\PDX000001.txt", ""],
-            ["PDX000003", "PDX000003", "", "", r".\Synthetic_Production\TEXT\TEXT001\PDX000003.txt", ""],
-            ["PDX000004", "PDX000004", "", "", r".\Synthetic_Production\TEXT\TEXT001\PDX000004.txt", r".\Synthetic_Production\NATIVES\NAT001\PDX000004.pdf"],
+            ["PDX000001", "PDX000002", "PDX000001", "PDX000003", loadfile_path("TEXT", "TEXT001", "PDX000001.txt"), ""],
+            ["PDX000003", "PDX000003", "", "", loadfile_path("TEXT", "TEXT001", "PDX000003.txt"), ""],
+            ["PDX000004", "PDX000004", "", "", loadfile_path("TEXT", "TEXT001", "PDX000004.txt"), loadfile_path("NATIVES", "NAT001", "PDX000004.pdf")],
             ["PDX000005", "PDX000006", "", "", "", ""],
         ]
         delimiter = b"\x14"
@@ -509,11 +565,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         (data_dir / "Synthetic_Production.dat").write_bytes(dat_line(headers) + b"".join(dat_line(row) for row in rows))
 
         opt_lines = [
-            "PDX000001,Synthetic_Production,.\\Synthetic_Production\\IMAGES\\IMG001\\PDX000001.tif,Y,,,2",
-            "PDX000002,Synthetic_Production,.\\Synthetic_Production\\IMAGES\\IMG001\\PDX000002.tif,,,,",
-            "PDX000003,Synthetic_Production,.\\Synthetic_Production\\IMAGES\\IMG001\\PDX000003.tif,Y,,,1",
-            "PDX000005,Synthetic_Production,.\\Synthetic_Production\\IMAGES\\IMG001\\PDX000005.tif,Y,,,2",
-            "PDX000006,Synthetic_Production,.\\Synthetic_Production\\IMAGES\\IMG001\\PDX000006.tif,,,,",
+            f"PDX000001,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000001.tif')},Y,,,2",
+            f"PDX000002,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000002.tif')},,,,",
+            f"PDX000003,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000003.tif')},Y,,,1",
+            f"PDX000005,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000005.tif')},Y,,,2",
+            f"PDX000006,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000006.tif')},,,,",
         ]
         (data_dir / "Synthetic_Production.opt").write_text("\n".join(opt_lines) + "\n", encoding="utf-8")
         return production_root
@@ -1374,9 +1430,25 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_row["begin_bates"], "PDX000001")
         self.assertEqual(parent_row["end_bates"], "PDX000002")
         self.assertEqual(parent_row["source_kind"], retriever_tools.PRODUCTION_SOURCE_KIND)
+        self.assertEqual(parent_row["content_type"], "Email")
+        self.assertEqual(parent_row["author"], "Elena Steven <elena@example.com>")
+        self.assertEqual(parent_row["date_created"], "2026-04-14T10:32:00Z")
+        self.assertEqual(parent_row["title"], "Attachment Handling")
+        self.assertEqual(parent_row["subject"], "Attachment Handling")
+        self.assertEqual(parent_row["recipients"], "Harry Montoro <harry@example.com>")
+        self.assertEqual(
+            parent_row["participants"],
+            "Elena Steven <elena@example.com>, Harry Montoro <harry@example.com>",
+        )
         self.assertEqual(child_row["parent_document_id"], parent_row["id"])
+        self.assertEqual(child_row["content_type"], "Email")
+        self.assertEqual(child_row["author"], "Review Team")
+        self.assertEqual(child_row["date_created"], "2026-04-14T09:00:00Z")
+        self.assertEqual(child_row["title"], "Case status update")
         self.assertEqual(native_row["file_name"], "PDX000004.pdf")
+        self.assertEqual(native_row["content_type"], "E-Doc")
         self.assertEqual(image_only_row["text_status"], "empty")
+        self.assertEqual(image_only_row["content_type"], "Image")
         self.assertEqual(image_only_row["page_count"], 2)
 
         exact_search = retriever_tools.search(self.root, "PDX000001", None, None, None, 1, 20)
@@ -1419,6 +1491,55 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("PDX000001", preview_html)
         self.assertIn("Discuss attachment handling.", preview_html)
         self.assertIn("data:image/png;base64,", preview_html)
+
+    def test_ingest_production_falls_back_when_loadfile_paths_include_missing_volume_prefix(self) -> None:
+        production_root = self.write_production_fixture(loadfile_volume_prefix="Sunrise_Production_01")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+
+        self.assertEqual(ingest_result["created"], 4)
+        self.assertEqual(ingest_result["docs_missing_linked_text"], 0)
+        self.assertEqual(ingest_result["docs_missing_linked_images"], 1)
+        self.assertEqual(ingest_result["docs_missing_linked_natives"], 0)
+        self.assertEqual(ingest_result["page_images_linked"], 5)
+        self.assertEqual(ingest_result["failures"], [])
+
+        parent_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000001.logical")
+        native_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000004.logical")
+        self.assertEqual(parent_row["content_type"], "Email")
+        self.assertEqual(parent_row["author"], "Elena Steven <elena@example.com>")
+        self.assertEqual(parent_row["date_created"], "2026-04-14T10:32:00Z")
+        self.assertEqual(parent_row["title"], "Attachment Handling")
+        self.assertEqual(parent_row["text_status"], "ok")
+        self.assertEqual(parent_row["page_count"], 2)
+        self.assertEqual(native_row["file_name"], "PDX000004.pdf")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            parent_source_parts = connection.execute(
+                """
+                SELECT part_kind, rel_source_path
+                FROM document_source_parts
+                WHERE document_id = ?
+                ORDER BY part_kind ASC, ordinal ASC
+                """,
+                (parent_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            [row["rel_source_path"] for row in parent_source_parts if row["part_kind"] == "text"],
+            ["Synthetic_Production/TEXT/TEXT001/PDX000001.txt"],
+        )
+        self.assertEqual(
+            [row["rel_source_path"] for row in parent_source_parts if row["part_kind"] == "image"],
+            [
+                "Synthetic_Production/IMAGES/IMG001/PDX000001.tif",
+                "Synthetic_Production/IMAGES/IMG001/PDX000002.tif",
+            ],
+        )
 
     def test_ingest_production_rerun_retires_missing_rows(self) -> None:
         production_root = self.write_production_fixture()

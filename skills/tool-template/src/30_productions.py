@@ -215,6 +215,18 @@ def normalize_source_reference(raw_value: str) -> list[str]:
     return [part for part in normalized.split("/") if part and part != "."]
 
 
+def source_reference_suffixes(parts: list[str]) -> list[list[str]]:
+    seen: set[tuple[str, ...]] = set()
+    suffixes: list[list[str]] = []
+    for index in range(len(parts)):
+        suffix = tuple(parts[index:])
+        if not suffix or suffix in seen:
+            continue
+        seen.add(suffix)
+        suffixes.append(list(suffix))
+    return suffixes
+
+
 def resolve_case_insensitive_relative_path(base_dir: Path, parts: list[str]) -> Path | None:
     current = base_dir
     for part in parts:
@@ -243,13 +255,28 @@ def resolve_production_source_path(workspace_root: Path, production_root: Path, 
         return absolute if absolute.exists() else None
 
     parts = normalize_source_reference(stripped)
-    if parts and parts[0].lower() == production_root.name.lower():
-        parts = parts[1:]
-    resolved = resolve_case_insensitive_relative_path(production_root, parts)
+    suffixes = source_reference_suffixes(parts)
+    if not suffixes:
+        return None
+
+    # Preserve existing literal resolution before we attempt any fallback prefix stripping.
+    literal_parts = suffixes[0]
+    resolved = resolve_case_insensitive_relative_path(production_root, literal_parts)
     if resolved is not None:
         return resolved
-    resolved = resolve_case_insensitive_relative_path(workspace_root, normalize_source_reference(stripped))
-    return resolved
+    resolved = resolve_case_insensitive_relative_path(workspace_root, literal_parts)
+    if resolved is not None:
+        return resolved
+
+    for candidate_parts in suffixes[1:]:
+        resolved = resolve_case_insensitive_relative_path(production_root, candidate_parts)
+        if resolved is not None:
+            return resolved
+    for candidate_parts in suffixes[1:]:
+        resolved = resolve_case_insensitive_relative_path(workspace_root, candidate_parts)
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def production_logical_rel_path(production_rel_root: str, control_number: str) -> str:
@@ -262,6 +289,8 @@ def infer_production_title(control_number: str, text_content: str, native_path: 
     for line in text_content.splitlines():
         candidate = normalize_whitespace(line)
         if candidate:
+            if re.match(r"^(From|To|Cc|Bcc|Sent|Date|Subject):\s*", candidate, flags=re.IGNORECASE):
+                continue
             return candidate[:220]
     if native_path is not None:
         return native_path.stem or native_path.name
@@ -1522,10 +1551,28 @@ def build_production_extracted_payload(
         text_content = normalize_whitespace(text_content)
         if not text_content:
             text_status = "empty"
+    email_headers = extract_email_like_headers(text_content)
+    author = email_headers.get("author") if email_headers else None
+    recipients = email_headers.get("recipients") if email_headers else None
+    subject = email_headers.get("subject") if email_headers else None
+    participants = extract_email_chain_participants(
+        text_content,
+        [author, recipients] if email_headers else None,
+    ) or extract_chat_participants(text_content)
     file_type = normalize_extension(native_path) if native_path is not None else ""
     preferred_native = production_previewable_native(native_path)
     image_content_type = infer_content_type_from_extension(normalize_extension(image_paths[0])) if image_paths else None
-    content_type = infer_content_type_from_extension(file_type) or image_content_type or "E-Doc"
+    fallback_content_type = infer_content_type_from_extension(file_type) or image_content_type or "E-Doc"
+    content_type_path = text_path or preferred_native or native_path or (image_paths[0] if image_paths else Path(f"{control_number}.txt"))
+    content_type = (
+        determine_content_type(
+            content_type_path,
+            text_content,
+            email_headers=email_headers or None,
+            explicit_content_type=fallback_content_type,
+        )
+        or fallback_content_type
+    )
     page_images: list[dict[str, object]] = []
     for index, image_path in enumerate(image_paths, start=1):
         if not image_path.exists():
@@ -1556,14 +1603,14 @@ def build_production_extracted_payload(
         )
     return {
         "page_count": len(image_paths) or None,
-        "author": None,
+        "author": author,
         "content_type": content_type,
-        "date_created": None,
+        "date_created": email_headers.get("date_created") if email_headers else None,
         "date_modified": None,
-        "participants": None,
-        "title": infer_production_title(control_number, text_content, native_path),
-        "subject": None,
-        "recipients": None,
+        "participants": participants,
+        "title": (email_headers.get("title") if email_headers else None) or infer_production_title(control_number, text_content, native_path),
+        "subject": subject,
+        "recipients": recipients,
         "text_content": text_content,
         "text_status": text_status,
         "preview_artifacts": preview_artifacts,

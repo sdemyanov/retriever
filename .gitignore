@@ -7,3 +7,4 @@ __pycache__/
 /backups/
 /test-marketplace/plugins/
 /skills/tool-template/retriever_tools.py
+/retriever.plugin
