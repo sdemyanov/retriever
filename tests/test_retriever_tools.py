@@ -310,11 +310,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self,
         *,
         source_item_id: str,
-        subject: str,
+        subject: str | None,
         body_text: str,
         folder_path: str = "Inbox",
         attachment_name: str | None = None,
         attachment_text: str | None = None,
+        author: str | None = "Alice Example <alice@example.com>",
+        recipients: str | None = "Bob Example <bob@example.com>, Carol Example <carol@example.com>",
+        date_created: str | None = "2026-04-14T10:00:00Z",
+        message_class: str | None = None,
     ) -> dict[str, object]:
         attachments: list[dict[str, object]] = []
         if attachment_name is not None and attachment_text is not None:
@@ -328,9 +332,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "source_item_id": source_item_id,
             "folder_path": folder_path,
             "subject": subject,
-            "author": "Alice Example <alice@example.com>",
-            "recipients": "Bob Example <bob@example.com>, Carol Example <carol@example.com>",
-            "date_created": "2026-04-14T10:00:00Z",
+            "author": author,
+            "recipients": recipients,
+            "date_created": date_created,
+            "message_class": message_class,
             "text_body": body_text,
             "html_body": None,
             "attachments": attachments,
@@ -855,6 +860,38 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(search_result["results"][0]["preview_rel_path"].endswith(".html"))
         self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "html")
 
+    def test_ingest_supports_chat_transcript_metadata_for_text_files(self) -> None:
+        transcript_path = self.root / "chat-thread.txt"
+        transcript_path.write_text(
+            "\n".join(
+                [
+                    "[2026-04-15 09:00] Alice Example: Kickoff thread for launch planning.",
+                    "[2026-04-15 09:05] Bob Example: I'll draft the update.",
+                    "[2026-04-15 09:07] Alice Example: Great, thanks.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        row = self.fetch_document_row("chat-thread.txt")
+        self.assertEqual(row["content_type"], "Chat")
+        self.assertEqual(row["author"], "Alice Example")
+        self.assertEqual(row["participants"], "Alice Example, Bob Example")
+        self.assertEqual(row["date_created"], "2026-04-15T09:00:00Z")
+        self.assertEqual(row["date_modified"], "2026-04-15T09:07:00Z")
+        self.assertEqual(row["title"], "Kickoff thread for launch planning.")
+        self.assertIsNone(row["subject"])
+        self.assertIsNone(row["recipients"])
+
+        search_result = retriever_tools.search(self.root, "draft the update", None, None, None, 1, 20)
+        self.assertEqual(search_result["results"][0]["file_name"], "chat-thread.txt")
+
     def test_ingest_supports_xls_sheet_previews(self) -> None:
         xls_path = self.root / "ledger.xls"
         self.write_xls_fixture(xls_path)
@@ -1262,6 +1299,47 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachment_search = retriever_tools.search(self.root, "pst attachment body", None, None, None, 1, 20)
         attachment_result = next(item for item in attachment_search["results"] if item["id"] == child_row["id"])
         self.assertEqual(attachment_result["parent"]["control_number"], parent_row["control_number"])
+
+    def test_ingest_pst_chat_like_message_uses_chat_document_metadata(self) -> None:
+        self.write_fake_pst_file()
+        transcript = "\n".join(
+            [
+                "[2026-04-15 09:00] Alice Example: Kickoff thread for launch planning.",
+                "[2026-04-15 09:05] Bob Example: I'll draft the update.",
+                "[2026-04-15 09:07] Alice Example: Great, thanks.",
+            ]
+        )
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-chat-001",
+                subject=None,
+                body_text=transcript,
+                folder_path="Conversation History",
+                author="Conversation History",
+                recipients=None,
+                date_created="2026-04-16T00:00:00Z",
+                message_class="IPM.Note.Microsoft.Conversation",
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 1)
+
+        row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-001"))
+        self.assertEqual(row["content_type"], "Chat")
+        self.assertEqual(row["author"], "Alice Example")
+        self.assertEqual(row["participants"], "Alice Example, Bob Example")
+        self.assertEqual(row["date_created"], "2026-04-15T09:00:00Z")
+        self.assertEqual(row["date_modified"], "2026-04-15T09:07:00Z")
+        self.assertEqual(row["title"], "Kickoff thread for launch planning.")
+        self.assertIsNone(row["subject"])
+        self.assertIsNone(row["recipients"])
+        self.assertEqual(row["source_folder_path"], "Conversation History")
 
     def test_unchanged_pst_source_skips_without_reparsing(self) -> None:
         self.write_fake_pst_file()

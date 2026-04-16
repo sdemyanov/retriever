@@ -8,7 +8,7 @@
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `3d538b83f480ef4790aff8cafb7ac8e9fc594d09b7dcaf0fcd0356dbdd747955`
+- source checksum (SHA256): `ee31771be075813d65a69d96d9754f40ccb16c63d3a719d12200264c38fbf3d4`
 
 ## Current command surface
 

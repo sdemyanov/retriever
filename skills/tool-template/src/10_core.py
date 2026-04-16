@@ -827,7 +827,13 @@ def decode_bytes(data: bytes, declared_encoding: str | None = None) -> tuple[str
 
 def strip_html_tags(text: str) -> str:
     without_scripts = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
-    without_tags = re.sub(r"(?s)<[^>]+>", " ", without_scripts)
+    with_breaks = re.sub(r"(?is)<br\s*/?>", "\n", without_scripts)
+    with_breaks = re.sub(
+        r"(?is)</(?:p|div|li|tr|td|th|h[1-6]|section|article|blockquote|pre|ul|ol|table)>",
+        "\n",
+        with_breaks,
+    )
+    without_tags = re.sub(r"(?s)<[^>]+>", " ", with_breaks)
     return normalize_whitespace(html.unescape(without_tags))
 
 
@@ -974,40 +980,102 @@ def extract_email_chain_participants(
     return ", ".join(participants) or None
 
 
-def extract_chat_participants(text: str) -> str | None:
-    if not text:
+CHAT_SPEAKER_BLOCKLIST = {
+    "agenda",
+    "answer",
+    "bcc",
+    "cc",
+    "date",
+    "description",
+    "from",
+    "message",
+    "note",
+    "notes",
+    "owner",
+    "priority",
+    "question",
+    "sent",
+    "status",
+    "subject",
+    "summary",
+    "task",
+    "thread",
+    "title",
+    "to",
+    "topic",
+}
+CHAT_TIMESTAMP_HINT_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b",
+    re.IGNORECASE,
+)
+CHAT_ISO_DATETIME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+CHAT_LINE_PATTERNS = (
+    r"^\[(?P<timestamp>[^\]]{4,80})\]\s*(?P<speaker>[^:\n]{2,80}?):\s+(?P<body>\S.*)$",
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\s*(?:AM|PM))?(?:\s*(?:Z|UTC|[+\-]\d{2}:?\d{2}))?)\s*[-,]?\s*(?P<speaker>[^:\n]{2,80}?):\s+(?P<body>\S.*)$",
+    r"^(?P<timestamp>\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\s*[-,]?\s*(?P<speaker>[^:\n]{2,80}?):\s+(?P<body>\S.*)$",
+    r"^(?P<speaker>[^:\n]{2,80}?):\s+(?P<body>\S.*)$",
+)
+
+
+def normalize_chat_speaker(value: str | None) -> str | None:
+    candidate = normalize_participant_token(value)
+    if not candidate:
         return None
+    lowered = candidate.lower().strip("[]()")
+    if lowered in CHAT_SPEAKER_BLOCKLIST or len(candidate.split()) > 8:
+        return None
+    return candidate
 
-    participants: list[str] = []
-    seen: set[str] = set()
-    speaker_counts: dict[str, int] = {}
-    line_pattern_candidates = (
-        r"^\[[^\]]{1,40}\]\s*([^:\n]{2,80}?):\s+\S",
-        r"^(?:\d{1,2}[:.]\d{2}(?::\d{2})?\s*(?:AM|PM)?\s+)?([^:\n]{2,80}?):\s+\S",
-        r"^([^-\n]{2,80}?)\s+-\s+\d{1,2}[:.]\d{2}(?::\d{2})?\s*(?:AM|PM)?\b",
-    )
-    blocked = {"from", "to", "cc", "bcc", "sent", "date", "subject"}
 
-    for raw_line in text.splitlines()[:800]:
+def parse_chat_timestamp(value: str | None) -> str | None:
+    raw = normalize_whitespace(str(value or "")).strip("[]()")
+    if not raw or not CHAT_TIMESTAMP_HINT_PATTERN.search(raw):
+        return None
+    normalized = normalize_datetime(raw)
+    if normalized and CHAT_ISO_DATETIME_PATTERN.fullmatch(normalized):
+        return normalized
+    return None
+
+
+def iter_chat_transcript_entries(text: str, max_lines: int = 800) -> list[dict[str, str | None]]:
+    if not text:
+        return []
+
+    entries: list[dict[str, str | None]] = []
+    for raw_line in text.splitlines()[:max_lines]:
         stripped = raw_line.strip()
         if not stripped or len(stripped) > 240:
             continue
-        for pattern in line_pattern_candidates:
+        for pattern in CHAT_LINE_PATTERNS:
             match = re.match(pattern, stripped, flags=re.IGNORECASE)
             if not match:
                 continue
-            candidate = normalize_participant_token(match.group(1))
-            if not candidate:
+            speaker = normalize_chat_speaker(match.groupdict().get("speaker"))
+            body = normalize_whitespace(match.groupdict().get("body") or "")
+            if not speaker or not body:
                 continue
-            lowered = candidate.lower().strip("[]()")
-            if lowered in blocked or len(candidate.split()) > 8:
-                continue
-            key = lowered
-            speaker_counts[key] = speaker_counts.get(key, 0) + 1
-            if key not in seen:
-                seen.add(key)
-                participants.append(candidate)
+            entries.append(
+                {
+                    "speaker": speaker,
+                    "body": body,
+                    "timestamp": parse_chat_timestamp(match.groupdict().get("timestamp")),
+                }
+            )
             break
+    return entries
+
+
+def extract_chat_participants(text: str) -> str | None:
+    participants: list[str] = []
+    seen: set[str] = set()
+    speaker_counts: dict[str, int] = {}
+    for entry in iter_chat_transcript_entries(text):
+        candidate = str(entry["speaker"])
+        key = candidate.lower().strip("[]()")
+        speaker_counts[key] = speaker_counts.get(key, 0) + 1
+        if key not in seen:
+            seen.add(key)
+            participants.append(candidate)
 
     total_matches = sum(speaker_counts.values())
     if total_matches < 2:
@@ -1017,13 +1085,69 @@ def extract_chat_participants(text: str) -> str | None:
     return ", ".join(participants)
 
 
+def extract_chat_transcript_metadata(text: str) -> dict[str, object] | None:
+    entries = iter_chat_transcript_entries(text, max_lines=1200)
+    if not entries:
+        return None
+
+    participants: list[str] = []
+    seen: set[str] = set()
+    speaker_counts: dict[str, int] = {}
+    first_speaker: str | None = None
+    first_body: str | None = None
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
+    timestamped_matches = 0
+
+    for entry in entries:
+        speaker = str(entry["speaker"])
+        key = speaker.lower().strip("[]()")
+        speaker_counts[key] = speaker_counts.get(key, 0) + 1
+        if key not in seen:
+            seen.add(key)
+            participants.append(speaker)
+        if first_speaker is None:
+            first_speaker = speaker
+        if first_body is None:
+            first_body = str(entry["body"])
+        timestamp = entry.get("timestamp")
+        if isinstance(timestamp, str):
+            timestamped_matches += 1
+            if first_timestamp is None:
+                first_timestamp = timestamp
+            last_timestamp = timestamp
+
+    total_matches = sum(speaker_counts.values())
+    repeated_speaker = any(count >= 2 for count in speaker_counts.values())
+    if total_matches < 2:
+        return None
+    if timestamped_matches < 2:
+        if len(participants) < 2 or total_matches < 3 or not repeated_speaker:
+            return None
+    elif len(participants) < 2 and total_matches < 3:
+        return None
+
+    return {
+        "author": first_speaker,
+        "participants": ", ".join(participants) or None,
+        "date_created": first_timestamp,
+        "date_modified": last_timestamp if last_timestamp and last_timestamp != first_timestamp else None,
+        "title": (first_body[:200] if first_body else None),
+        "message_count": total_matches,
+        "timestamped_message_count": timestamped_matches,
+    }
+
+
 def infer_content_type_from_content(
     file_type: str,
     text_content: str,
     email_headers: dict[str, str | None] | None = None,
+    chat_metadata: dict[str, object] | None = None,
 ) -> str | None:
     if email_headers:
         return "Email"
+    if chat_metadata:
+        return "Chat"
     if not text_content:
         return None
 
@@ -1039,11 +1163,12 @@ def determine_content_type(
     path: Path,
     text_content: str,
     email_headers: dict[str, str | None] | None = None,
+    chat_metadata: dict[str, object] | None = None,
     explicit_content_type: str | None = None,
 ) -> str | None:
     file_type = normalize_extension(path)
     return (
-        infer_content_type_from_content(file_type, text_content, email_headers)
+        infer_content_type_from_content(file_type, text_content, email_headers, chat_metadata)
         or explicit_content_type
         or infer_content_type_from_extension(file_type)
     )

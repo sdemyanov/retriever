@@ -160,19 +160,20 @@ def extract_plain_text_file(path: Path) -> dict[str, object]:
     file_type = normalize_extension(path)
     text_content = strip_html_tags(decoded) if file_type in {"htm", "html"} else normalize_whitespace(decoded)
     email_headers = extract_email_like_headers(text_content)
+    chat_metadata = extract_chat_transcript_metadata(text_content)
     participants = extract_email_chain_participants(
         text_content,
         [email_headers.get("author"), email_headers.get("recipients")] if email_headers else None,
-    ) or extract_chat_participants(text_content)
-    title = email_headers.get("title") if email_headers else None
+    ) or (str(chat_metadata["participants"]) if chat_metadata and chat_metadata.get("participants") else None) or extract_chat_participants(text_content)
+    title = email_headers.get("title") if email_headers else (str(chat_metadata["title"]) if chat_metadata and chat_metadata.get("title") else None)
     if title is None and file_type in {"md", "txt"} and text_content:
         title = text_content.splitlines()[0][:200]
     return {
         "page_count": None,
-        "author": email_headers.get("author") if email_headers else None,
-        "content_type": determine_content_type(path, text_content, email_headers=email_headers),
-        "date_created": email_headers.get("date_created") if email_headers else None,
-        "date_modified": None,
+        "author": (email_headers.get("author") if email_headers else None) or (str(chat_metadata["author"]) if chat_metadata and chat_metadata.get("author") else None),
+        "content_type": determine_content_type(path, text_content, email_headers=email_headers, chat_metadata=chat_metadata),
+        "date_created": (email_headers.get("date_created") if email_headers else None) or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None),
+        "date_modified": str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None,
         "participants": participants,
         "title": title,
         "subject": email_headers.get("subject") if email_headers else None,
@@ -205,11 +206,12 @@ def extract_rtf_file(path: Path) -> dict[str, object]:
     decoded, text_status, _ = decode_bytes(path.read_bytes())
     text_content = normalize_whitespace(rtf_to_text(decoded))
     email_headers = extract_email_like_headers(text_content)
+    chat_metadata = extract_chat_transcript_metadata(text_content)
     participants = extract_email_chain_participants(
         text_content,
         [email_headers.get("author"), email_headers.get("recipients")] if email_headers else None,
-    ) or extract_chat_participants(text_content)
-    title = email_headers.get("title") if email_headers else None
+    ) or (str(chat_metadata["participants"]) if chat_metadata and chat_metadata.get("participants") else None) or extract_chat_participants(text_content)
+    title = email_headers.get("title") if email_headers else (str(chat_metadata["title"]) if chat_metadata and chat_metadata.get("title") else None)
     if title is None and text_content:
         title = text_content.splitlines()[0][:200]
     preview = build_html_preview(
@@ -218,15 +220,16 @@ def extract_rtf_file(path: Path) -> dict[str, object]:
     )
     return {
         "page_count": None,
-        "author": email_headers.get("author") if email_headers else None,
+        "author": (email_headers.get("author") if email_headers else None) or (str(chat_metadata["author"]) if chat_metadata and chat_metadata.get("author") else None),
         "content_type": determine_content_type(
             path,
             text_content,
             email_headers=email_headers,
+            chat_metadata=chat_metadata,
             explicit_content_type="E-Doc",
         ),
-        "date_created": email_headers.get("date_created") if email_headers else None,
-        "date_modified": None,
+        "date_created": (email_headers.get("date_created") if email_headers else None) or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None),
+        "date_modified": str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None,
         "participants": participants,
         "title": title,
         "subject": email_headers.get("subject") if email_headers else None,
@@ -252,24 +255,32 @@ def extract_pdf_file(path: Path) -> dict[str, object]:
         texts = [(page.extract_text() or "").strip() for page in pdf.pages]
         text_content = normalize_whitespace("\n\n".join(part for part in texts if part))
         email_headers = extract_email_like_headers(texts[0] if texts else "")
+        chat_metadata = extract_chat_transcript_metadata(text_content)
         participants = extract_email_chain_participants(
             text_content,
             [email_headers.get("author"), email_headers.get("recipients")] if email_headers else None,
-        ) or extract_chat_participants(text_content)
+        ) or (str(chat_metadata["participants"]) if chat_metadata and chat_metadata.get("participants") else None) or extract_chat_participants(text_content)
         return {
             "page_count": len(pdf.pages),
-            "author": (email_headers.get("author") if email_headers else None) or metadata.get("Author"),
+            "author": (email_headers.get("author") if email_headers else None)
+            or (str(chat_metadata["author"]) if chat_metadata and chat_metadata.get("author") else None)
+            or metadata.get("Author"),
             "content_type": determine_content_type(
                 path,
                 text_content,
                 email_headers=email_headers,
+                chat_metadata=chat_metadata,
                 explicit_content_type="E-Doc",
             ),
             "date_created": (email_headers.get("date_created") if email_headers else None)
+            or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None)
             or normalize_datetime(metadata.get("CreationDate")),
-            "date_modified": normalize_datetime(metadata.get("ModDate")),
+            "date_modified": (str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None)
+            or normalize_datetime(metadata.get("ModDate")),
             "participants": participants,
-            "title": (email_headers.get("title") if email_headers else None) or metadata.get("Title"),
+            "title": (email_headers.get("title") if email_headers else None)
+            or (str(chat_metadata["title"]) if chat_metadata and chat_metadata.get("title") else None)
+            or metadata.get("Title"),
             "subject": (email_headers.get("subject") if email_headers else None) or metadata.get("Subject"),
             "recipients": email_headers.get("recipients") if email_headers else None,
             "text_content": text_content,
@@ -284,23 +295,34 @@ def extract_docx_file(path: Path) -> dict[str, object]:
     text_content = normalize_whitespace("\n\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text))
     props = document.core_properties
     email_headers = extract_email_like_headers(text_content)
+    chat_metadata = extract_chat_transcript_metadata(text_content)
     participants = extract_email_chain_participants(
         text_content,
         [email_headers.get("author"), email_headers.get("recipients")] if email_headers else None,
-    ) or extract_chat_participants(text_content)
+    ) or (str(chat_metadata["participants"]) if chat_metadata and chat_metadata.get("participants") else None) or extract_chat_participants(text_content)
     return {
         "page_count": None,
-        "author": (email_headers.get("author") if email_headers else None) or props.author or None,
+        "author": (email_headers.get("author") if email_headers else None)
+        or (str(chat_metadata["author"]) if chat_metadata and chat_metadata.get("author") else None)
+        or props.author
+        or None,
         "content_type": determine_content_type(
             path,
             text_content,
             email_headers=email_headers,
+            chat_metadata=chat_metadata,
             explicit_content_type="E-Doc",
         ),
-        "date_created": (email_headers.get("date_created") if email_headers else None) or normalize_datetime(props.created),
-        "date_modified": normalize_datetime(props.modified),
+        "date_created": (email_headers.get("date_created") if email_headers else None)
+        or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None)
+        or normalize_datetime(props.created),
+        "date_modified": (str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None)
+        or normalize_datetime(props.modified),
         "participants": participants,
-        "title": (email_headers.get("title") if email_headers else None) or props.title or None,
+        "title": (email_headers.get("title") if email_headers else None)
+        or (str(chat_metadata["title"]) if chat_metadata and chat_metadata.get("title") else None)
+        or props.title
+        or None,
         "subject": (email_headers.get("subject") if email_headers else None) or props.subject or None,
         "recipients": email_headers.get("recipients") if email_headers else None,
         "text_content": text_content,
@@ -569,6 +591,81 @@ def build_email_extracted_payload(
             }
         ],
     }
+
+
+def build_chat_extracted_payload(
+    *,
+    title: str | None,
+    author: str | None,
+    date_created: str | None,
+    text_body: str | None,
+    html_body: str | None,
+    attachments: list[dict[str, object]] | None,
+    preview_file_name: str,
+    chat_metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    normalized_html = None if html_body is None else str(html_body)
+    normalized_text = normalize_whitespace(str(text_body or ""))
+    if not normalized_text and normalized_html:
+        normalized_text = strip_html_tags(normalized_html)
+    normalized_text = normalize_whitespace(normalized_text)
+    metadata = chat_metadata or extract_chat_transcript_metadata(normalized_text) or {}
+    participants = (
+        str(metadata["participants"])
+        if metadata.get("participants")
+        else extract_chat_participants(normalized_text)
+    )
+    resolved_author = str(metadata["author"]) if metadata.get("author") else author
+    resolved_date_created = str(metadata["date_created"]) if metadata.get("date_created") else date_created
+    resolved_date_modified = str(metadata["date_modified"]) if metadata.get("date_modified") else None
+    resolved_title = title or (str(metadata["title"]) if metadata.get("title") else None)
+    preview = build_html_preview(
+        {
+            "Author": resolved_author or "",
+            "Participants": participants or "",
+            "Started": resolved_date_created or "",
+            "Updated": resolved_date_modified or "",
+            "Title": resolved_title or "",
+        },
+        body_html=normalized_html,
+        body_text=normalized_text,
+    )
+    return {
+        "page_count": 1,
+        "author": resolved_author,
+        "content_type": "Chat",
+        "date_created": resolved_date_created,
+        "date_modified": resolved_date_modified,
+        "participants": participants,
+        "title": resolved_title,
+        "subject": None,
+        "recipients": None,
+        "text_content": normalized_text,
+        "text_status": "empty" if not normalized_text else "ok",
+        "attachments": list(attachments or []),
+        "preview_artifacts": [
+            {
+                "file_name": preview_file_name,
+                "preview_type": "html",
+                "label": "conversation",
+                "ordinal": 0,
+                "content": preview,
+            }
+        ],
+    }
+
+
+def pst_message_prefers_chat_payload(message_dict: dict[str, object], chat_metadata: dict[str, object] | None) -> bool:
+    if not chat_metadata:
+        return False
+    message_class = normalize_whitespace(
+        str(message_dict.get("message_class") or message_dict.get("item_class") or "")
+    )
+    lowered_class = message_class.lower() if message_class else ""
+    if any(token in lowered_class for token in ("conversation", "chat", "im")):
+        return True
+    recipients = normalize_whitespace(str(message_dict.get("recipients") or ""))
+    return not recipients
 
 
 def parse_email_message(
@@ -871,6 +968,7 @@ def iter_pst_messages(path: Path):
             yield {
                 "source_item_id": source_item_id,
                 "folder_path": folder_path,
+                "message_class": normalize_whitespace(str(getattr(message, "message_class", "") or "")) or None,
                 "subject": normalize_whitespace(str(getattr(message, "subject", "") or "")) or None,
                 "author": _message_author(message),
                 "recipients": _message_recipients(message),
@@ -939,16 +1037,36 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
         )
 
     html_body = message_dict.get("html_body")
-    extracted = build_email_extracted_payload(
-        subject=normalize_whitespace(str(message_dict.get("subject") or "")) or None,
-        author=normalize_whitespace(str(message_dict.get("author") or "")) or None,
-        recipients=normalize_whitespace(str(message_dict.get("recipients") or "")) or None,
-        date_created=normalize_datetime(message_dict.get("date_created")),
-        text_body=None if message_dict.get("text_body") is None else str(message_dict.get("text_body") or ""),
-        html_body=None if html_body is None else str(html_body),
-        attachments=normalized_attachments,
-        preview_file_name=pst_preview_file_name(source_item_id),
-    )
+    normalized_subject = normalize_whitespace(str(message_dict.get("subject") or "")) or None
+    normalized_author = normalize_whitespace(str(message_dict.get("author") or "")) or None
+    normalized_recipients = normalize_whitespace(str(message_dict.get("recipients") or "")) or None
+    normalized_date_created = normalize_datetime(message_dict.get("date_created"))
+    normalized_text_body = None if message_dict.get("text_body") is None else str(message_dict.get("text_body") or "")
+    normalized_html_body = None if html_body is None else str(html_body)
+    chat_text = normalized_text_body or (strip_html_tags(normalized_html_body) if normalized_html_body else "")
+    chat_metadata = extract_chat_transcript_metadata(chat_text)
+    if pst_message_prefers_chat_payload(message_dict, chat_metadata):
+        extracted = build_chat_extracted_payload(
+            title=normalized_subject,
+            author=normalized_author,
+            date_created=normalized_date_created,
+            text_body=normalized_text_body,
+            html_body=normalized_html_body,
+            attachments=normalized_attachments,
+            preview_file_name=pst_preview_file_name(source_item_id),
+            chat_metadata=chat_metadata,
+        )
+    else:
+        extracted = build_email_extracted_payload(
+            subject=normalized_subject,
+            author=normalized_author,
+            recipients=normalized_recipients,
+            date_created=normalized_date_created,
+            text_body=normalized_text_body,
+            html_body=normalized_html_body,
+            attachments=normalized_attachments,
+            preview_file_name=pst_preview_file_name(source_item_id),
+        )
     return {
         "rel_path": pst_message_rel_path(source_rel_path, source_item_id),
         "file_name": pst_message_file_name(source_item_id),
