@@ -1,0 +1,76 @@
+{
+  "checks": {
+    "csv_latin1_detection": {
+      "decoded_preview": "name,city\nAndre,M\u00fcnchen\n",
+      "encoding": "cp1250"
+    },
+    "docx_parsing": {
+      "details": "Extracted text: Phase 0 DOCX probe\nThis file validates DOCX creation and parsing.",
+      "status": "pass"
+    },
+    "eml_latin1": {
+      "content_preview": "Bonjour de caf\u00e9 et M\u00fcnchen.\n",
+      "subject": "Latin-1 EML probe"
+    },
+    "eml_utf8": {
+      "content_preview": "Hello from the UTF-8 message body.\n",
+      "subject": "UTF-8 EML probe"
+    },
+    "fts5": {
+      "details": "SQLite FTS5 virtual tables can be created.",
+      "status": "pass"
+    },
+    "local_persistence": {
+      "details": "Local filesystem persistence across processes is fine, but cross-session Cowork persistence still needs in-product validation.",
+      "status": "partial"
+    },
+    "msg_invalid": {
+      "details": "Invalid MSG raised cleanly: InvalidFileFormatError",
+      "status": "pass"
+    },
+    "pdf_parsing": {
+      "corrupt_pdf": {
+        "details": "Corrupt PDF raised cleanly: PdfminerException",
+        "status": "pass"
+      },
+      "valid_pdf": {
+        "details": "Extracted text: Phase 0 PDF probe",
+        "status": "pass"
+      }
+    },
+    "txt_latin1_detection": {
+      "decoded_preview": "Latin-1 probe: caf\u00e9, M\u00fcnchen.\n",
+      "encoding": "cp1250"
+    },
+    "xlsx_parsing": {
+      "details": "Sheet names: Summary, Details",
+      "status": "pass"
+    }
+  },
+  "corpus_files": {
+    "corrupt_pdf": "regression_corpus/corrupt.pdf",
+    "csv_latin1": "regression_corpus/sample_latin1.csv",
+    "csv_utf8": "regression_corpus/sample_utf8.csv",
+    "docx": "regression_corpus/sample.docx",
+    "eml_latin1": "regression_corpus/sample_latin1.eml",
+    "eml_utf8": "regression_corpus/sample_utf8.eml",
+    "html": "regression_corpus/sample.html",
+    "msg_invalid": "regression_corpus/sample_invalid.msg",
+    "pdf": "regression_corpus/sample.pdf",
+    "txt_latin1": "regression_corpus/sample_latin1.txt",
+    "txt_utf8": "regression_corpus/sample_utf8.txt",
+    "xlsx": "regression_corpus/sample.xlsx"
+  },
+  "environment": {
+    "platform": "darwin",
+    "python_version": "3.11.5",
+    "sqlite_version": "3.42.0"
+  },
+  "imports": {
+    "charset-normalizer": "3.4.7",
+    "extract-msg": "0.55.0",
+    "openpyxl": "3.1.5",
+    "pdfplumber": "0.11.9",
+    "python-docx": "1.2.0"
+  }
+}
