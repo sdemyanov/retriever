@@ -34,9 +34,11 @@ Use this skill when the user says things like:
   - `Datetime (UTC)`
   - `Author`
   - `Title preview`
+- When `control_number` values are available, add a separate rightmost `Control number` column rather than embedding them in the title link.
 - Keep those same four leading columns for ranked browse requests such as "largest", "newest", and "oldest" unless the user explicitly asks for different columns.
-- You may append request-relevant columns after `Title preview`, such as `Size` for a "largest documents" query, but do not replace or reorder the default leading columns.
-- When listing or showing documents, present every shown result title as a clickable link to its first preview target.
+- You may append request-relevant columns after `Title preview`, such as `Size` for a "largest documents" query, but do not replace or reorder the default leading columns, and keep `Control number` as the far-right column when it is shown.
+- When listing or showing documents, present every shown result title as a clickable link to its first preview target, or to the source/native file when no preview target exists.
+- If the active filters constrain a field to one specific value across the shown rows, omit that redundant field from the displayed columns unless the user explicitly asks to see it.
 - Prefer `preview_abs_path`; fall back to `abs_path` for native-preview files.
 - Show attachment children as indented `↳` rows beneath the parent result when they are present in the response.
 - Apply the same clickable-title rule to attachment rows and any document rows shown in tables.

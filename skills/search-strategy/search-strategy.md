@@ -36,8 +36,10 @@ Default to a four-column result table unless the user explicitly asks for anothe
 This default layout also applies to ranked browse requests such as "show 10 largest documents", "newest documents", or "oldest emails".
 Do not replace or reorder the default leading columns unless the user explicitly asks for different columns.
 It is fine to append one or more request-relevant columns after `Title preview` when that improves the result, for example adding `Size` to a "largest documents" browse view.
+When `control_number` values are available, show them in a dedicated rightmost `Control number` column instead of folding them into the title link.
 
 Whenever you show files, documents, or attachment children, render each shown item as a clickable link that opens in the preview pane. Do not show a bare document name when a preview/open target is available.
+If no generated preview exists, keep the item clickable by linking directly to the source/native file instead of dropping the link.
 
 Default column order:
 
@@ -45,26 +47,29 @@ Default column order:
 - `Datetime (UTC)`
 - `Author`
 - `Title preview`
+- `Control number` when available, as the rightmost column
 
 Default table rules:
 
 - `Datetime (UTC)` should use the best available document datetime, preferring `date_created`, then `date_modified`, then `updated_at`
 - the `Title preview` cell should contain the primary clickable link for the document
 - use the document title when available; otherwise fall back to subject, then file name
-- show `control_number` inline with the title cell when available
-- for production-derived documents, keep the produced Bates/control number inline rather than replacing it with a generated `DOC...` value
+- do not fold `control_number` into the title cell; show it in a separate `Control number` column when it is available
+- for production-derived documents, keep the produced Bates/control number in that separate `Control number` column rather than replacing it with a generated `DOC...` value
 - the default leading columns must remain, in this order: `Content type`, `Datetime (UTC)`, `Author`, `Title preview`
 - for ranked browse requests, keep those default leading columns and describe the sort key/order in the heading or summary
-- if a ranked browse request benefits from showing the sort metric as a column, append it after `Title preview` rather than replacing the default leading columns
+- if a ranked browse request benefits from showing the sort metric as a column, append it after `Title preview` but keep `Control number` as the far-right column when that column is shown
 - keep the primary document column clickable for every row
 - show paging summary above or below the table when relevant
+- if the active filters constrain a field to one specific value for every shown row, omit that redundant field/column unless the user explicitly asks to see it
 
 Table format should:
 
 - include only the columns the user asked for, plus file name when needed for navigation
 - keep the primary document column clickable for every row
 - if the user does not ask for different columns, keep the default leading four-column order above
-- if you append helpful extra columns, add them after `Title preview`
+- if you append helpful extra columns, add them after `Title preview` and before `Control number` when that column is shown
+- when the results are already scoped to a single specific field value, drop that redundant column unless the user explicitly asks to keep it
 
 When the user asks to inspect fields or columns:
 
