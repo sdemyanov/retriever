@@ -293,7 +293,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     "path": path,
                     "rel_path": rel_path,
                     "file_type": file_type,
-                    "file_hash": None if file_type in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} else filesystem_ingest_fingerprint(path),
+                    "file_hash": None if file_type in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} else sha256_file(path),
                 }
             )
 
@@ -424,7 +424,6 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     control_number_batch=control_number_batch,
                     control_number_family_sequence=control_number_family_sequence,
                     control_number_attachment_sequence=control_number_attachment_sequence,
-                    file_hash_override=file_hash,
                 )
                 ensure_dataset_document_membership(
                     connection,
