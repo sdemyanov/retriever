@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import importlib.util
 import json
@@ -2422,6 +2423,106 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(custom["effective_date"]["date_granularities"], ["year", "quarter", "month", "week"])
         self.assertTrue(virtual["dataset_name"]["aggregatable"])
         self.assertEqual(virtual["dataset_name"]["description"], retriever_tools.VIRTUAL_FIELD_DESCRIPTIONS["dataset_name"])
+
+    def test_export_csv_cli_writes_requested_fields_for_filtered_collection(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        self.assertEqual(self.run_cli("add-field", str(self.root), "effective_date", "date")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "set-field",
+                str(self.root),
+                "--doc-id",
+                str(alpha_row["id"]),
+                "--field",
+                "effective_date",
+                "--value",
+                "2026-04-16",
+            )[0],
+            0,
+        )
+
+        export_path = self.root / "exports" / "review.csv"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-csv",
+            str(self.root),
+            "exports/review.csv",
+            "--field",
+            "dataset_name",
+            "--field",
+            "control_number",
+            "--field",
+            "effective_date",
+            "--field",
+            "file_name",
+            "--filter",
+            "file_name",
+            "eq",
+            "alpha.txt",
+            "--sort",
+            "file_name",
+            "--order",
+            "asc",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["document_count"], 1)
+        self.assertEqual(payload["output_rel_path"], "exports/review.csv")
+        self.assertEqual(payload["selector"]["mode"], "search")
+        self.assertEqual([field["field_name"] for field in payload["fields"]], ["dataset_name", "control_number", "effective_date", "file_name"])
+
+        with export_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        self.assertEqual(rows[0], ["dataset_name", "control_number", "effective_date", "file_name"])
+        self.assertEqual(rows[1], [self.root.name, alpha_row["control_number"], "2026-04-16", "alpha.txt"])
+        self.assertEqual(len(rows), 2)
+
+    def test_export_csv_cli_preserves_explicit_document_order(self) -> None:
+        (self.root / "first.txt").write_text("first body\n", encoding="utf-8")
+        (self.root / "second.txt").write_text("second body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_row = self.fetch_document_row("first.txt")
+        second_row = self.fetch_document_row("second.txt")
+
+        export_path = self.root / "exports" / "ordered.csv"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-csv",
+            str(self.root),
+            "exports/ordered.csv",
+            "--field",
+            "file_name",
+            "--field",
+            "control_number",
+            "--doc-id",
+            str(second_row["id"]),
+            "--doc-id",
+            str(first_row["id"]),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["document_count"], 2)
+        self.assertEqual(payload["selector"]["mode"], "document_ids")
+        self.assertEqual(payload["selector"]["document_ids"], [second_row["id"], first_row["id"]])
+
+        with export_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        self.assertEqual(rows[0], ["file_name", "control_number"])
+        self.assertEqual(rows[1], ["second.txt", second_row["control_number"]])
+        self.assertEqual(rows[2], ["first.txt", first_row["control_number"]])
 
     def test_get_doc_and_list_chunks_return_summary_and_exact_chunk_text(self) -> None:
         paragraph = "Termination notice requires careful review and supporting detail. "

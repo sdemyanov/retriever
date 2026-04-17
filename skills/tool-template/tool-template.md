@@ -2,13 +2,13 @@
 
 ## Template metadata
 
-- tool version: `0.10.0`
+- tool version: `0.11.0`
 - schema version: `12`
 - requirements version: `2026-04-16-phase4-pst`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `ea4535d94a62fab890ee7d781c56747f769482faaf14c6c4d3cce91ba9a9e0dc`
+- source checksum (SHA256): `1efcafcf4d8c230b962901caa2f9042832f2a00532ab8a8c56d17c2428087ff0`
 
 ## Current command surface
 
@@ -22,6 +22,7 @@ The current template implements:
 - `search`
 - `search-docs`
 - `catalog`
+- `export-csv`
 - `get-doc`
 - `list-chunks`
 - `search-chunks`
@@ -35,7 +36,7 @@ The current template implements:
 - `remove-from-dataset`
 - `delete-dataset`
 
-Stats, export, and review commands remain later-phase work.
+Stats and review commands remain later-phase work.
 
 ## Materialization rules
 

@@ -674,6 +674,61 @@ def sort_search_results(
     )
 
 
+def resolve_document_search(
+    connection: sqlite3.Connection,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+) -> dict[str, object]:
+    filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+    normalized_sort_field = sort_field
+    bates_query_begin, bates_query_end = parse_bates_query(query)
+    is_bates_query = bates_query_begin is not None and bates_query_end is not None
+    if sort_field == "relevance" and not query.strip():
+        raise RetrieverError("Sort 'relevance' requires a non-empty query.")
+    if sort_field and sort_field != "relevance":
+        sort_field_def = resolve_field_definition(connection, sort_field)
+        if sort_field_def.get("source") == "virtual":
+            raise RetrieverError(f"Cannot sort by virtual filter field: {sort_field}")
+        normalized_sort_field = sort_field_def["field_name"]
+    if is_bates_query:
+        matches = search_bates(connection, str(bates_query_begin), str(bates_query_end), clauses, params)
+    elif query.strip():
+        matches = search_fts(connection, query, clauses, params)
+    else:
+        matches = search_browse(connection, clauses, params)
+
+    results = [
+        {
+            "id": document_id,
+            "rank": match["rank"],
+            "snippet": match["snippet"],
+            "bates_sort_key": match.get("bates_sort_key"),
+            "row": match["row"],
+        }
+        for document_id, match in matches.items()
+    ]
+    if is_bates_query and normalized_sort_field is None and order is None:
+        sorted_results = sorted(
+            sorted(results, key=lambda item: item["id"]),
+            key=lambda item: (
+                item["rank"] is None,
+                item["rank"],
+                item.get("bates_sort_key") or (1, "", 0, ""),
+            ),
+        )
+    else:
+        sorted_results = sort_search_results(results, normalized_sort_field, order, query)
+    return {
+        "query": query,
+        "filters": filter_summary,
+        "sort": normalized_sort_field or ("bates" if is_bates_query and query.strip() else ("relevance" if query.strip() else "updated_at")),
+        "order": (order or ("asc" if (is_bates_query or (query.strip() and (sort_field in (None, "relevance")))) else "desc")).lower(),
+        "results": sorted_results,
+    }
+
+
 def search(
     root: Path,
     query: str,
@@ -694,30 +749,14 @@ def search(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        filter_summary, clauses, params = build_search_filters(connection, raw_filters)
-        normalized_sort_field = sort_field
-        bates_query_begin, bates_query_end = parse_bates_query(query)
-        is_bates_query = bates_query_begin is not None and bates_query_end is not None
-        if sort_field == "relevance" and not query.strip():
-            raise RetrieverError("Sort 'relevance' requires a non-empty query.")
-        if sort_field and sort_field != "relevance":
-            sort_field_def = resolve_field_definition(connection, sort_field)
-            if sort_field_def.get("source") == "virtual":
-                raise RetrieverError(f"Cannot sort by virtual filter field: {sort_field}")
-            normalized_sort_field = sort_field_def["field_name"]
-        if is_bates_query:
-            matches = search_bates(connection, str(bates_query_begin), str(bates_query_end), clauses, params)
-        elif query.strip():
-            matches = search_fts(connection, query, clauses, params)
-        else:
-            matches = search_browse(connection, clauses, params)
+        selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
 
         results: list[dict[str, object]] = []
-        for document_id, match in matches.items():
+        for match in selection["results"]:
             row = match["row"]
             results.append(
                 {
-                    "id": document_id,
+                    "id": int(match["id"]),
                     "control_number": row["control_number"],
                     "dataset_id": row["dataset_id"],
                     "parent_document_id": row["parent_document_id"],
@@ -729,7 +768,7 @@ def search(
                     **document_path_payload(paths, connection, row),
                     "file_name": row["file_name"],
                     "file_type": row["file_type"],
-                    "snippet": match["snippet"],
+                    "snippet": str(match["snippet"]),
                     "rank": match["rank"],
                     "bates_sort_key": match.get("bates_sort_key"),
                     "metadata": {
@@ -759,17 +798,7 @@ def search(
                 }
             )
 
-        if is_bates_query and normalized_sort_field is None and order is None:
-            sorted_results = sorted(
-                sorted(results, key=lambda item: item["id"]),
-                key=lambda item: (
-                    item["rank"] is None,
-                    item["rank"],
-                    item.get("bates_sort_key") or (1, "", 0, ""),
-                ),
-            )
-        else:
-            sorted_results = sort_search_results(results, normalized_sort_field, order, query)
+        sorted_results = results
         total_hits = len(sorted_results)
         total_pages = max(1, (total_hits + per_page - 1) // per_page)
         start = (page - 1) * per_page
@@ -818,10 +847,10 @@ def search(
             item.pop("row", None)
 
         return {
-            "query": query,
-            "filters": filter_summary,
-            "sort": normalized_sort_field or ("bates" if is_bates_query and query.strip() else ("relevance" if query.strip() else "updated_at")),
-            "order": (order or ("asc" if (is_bates_query or (query.strip() and (sort_field in (None, "relevance")))) else "desc")).lower(),
+            "query": selection["query"],
+            "filters": selection["filters"],
+            "sort": selection["sort"],
+            "order": selection["order"],
             "page": page,
             "per_page": per_page,
             "total_hits": total_hits,
@@ -878,6 +907,233 @@ def catalog(root: Path) -> dict[str, object]:
             "intrinsic": intrinsic,
             "custom": custom,
             "virtual": virtual,
+        }
+    finally:
+        connection.close()
+
+
+def fetch_active_document_rows_by_ids(
+    connection: sqlite3.Connection,
+    document_ids: list[int],
+) -> list[sqlite3.Row]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in document_ids))
+    if not normalized_document_ids:
+        return []
+    placeholders = ", ".join("?" for _ in normalized_document_ids)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM documents
+        WHERE id IN ({placeholders})
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+          AND EXISTS (SELECT 1 FROM dataset_documents dd WHERE dd.document_id = documents.id)
+        """,
+        normalized_document_ids,
+    ).fetchall()
+    rows_by_id = {int(row["id"]): row for row in rows}
+    missing_ids = [document_id for document_id in normalized_document_ids if document_id not in rows_by_id]
+    if missing_ids:
+        raise RetrieverError(
+            "Unknown active document id"
+            + ("" if len(missing_ids) == 1 else "s")
+            + f": {', '.join(str(document_id) for document_id in missing_ids)}"
+        )
+    return [rows_by_id[document_id] for document_id in normalized_document_ids]
+
+
+def fetch_attachment_parent_ids(
+    connection: sqlite3.Connection,
+    parent_ids: list[int],
+) -> set[int]:
+    if not parent_ids:
+        return set()
+    placeholders = ", ".join("?" for _ in parent_ids)
+    rows = connection.execute(
+        f"""
+        SELECT DISTINCT parent_document_id
+        FROM documents
+        WHERE parent_document_id IN ({placeholders})
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+        """,
+        parent_ids,
+    ).fetchall()
+    return {
+        int(row["parent_document_id"])
+        for row in rows
+        if row["parent_document_id"] is not None
+    }
+
+
+def resolve_export_field_definitions(
+    connection: sqlite3.Connection,
+    raw_fields: list[str] | None,
+) -> list[dict[str, str]]:
+    if not raw_fields:
+        raise RetrieverError("export-csv requires at least one --field.")
+    resolved_fields: list[dict[str, str]] = []
+    seen_fields: set[str] = set()
+    for raw_field in raw_fields:
+        field_def = resolve_field_definition(connection, raw_field)
+        normalized_field_name = str(field_def["field_name"])
+        if normalized_field_name in seen_fields:
+            raise RetrieverError(f"Duplicate export field: {normalized_field_name}")
+        seen_fields.add(normalized_field_name)
+        resolved_fields.append(
+            {
+                "requested_name": raw_field,
+                "field_name": normalized_field_name,
+                "field_type": str(field_def["field_type"]),
+                "source": str(field_def.get("source") or ""),
+            }
+        )
+    return resolved_fields
+
+
+def resolve_export_output_path(root: Path, raw_output_path: str) -> Path:
+    normalized_output_path = raw_output_path.strip()
+    if not normalized_output_path:
+        raise RetrieverError("Output path cannot be empty.")
+    output_path = Path(normalized_output_path).expanduser()
+    if not output_path.is_absolute():
+        output_path = root / output_path
+    resolved_path = output_path.resolve()
+    if resolved_path.exists() and resolved_path.is_dir():
+        raise RetrieverError(f"Output path is a directory: {resolved_path}")
+    return resolved_path
+
+
+def build_export_context(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    field_defs: list[dict[str, str]],
+) -> dict[str, object]:
+    requested_field_names = {field_def["field_name"] for field_def in field_defs}
+    context: dict[str, object] = {
+        "dataset_memberships": {},
+        "production_names": {},
+        "attachment_parent_ids": set(),
+    }
+    if "dataset_id" in requested_field_names or "dataset_name" in requested_field_names:
+        context["dataset_memberships"] = fetch_document_dataset_memberships(connection, rows)
+    if "production_name" in requested_field_names:
+        context["production_names"] = fetch_production_names(connection, rows)
+    if "has_attachments" in requested_field_names:
+        context["attachment_parent_ids"] = fetch_attachment_parent_ids(
+            connection,
+            [int(row["id"]) for row in rows if row["parent_document_id"] is None],
+        )
+    return context
+
+
+def export_field_value(
+    row: sqlite3.Row,
+    field_def: dict[str, str],
+    context: dict[str, object],
+) -> object:
+    field_name = field_def["field_name"]
+    document_id = int(row["id"])
+    if field_name == "dataset_name":
+        dataset_membership = context["dataset_memberships"].get(document_id, {"names": []})
+        return "; ".join(str(dataset_name) for dataset_name in dataset_membership["names"])
+    if field_name == "dataset_id":
+        dataset_membership = context["dataset_memberships"].get(document_id, {"ids": []})
+        membership_ids = [str(int(dataset_id)) for dataset_id in dataset_membership["ids"]]
+        if membership_ids:
+            return "; ".join(membership_ids)
+        return row["dataset_id"]
+    if field_name == "production_name":
+        if row["production_id"] is None:
+            return None
+        return context["production_names"].get(int(row["production_id"]))
+    if field_name == "is_attachment":
+        return row["parent_document_id"] is not None
+    if field_name == "has_attachments":
+        return int(row["id"]) in context["attachment_parent_ids"]
+    return row[field_name]
+
+
+def serialize_export_cell_value(value: object, field_type: str) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "; ".join(str(item) for item in value if item is not None)
+    if field_type == "boolean":
+        return "true" if bool(value) else "false"
+    return str(value)
+
+
+def export_csv(
+    root: Path,
+    raw_output_path: str,
+    raw_fields: list[str] | None,
+    document_ids: list[int] | None,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        field_defs = resolve_export_field_definitions(connection, raw_fields)
+        output_path = resolve_export_output_path(root, raw_output_path)
+
+        normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+        if normalized_document_ids and (query.strip() or raw_filters or sort_field or order):
+            raise RetrieverError("export-csv accepts either --doc-id selectors or query/filter selectors, not both.")
+
+        if normalized_document_ids:
+            rows = fetch_active_document_rows_by_ids(connection, normalized_document_ids)
+            selector: dict[str, object] = {
+                "mode": "document_ids",
+                "document_ids": normalized_document_ids,
+            }
+        else:
+            selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
+            rows = [item["row"] for item in selection["results"]]
+            selector = {
+                "mode": "search",
+                "query": selection["query"],
+                "filters": selection["filters"],
+                "sort": selection["sort"],
+                "order": selection["order"],
+            }
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        overwrote_existing_file = output_path.exists()
+        context = build_export_context(connection, rows, field_defs)
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([field_def["field_name"] for field_def in field_defs])
+            for row in rows:
+                writer.writerow(
+                    [
+                        serialize_export_cell_value(
+                            export_field_value(row, field_def, context),
+                            field_def["field_type"],
+                        )
+                        for field_def in field_defs
+                    ]
+                )
+
+        output_rel_path = None
+        try:
+            output_rel_path = output_path.relative_to(root).as_posix()
+        except ValueError:
+            output_rel_path = None
+
+        return {
+            "status": "ok",
+            "output_path": str(output_path),
+            "output_rel_path": output_rel_path,
+            "document_count": len(rows),
+            "field_count": len(field_defs),
+            "fields": field_defs,
+            "selector": selector,
+            "overwrote_existing_file": overwrote_existing_file,
+            "file_size": file_size_bytes(output_path),
         }
     finally:
         connection.close()
@@ -1486,6 +1742,34 @@ def build_parser() -> argparse.ArgumentParser:
     catalog_parser = subparsers.add_parser("catalog", help="Describe searchable, filterable, and aggregatable fields")
     catalog_parser.add_argument("workspace", help="Workspace root path")
 
+    export_parser = subparsers.add_parser("export-csv", help="Write selected documents and fields to a CSV on disk")
+    export_parser.add_argument("workspace", help="Workspace root path")
+    export_parser.add_argument("output_path", help="CSV file path; relative paths resolve from the workspace root")
+    export_parser.add_argument("query", nargs="?", default="", help="Optional keyword query text for search-based export")
+    export_parser.add_argument(
+        "--field",
+        dest="fields",
+        action="append",
+        required=True,
+        help="Field to export (repeatable, preserves order)",
+    )
+    export_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to export (repeatable, preserves input order)",
+    )
+    export_parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        nargs="+",
+        help="Repeatable filter in the form <field> <op> <value>",
+    )
+    export_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field for search-based export or 'relevance'")
+    export_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
+
     get_doc_parser = subparsers.add_parser("get-doc", help="Fetch one document with optional summary text or exact chunks")
     get_doc_parser.add_argument("workspace", help="Workspace root path")
     get_doc_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
@@ -1661,6 +1945,25 @@ def main() -> int:
 
         if args.command == "catalog":
             print(json.dumps(catalog(root), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "export-csv":
+            print(
+                json.dumps(
+                    export_csv(
+                        root,
+                        args.output_path,
+                        args.fields,
+                        args.document_ids,
+                        args.query,
+                        args.filters,
+                        args.sort,
+                        args.order,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
 
         if args.command == "get-doc":
