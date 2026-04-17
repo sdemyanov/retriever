@@ -912,7 +912,7 @@ def catalog(root: Path) -> dict[str, object]:
         connection.close()
 
 
-def fetch_active_document_rows_by_ids(
+def fetch_visible_document_rows_by_ids(
     connection: sqlite3.Connection,
     document_ids: list[int],
 ) -> list[sqlite3.Row]:
@@ -922,23 +922,58 @@ def fetch_active_document_rows_by_ids(
     placeholders = ", ".join("?" for _ in normalized_document_ids)
     rows = connection.execute(
         f"""
-        SELECT *
-        FROM documents
+        SELECT
+          d.*,
+          EXISTS (
+            SELECT 1
+            FROM dataset_documents dd
+            WHERE dd.document_id = d.id
+          ) AS has_dataset_membership
+        FROM documents d
         WHERE id IN ({placeholders})
-          AND lifecycle_status NOT IN ('missing', 'deleted')
-          AND EXISTS (SELECT 1 FROM dataset_documents dd WHERE dd.document_id = documents.id)
         """,
         normalized_document_ids,
     ).fetchall()
     rows_by_id = {int(row["id"]): row for row in rows}
-    missing_ids = [document_id for document_id in normalized_document_ids if document_id not in rows_by_id]
+    missing_ids: list[int] = []
+    lifecycle_hidden: list[str] = []
+    membership_hidden: list[int] = []
+    visible_rows_by_id: dict[int, sqlite3.Row] = {}
+    for document_id in normalized_document_ids:
+        row = rows_by_id.get(document_id)
+        if row is None:
+            missing_ids.append(document_id)
+            continue
+        if row["lifecycle_status"] in {"missing", "deleted"}:
+            lifecycle_hidden.append(f"{document_id} ({row['lifecycle_status']})")
+            continue
+        if not bool(row["has_dataset_membership"]):
+            membership_hidden.append(document_id)
+            continue
+        visible_rows_by_id[document_id] = row
+
+    errors: list[str] = []
     if missing_ids:
-        raise RetrieverError(
-            "Unknown active document id"
-            + ("" if len(missing_ids) == 1 else "s")
-            + f": {', '.join(str(document_id) for document_id in missing_ids)}"
+        errors.append(
+            "Unknown document id" + ("" if len(missing_ids) == 1 else "s") + f": {', '.join(str(document_id) for document_id in missing_ids)}"
         )
-    return [rows_by_id[document_id] for document_id in normalized_document_ids]
+    if lifecycle_hidden:
+        errors.append(
+            "Document id"
+            + ("" if len(lifecycle_hidden) == 1 else "s")
+            + " not visible due to lifecycle_status: "
+            + ", ".join(lifecycle_hidden)
+        )
+    if membership_hidden:
+        errors.append(
+            "Document id"
+            + ("" if len(membership_hidden) == 1 else "s")
+            + " not visible because they have no dataset memberships: "
+            + ", ".join(str(document_id) for document_id in membership_hidden)
+        )
+    if errors:
+        raise RetrieverError(" ".join(errors))
+    return [visible_rows_by_id[document_id] for document_id in normalized_document_ids]
 
 
 def fetch_attachment_parent_ids(
@@ -989,16 +1024,33 @@ def resolve_export_field_definitions(
     return resolved_fields
 
 
-def resolve_export_output_path(root: Path, raw_output_path: str) -> Path:
+def path_within(candidate: Path, parent: Path) -> bool:
+    try:
+        candidate.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_export_output_path(paths: dict[str, Path], raw_output_path: str) -> Path:
     normalized_output_path = raw_output_path.strip()
     if not normalized_output_path:
         raise RetrieverError("Output path cannot be empty.")
-    output_path = Path(normalized_output_path).expanduser()
-    if not output_path.is_absolute():
-        output_path = root / output_path
-    resolved_path = output_path.resolve()
+    exports_dir = (paths["state_dir"] / "exports").resolve()
+    requested_path = Path(normalized_output_path).expanduser()
+    if requested_path.is_absolute():
+        resolved_path = requested_path.resolve()
+    else:
+        resolved_path = (exports_dir / requested_path).resolve()
+        if not path_within(resolved_path, exports_dir):
+            raise RetrieverError(f"Relative output paths must stay within {exports_dir}.")
     if resolved_path.exists() and resolved_path.is_dir():
         raise RetrieverError(f"Output path is a directory: {resolved_path}")
+    workspace_root = paths["root"].resolve()
+    if path_within(resolved_path, workspace_root) and not path_within(resolved_path, exports_dir):
+        raise RetrieverError(
+            f"Workspace-internal output paths must live under {exports_dir} to avoid re-ingesting exported CSVs."
+        )
     return resolved_path
 
 
@@ -1078,14 +1130,14 @@ def export_csv(
     try:
         apply_schema(connection, root)
         field_defs = resolve_export_field_definitions(connection, raw_fields)
-        output_path = resolve_export_output_path(root, raw_output_path)
+        output_path = resolve_export_output_path(paths, raw_output_path)
 
         normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
         if normalized_document_ids and (query.strip() or raw_filters or sort_field or order):
             raise RetrieverError("export-csv accepts either --doc-id selectors or query/filter selectors, not both.")
 
         if normalized_document_ids:
-            rows = fetch_active_document_rows_by_ids(connection, normalized_document_ids)
+            rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
             selector: dict[str, object] = {
                 "mode": "document_ids",
                 "document_ids": normalized_document_ids,
@@ -1744,7 +1796,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     export_parser = subparsers.add_parser("export-csv", help="Write selected documents and fields to a CSV on disk")
     export_parser.add_argument("workspace", help="Workspace root path")
-    export_parser.add_argument("output_path", help="CSV file path; relative paths resolve from the workspace root")
+    export_parser.add_argument("output_path", help="CSV file path; relative paths resolve under .retriever/exports")
     export_parser.add_argument("query", nargs="?", default="", help="Optional keyword query text for search-based export")
     export_parser.add_argument(
         "--field",

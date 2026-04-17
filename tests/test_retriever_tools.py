@@ -2448,11 +2448,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             0,
         )
 
-        export_path = self.root / "exports" / "review.csv"
+        export_path = self.root / ".retriever" / "exports" / "review.csv"
         exit_code, payload, _, _ = self.run_cli(
             "export-csv",
             str(self.root),
-            "exports/review.csv",
+            "review.csv",
             "--field",
             "dataset_name",
             "--field",
@@ -2474,7 +2474,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(payload)
         self.assertEqual(payload["document_count"], 1)
-        self.assertEqual(payload["output_rel_path"], "exports/review.csv")
+        self.assertEqual(payload["output_rel_path"], ".retriever/exports/review.csv")
         self.assertEqual(payload["selector"]["mode"], "search")
         self.assertEqual([field["field_name"] for field in payload["fields"]], ["dataset_name", "control_number", "effective_date", "file_name"])
 
@@ -2496,11 +2496,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         first_row = self.fetch_document_row("first.txt")
         second_row = self.fetch_document_row("second.txt")
 
-        export_path = self.root / "exports" / "ordered.csv"
+        export_path = self.root / ".retriever" / "exports" / "ordered.csv"
         exit_code, payload, _, _ = self.run_cli(
             "export-csv",
             str(self.root),
-            "exports/ordered.csv",
+            "ordered.csv",
             "--field",
             "file_name",
             "--field",
@@ -2523,6 +2523,90 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(rows[0], ["file_name", "control_number"])
         self.assertEqual(rows[1], ["second.txt", second_row["control_number"]])
         self.assertEqual(rows[2], ["first.txt", first_row["control_number"]])
+
+    def test_export_csv_relative_output_does_not_get_reingested(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_ingest["new"], 2)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "export-csv",
+            str(self.root),
+            "nested/review.csv",
+            "--field",
+            "file_name",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["output_rel_path"], ".retriever/exports/nested/review.csv")
+
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(second_ingest["new"], 0)
+        self.assertEqual(second_ingest["skipped"], 2)
+
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(browse_result["total_hits"], 2)
+        self.assertEqual(sorted(item["file_name"] for item in browse_result["results"]), ["alpha.txt", "beta.txt"])
+
+    def test_export_csv_rejects_workspace_output_path_outside_retriever_state_dir(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        unsafe_path = self.root / "exports" / "review.csv"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-csv",
+            str(self.root),
+            str(unsafe_path),
+            "--field",
+            "file_name",
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIsNotNone(payload)
+        self.assertIn("must live under", payload["error"])
+
+    def test_export_csv_doc_id_mode_rejects_rows_without_dataset_membership(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("sample dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        delete_exit, delete_payload, _, _ = self.run_cli(
+            "delete-dataset",
+            str(self.root),
+            "--dataset-name",
+            self.root.name,
+        )
+        self.assertEqual(delete_exit, 0)
+        self.assertIsNotNone(delete_payload)
+        self.assertEqual(delete_payload["documents_without_dataset_memberships"], [row["id"]])
+
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(browse_result["total_hits"], 0)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "export-csv",
+            str(self.root),
+            "doc-id.csv",
+            "--field",
+            "file_name",
+            "--doc-id",
+            str(row["id"]),
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIsNotNone(payload)
+        self.assertIn("not visible because they have no dataset memberships", payload["error"])
 
     def test_get_doc_and_list_chunks_return_summary_and_exact_chunk_text(self) -> None:
         paragraph = "Termination notice requires careful review and supporting detail. "
