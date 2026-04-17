@@ -740,6 +740,18 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "documents", "control_number_batch INTEGER")
     ensure_column(connection, "documents", "control_number_family_sequence INTEGER")
     ensure_column(connection, "documents", "control_number_attachment_sequence INTEGER")
+    ensure_column(connection, "documents", "source_text_revision_id INTEGER REFERENCES text_revisions(id) ON DELETE SET NULL")
+    ensure_column(connection, "documents", "active_search_text_revision_id INTEGER REFERENCES text_revisions(id) ON DELETE SET NULL")
+    ensure_column(connection, "documents", "active_text_source_kind TEXT")
+    ensure_column(connection, "documents", "active_text_language TEXT")
+    ensure_column(connection, "documents", "active_text_quality_score REAL")
+    ensure_column(connection, "job_versions", "capability TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "run_items", "result_id INTEGER REFERENCES results(id) ON DELETE SET NULL")
+    ensure_column(connection, "run_items", "page_number INTEGER")
+    ensure_column(connection, "run_items", "input_artifact_rel_path TEXT")
+    ensure_column(connection, "run_items", "claimed_by TEXT")
+    ensure_column(connection, "run_items", "claimed_at TEXT")
+    ensure_column(connection, "run_items", "last_heartbeat_at TEXT")
     ensure_column(connection, "productions", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     ensure_column(connection, "container_sources", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     backfilled_legacy_control_number = backfill_legacy_column(
@@ -767,6 +779,25 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         "display_attachment_sequence",
         "control_number_attachment_sequence",
     )
+    if table_exists(connection, "job_versions") and table_exists(connection, "jobs"):
+        blank_capability_rows = connection.execute(
+            """
+            SELECT jv.id, j.job_kind
+            FROM job_versions jv
+            JOIN jobs j ON j.id = jv.job_id
+            WHERE jv.capability IS NULL OR TRIM(jv.capability) = ''
+            """
+        ).fetchall()
+        for row in blank_capability_rows:
+            job_kind = normalize_whitespace(str(row["job_kind"] or "")).lower()
+            try:
+                capability = default_job_capability_for_kind(job_kind)
+            except RetrieverError:
+                capability = "text_structured"
+            connection.execute(
+                "UPDATE job_versions SET capability = ? WHERE id = ?",
+                (capability, int(row["id"])),
+            )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_parent_document_id ON documents(parent_document_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_dataset_id ON documents(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_kind ON documents(source_kind)")
@@ -774,6 +805,10 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_production_id ON documents(production_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_begin_bates ON documents(begin_bates)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_end_bates ON documents(end_bates)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_text_revision_id ON documents(source_text_revision_id)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_documents_active_search_text_revision_id ON documents(active_search_text_revision_id)"
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_sources_dataset_id ON dataset_sources(dataset_id)")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_sources_locator_unique ON dataset_sources(source_kind, source_locator)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_documents_document_id ON dataset_documents(document_id)")
@@ -802,6 +837,83 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         """
         CREATE INDEX IF NOT EXISTS idx_documents_control_number_sort
         ON documents(control_number_batch, control_number_family_sequence, control_number_attachment_sequence)
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_job_outputs_job_id ON job_outputs(job_id, ordinal)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_job_versions_job_id ON job_versions(job_id, version DESC)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_job_versions_capability ON job_versions(capability)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_job_version_id ON runs(job_version_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_from_run_id ON runs(from_run_id)")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_run_snapshot_documents_run_id_ordinal
+        ON run_snapshot_documents(run_id, ordinal, id)
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_snapshot_documents_document_id ON run_snapshot_documents(document_id)"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_run_id_status ON run_items(run_id, status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_document_id ON run_items(document_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_result_id ON run_items(result_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_page_number ON run_items(run_id, document_id, page_number)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_run_claim ON run_items(run_id, status, claimed_by)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_heartbeat ON run_items(last_heartbeat_at)")
+    connection.execute("DROP INDEX IF EXISTS idx_run_items_snapshot_kind_unique")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_run_items_snapshot_kind_unique
+        ON run_items(
+          run_id,
+          COALESCE(run_snapshot_document_id, 0),
+          item_kind,
+          COALESCE(page_number, 0),
+          COALESCE(segment_id, 0)
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_attempts_run_item_id ON attempts(run_item_id, attempt_number)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_ocr_page_outputs_run_id_doc_page ON ocr_page_outputs(run_id, document_id, page_number)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_job_version_id ON results(job_version_id, created_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_document_id ON results(document_id, created_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_input_revision_id ON results(input_revision_id)")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_results_active_identity_unique
+        ON results(document_id, job_version_id, input_identity)
+        WHERE retracted_at IS NULL
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_result_outputs_result_id ON result_outputs(result_id)")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_text_revisions_document_created_at
+        ON text_revisions(document_id, created_at, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_text_revision_segments_revision_profile
+        ON text_revision_segments(revision_id, segment_profile, level, ordinal)
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_vectors_active_segment_unique
+        ON embedding_vectors(job_version_id, segment_id)
+        WHERE retracted_at IS NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_publications_document_field
+        ON publications(document_id, custom_field_name, published_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_text_revision_activation_events_document_created_at
+        ON text_revision_activation_events(document_id, created_at, id)
         """
     )
     merged_legacy_locks = merge_legacy_field_locks(connection)
@@ -875,6 +987,54 @@ def detect_platform() -> dict[str, str]:
     }
 
 
+def probe_processing_providers(connection: sqlite3.Connection | None) -> dict[str, object]:
+    configured_providers: list[str] = []
+    configured_capabilities: list[str] = []
+    if connection is not None and table_exists(connection, "job_versions"):
+        configured_providers = sorted(
+            {
+                normalize_whitespace(str(row["provider"] or "")).lower()
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT provider
+                    FROM job_versions
+                    WHERE provider IS NOT NULL AND TRIM(provider) != ''
+                    """
+                ).fetchall()
+                if normalize_whitespace(str(row["provider"] or ""))
+            }
+        )
+        configured_capabilities = sorted(
+            {
+                normalize_whitespace(str(row["capability"] or "")).lower()
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT capability
+                    FROM job_versions
+                    WHERE capability IS NOT NULL AND TRIM(capability) != ''
+                    """
+                ).fetchall()
+                if normalize_whitespace(str(row["capability"] or ""))
+            }
+        )
+    return {
+        "configured_providers": configured_providers,
+        "configured_capabilities": configured_capabilities,
+        "cowork_runtime": {
+            "status": "pass",
+            "detail": "Cowork agent execution is the primary runtime path for processing jobs.",
+        },
+        "external_providers": {
+            "status": "warn" if configured_providers else "pass",
+            "detail": (
+                "External provider identifiers are stored for future integrations, but are not required for Cowork execution."
+                if configured_providers
+                else "No external provider identifiers are configured."
+            ),
+        },
+    }
+
+
 def determine_workspace_state(paths: dict[str, Path]) -> str:
     state_dir = paths["state_dir"].exists()
     tool_path = paths["tool_path"].exists()
@@ -907,6 +1067,7 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
     registry_status = None
     schema_status = None
     workspace_inventory = None
+    processing_providers = probe_processing_providers(None)
     journal_mode = None
     db_error = None
 
@@ -918,6 +1079,7 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
                 schema_status = apply_schema(connection, root)
                 registry_status = reconcile_custom_fields_registry(connection, repair=True)
                 workspace_inventory = document_inventory_counts(connection)
+                processing_providers = probe_processing_providers(connection)
             finally:
                 connection.close()
         except Exception as exc:
@@ -943,6 +1105,7 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
         "sqlite_version": sqlite3.sqlite_version,
         "fts5": fts5,
         "pst_backend": pst_backend,
+        "processing_providers": processing_providers,
         "platform": detect_platform(),
         "workspace": {
             "root": str(root.resolve()),
