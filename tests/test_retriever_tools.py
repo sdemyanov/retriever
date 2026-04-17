@@ -708,6 +708,1602 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(runtime["schema_version"], retriever_tools.SCHEMA_VERSION)
         self.assertEqual(runtime["template_sha256"], retriever_tools.sha256_file(self.paths["tool_path"]))
 
+    def test_bootstrap_initializes_processing_schema_and_job_crud(self) -> None:
+        result = retriever_tools.bootstrap(self.root)
+        self.assertEqual(result["schema_version"], retriever_tools.SCHEMA_VERSION)
+
+        exit_code, create_job_payload, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Contract Metadata",
+            "structured_extraction",
+            "--description",
+            "Extract key contract facts",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(create_job_payload)
+        self.assertEqual(create_job_payload["job"]["job_name"], "contract_metadata")
+        self.assertEqual(create_job_payload["job"]["job_kind"], "structured_extraction")
+
+        exit_code, add_output_payload, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "contract_metadata",
+            "Governing Law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(add_output_payload)
+        self.assertEqual(add_output_payload["job_output"]["output_name"], "governing_law")
+        self.assertTrue(add_output_payload["created"])
+
+        exit_code, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "contract_metadata",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Extract the governing law field.",
+            "--response-schema-json",
+            "{\"type\":\"object\",\"properties\":{\"governing_law\":{\"type\":\"string\"}}}",
+            "--parameters-json",
+            "{\"temperature\":0}",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["version"], 1)
+        self.assertEqual(create_version_payload["job_version"]["capability"], "text_structured")
+        self.assertEqual(create_version_payload["job_version"]["provider"], "openai")
+        self.assertEqual(create_version_payload["job_version"]["parameters"], {"temperature": 0})
+        self.assertEqual(
+            create_version_payload["job_version"]["response_schema"]["type"],
+            "object",
+        )
+
+        exit_code, list_jobs_payload, _, _ = self.run_cli("list-jobs", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_jobs_payload)
+        self.assertEqual(len(list_jobs_payload["jobs"]), 1)
+        self.assertEqual(list_jobs_payload["jobs"][0]["latest_job_version"]["version"], 1)
+        self.assertEqual(list_jobs_payload["jobs"][0]["outputs"][0]["output_name"], "governing_law")
+
+        exit_code, versions_payload, _, _ = self.run_cli("list-job-versions", str(self.root), "contract_metadata")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(versions_payload)
+        self.assertEqual(len(versions_payload["job_versions"]), 1)
+        self.assertEqual(versions_payload["job_versions"][0]["display_name"], "contract_metadata v1")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_columns = retriever_tools.table_columns(connection, "documents")
+            self.assertIn("source_text_revision_id", document_columns)
+            self.assertIn("active_search_text_revision_id", document_columns)
+            self.assertIn("active_text_source_kind", document_columns)
+            self.assertIn("active_text_language", document_columns)
+            self.assertIn("active_text_quality_score", document_columns)
+            self.assertIn("capability", retriever_tools.table_columns(connection, "job_versions"))
+            run_item_columns = retriever_tools.table_columns(connection, "run_items")
+            self.assertIn("claimed_by", run_item_columns)
+            self.assertIn("claimed_at", run_item_columns)
+            self.assertIn("last_heartbeat_at", run_item_columns)
+
+            expected_tables = {
+                "jobs",
+                "job_outputs",
+                "job_versions",
+                "runs",
+                "run_snapshot_documents",
+                "run_items",
+                "attempts",
+                "results",
+                "result_outputs",
+                "text_revisions",
+                "text_revision_segments",
+                "embedding_vectors",
+                "publications",
+                "text_revision_activation_events",
+            }
+            actual_tables = {
+                row["name"]
+                for row in connection.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                    """
+                ).fetchall()
+            }
+            self.assertTrue(expected_tables.issubset(actual_tables))
+
+            job_row = connection.execute(
+                "SELECT id FROM jobs WHERE job_name = ?",
+                ("contract_metadata",),
+            ).fetchone()
+            self.assertIsNotNone(job_row)
+            job_version_row = connection.execute(
+                "SELECT id FROM job_versions WHERE job_id = ? AND version = 1",
+                (job_row["id"],),
+            ).fetchone()
+            self.assertIsNotNone(job_version_row)
+
+            document_cursor = connection.execute(
+                """
+                INSERT INTO documents (rel_path, file_name, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                ("sample.txt", "sample.txt", "2026-04-17T00:00:00Z"),
+            )
+            document_id = int(document_cursor.lastrowid)
+            text_revision_cursor = connection.execute(
+                """
+                INSERT INTO text_revisions (
+                  document_id,
+                  revision_kind,
+                  language,
+                  parent_revision_id,
+                  created_by_job_version_id,
+                  storage_rel_path,
+                  content_hash,
+                  char_count,
+                  token_estimate,
+                  quality_score,
+                  provider_metadata_json,
+                  created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    "source_extract",
+                    "en",
+                    None,
+                    None,
+                    None,
+                    retriever_tools.sha256_text("alpha"),
+                    5,
+                    1,
+                    None,
+                    "{}",
+                    "2026-04-17T00:00:00Z",
+                ),
+            )
+            input_revision_id = int(text_revision_cursor.lastrowid)
+            input_identity = retriever_tools.build_text_revision_input_identity(input_revision_id)
+
+            connection.execute(
+                """
+                INSERT INTO results (
+                  run_id,
+                  document_id,
+                  job_version_id,
+                  input_revision_id,
+                  input_identity,
+                  raw_output_json,
+                  normalized_output_json,
+                  created_text_revision_id,
+                  provider_metadata_json,
+                  created_at,
+                  retracted_at,
+                  retraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None,
+                    document_id,
+                    int(job_version_row["id"]),
+                    input_revision_id,
+                    input_identity,
+                    "{\"governing_law\":\"Delaware\"}",
+                    "{\"governing_law\":\"Delaware\"}",
+                    None,
+                    "{}",
+                    "2026-04-17T00:00:00Z",
+                    None,
+                    None,
+                ),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO results (
+                      run_id,
+                      document_id,
+                      job_version_id,
+                      input_revision_id,
+                      input_identity,
+                      raw_output_json,
+                      normalized_output_json,
+                      created_text_revision_id,
+                      provider_metadata_json,
+                      created_at,
+                      retracted_at,
+                      retraction_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        None,
+                        document_id,
+                        int(job_version_row["id"]),
+                        input_revision_id,
+                        input_identity,
+                        "{\"governing_law\":\"Delaware\"}",
+                        "{\"governing_law\":\"Delaware\"}",
+                        None,
+                        "{}",
+                        "2026-04-17T00:00:01Z",
+                        None,
+                        None,
+                    ),
+                )
+
+            connection.execute(
+                """
+                UPDATE results
+                SET retracted_at = ?, retraction_reason = ?
+                WHERE document_id = ? AND job_version_id = ? AND input_identity = ?
+                """,
+                (
+                    "2026-04-17T00:00:02Z",
+                    "Superseded during testing",
+                    document_id,
+                    int(job_version_row["id"]),
+                    input_identity,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO results (
+                  run_id,
+                  document_id,
+                  job_version_id,
+                  input_revision_id,
+                  input_identity,
+                  raw_output_json,
+                  normalized_output_json,
+                  created_text_revision_id,
+                  provider_metadata_json,
+                  created_at,
+                  retracted_at,
+                  retraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None,
+                    document_id,
+                    int(job_version_row["id"]),
+                    input_revision_id,
+                    input_identity,
+                    "{\"governing_law\":\"New York\"}",
+                    "{\"governing_law\":\"New York\"}",
+                    None,
+                    "{}",
+                    "2026-04-17T00:00:03Z",
+                    None,
+                    None,
+                ),
+            )
+            connection.commit()
+
+            active_count_row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM results
+                WHERE document_id = ? AND job_version_id = ? AND input_identity = ? AND retracted_at IS NULL
+                """,
+                (document_id, int(job_version_row["id"]), input_identity),
+            ).fetchone()
+            self.assertEqual(active_count_row["count"], 1)
+        finally:
+            connection.close()
+
+    def test_ingest_seeds_text_revisions_and_create_run_freezes_family_snapshot(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Run planning",
+            body_text="Parent body text for the email.",
+            attachment_name="notes.txt",
+            attachment_text="confidential attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        parent_row = self.fetch_document_row("thread.eml")
+        child_rows = self.fetch_child_rows(parent_row["id"])
+        self.assertEqual(len(child_rows), 1)
+        child_row = child_rows[0]
+
+        self.assertIsNotNone(parent_row["source_text_revision_id"])
+        self.assertEqual(parent_row["source_text_revision_id"], parent_row["active_search_text_revision_id"])
+        self.assertIsNotNone(child_row["source_text_revision_id"])
+        self.assertEqual(child_row["source_text_revision_id"], child_row["active_search_text_revision_id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            parent_revision_row = connection.execute(
+                "SELECT * FROM text_revisions WHERE id = ?",
+                (parent_row["source_text_revision_id"],),
+            ).fetchone()
+            child_revision_row = connection.execute(
+                "SELECT * FROM text_revisions WHERE id = ?",
+                (child_row["source_text_revision_id"],),
+            ).fetchone()
+            self.assertIsNotNone(parent_revision_row)
+            self.assertIsNotNone(child_revision_row)
+            parent_revision_text = retriever_tools.read_text_revision_body(
+                self.paths,
+                parent_revision_row["storage_rel_path"],
+            )
+            child_revision_text = retriever_tools.read_text_revision_body(
+                self.paths,
+                child_revision_row["storage_rel_path"],
+            )
+        finally:
+            connection.close()
+
+        self.assertIn("Parent body text for the email.", parent_revision_text)
+        self.assertIn("confidential attachment detail", child_revision_text)
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Issue Tags",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "issue_tags",
+            "primary_issue",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        version_exit, version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "issue_tags",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Extract the main issue tag.",
+            "--parameters-json",
+            "{\"temperature\":0}",
+        )
+        self.assertEqual(version_exit, 0)
+        self.assertIsNotNone(version_payload)
+        self.assertEqual(version_payload["job_version"]["version"], 1)
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-name",
+            "issue_tags",
+            "--job-version",
+            "1",
+            "--query",
+            "confidential",
+            "--family-mode",
+            "with_family",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_payload = create_run_payload["run"]
+        self.assertEqual(run_payload["planned_count"], 2)
+        self.assertEqual(len(run_payload["documents"]), 2)
+
+        snapshot_by_document_id = {
+            int(item["document_id"]): item
+            for item in run_payload["documents"]
+        }
+        self.assertEqual(set(snapshot_by_document_id), {int(parent_row["id"]), int(child_row["id"])})
+        self.assertEqual(
+            snapshot_by_document_id[int(child_row["id"])]["pinned_input_revision_id"],
+            int(child_row["source_text_revision_id"]),
+        )
+        self.assertEqual(
+            snapshot_by_document_id[int(child_row["id"])]["pinned_input_identity"],
+            retriever_tools.build_text_revision_input_identity(int(child_row["source_text_revision_id"])),
+        )
+        self.assertEqual(
+            snapshot_by_document_id[int(child_row["id"])]["inclusion_reason"]["direct_reasons"][0]["type"],
+            "search",
+        )
+        self.assertEqual(
+            snapshot_by_document_id[int(parent_row["id"])]["inclusion_reason"]["family_seed_document_ids"],
+            [int(child_row["id"])],
+        )
+
+        first_run_id = int(run_payload["id"])
+        second_run_exit, second_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-name",
+            "issue_tags",
+            "--job-version",
+            "1",
+            "--from-run-id",
+            str(first_run_id),
+        )
+        self.assertEqual(second_run_exit, 0)
+        self.assertIsNotNone(second_run_payload)
+        second_snapshot = {
+            int(item["document_id"]): item
+            for item in second_run_payload["run"]["documents"]
+        }
+        self.assertEqual(set(second_snapshot), set(snapshot_by_document_id))
+        self.assertEqual(
+            second_snapshot[int(parent_row["id"])]["pinned_input_revision_id"],
+            snapshot_by_document_id[int(parent_row["id"])]["pinned_input_revision_id"],
+        )
+        self.assertEqual(
+            second_snapshot[int(child_row["id"])]["pinned_input_identity"],
+            snapshot_by_document_id[int(child_row["id"])]["pinned_input_identity"],
+        )
+
+    def test_activate_text_revision_rebuilds_search_chunks_and_records_event(self) -> None:
+        note_path = self.root / "note.txt"
+        note_path.write_text("sourcealphaonly original searchable text", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("note.txt")
+        source_revision_id = int(document_row["source_text_revision_id"])
+        replacement_text = "promotedbetaonly replacement searchable text"
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("BEGIN")
+            try:
+                promoted_revision_id = retriever_tools.create_text_revision_row(
+                    connection,
+                    self.paths,
+                    document_id=int(document_row["id"]),
+                    revision_kind="ocr",
+                    text_content=replacement_text,
+                    language="en",
+                    parent_revision_id=source_revision_id,
+                    created_by_job_version_id=None,
+                    quality_score=0.95,
+                    provider_metadata={"provider": "test"},
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        finally:
+            connection.close()
+
+        before_activation = retriever_tools.search(self.root, "promotedbetaonly", None, None, None, 1, 20)
+        self.assertEqual(before_activation["total_hits"], 0)
+        original_search = retriever_tools.search(self.root, "sourcealphaonly", None, None, None, 1, 20)
+        self.assertEqual(original_search["total_hits"], 1)
+
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+            "--text-revision-id",
+            str(promoted_revision_id),
+        )
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        self.assertEqual(activate_payload["activation_policy"], "manual")
+        self.assertEqual(activate_payload["text_revision"]["id"], promoted_revision_id)
+        self.assertTrue(activate_payload["text_revision"]["is_active_search_revision"])
+
+        list_exit, list_payload, _, _ = self.run_cli(
+            "list-text-revisions",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(list_exit, 0)
+        self.assertIsNotNone(list_payload)
+        listed_by_id = {int(item["id"]): item for item in list_payload["text_revisions"]}
+        self.assertEqual(set(listed_by_id), {source_revision_id, int(promoted_revision_id)})
+        self.assertTrue(listed_by_id[int(promoted_revision_id)]["is_active_search_revision"])
+        self.assertTrue(listed_by_id[source_revision_id]["is_source_revision"])
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["source_text_revision_id"], source_revision_id)
+        self.assertEqual(updated_row["active_search_text_revision_id"], promoted_revision_id)
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+        self.assertEqual(updated_row["content_hash"], retriever_tools.sha256_text(replacement_text))
+
+        promoted_search = retriever_tools.search(self.root, "promotedbetaonly", None, None, None, 1, 20)
+        self.assertEqual(promoted_search["total_hits"], 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            chunk_texts = [
+                row["text_content"]
+                for row in connection.execute(
+                    """
+                    SELECT text_content
+                    FROM document_chunks
+                    WHERE document_id = ?
+                    ORDER BY chunk_index ASC
+                    """,
+                    (document_row["id"],),
+                ).fetchall()
+            ]
+            self.assertEqual(chunk_texts, [replacement_text])
+            activation_row = connection.execute(
+                """
+                SELECT *
+                FROM text_revision_activation_events
+                WHERE document_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (document_row["id"],),
+            ).fetchone()
+            self.assertIsNotNone(activation_row)
+            self.assertEqual(activation_row["text_revision_id"], promoted_revision_id)
+            self.assertEqual(activation_row["activation_policy"], "manual")
+        finally:
+            connection.close()
+
+    def test_execute_run_reuses_results_and_publishes_bound_outputs(self) -> None:
+        note_path = self.root / "contract.txt"
+        note_path.write_text("This contract mentions Delaware and an automatic renewal clause.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("contract.txt")
+
+        add_field_exit, _, _, _ = self.run_cli("add-field", str(self.root), "governing_law", "text")
+        self.assertEqual(add_field_exit, 0)
+        add_bool_field_exit, _, _, _ = self.run_cli("add-field", str(self.root), "auto_renewal", "boolean")
+        self.assertEqual(add_bool_field_exit, 0)
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_governing_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "contract_metadata",
+            "governing_law",
+            "--value-type",
+            "text",
+            "--bind-custom-field",
+            "governing_law",
+        )
+        self.assertEqual(add_governing_output_exit, 0)
+        add_renewal_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "contract_metadata",
+            "auto_renewal",
+            "--value-type",
+            "boolean",
+            "--bind-custom-field",
+            "auto_renewal",
+        )
+        self.assertEqual(add_renewal_output_exit, 0)
+
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "contract_metadata",
+            "--provider",
+            "static_json",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Return contract metadata.",
+            "--parameters-json",
+            "{\"output_values\":{\"governing_law\":\"Delaware\",\"auto_renewal\":true}}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        first_run_id = int(create_run_payload["run"]["id"])
+
+        execute_run_exit, execute_run_payload, _, _ = self.run_cli(
+            "execute-run",
+            str(self.root),
+            "--run-id",
+            str(first_run_id),
+        )
+        self.assertEqual(execute_run_exit, 0)
+        self.assertIsNotNone(execute_run_payload)
+        self.assertEqual(execute_run_payload["run"]["status"], "completed")
+        self.assertEqual(execute_run_payload["run"]["completed_count"], 1)
+        self.assertEqual(execute_run_payload["run"]["skipped_count"], 0)
+        self.assertEqual(len(execute_run_payload["run_items"]), 1)
+        self.assertEqual(execute_run_payload["run_items"][0]["status"], "completed")
+        self.assertEqual(len(execute_run_payload["results"]), 1)
+        first_result = execute_run_payload["results"][0]
+        outputs_by_name = {item["output_name"]: item for item in first_result["outputs"]}
+        self.assertEqual(outputs_by_name["governing_law"]["output_value"], "Delaware")
+        self.assertEqual(outputs_by_name["auto_renewal"]["output_value"], True)
+
+        list_results_exit, list_results_payload, _, _ = self.run_cli(
+            "list-results",
+            str(self.root),
+            "--run-id",
+            str(first_run_id),
+        )
+        self.assertEqual(list_results_exit, 0)
+        self.assertIsNotNone(list_results_payload)
+        self.assertEqual(len(list_results_payload["results"]), 1)
+
+        publish_exit, publish_payload, _, _ = self.run_cli(
+            "publish-run-results",
+            str(self.root),
+            "--run-id",
+            str(first_run_id),
+        )
+        self.assertEqual(publish_exit, 0)
+        self.assertIsNotNone(publish_payload)
+        self.assertEqual(publish_payload["published_count"], 2)
+        updated_document_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_document_row["governing_law"], "Delaware")
+        self.assertEqual(updated_document_row["auto_renewal"], 1)
+
+        second_run_exit, second_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--from-run-id",
+            str(first_run_id),
+        )
+        self.assertEqual(second_run_exit, 0)
+        self.assertIsNotNone(second_run_payload)
+        second_run_id = int(second_run_payload["run"]["id"])
+
+        second_execute_exit, second_execute_payload, _, _ = self.run_cli(
+            "execute-run",
+            str(self.root),
+            "--run-id",
+            str(second_run_id),
+        )
+        self.assertEqual(second_execute_exit, 0)
+        self.assertIsNotNone(second_execute_payload)
+        self.assertEqual(second_execute_payload["run"]["status"], "completed")
+        self.assertEqual(second_execute_payload["run"]["completed_count"], 0)
+        self.assertEqual(second_execute_payload["run"]["skipped_count"], 1)
+        self.assertEqual(len(second_execute_payload["results"]), 1)
+        self.assertEqual(second_execute_payload["results"][0]["id"], first_result["id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            result_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM results
+                WHERE document_id = ? AND job_version_id = ? AND retracted_at IS NULL
+                """,
+                (document_row["id"], job_version_id),
+            ).fetchone()["count"]
+            self.assertEqual(result_count, 1)
+            publication_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM publications
+                WHERE document_id = ?
+                """,
+                (document_row["id"],),
+            ).fetchone()["count"]
+            self.assertEqual(publication_count, 2)
+            reused_run_item = connection.execute(
+                """
+                SELECT *
+                FROM run_items
+                WHERE run_id = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (second_run_id,),
+            ).fetchone()
+            self.assertIsNotNone(reused_run_item)
+            self.assertEqual(reused_run_item["status"], "skipped")
+            self.assertEqual(reused_run_item["result_id"], first_result["id"])
+        finally:
+            connection.close()
+
+    def test_execute_translation_run_creates_derived_text_revision(self) -> None:
+        note_path = self.root / "memo.txt"
+        note_path.write_text("Original English memo text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("memo.txt")
+        source_revision_id = int(document_row["source_text_revision_id"])
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Translate ES",
+            "translation",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "translate_es",
+            "--provider",
+            "static_text",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Translate to Spanish.",
+            "--parameters-json",
+            "{\"target_language\":\"es\",\"translated_text\":\"ES::{text}\"}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        execute_run_exit, execute_run_payload, _, _ = self.run_cli(
+            "execute-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(execute_run_exit, 0)
+        self.assertIsNotNone(execute_run_payload)
+        self.assertEqual(execute_run_payload["run"]["status"], "completed")
+        self.assertEqual(len(execute_run_payload["results"]), 1)
+        result_payload = execute_run_payload["results"][0]
+        self.assertIsNotNone(result_payload["created_text_revision_id"])
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["active_search_text_revision_id"], source_revision_id)
+        self.assertEqual(updated_row["source_text_revision_id"], source_revision_id)
+
+        revision_exit, revision_payload, _, _ = self.run_cli(
+            "list-text-revisions",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(revision_exit, 0)
+        self.assertIsNotNone(revision_payload)
+        revisions_by_id = {int(item["id"]): item for item in revision_payload["text_revisions"]}
+        translated_revision = revisions_by_id[int(result_payload["created_text_revision_id"])]
+        self.assertEqual(translated_revision["revision_kind"], "translation")
+        self.assertEqual(translated_revision["parent_revision_id"], source_revision_id)
+        self.assertFalse(translated_revision["is_active_search_revision"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            translated_row = connection.execute(
+                "SELECT * FROM text_revisions WHERE id = ?",
+                (result_payload["created_text_revision_id"],),
+            ).fetchone()
+            self.assertIsNotNone(translated_row)
+            translated_text = retriever_tools.read_text_revision_body(
+                self.paths,
+                translated_row["storage_rel_path"],
+            )
+            self.assertEqual(translated_text, "ES::Original English memo text.")
+        finally:
+            connection.close()
+
+    def test_claim_complete_run_item_flow_is_idempotent(self) -> None:
+        note_path = self.root / "contract.txt"
+        note_path.write_text("Governing law is Delaware.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("contract.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "contract_metadata",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "contract_metadata",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["capability"], "text_structured")
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-a",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        self.assertEqual(len(claim_payload["run_items"]), 1)
+        run_item_id = int(claim_payload["run_items"][0]["id"])
+        self.assertEqual(claim_payload["run_items"][0]["claimed_by"], "worker-a")
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(context_payload["context"]["job_version"]["capability"], "text_structured")
+        self.assertEqual(
+            context_payload["context"]["input"]["inline_text"],
+            "Governing law is Delaware.",
+        )
+        self.assertIn("governing_law", context_payload["context"]["response_schema"]["properties"])
+
+        complete_exit, complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "worker-a",
+            "--raw-output-json",
+            "{\"governing_law\":\"Delaware\"}",
+            "--normalized-output-json",
+            "{\"governing_law\":\"Delaware\"}",
+            "--output-values-json",
+            "{\"governing_law\":\"Delaware\"}",
+        )
+        self.assertEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+        self.assertFalse(complete_payload["idempotent"])
+        self.assertEqual(complete_payload["run"]["status"], "completed")
+        self.assertEqual(
+            complete_payload["result"]["outputs"][0]["output_value"],
+            "Delaware",
+        )
+
+        repeat_complete_exit, repeat_complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "worker-a",
+            "--raw-output-json",
+            "{\"governing_law\":\"Delaware\"}",
+            "--normalized-output-json",
+            "{\"governing_law\":\"Delaware\"}",
+            "--output-values-json",
+            "{\"governing_law\":\"Delaware\"}",
+        )
+        self.assertEqual(repeat_complete_exit, 0)
+        self.assertIsNotNone(repeat_complete_payload)
+        self.assertTrue(repeat_complete_payload["idempotent"])
+        self.assertEqual(repeat_complete_payload["result"]["id"], complete_payload["result"]["id"])
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "run-status",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        self.assertEqual(status_payload["run"]["status"], "completed")
+        self.assertEqual(status_payload["run"]["run_item_counts"]["completed"], 1)
+
+    def test_claim_run_items_reclaims_stale_running_items(self) -> None:
+        note_path = self.root / "stale.txt"
+        note_path.write_text("Counterparty is Acme.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("stale.txt")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Counterparty", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "counterparty",
+            "counterparty_name",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "counterparty",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Extract the counterparty.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        first_claim_exit, first_claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-a",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(first_claim_exit, 0)
+        self.assertIsNotNone(first_claim_payload)
+        run_item_id = int(first_claim_payload["run_items"][0]["id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                "UPDATE run_items SET last_heartbeat_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00Z", run_item_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        second_claim_exit, second_claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-b",
+            "--limit",
+            "1",
+            "--stale-seconds",
+            "60",
+        )
+        self.assertEqual(second_claim_exit, 0)
+        self.assertIsNotNone(second_claim_payload)
+        self.assertEqual(len(second_claim_payload["run_items"]), 1)
+        self.assertEqual(int(second_claim_payload["run_items"][0]["id"]), run_item_id)
+        self.assertEqual(second_claim_payload["run_items"][0]["claimed_by"], "worker-b")
+
+    def test_cancel_run_skips_pending_items_and_blocks_new_claims(self) -> None:
+        (self.root / "a.txt").write_text("Alpha text.", encoding="utf-8")
+        (self.root / "b.txt").write_text("Beta text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_doc = self.fetch_document_row("a.txt")
+        second_doc = self.fetch_document_row("b.txt")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Cancel Test", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "cancel_test",
+            "summary_text",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "cancel_test",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Summarize the document.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(first_doc["id"]),
+            "--doc-id",
+            str(second_doc["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-a",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        self.assertEqual(len(claim_payload["run_items"]), 1)
+
+        cancel_exit, cancel_payload, _, _ = self.run_cli(
+            "cancel-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(cancel_exit, 0)
+        self.assertIsNotNone(cancel_payload)
+        self.assertEqual(cancel_payload["run"]["status"], "canceled")
+        self.assertEqual(cancel_payload["canceled_pending_items"], 1)
+
+        post_cancel_claim_exit, post_cancel_claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-b",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(post_cancel_claim_exit, 0)
+        self.assertIsNotNone(post_cancel_claim_payload)
+        self.assertEqual(post_cancel_claim_payload["run"]["status"], "canceled")
+        self.assertEqual(post_cancel_claim_payload["run_items"], [])
+
+    def test_ocr_page_run_items_finalize_into_document_result(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+        self.assertEqual(image_only_row["text_status"], "empty")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Production OCR", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "production_ocr",
+            "--instruction",
+            "OCR each page image and preserve reading order.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["capability"], "vision_ocr")
+        self.assertEqual(create_version_payload["job_version"]["input_basis"], "source_parts")
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "ocr-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        claimed_items = claim_payload["run_items"]
+        self.assertEqual(len(claimed_items), 2)
+        self.assertTrue(all(item["item_kind"] == "page" for item in claimed_items))
+        self.assertEqual([item["page_number"] for item in claimed_items], [1, 2])
+
+        first_item_id = int(claimed_items[0]["id"])
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(first_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(context_payload["context"]["input"]["kind"], "ocr_page_image")
+        self.assertEqual(context_payload["context"]["input"]["page_number"], 1)
+        self.assertTrue(context_payload["context"]["input"]["artifact_path"].endswith("PDX000005.tif"))
+
+        for item in claimed_items:
+            page_number = int(item["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(item["id"]),
+                "--claimed-by",
+                "ocr-worker",
+                "--page-text",
+                f"OCR page {page_number}",
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+            self.assertIn("ocr_page_output", complete_payload)
+            self.assertEqual(complete_payload["ocr_page_output"]["page_number"], page_number)
+            self.assertEqual(complete_payload["ocr_page_output"]["text_content"], f"OCR page {page_number}")
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "finalize-ocr-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+        self.assertEqual(len(finalize_payload["results"]), 1)
+        result_payload = finalize_payload["results"][0]
+        self.assertIsNotNone(result_payload["created_text_revision_id"])
+
+        revisions_exit, revisions_payload, _, _ = self.run_cli(
+            "list-text-revisions",
+            str(self.root),
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(revisions_exit, 0)
+        self.assertIsNotNone(revisions_payload)
+        revisions_by_id = {int(item["id"]): item for item in revisions_payload["text_revisions"]}
+        ocr_revision = revisions_by_id[int(result_payload["created_text_revision_id"])]
+        self.assertEqual(ocr_revision["revision_kind"], "ocr")
+        self.assertFalse(ocr_revision["is_active_search_revision"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            text_revision_row = connection.execute(
+                "SELECT * FROM text_revisions WHERE id = ?",
+                (result_payload["created_text_revision_id"],),
+            ).fetchone()
+            self.assertIsNotNone(text_revision_row)
+            merged_text = retriever_tools.read_text_revision_body(
+                self.paths,
+                text_revision_row["storage_rel_path"],
+            )
+            self.assertEqual(merged_text, "OCR page 1\n\nOCR page 2")
+
+            page_item_rows = connection.execute(
+                """
+                SELECT page_number, result_id, status
+                FROM run_items
+                WHERE run_id = ?
+                ORDER BY page_number ASC, id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual([int(row["page_number"]) for row in page_item_rows], [1, 2])
+        self.assertTrue(all(str(row["status"]) == "completed" for row in page_item_rows))
+        self.assertTrue(all(int(row["result_id"]) == int(result_payload["id"]) for row in page_item_rows))
+
+    def test_ocr_source_parts_uses_native_pdf_parts_for_production_docs(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        native_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000004.logical")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Native PDF OCR", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "native_pdf_ocr",
+            "--instruction",
+            "OCR the native production PDF.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["input_basis"], "source_parts")
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(native_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+        self.assertEqual(create_run_payload["run"]["planned_count"], 1)
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "native-ocr-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        self.assertEqual(len(claim_payload["run_items"]), 1)
+        run_item = claim_payload["run_items"][0]
+        self.assertEqual(run_item["item_kind"], "page")
+        self.assertEqual(run_item["page_number"], 1)
+        self.assertTrue(
+            str(run_item["input_artifact_rel_path"]).startswith(
+                f".retriever/jobs/ocr/run-{run_id}/doc-{native_row['id']}/page-0001"
+            )
+        )
+        self.assertTrue(str(run_item["input_artifact_rel_path"]).endswith(".png"))
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item["id"]),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(context_payload["context"]["input"]["kind"], "ocr_page_image")
+        self.assertEqual(context_payload["context"]["input"]["page_number"], 1)
+        self.assertTrue(str(context_payload["context"]["input"]["artifact_rel_path"]).endswith(".png"))
+        self.assertTrue(str(context_payload["context"]["input"]["artifact_path"]).endswith(".png"))
+
+    def test_ocr_run_freezes_artifacts_at_create_run_and_reuses_them_from_prior_run(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            source_part_rows = connection.execute(
+                """
+                SELECT rel_source_path
+                FROM document_source_parts
+                WHERE document_id = ?
+                  AND part_kind = 'image'
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (image_only_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(source_part_rows), 2)
+        source_part_paths = [str(row["rel_source_path"]) for row in source_part_rows]
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Frozen OCR", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "frozen_ocr",
+            "--instruction",
+            "OCR the document pages.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["input_basis"], "source_parts")
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        first_run_id = int(create_run_payload["run"]["id"])
+        self.assertEqual(create_run_payload["run"]["planned_count"], 2)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            first_run_item_rows = connection.execute(
+                """
+                SELECT page_number, input_artifact_rel_path
+                FROM run_items
+                WHERE run_id = ?
+                ORDER BY page_number ASC, id ASC
+                """,
+                (first_run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual([int(row["page_number"]) for row in first_run_item_rows], [1, 2])
+        first_run_artifact_paths = [str(row["input_artifact_rel_path"]) for row in first_run_item_rows]
+        self.assertTrue(all(path.startswith(f".retriever/jobs/ocr/run-{first_run_id}/doc-{image_only_row['id']}/") for path in first_run_artifact_paths))
+        self.assertTrue(all(path not in source_part_paths for path in first_run_artifact_paths))
+
+        self.write_tiff_fixture(self.root / source_part_paths[0], (17, 34, 51))
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(first_run_id),
+            "--claimed-by",
+            "freeze-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        self.assertEqual(len(claim_payload["run_items"]), 2)
+        first_run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(first_run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(
+            context_payload["context"]["input"]["artifact_rel_path"],
+            first_run_artifact_paths[0],
+        )
+
+        second_run_exit, second_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--from-run-id",
+            str(first_run_id),
+        )
+        self.assertEqual(second_run_exit, 0)
+        self.assertIsNotNone(second_run_payload)
+        second_run_id = int(second_run_payload["run"]["id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            second_run_item_rows = connection.execute(
+                """
+                SELECT page_number, input_artifact_rel_path
+                FROM run_items
+                WHERE run_id = ?
+                ORDER BY page_number ASC, id ASC
+                """,
+                (second_run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual([int(row["page_number"]) for row in second_run_item_rows], [1, 2])
+        self.assertEqual(
+            [str(row["input_artifact_rel_path"]) for row in second_run_item_rows],
+            first_run_artifact_paths,
+        )
+
+    def test_execute_openai_structured_extraction_run_uses_provider_api(self) -> None:
+        note_path = self.root / "party.txt"
+        note_path.write_text("Counterparty is Acme Corp.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("party.txt")
+
+        add_field_exit, _, _, _ = self.run_cli("add-field", str(self.root), "counterparty_name", "text")
+        self.assertEqual(add_field_exit, 0)
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Counterparty Extract",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "counterparty_extract",
+            "counterparty_name",
+            "--value-type",
+            "text",
+            "--bind-custom-field",
+            "counterparty_name",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "counterparty_extract",
+            "--provider",
+            "openai_responses",
+            "--model",
+            "gpt-5.4",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Extract the counterparty.",
+            "--parameters-json",
+            "{\"temperature\":0}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        fake_response = {
+            "id": "resp_test_123",
+            "status": "completed",
+            "output_text": "{\"counterparty_name\":\"Acme Corp\"}",
+            "usage": {"input_tokens": 17, "output_tokens": 9},
+        }
+        with mock.patch.object(retriever_tools, "call_openai_responses_api", return_value=fake_response):
+            execute_run_exit, execute_run_payload, _, _ = self.run_cli(
+                "execute-run",
+                str(self.root),
+                "--run-id",
+                str(run_id),
+            )
+        self.assertEqual(execute_run_exit, 0)
+        self.assertIsNotNone(execute_run_payload)
+        self.assertEqual(execute_run_payload["run"]["status"], "completed")
+        self.assertEqual(len(execute_run_payload["results"]), 1)
+        result_payload = execute_run_payload["results"][0]
+        outputs_by_name = {item["output_name"]: item for item in result_payload["outputs"]}
+        self.assertEqual(outputs_by_name["counterparty_name"]["output_value"], "Acme Corp")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            attempt_row = connection.execute(
+                """
+                SELECT *
+                FROM attempts
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            self.assertIsNotNone(attempt_row)
+            self.assertEqual(attempt_row["provider_request_id"], "resp_test_123")
+            self.assertEqual(attempt_row["input_tokens"], 17)
+            self.assertEqual(attempt_row["output_tokens"], 9)
+        finally:
+            connection.close()
+
+        publish_exit, publish_payload, _, _ = self.run_cli(
+            "publish-run-results",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(publish_exit, 0)
+        self.assertIsNotNone(publish_payload)
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["counterparty_name"], "Acme Corp")
+
     def test_connect_db_falls_back_to_delete_when_wal_fails(self) -> None:
         class FakeCursor:
             def __init__(self, row):

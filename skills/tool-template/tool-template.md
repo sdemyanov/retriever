@@ -2,13 +2,13 @@
 
 ## Template metadata
 
-- tool version: `0.11.0`
-- schema version: `12`
+- tool version: `0.13.0`
+- schema version: `15`
 - requirements version: `2026-04-16-phase4-pst`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `bde7f2fa7e7e1ac7caa667353dcfe1b51ad2431b62eb8807014c0e0c0b493a80`
+- source checksum (SHA256): `b5c6cda5b72f0b85519fc989a57df1af3d74d99c46d69812dee780e701f4085c`
 
 ## Current command surface
 
@@ -35,6 +35,26 @@ The current template implements:
 - `add-to-dataset`
 - `remove-from-dataset`
 - `delete-dataset`
+- `list-jobs`
+- `create-job`
+- `add-job-output`
+- `list-job-versions`
+- `create-job-version`
+- `list-runs`
+- `get-run`
+- `create-run`
+- `run-status`
+- `cancel-run`
+- `claim-run-items`
+- `get-run-item-context`
+- `heartbeat-run-items`
+- `complete-run-item`
+- `fail-run-item`
+- `list-results`
+- `execute-run`
+- `publish-run-results`
+- `list-text-revisions`
+- `activate-text-revision`
 
 Stats and review commands remain later-phase work.
 
