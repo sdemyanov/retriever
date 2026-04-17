@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import argparse
 import base64
 import csv
@@ -10,6 +11,7 @@ import io
 import json
 import mailbox
 import mimetypes
+import os
 import posixpath
 import platform
 import re
@@ -17,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
@@ -26,6 +29,8 @@ from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 try:
     import charset_normalizer
@@ -73,8 +78,8 @@ except Exception:  # pragma: no cover - required PST backend probe
     pypff = None
 
 
-TOOL_VERSION = "0.11.0"
-SCHEMA_VERSION = 13
+TOOL_VERSION = "0.13.0"
+SCHEMA_VERSION = 15
 REQUIREMENTS_VERSION = "2026-04-16-phase4-pst"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
 MANUAL_FIELD_LOCKS_COLUMN = "manual_field_locks_json"

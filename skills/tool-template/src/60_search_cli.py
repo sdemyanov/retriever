@@ -1926,6 +1926,30 @@ def add_search_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_run_selector_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -> None:
+    option_prefix = f"{prefix}-" if prefix else ""
+    dest_prefix = f"{prefix.replace('-', '_')}_" if prefix else ""
+    parser.add_argument(f"--{option_prefix}dataset-id", dest=f"{dest_prefix}dataset_ids", action="append", type=int, help="Dataset id (repeatable)")
+    parser.add_argument(f"--{option_prefix}dataset-name", dest=f"{dest_prefix}dataset_names", action="append", help="Exact dataset name (repeatable)")
+    parser.add_argument(f"--{option_prefix}doc-id", dest=f"{dest_prefix}document_ids", action="append", type=int, help="Document id (repeatable)")
+    parser.add_argument(
+        f"--{option_prefix}control-number",
+        dest=f"{dest_prefix}control_numbers",
+        action="append",
+        help="Control number (repeatable)",
+    )
+    parser.add_argument(f"--{option_prefix}query", dest=f"{dest_prefix}query", help="Keyword query text")
+    parser.add_argument(
+        f"--{option_prefix}filter",
+        dest=f"{dest_prefix}filters",
+        action="append",
+        nargs="+",
+        help="Repeatable filter in the form <field> <op> <value>",
+    )
+    if not prefix:
+        parser.add_argument("--from-run-id", type=int, help="Reuse the full frozen snapshot from a prior run")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retriever workspace tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2101,6 +2125,132 @@ def build_parser() -> argparse.ArgumentParser:
     delete_dataset_parser.add_argument("workspace", help="Workspace root path")
     add_dataset_selector_arguments(delete_dataset_parser)
 
+    list_runs_parser = subparsers.add_parser("list-runs", help="List planned processing runs")
+    list_runs_parser.add_argument("workspace", help="Workspace root path")
+
+    get_run_parser = subparsers.add_parser("get-run", help="Fetch one planned processing run")
+    get_run_parser.add_argument("workspace", help="Workspace root path")
+    get_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+
+    create_run_parser = subparsers.add_parser("create-run", help="Create a frozen processing run snapshot")
+    create_run_parser.add_argument("workspace", help="Workspace root path")
+    job_version_group = create_run_parser.add_mutually_exclusive_group(required=True)
+    job_version_group.add_argument("--job-version-id", type=int, help="Explicit job version id")
+    job_version_group.add_argument("--job-name", help="Job name")
+    create_run_parser.add_argument("--job-version", dest="job_version_number", type=int, help="Job version number when selecting by job name")
+    add_run_selector_arguments(create_run_parser)
+    add_run_selector_arguments(create_run_parser, prefix="exclude")
+    create_run_parser.add_argument(
+        "--family-mode",
+        default="exact",
+        choices=sorted(RUN_FAMILY_MODES),
+        help="Whether to include only seed docs or their family members too",
+    )
+    create_run_parser.add_argument("--limit", dest="seed_limit", type=int, help="Limit the directly matched seed set")
+
+    list_text_revisions_parser = subparsers.add_parser("list-text-revisions", help="List stored text revisions for a document")
+    list_text_revisions_parser.add_argument("workspace", help="Workspace root path")
+    list_text_revisions_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
+
+    activate_text_revision_parser = subparsers.add_parser("activate-text-revision", help="Promote a stored text revision to active indexed text")
+    activate_text_revision_parser.add_argument("workspace", help="Workspace root path")
+    activate_text_revision_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
+    activate_text_revision_parser.add_argument("--text-revision-id", type=int, required=True, help="Stored text revision id")
+    activate_text_revision_parser.add_argument(
+        "--activation-policy",
+        default="manual",
+        choices=sorted(TEXT_REVISION_ACTIVATION_POLICIES),
+        help="Audit label for why this revision is being promoted",
+    )
+
+    list_results_parser = subparsers.add_parser("list-results", help="List stored processing results")
+    list_results_parser.add_argument("workspace", help="Workspace root path")
+    list_results_parser.add_argument("--run-id", type=int, help="Filter results to one run")
+    list_results_parser.add_argument("--doc-id", dest="document_id", type=int, help="Filter results to one document")
+
+    execute_run_parser = subparsers.add_parser("execute-run", help="Execute one planned processing run")
+    execute_run_parser.add_argument("workspace", help="Workspace root path")
+    execute_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+
+    claim_run_items_parser = subparsers.add_parser("claim-run-items", help="Atomically claim pending run items for one worker")
+    claim_run_items_parser.add_argument("workspace", help="Workspace root path")
+    claim_run_items_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    claim_run_items_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier claiming the items")
+    claim_run_items_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE,
+        help="Maximum number of run items to claim",
+    )
+    claim_run_items_parser.add_argument(
+        "--stale-seconds",
+        type=int,
+        default=DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+        help="Reclaim running items whose heartbeat is older than this many seconds",
+    )
+
+    get_run_item_context_parser = subparsers.add_parser("get-run-item-context", help="Load the execution context for one run item")
+    get_run_item_context_parser.add_argument("workspace", help="Workspace root path")
+    get_run_item_context_parser.add_argument("--run-item-id", type=int, required=True, help="Run item id")
+
+    heartbeat_run_items_parser = subparsers.add_parser("heartbeat-run-items", help="Refresh heartbeat timestamps for one worker's claimed items")
+    heartbeat_run_items_parser.add_argument("workspace", help="Workspace root path")
+    heartbeat_run_items_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    heartbeat_run_items_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
+
+    complete_run_item_parser = subparsers.add_parser("complete-run-item", help="Mark one claimed run item completed and persist its result")
+    complete_run_item_parser.add_argument("workspace", help="Workspace root path")
+    complete_run_item_parser.add_argument("--run-item-id", type=int, required=True, help="Run item id")
+    complete_run_item_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
+    complete_run_item_parser.add_argument("--page-text", help="OCR page text for page-scoped run items")
+    complete_run_item_parser.add_argument("--raw-output-json", help="Optional raw output JSON")
+    complete_run_item_parser.add_argument("--normalized-output-json", help="Optional normalized output JSON")
+    complete_run_item_parser.add_argument("--output-values-json", help="Optional per-output values JSON object")
+    complete_run_item_parser.add_argument("--created-text-revision-json", help="Optional derived text revision payload JSON object")
+    complete_run_item_parser.add_argument("--provider-metadata-json", help="Optional provider metadata JSON object")
+    complete_run_item_parser.add_argument("--provider-request-id", help="Optional provider request identifier")
+    complete_run_item_parser.add_argument("--input-tokens", type=int, help="Optional input token count")
+    complete_run_item_parser.add_argument("--output-tokens", type=int, help="Optional output token count")
+    complete_run_item_parser.add_argument("--cost-cents", type=int, help="Optional provider cost in cents")
+    complete_run_item_parser.add_argument("--latency-ms", type=int, help="Optional execution latency in milliseconds")
+
+    fail_run_item_parser = subparsers.add_parser("fail-run-item", help="Mark one claimed run item failed")
+    fail_run_item_parser.add_argument("workspace", help="Workspace root path")
+    fail_run_item_parser.add_argument("--run-item-id", type=int, required=True, help="Run item id")
+    fail_run_item_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
+    fail_run_item_parser.add_argument("--error", required=True, help="Failure summary")
+    fail_run_item_parser.add_argument("--provider-metadata-json", help="Optional provider metadata JSON object")
+    fail_run_item_parser.add_argument("--provider-request-id", help="Optional provider request identifier")
+    fail_run_item_parser.add_argument("--input-tokens", type=int, help="Optional input token count")
+    fail_run_item_parser.add_argument("--output-tokens", type=int, help="Optional output token count")
+    fail_run_item_parser.add_argument("--cost-cents", type=int, help="Optional provider cost in cents")
+    fail_run_item_parser.add_argument("--latency-ms", type=int, help="Optional execution latency in milliseconds")
+
+    run_status_parser = subparsers.add_parser("run-status", help="Summarize run progress, claims, and recent failures")
+    run_status_parser.add_argument("workspace", help="Workspace root path")
+    run_status_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+
+    cancel_run_parser = subparsers.add_parser("cancel-run", help="Stop claiming new work for a run and skip its pending items")
+    cancel_run_parser.add_argument("workspace", help="Workspace root path")
+    cancel_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+
+    finalize_ocr_run_parser = subparsers.add_parser("finalize-ocr-run", help="Merge completed OCR page items into document-level OCR results")
+    finalize_ocr_run_parser.add_argument("workspace", help="Workspace root path")
+    finalize_ocr_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+
+    publish_run_results_parser = subparsers.add_parser(
+        "publish-run-results",
+        help="Publish bound result outputs from a run into custom fields",
+    )
+    publish_run_results_parser.add_argument("workspace", help="Workspace root path")
+    publish_run_results_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    publish_run_results_parser.add_argument(
+        "--output-name",
+        dest="output_names",
+        action="append",
+        help="Optional job output name to publish (repeatable)",
+    )
+
     list_jobs_parser = subparsers.add_parser("list-jobs", help="List configured processing jobs")
     list_jobs_parser.add_argument("workspace", help="Workspace root path")
 
@@ -2131,7 +2281,16 @@ def build_parser() -> argparse.ArgumentParser:
     create_job_version_parser.add_argument("workspace", help="Workspace root path")
     create_job_version_parser.add_argument("job_name", help="Existing job name")
     create_job_version_parser.add_argument("--instruction", help="Optional job instruction text")
-    create_job_version_parser.add_argument("--provider", required=True, help="Provider identifier")
+    create_job_version_parser.add_argument(
+        "--capability",
+        choices=sorted(JOB_CAPABILITIES),
+        help="Optional Cowork execution capability; defaults from job kind when omitted",
+    )
+    create_job_version_parser.add_argument(
+        "--provider",
+        default="cowork_agent",
+        help="Optional provider identifier (defaults to cowork_agent; external providers are future-facing)",
+    )
     create_job_version_parser.add_argument("--model", help="Optional model name")
     create_job_version_parser.add_argument(
         "--input-basis",
@@ -2305,6 +2464,175 @@ def main() -> int:
                 ),
             )
 
+        if args.command == "list-runs":
+            print(json.dumps(list_runs(root), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "get-run":
+            print(json.dumps(get_run(root, args.run_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "create-run":
+            print(
+                json.dumps(
+                    create_run(
+                        root,
+                        job_version_id=args.job_version_id,
+                        raw_job_name=args.job_name,
+                        job_version_number=args.job_version_number,
+                        dataset_ids=args.dataset_ids,
+                        dataset_names=args.dataset_names,
+                        document_ids=args.document_ids,
+                        control_numbers=args.control_numbers,
+                        query=args.query,
+                        raw_filters=args.filters,
+                        from_run_id=args.from_run_id,
+                        exclude_dataset_ids=args.exclude_dataset_ids,
+                        exclude_dataset_names=args.exclude_dataset_names,
+                        exclude_document_ids=args.exclude_document_ids,
+                        exclude_control_numbers=args.exclude_control_numbers,
+                        exclude_query=args.exclude_query,
+                        exclude_filters=args.exclude_filters,
+                        family_mode=args.family_mode,
+                        seed_limit=args.seed_limit,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "list-text-revisions":
+            print(json.dumps(list_text_revisions(root, document_id=args.document_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "activate-text-revision":
+            print(
+                json.dumps(
+                    activate_text_revision(
+                        root,
+                        document_id=args.document_id,
+                        text_revision_id=args.text_revision_id,
+                        activation_policy=args.activation_policy,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "list-results":
+            print(
+                json.dumps(
+                    list_results(root, run_id=args.run_id, document_id=args.document_id),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "execute-run":
+            print(json.dumps(execute_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "claim-run-items":
+            print(
+                json.dumps(
+                    claim_run_items(
+                        root,
+                        run_id=args.run_id,
+                        claimed_by=args.claimed_by,
+                        limit=args.limit,
+                        stale_after_seconds=args.stale_seconds,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "get-run-item-context":
+            print(json.dumps(get_run_item_context(root, run_item_id=args.run_item_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "heartbeat-run-items":
+            print(
+                json.dumps(
+                    heartbeat_run_items(root, run_id=args.run_id, claimed_by=args.claimed_by),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "complete-run-item":
+            print(
+                json.dumps(
+                    complete_run_item(
+                        root,
+                        run_item_id=args.run_item_id,
+                        claimed_by=args.claimed_by,
+                        page_text=args.page_text,
+                        raw_output_json=args.raw_output_json,
+                        normalized_output_json=args.normalized_output_json,
+                        output_values_json=args.output_values_json,
+                        created_text_revision_json=args.created_text_revision_json,
+                        provider_metadata_json=args.provider_metadata_json,
+                        provider_request_id=args.provider_request_id,
+                        input_tokens=args.input_tokens,
+                        output_tokens=args.output_tokens,
+                        cost_cents=args.cost_cents,
+                        latency_ms=args.latency_ms,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "fail-run-item":
+            print(
+                json.dumps(
+                    fail_run_item(
+                        root,
+                        run_item_id=args.run_item_id,
+                        claimed_by=args.claimed_by,
+                        error_summary=args.error,
+                        provider_metadata_json=args.provider_metadata_json,
+                        provider_request_id=args.provider_request_id,
+                        input_tokens=args.input_tokens,
+                        output_tokens=args.output_tokens,
+                        cost_cents=args.cost_cents,
+                        latency_ms=args.latency_ms,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "run-status":
+            print(json.dumps(run_status(root, run_id=args.run_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "cancel-run":
+            print(json.dumps(cancel_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "finalize-ocr-run":
+            print(json.dumps(finalize_ocr_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "publish-run-results":
+            print(
+                json.dumps(
+                    publish_run_results(root, run_id=args.run_id, raw_output_names=args.output_names),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
         if args.command == "list-jobs":
             print(json.dumps(list_jobs(root), indent=2, sort_keys=True))
             return 0
@@ -2347,6 +2675,7 @@ def main() -> int:
                         root,
                         args.job_name,
                         instruction=args.instruction,
+                        capability=args.capability,
                         provider=args.provider,
                         model=args.model,
                         input_basis=args.input_basis,

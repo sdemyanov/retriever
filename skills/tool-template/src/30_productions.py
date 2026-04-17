@@ -381,41 +381,7 @@ def replace_document_related_rows(
             ],
         )
 
-    if chunks:
-        connection.executemany(
-            """
-            INSERT INTO document_chunks (
-              document_id, chunk_index, char_start, char_end, token_estimate, text_content
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    document_id,
-                    chunk["chunk_index"],
-                    chunk["char_start"],
-                    chunk["char_end"],
-                    chunk["token_estimate"],
-                    chunk["text_content"],
-                )
-                for chunk in chunks
-            ],
-        )
-        chunk_rows = connection.execute(
-            """
-            SELECT id, document_id, text_content
-            FROM document_chunks
-            WHERE document_id = ?
-            ORDER BY chunk_index ASC
-            """,
-            (document_id,),
-        ).fetchall()
-        connection.executemany(
-            """
-            INSERT INTO chunks_fts (chunk_id, document_id, text_content)
-            VALUES (?, ?, ?)
-            """,
-            [(row["id"], row["document_id"], row["text_content"]) for row in chunk_rows],
-        )
+    replace_document_chunks(connection, document_id, chunks)
 
     connection.execute(
         """
@@ -460,6 +426,51 @@ def replace_document_source_parts(
             )
             for row in source_parts
         ],
+    )
+
+
+def replace_document_chunks(
+    connection: sqlite3.Connection,
+    document_id: int,
+    chunks: list[dict[str, object]],
+) -> None:
+    connection.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
+    connection.execute("DELETE FROM chunks_fts WHERE document_id = ?", (document_id,))
+    if not chunks:
+        return
+    connection.executemany(
+        """
+        INSERT INTO document_chunks (
+          document_id, chunk_index, char_start, char_end, token_estimate, text_content
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                document_id,
+                chunk["chunk_index"],
+                chunk["char_start"],
+                chunk["char_end"],
+                chunk["token_estimate"],
+                chunk["text_content"],
+            )
+            for chunk in chunks
+        ],
+    )
+    chunk_rows = connection.execute(
+        """
+        SELECT id, document_id, text_content
+        FROM document_chunks
+        WHERE document_id = ?
+        ORDER BY chunk_index ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    connection.executemany(
+        """
+        INSERT INTO chunks_fts (chunk_id, document_id, text_content)
+        VALUES (?, ?, ?)
+        """,
+        [(row["id"], row["document_id"], row["text_content"]) for row in chunk_rows],
     )
 
 
@@ -997,6 +1008,13 @@ def reconcile_attachment_documents(
             control_number_attachment_sequence=attachment_sequence,
             custodian_override=parent_custodian,
         )
+        seed_source_text_revision_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+            extracted=extracted,
+            existing_row=existing_row,
+        )
         preview_rows = write_preview_artifacts(paths, child_rel_path, list(extracted.get("preview_artifacts", [])))
         chunks = chunk_text(str(extracted.get("text_content") or ""))
         replace_document_related_rows(
@@ -1388,7 +1406,15 @@ def ingest_container_source(
         ]
     )
 
-    if existing_source is not None and container_source_scan_completed(existing_source):
+    if (
+        existing_source is not None
+        and container_source_scan_completed(existing_source)
+        and not container_documents_missing_text_revisions(
+            connection,
+            source_kind=PST_SOURCE_KIND,
+            source_rel_path=source_rel_path,
+        )
+    ):
         same_size = existing_source["file_size"] == file_size
         same_mtime = existing_source["file_mtime"] == file_mtime
         file_hash = source_scan_hash
@@ -1565,6 +1591,14 @@ def ingest_container_source(
                 ingested_at_override=scan_started_at,
                 last_seen_at_override=scan_started_at,
                 updated_at_override=scan_started_at,
+            )
+            seed_source_text_revision_for_document(
+                connection,
+                paths,
+                document_id=document_id,
+                extracted=extracted,
+                existing_row=existing_row,
+                created_at=scan_started_at,
             )
             preview_rows = write_preview_artifacts(paths, str(normalized["rel_path"]), list(extracted.get("preview_artifacts", [])))
             chunks = chunk_text(str(extracted.get("text_content") or ""))

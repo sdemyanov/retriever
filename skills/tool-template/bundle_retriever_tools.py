@@ -12,6 +12,9 @@ FRAGMENT_FILENAMES = [
     "40_schema_runtime.py",
     "45_processing_core.py",
     "46_processing_store.py",
+    "47_processing_runner.py",
+    "48_processing_claude_harness.py",
+    "49_processing_providers.py",
     "50_ingest_mutation.py",
     "60_search_cli.py",
 ]

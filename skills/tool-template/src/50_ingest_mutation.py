@@ -162,6 +162,13 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
                         else (sha256_file(text_path) if text_path is not None and text_path.exists() else None)
                     ),
                 )
+                seed_source_text_revision_for_document(
+                    connection,
+                    paths,
+                    document_id=document_id,
+                    extracted=extracted,
+                    existing_row=existing_row,
+                )
                 ensure_dataset_document_membership(
                     connection,
                     dataset_id=dataset_id,
@@ -368,7 +375,11 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             existing_row = existing_by_rel.get(rel_path)
             action = "new"
             if existing_row is not None:
-                if existing_row["file_hash"] == file_hash and existing_row["lifecycle_status"] == "active":
+                if (
+                    existing_row["file_hash"] == file_hash
+                    and existing_row["lifecycle_status"] == "active"
+                    and document_row_has_seeded_text_revisions(existing_row)
+                ):
                     filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
                     connection.execute("BEGIN")
                     try:
@@ -424,6 +435,13 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     control_number_batch=control_number_batch,
                     control_number_family_sequence=control_number_family_sequence,
                     control_number_attachment_sequence=control_number_attachment_sequence,
+                )
+                seed_source_text_revision_for_document(
+                    connection,
+                    paths,
+                    document_id=document_id,
+                    extracted=extracted,
+                    existing_row=existing_row,
                 )
                 ensure_dataset_document_membership(
                     connection,
@@ -707,6 +725,778 @@ def delete_dataset(
         connection.close()
 
 
+def list_runs(root: Path) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        return {
+            "status": "ok",
+            "runs": list_run_summaries(connection),
+        }
+    finally:
+        connection.close()
+
+
+def get_run(root: Path, run_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        return {
+            "status": "ok",
+            "run": run_summary_by_id(connection, run_id),
+        }
+    finally:
+        connection.close()
+
+
+def create_run(
+    root: Path,
+    *,
+    job_version_id: int | None = None,
+    raw_job_name: str | None = None,
+    job_version_number: int | None = None,
+    dataset_ids: list[int] | None = None,
+    dataset_names: list[str] | None = None,
+    document_ids: list[int] | None = None,
+    control_numbers: list[str] | None = None,
+    query: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    from_run_id: int | None = None,
+    exclude_dataset_ids: list[int] | None = None,
+    exclude_dataset_names: list[str] | None = None,
+    exclude_document_ids: list[int] | None = None,
+    exclude_control_numbers: list[str] | None = None,
+    exclude_query: str | None = None,
+    exclude_filters: list[list[str]] | None = None,
+    family_mode: str = "exact",
+    seed_limit: int | None = None,
+) -> dict[str, object]:
+    normalized_job_name = (
+        sanitize_processing_identifier(raw_job_name, label="Job name", prefix="job")
+        if raw_job_name is not None
+        else None
+    )
+    normalized_family_mode = normalize_run_family_mode(family_mode)
+    if seed_limit is not None and seed_limit < 1:
+        raise RetrieverError("Run limit must be >= 1.")
+
+    selector = normalize_run_selector_spec(
+        dataset_ids=dataset_ids,
+        dataset_names=dataset_names,
+        document_ids=document_ids,
+        control_numbers=control_numbers,
+        query=query,
+        raw_filters=raw_filters,
+        from_run_id=from_run_id,
+    )
+    exclude_selector = normalize_run_selector_spec(
+        dataset_ids=exclude_dataset_ids,
+        dataset_names=exclude_dataset_names,
+        document_ids=exclude_document_ids,
+        control_numbers=exclude_control_numbers,
+        query=exclude_query,
+        raw_filters=exclude_filters,
+        from_run_id=None,
+    )
+    if not selector_has_inputs(selector):
+        raise RetrieverError("Run selector must include at least one inclusion input.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        job_version_row = require_job_version_row(
+            connection,
+            job_version_id=job_version_id,
+            job_name=normalized_job_name,
+            version=job_version_number,
+        )
+        job_row = connection.execute(
+            "SELECT * FROM jobs WHERE id = ?",
+            (job_version_row["job_id"],),
+        ).fetchone()
+        assert job_row is not None
+        snapshot_rows = plan_run_snapshot_rows(
+            connection,
+            root=root,
+            job_row=job_row,
+            job_version_row=job_version_row,
+            selector=selector,
+            exclude_selector=exclude_selector,
+            family_mode=normalized_family_mode,
+            seed_limit=seed_limit,
+        )
+        connection.execute("BEGIN")
+        try:
+            run_id = create_run_row(
+                connection,
+                job_version_id=int(job_version_row["id"]),
+                selector=selector,
+                exclude_selector=exclude_selector,
+                family_mode=normalized_family_mode,
+                seed_limit=seed_limit,
+                from_run_id=from_run_id,
+                status="planned",
+            )
+            replace_run_snapshot_documents(
+                connection,
+                run_id=run_id,
+                snapshot_rows=snapshot_rows,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "run": run_summary_by_id(connection, run_id),
+        }
+    finally:
+        connection.close()
+
+
+def list_text_revisions(root: Path, *, document_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        document_row = connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+        if document_row is None:
+            raise RetrieverError(f"Unknown document id: {document_id}")
+        return {
+            "status": "ok",
+            "document_id": int(document_id),
+            "text_revisions": list_text_revision_summaries_for_document(connection, int(document_id)),
+        }
+    finally:
+        connection.close()
+
+
+def activate_text_revision(
+    root: Path,
+    *,
+    document_id: int,
+    text_revision_id: int,
+    activation_policy: str = "manual",
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN")
+        try:
+            payload = activate_text_revision_for_document(
+                connection,
+                paths,
+                document_id=document_id,
+                text_revision_id=text_revision_id,
+                activation_policy=activation_policy,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def list_results(
+    root: Path,
+    *,
+    run_id: int | None = None,
+    document_id: int | None = None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        return {
+            "status": "ok",
+            "results": list_result_summaries(connection, run_id=run_id, document_id=document_id),
+        }
+    finally:
+        connection.close()
+
+
+def execute_run(root: Path, *, run_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        payload = asyncio.run(execute_run_async(connection, paths, run_id=run_id))
+        return payload
+    finally:
+        connection.close()
+
+
+def claim_run_items(
+    root: Path,
+    *,
+    run_id: int,
+    claimed_by: str,
+    limit: int = DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE,
+    stale_after_seconds: int = DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+) -> dict[str, object]:
+    if limit < 1:
+        raise RetrieverError("Claim limit must be >= 1.")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            materialize_run_items_for_run(connection, paths, root, run_id)
+            reused_count = reuse_active_results_for_run(connection, run_id)
+            claimed_rows = claim_run_item_rows(
+                connection,
+                run_id=run_id,
+                claimed_by=claimed_by,
+                limit=limit,
+                stale_after_seconds=stale_after_seconds,
+            )
+            refresh_run_progress(connection, run_id)
+            payload = {
+                "status": "ok",
+                "run": run_status_by_id(connection, run_id),
+                "claimed_by": normalize_whitespace(claimed_by),
+                "reused_count": reused_count,
+                "run_items": [run_item_row_to_payload(row) for row in claimed_rows],
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def get_run_item_context(root: Path, *, run_item_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        run_item_row = require_run_item_row_by_id(connection, run_item_id)
+        return {
+            "status": "ok",
+            "context": build_run_item_context_payload(connection, paths, root, run_item_row),
+        }
+    finally:
+        connection.close()
+
+
+def heartbeat_run_items(
+    root: Path,
+    *,
+    run_id: int,
+    claimed_by: str,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN")
+        try:
+            updated_count = heartbeat_claimed_run_items(connection, run_id=run_id, claimed_by=claimed_by)
+            payload = {
+                "status": "ok",
+                "updated_count": updated_count,
+                "run": run_status_by_id(connection, run_id),
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def complete_run_item(
+    root: Path,
+    *,
+    run_item_id: int,
+    claimed_by: str,
+    page_text: str | None = None,
+    raw_output_json: str | None = None,
+    normalized_output_json: str | None = None,
+    output_values_json: str | None = None,
+    created_text_revision_json: str | None = None,
+    provider_metadata_json: str | None = None,
+    provider_request_id: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cost_cents: int | None = None,
+    latency_ms: int | None = None,
+) -> dict[str, object]:
+    normalized_claimed_by = normalize_whitespace(claimed_by)
+    if not normalized_claimed_by:
+        raise RetrieverError("claimed_by cannot be empty.")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN")
+        try:
+            run_item_row = require_run_item_row_by_id(connection, run_item_id)
+            if str(run_item_row["status"] or "") == "completed":
+                result_payload = (
+                    result_summary_by_id(connection, int(run_item_row["result_id"]))
+                    if run_item_row["result_id"] is not None
+                    else None
+                )
+                ocr_page_output_payload = None
+                if str(run_item_row["item_kind"] or "") == "page":
+                    existing_page_output_row = find_ocr_page_output_row(connection, run_item_id=run_item_id)
+                    if existing_page_output_row is not None:
+                        ocr_page_output_payload = ocr_page_output_row_to_payload(existing_page_output_row)
+                payload = {
+                    "status": "ok",
+                    "idempotent": True,
+                    "run_item": run_item_row_to_payload(run_item_row),
+                    "result": result_payload,
+                    "ocr_page_output": ocr_page_output_payload,
+                    "run": run_status_by_id(connection, int(run_item_row["run_id"])),
+                }
+                connection.commit()
+                return payload
+            if str(run_item_row["status"] or "") == "failed":
+                raise RetrieverError(f"Run item {run_item_id} is already failed; reclaim it before completing it.")
+            current_claimed_by = normalize_whitespace(str(run_item_row["claimed_by"] or ""))
+            if current_claimed_by and current_claimed_by != normalized_claimed_by:
+                raise RetrieverError(
+                    f"Run item {run_item_id} is claimed by {current_claimed_by!r}, not {normalized_claimed_by!r}."
+                )
+            if str(run_item_row["status"] or "") != "running":
+                raise RetrieverError(f"Run item {run_item_id} must be running before it can be completed.")
+
+            run_row = require_run_row_by_id(connection, int(run_item_row["run_id"]))
+            job_version_row = require_job_version_row_by_id(connection, int(run_row["job_version_id"]))
+            job_row = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?",
+                (job_version_row["job_id"],),
+            ).fetchone()
+            assert job_row is not None
+            job_kind = normalize_job_kind(str(job_row["job_kind"]))
+            snapshot_row = None
+            if run_item_row["run_snapshot_document_id"] is not None:
+                snapshot_row = connection.execute(
+                    "SELECT * FROM run_snapshot_documents WHERE id = ?",
+                    (run_item_row["run_snapshot_document_id"],),
+                ).fetchone()
+            job_output_rows = connection.execute(
+                """
+                SELECT *
+                FROM job_outputs
+                WHERE job_id = ?
+                ORDER BY ordinal ASC, output_name ASC, id ASC
+                """,
+                (job_row["id"],),
+            ).fetchall()
+
+            raw_output = parse_json_argument(raw_output_json, label="Raw output", default=None)
+            normalized_output = parse_json_argument(
+                normalized_output_json,
+                label="Normalized output",
+                default=raw_output,
+            )
+            output_values_default = normalized_output if isinstance(normalized_output, dict) else {}
+            output_values = parse_json_object_argument(
+                output_values_json,
+                label="Output values",
+                default=output_values_default if isinstance(output_values_default, dict) else {},
+            )
+            provider_metadata = parse_json_object_argument(
+                provider_metadata_json,
+                label="Provider metadata",
+                default={},
+            )
+            created_text_revision_payload = (
+                parse_json_object_argument(
+                    created_text_revision_json,
+                    label="Created text revision",
+                    default={},
+                )
+                if created_text_revision_json is not None
+                else None
+            )
+
+            created_text_revision_id = None
+            if job_kind == "ocr" and str(run_item_row["item_kind"] or "") == "page":
+                resolved_page_text = page_text if page_text is not None else None
+                if resolved_page_text is None:
+                    normalized_candidate = normalized_output if isinstance(normalized_output, str) else None
+                    raw_candidate = raw_output if isinstance(raw_output, str) else None
+                    resolved_page_text = normalized_candidate or raw_candidate
+                if resolved_page_text is None:
+                    raise RetrieverError("OCR page completion requires --page-text or a raw/normalized string payload.")
+                page_raw_output = raw_output if raw_output is not None else {"page_text": resolved_page_text}
+                page_normalized_output = (
+                    normalized_output if normalized_output is not None else {"page_text": resolved_page_text}
+                )
+                ocr_page_output_id, _ = upsert_ocr_page_output_row(
+                    connection,
+                    run_item_id=run_item_id,
+                    run_id=int(run_item_row["run_id"]),
+                    document_id=int(run_item_row["document_id"]),
+                    page_number=int(run_item_row["page_number"] or 0),
+                    text_content=str(resolved_page_text),
+                    raw_output=page_raw_output,
+                    normalized_output=page_normalized_output,
+                    provider_metadata=provider_metadata,
+                )
+                create_attempt_row(
+                    connection,
+                    run_item_id=run_item_id,
+                    provider_request_id=provider_request_id,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_cents=cost_cents,
+                    latency_ms=latency_ms,
+                    provider_metadata=provider_metadata or {"executor": "cowork_agent"},
+                    error_summary=None,
+                )
+                completion_time = utc_now()
+                update_run_item_row(
+                    connection,
+                    run_item_id=run_item_id,
+                    status="completed",
+                    result_id=None,
+                    last_error=None,
+                    claimed_by=normalized_claimed_by,
+                    claimed_at=str(run_item_row["claimed_at"] or completion_time),
+                    last_heartbeat_at=completion_time,
+                    completed_at=completion_time,
+                    increment_attempt_count=True,
+                )
+                payload = {
+                    "status": "ok",
+                    "idempotent": False,
+                    "run_item": run_item_row_to_payload(require_run_item_row_by_id(connection, run_item_id)),
+                    "ocr_page_output": ocr_page_output_row_to_payload(
+                        find_ocr_page_output_row(connection, run_item_id=run_item_id)  # type: ignore[arg-type]
+                    ),
+                    "run": run_status_by_id(connection, int(run_item_row["run_id"])),
+                }
+                connection.commit()
+                return payload
+            if created_text_revision_payload:
+                text_content = str(created_text_revision_payload.get("text_content") or "")
+                if not text_content:
+                    raise RetrieverError("Created text revision payload must include text_content.")
+                created_text_revision_id = create_text_revision_row(
+                    connection,
+                    paths,
+                    document_id=int(run_item_row["document_id"]),
+                    revision_kind=str(created_text_revision_payload.get("revision_kind") or job_kind),
+                    text_content=text_content,
+                    language=(
+                        str(created_text_revision_payload["language"])
+                        if created_text_revision_payload.get("language")
+                        else None
+                    ),
+                    parent_revision_id=(
+                        int(snapshot_row["pinned_input_revision_id"])
+                        if snapshot_row is not None and snapshot_row["pinned_input_revision_id"] is not None
+                        else None
+                    ),
+                    created_by_job_version_id=int(job_version_row["id"]),
+                    quality_score=(
+                        float(created_text_revision_payload["quality_score"])
+                        if created_text_revision_payload.get("quality_score") is not None
+                        else None
+                    ),
+                    provider_metadata=provider_metadata,
+                )
+            elif job_kind == "translation":
+                raise RetrieverError("Translation run items must include a created text revision payload.")
+
+            if raw_output is None:
+                if created_text_revision_id is not None:
+                    raw_output = {
+                        "created_text_revision_id": created_text_revision_id,
+                        "job_kind": job_kind,
+                    }
+                else:
+                    raw_output = output_values
+            if normalized_output is None:
+                normalized_output = output_values if output_values else raw_output
+
+            result_id, created = create_result_row(
+                connection,
+                run_id=int(run_item_row["run_id"]),
+                document_id=int(run_item_row["document_id"]),
+                job_version_id=int(job_version_row["id"]),
+                input_revision_id=(
+                    int(snapshot_row["pinned_input_revision_id"])
+                    if snapshot_row is not None and snapshot_row["pinned_input_revision_id"] is not None
+                    else None
+                ),
+                input_identity=str(run_item_row["input_identity"]),
+                raw_output=raw_output,
+                normalized_output=normalized_output,
+                created_text_revision_id=created_text_revision_id,
+                provider_metadata=provider_metadata,
+            )
+            if created and job_output_rows:
+                upsert_result_output_rows(
+                    connection,
+                    result_id=result_id,
+                    job_output_rows=job_output_rows,
+                    output_values_by_name=output_values,
+                )
+            create_attempt_row(
+                connection,
+                run_item_id=run_item_id,
+                provider_request_id=provider_request_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_cents=cost_cents,
+                latency_ms=latency_ms,
+                provider_metadata=provider_metadata or {"executor": "cowork_agent"},
+                error_summary=None,
+            )
+            completion_time = utc_now()
+            update_run_item_row(
+                connection,
+                run_item_id=run_item_id,
+                status="completed",
+                result_id=result_id,
+                last_error=None,
+                claimed_by=normalized_claimed_by,
+                claimed_at=str(run_item_row["claimed_at"] or completion_time),
+                last_heartbeat_at=completion_time,
+                completed_at=completion_time,
+                increment_attempt_count=True,
+            )
+            payload = {
+                "status": "ok",
+                "idempotent": False,
+                "run_item": run_item_row_to_payload(require_run_item_row_by_id(connection, run_item_id)),
+                "result": result_summary_by_id(connection, result_id),
+                "run": run_status_by_id(connection, int(run_item_row["run_id"])),
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def fail_run_item(
+    root: Path,
+    *,
+    run_item_id: int,
+    claimed_by: str,
+    error_summary: str,
+    provider_metadata_json: str | None = None,
+    provider_request_id: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cost_cents: int | None = None,
+    latency_ms: int | None = None,
+) -> dict[str, object]:
+    normalized_claimed_by = normalize_whitespace(claimed_by)
+    if not normalized_claimed_by:
+        raise RetrieverError("claimed_by cannot be empty.")
+    normalized_error = normalize_whitespace(error_summary)
+    if not normalized_error:
+        raise RetrieverError("error cannot be empty.")
+    provider_metadata = parse_json_object_argument(
+        provider_metadata_json,
+        label="Provider metadata",
+        default={},
+    )
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN")
+        try:
+            run_item_row = require_run_item_row_by_id(connection, run_item_id)
+            if str(run_item_row["status"] or "") == "failed":
+                payload = {
+                    "status": "ok",
+                    "idempotent": True,
+                    "run_item": run_item_row_to_payload(run_item_row),
+                    "run": run_status_by_id(connection, int(run_item_row["run_id"])),
+                }
+                connection.commit()
+                return payload
+            if str(run_item_row["status"] or "") == "completed":
+                raise RetrieverError(f"Run item {run_item_id} is already completed and cannot be failed.")
+            current_claimed_by = normalize_whitespace(str(run_item_row["claimed_by"] or ""))
+            if current_claimed_by and current_claimed_by != normalized_claimed_by:
+                raise RetrieverError(
+                    f"Run item {run_item_id} is claimed by {current_claimed_by!r}, not {normalized_claimed_by!r}."
+                )
+            if str(run_item_row["status"] or "") != "running":
+                raise RetrieverError(f"Run item {run_item_id} must be running before it can be failed.")
+
+            create_attempt_row(
+                connection,
+                run_item_id=run_item_id,
+                provider_request_id=provider_request_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_cents=cost_cents,
+                latency_ms=latency_ms,
+                provider_metadata=provider_metadata or {"executor": "cowork_agent"},
+                error_summary=normalized_error,
+            )
+            completion_time = utc_now()
+            update_run_item_row(
+                connection,
+                run_item_id=run_item_id,
+                status="failed",
+                result_id=None,
+                last_error=normalized_error,
+                claimed_by=normalized_claimed_by,
+                claimed_at=str(run_item_row["claimed_at"] or completion_time),
+                last_heartbeat_at=completion_time,
+                completed_at=completion_time,
+                increment_attempt_count=True,
+            )
+            payload = {
+                "status": "ok",
+                "idempotent": False,
+                "run_item": run_item_row_to_payload(require_run_item_row_by_id(connection, run_item_id)),
+                "run": run_status_by_id(connection, int(run_item_row["run_id"])),
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def run_status(root: Path, *, run_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        return {
+            "status": "ok",
+            "run": run_status_by_id(connection, run_id),
+        }
+    finally:
+        connection.close()
+
+
+def cancel_run(root: Path, *, run_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            run_row = require_run_row_by_id(connection, run_id)
+            already_canceled = str(run_row["status"] or "") == "canceled" or run_row["canceled_at"] is not None
+            materialize_run_items_for_run(connection, paths, root, run_id)
+            canceled_at = str(run_row["canceled_at"] or utc_now())
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'canceled',
+                    canceled_at = COALESCE(canceled_at, ?)
+                WHERE id = ?
+                """,
+                (canceled_at, run_id),
+            )
+            skipped_count = cancel_pending_run_items(connection, run_id=run_id)
+            payload = {
+                "status": "ok",
+                "idempotent": already_canceled,
+                "canceled_pending_items": skipped_count,
+                "run": run_status_by_id(connection, run_id),
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def finalize_ocr_run(root: Path, *, run_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            materialize_run_items_for_run(connection, paths, root, run_id)
+            payload = finalize_ocr_results_for_run(connection, paths, run_id=run_id)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def publish_run_results(
+    root: Path,
+    *,
+    run_id: int,
+    raw_output_names: list[str] | None = None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN")
+        try:
+            publish_summary = publish_result_outputs_for_run(
+                connection,
+                run_id=run_id,
+                output_names=raw_output_names,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "run": run_summary_by_id(connection, run_id),
+            **publish_summary,
+        }
+    finally:
+        connection.close()
+
+
 def list_jobs(root: Path) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -832,7 +1622,8 @@ def create_job_version(
     raw_job_name: str,
     *,
     instruction: str | None,
-    provider: str,
+    provider: str | None,
+    capability: str | None,
     model: str | None,
     input_basis: str,
     response_schema_json: str | None,
@@ -842,9 +1633,7 @@ def create_job_version(
     display_name: str | None,
 ) -> dict[str, object]:
     job_name = sanitize_processing_identifier(raw_job_name, label="Job name", prefix="job")
-    normalized_provider = normalize_whitespace(provider)
-    if not normalized_provider:
-        raise RetrieverError("Provider cannot be empty.")
+    normalized_provider = normalize_whitespace(provider) if provider and provider.strip() else "cowork_agent"
     normalized_input_basis = normalize_job_input_basis(input_basis)
     normalized_instruction = (instruction or "").strip()
     normalized_model = normalize_whitespace(model) if model and model.strip() else None
@@ -877,6 +1666,11 @@ def create_job_version(
     try:
         apply_schema(connection, root)
         job_row = require_job_row_by_name(connection, job_name)
+        normalized_capability = (
+            normalize_job_capability(capability)
+            if capability and capability.strip()
+            else default_job_capability_for_kind(str(job_row["job_kind"]))
+        )
         connection.execute("BEGIN")
         try:
             version_id = create_job_version_row(
@@ -885,6 +1679,7 @@ def create_job_version(
                 job_name=job_name,
                 instruction_text=normalized_instruction,
                 response_schema_json=response_schema_text,
+                capability=normalized_capability,
                 provider=normalized_provider,
                 model=normalized_model,
                 parameters_json=compact_json_text(parameters),
