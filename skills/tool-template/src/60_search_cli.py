@@ -94,6 +94,34 @@ def build_virtual_filter_clause(
             return f"COALESCE({column_expr}, '') {comparator} ?", [value or ""]
         raise RetrieverError(f"Virtual filter '{field_name}' does not support operator '{operator}'.")
 
+    if field_name == "dataset_name":
+        exists_expr = (
+            "EXISTS ("
+            "SELECT 1 "
+            "FROM dataset_documents dd "
+            "JOIN datasets ds ON ds.id = dd.dataset_id "
+            f"WHERE dd.document_id = {alias}.id"
+        )
+        filtered_exists_expr = (
+            "EXISTS ("
+            "SELECT 1 "
+            "FROM dataset_documents dd "
+            "JOIN datasets ds ON ds.id = dd.dataset_id "
+            f"WHERE dd.document_id = {alias}.id "
+        )
+        if operator == "is-null":
+            return f"NOT {exists_expr})", []
+        if operator == "not-null":
+            return f"{exists_expr})", []
+        if operator == "contains":
+            return f"{filtered_exists_expr} AND LOWER(COALESCE(ds.dataset_name, '')) LIKE LOWER(?))", [f"%{value}%"]
+        if operator in {"eq", "neq"}:
+            positive_clause = f"{filtered_exists_expr} AND COALESCE(ds.dataset_name, '') = ?)"
+            if operator == "eq":
+                return positive_clause, [value or ""]
+            return f"NOT ({positive_clause})", [value or ""]
+        raise RetrieverError(f"Virtual filter '{field_name}' does not support operator '{operator}'.")
+
     raise RetrieverError(f"Unknown virtual filter: {field_name}")
 
 
@@ -101,7 +129,10 @@ def build_search_filters(
     connection: sqlite3.Connection, raw_filters: list[list[str]] | None
 ) -> tuple[list[dict[str, object]], list[str], list[object]]:
     parsed_filters = parse_filter_args(raw_filters)
-    clauses = ["d.lifecycle_status NOT IN ('missing', 'deleted')"]
+    clauses = [
+        "d.lifecycle_status NOT IN ('missing', 'deleted')",
+        "EXISTS (SELECT 1 FROM dataset_documents dd WHERE dd.document_id = d.id)",
+    ]
     params: list[object] = []
     normalized_filters: list[dict[str, object]] = []
     for raw_filter in parsed_filters:
@@ -131,6 +162,7 @@ def metadata_snippet(row: sqlite3.Row) -> str:
         row["begin_bates"],
         row["end_bates"],
         row["content_type"],
+        row["custodian"],
         row["source_rel_path"],
         row["source_folder_path"],
         row["title"],
@@ -289,6 +321,36 @@ def fetch_production_names(connection: sqlite3.Connection, rows: list[sqlite3.Ro
         production_ids,
     ).fetchall()
     return {int(row["id"]): str(row["production_name"]) for row in result_rows}
+
+
+def fetch_document_dataset_memberships(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+) -> dict[int, dict[str, list[object]]]:
+    document_ids = sorted({int(row["id"]) for row in rows})
+    if not document_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in document_ids)
+    result_rows = connection.execute(
+        f"""
+        SELECT dd.document_id, ds.id AS dataset_id, ds.dataset_name
+        FROM dataset_documents dd
+        JOIN datasets ds ON ds.id = dd.dataset_id
+        WHERE dd.document_id IN ({placeholders})
+        ORDER BY dd.document_id ASC, LOWER(ds.dataset_name) ASC, ds.id ASC
+        """,
+        document_ids,
+    ).fetchall()
+    memberships: dict[int, dict[str, list[object]]] = defaultdict(lambda: {"ids": [], "names": []})
+    for row in result_rows:
+        payload = memberships[int(row["document_id"])]
+        dataset_id = int(row["dataset_id"])
+        dataset_name = str(row["dataset_name"])
+        if dataset_id not in payload["ids"]:
+            payload["ids"].append(dataset_id)
+        if dataset_name not in payload["names"]:
+            payload["names"].append(dataset_name)
+    return memberships
 
 
 def search_bates(
@@ -452,7 +514,7 @@ def search(
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
-        apply_schema(connection)
+        apply_schema(connection, root)
         filter_summary, clauses, params = build_search_filters(connection, raw_filters)
         normalized_sort_field = sort_field
         bates_query_begin, bates_query_end = parse_bates_query(query)
@@ -478,6 +540,7 @@ def search(
                 {
                     "id": document_id,
                     "control_number": row["control_number"],
+                    "dataset_id": row["dataset_id"],
                     "parent_document_id": row["parent_document_id"],
                     "source_kind": row["source_kind"],
                     "source_rel_path": row["source_rel_path"],
@@ -495,6 +558,8 @@ def search(
                         "begin_attachment": row["begin_attachment"],
                         "begin_bates": row["begin_bates"],
                         "content_type": row["content_type"],
+                        "custodian": row["custodian"],
+                        "dataset_id": row["dataset_id"],
                         "date_created": row["date_created"],
                         "date_modified": row["date_modified"],
                         "end_attachment": row["end_attachment"],
@@ -533,6 +598,7 @@ def search(
         paged_results = sorted_results[start:end]
         paged_rows = [item["row"] for item in paged_results]
         production_names = fetch_production_names(connection, paged_rows)
+        dataset_memberships = fetch_document_dataset_memberships(connection, paged_rows)
         attachment_summaries = fetch_attachment_summaries(
             connection,
             paths,
@@ -544,6 +610,22 @@ def search(
         )
         for item in paged_results:
             row = item["row"]
+            memberships = dataset_memberships.get(int(row["id"]), {"ids": [], "names": []})
+            dataset_ids = [int(dataset_id) for dataset_id in memberships["ids"]]
+            dataset_names = [str(dataset_name) for dataset_name in memberships["names"]]
+            item["dataset_ids"] = dataset_ids
+            item["dataset_names"] = dataset_names
+            item["metadata"]["dataset_ids"] = dataset_ids
+            item["metadata"]["dataset_names"] = dataset_names
+            if len(dataset_ids) == 1:
+                item["dataset_id"] = dataset_ids[0]
+                item["metadata"]["dataset_id"] = dataset_ids[0]
+            else:
+                item["dataset_id"] = None
+                item["metadata"]["dataset_id"] = None
+            if len(dataset_names) == 1:
+                item["dataset_name"] = dataset_names[0]
+                item["metadata"]["dataset_name"] = dataset_names[0]
             if row["production_id"] is not None:
                 item["production_name"] = production_names.get(int(row["production_id"]))
                 item["metadata"]["production_name"] = production_names.get(int(row["production_id"]))
@@ -569,6 +651,12 @@ def search(
         }
     finally:
         connection.close()
+
+
+def add_dataset_selector_arguments(parser: argparse.ArgumentParser) -> None:
+    selector_group = parser.add_mutually_exclusive_group(required=True)
+    selector_group.add_argument("--dataset-id", type=int, help="Dataset id")
+    selector_group.add_argument("--dataset-name", help="Exact dataset name")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -604,10 +692,31 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         help="Repeatable filter in the form <field> <op> <value>",
     )
-    search_parser.add_argument("--sort", help="Sort field or 'relevance'")
-    search_parser.add_argument("--order", choices=("asc", "desc"), help="Sort order")
+    search_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field or 'relevance'")
+    search_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
     search_parser.add_argument("--page", type=int, default=1, help="1-based result page")
-    search_parser.add_argument("--per-page", type=int, default=DEFAULT_PAGE_SIZE, help="Results per page")
+    search_parser.add_argument("--per-page", "--limit", dest="per_page", type=int, default=DEFAULT_PAGE_SIZE, help="Results per page")
+
+    list_datasets_parser = subparsers.add_parser("list-datasets", help="List datasets in the workspace")
+    list_datasets_parser.add_argument("workspace", help="Workspace root path")
+
+    create_dataset_parser = subparsers.add_parser("create-dataset", help="Create a manual dataset")
+    create_dataset_parser.add_argument("workspace", help="Workspace root path")
+    create_dataset_parser.add_argument("dataset_name", help="Dataset name")
+
+    add_to_dataset_parser = subparsers.add_parser("add-to-dataset", help="Add documents to a dataset")
+    add_to_dataset_parser.add_argument("workspace", help="Workspace root path")
+    add_to_dataset_parser.add_argument("--doc-id", dest="document_ids", action="append", type=int, required=True, help="Document id to add (repeatable)")
+    add_dataset_selector_arguments(add_to_dataset_parser)
+
+    remove_from_dataset_parser = subparsers.add_parser("remove-from-dataset", help="Remove documents from a dataset")
+    remove_from_dataset_parser.add_argument("workspace", help="Workspace root path")
+    remove_from_dataset_parser.add_argument("--doc-id", dest="document_ids", action="append", type=int, required=True, help="Document id to remove (repeatable)")
+    add_dataset_selector_arguments(remove_from_dataset_parser)
+
+    delete_dataset_parser = subparsers.add_parser("delete-dataset", help="Delete a dataset")
+    delete_dataset_parser.add_argument("workspace", help="Workspace root path")
+    add_dataset_selector_arguments(delete_dataset_parser)
 
     add_field_parser = subparsers.add_parser("add-field", help="Add a custom document field")
     add_field_parser.add_argument("workspace", help="Workspace root path")
@@ -656,6 +765,58 @@ def main() -> int:
             print(
                 json.dumps(
                     search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "list-datasets":
+            print(json.dumps(list_datasets(root), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "create-dataset":
+            print(json.dumps(create_dataset(root, args.dataset_name), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "add-to-dataset":
+            print(
+                json.dumps(
+                    add_to_dataset(
+                        root,
+                        args.document_ids,
+                        dataset_id=args.dataset_id,
+                        dataset_name=args.dataset_name,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "remove-from-dataset":
+            print(
+                json.dumps(
+                    remove_from_dataset(
+                        root,
+                        args.document_ids,
+                        dataset_id=args.dataset_id,
+                        dataset_name=args.dataset_name,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "delete-dataset":
+            print(
+                json.dumps(
+                    delete_dataset(
+                        root,
+                        dataset_id=args.dataset_id,
+                        dataset_name=args.dataset_name,
+                    ),
                     indent=2,
                     sort_keys=True,
                 )

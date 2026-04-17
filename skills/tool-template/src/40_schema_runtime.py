@@ -113,6 +113,307 @@ def backfill_content_type(connection: sqlite3.Connection) -> int:
     return updated
 
 
+def backfill_custodian(connection: sqlite3.Connection) -> int:
+    columns = table_columns(connection, "documents")
+    required = {"custodian", "source_kind", "source_rel_path", "parent_document_id"}
+    if not required.issubset(columns):
+        return 0
+
+    rows = connection.execute(
+        """
+        SELECT id, source_kind, source_rel_path, parent_document_id
+        FROM documents
+        WHERE custodian IS NULL OR TRIM(custodian) = ''
+        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
+        """
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        parent_custodian = None
+        parent_document_id = row["parent_document_id"]
+        if parent_document_id is not None:
+            parent_row = connection.execute(
+                "SELECT custodian FROM documents WHERE id = ?",
+                (parent_document_id,),
+            ).fetchone()
+            if parent_row is not None:
+                parent_custodian = parent_row["custodian"]
+        custodian = infer_source_custodian(
+            source_kind=row["source_kind"],
+            source_rel_path=row["source_rel_path"],
+            parent_custodian=parent_custodian,
+        )
+        if not custodian:
+            continue
+        connection.execute(
+            "UPDATE documents SET custodian = ? WHERE id = ?",
+            (custodian, row["id"]),
+        )
+        updated += 1
+    return updated
+
+
+def backfill_dataset_ids(connection: sqlite3.Connection, root: Path | None = None) -> int:
+    if not table_exists(connection, "datasets") or not table_exists(connection, "documents"):
+        return 0
+
+    productions_by_id: dict[int, sqlite3.Row] = {}
+    if table_exists(connection, "productions"):
+        production_rows = connection.execute(
+            """
+            SELECT id, dataset_id, rel_root, production_name
+            FROM productions
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        for row in production_rows:
+            productions_by_id[int(row["id"])] = row
+
+    updated = 0
+
+    if productions_by_id:
+        for row in productions_by_id.values():
+            if row["dataset_id"] is not None:
+                continue
+            dataset_id = ensure_dataset_row(
+                connection,
+                source_kind=PRODUCTION_SOURCE_KIND,
+                dataset_locator=str(row["rel_root"]),
+                dataset_name=production_dataset_name(str(row["rel_root"]), str(row["production_name"] or "")),
+            )
+            connection.execute(
+                "UPDATE productions SET dataset_id = ? WHERE id = ?",
+                (dataset_id, row["id"]),
+            )
+            updated += 1
+
+    if table_exists(connection, "container_sources"):
+        container_rows = connection.execute(
+            """
+            SELECT id, dataset_id, source_kind, source_rel_path
+            FROM container_sources
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        for row in container_rows:
+            if row["dataset_id"] is not None:
+                continue
+            source_kind = str(row["source_kind"] or "")
+            source_rel_path = str(row["source_rel_path"] or "")
+            if not source_kind or not source_rel_path:
+                continue
+            dataset_name = pst_dataset_name(source_rel_path) if source_kind == PST_SOURCE_KIND else source_rel_path
+            dataset_id = ensure_dataset_row(
+                connection,
+                source_kind=source_kind,
+                dataset_locator=source_rel_path,
+                dataset_name=dataset_name,
+            )
+            connection.execute(
+                "UPDATE container_sources SET dataset_id = ? WHERE id = ?",
+                (dataset_id, row["id"]),
+            )
+            updated += 1
+
+    document_columns = table_columns(connection, "documents")
+    required_document_columns = {"id", "dataset_id", "parent_document_id", "source_kind", "source_rel_path", "production_id"}
+    if not required_document_columns.issubset(document_columns):
+        return updated
+
+    filesystem_dataset_id: int | None = None
+    rows = connection.execute(
+        """
+        SELECT id, dataset_id, parent_document_id, source_kind, source_rel_path, production_id
+        FROM documents
+        WHERE dataset_id IS NULL
+        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        dataset_id: int | None = None
+        parent_document_id = row["parent_document_id"]
+        if parent_document_id is not None:
+            parent_row = connection.execute(
+                "SELECT dataset_id FROM documents WHERE id = ?",
+                (parent_document_id,),
+            ).fetchone()
+            if parent_row is not None and parent_row["dataset_id"] is not None:
+                dataset_id = int(parent_row["dataset_id"])
+        if dataset_id is None and row["production_id"] is not None:
+            production_row = productions_by_id.get(int(row["production_id"]))
+            if production_row is not None:
+                if production_row["dataset_id"] is None:
+                    dataset_id = ensure_dataset_row(
+                        connection,
+                        source_kind=PRODUCTION_SOURCE_KIND,
+                        dataset_locator=str(production_row["rel_root"]),
+                        dataset_name=production_dataset_name(
+                            str(production_row["rel_root"]),
+                            str(production_row["production_name"] or ""),
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE productions SET dataset_id = ? WHERE id = ?",
+                        (dataset_id, production_row["id"]),
+                    )
+                    productions_by_id[int(production_row["id"])] = connection.execute(
+                        "SELECT id, dataset_id, rel_root, production_name FROM productions WHERE id = ?",
+                        (production_row["id"],),
+                    ).fetchone()
+                    updated += 1
+                else:
+                    dataset_id = int(production_row["dataset_id"])
+        source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
+        source_rel_path = normalize_whitespace(str(row["source_rel_path"] or ""))
+        if dataset_id is None and source_kind == PST_SOURCE_KIND and source_rel_path:
+            dataset_id = ensure_dataset_row(
+                connection,
+                source_kind=PST_SOURCE_KIND,
+                dataset_locator=source_rel_path,
+                dataset_name=pst_dataset_name(source_rel_path),
+            )
+        if dataset_id is None:
+            if filesystem_dataset_id is None:
+                filesystem_dataset_id = ensure_dataset_row(
+                    connection,
+                    source_kind=FILESYSTEM_SOURCE_KIND,
+                    dataset_locator=filesystem_dataset_locator(),
+                    dataset_name=filesystem_dataset_name(root),
+                )
+            dataset_id = filesystem_dataset_id
+        connection.execute(
+            "UPDATE documents SET dataset_id = ? WHERE id = ?",
+            (dataset_id, row["id"]),
+        )
+        updated += 1
+
+    return updated
+
+
+def backfill_dataset_memberships(connection: sqlite3.Connection) -> int:
+    if not table_exists(connection, "dataset_documents") or not table_exists(connection, "datasets"):
+        return 0
+
+    updated = 0
+    dataset_rows = connection.execute(
+        """
+        SELECT id, source_kind, dataset_locator
+        FROM datasets
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for row in dataset_rows:
+        source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
+        source_locator = normalize_whitespace(str(row["dataset_locator"] or ""))
+        if not source_kind or not source_locator or source_kind == MANUAL_DATASET_SOURCE_KIND:
+            continue
+        ensure_dataset_source_row(
+            connection,
+            dataset_id=int(row["id"]),
+            source_kind=source_kind,
+            source_locator=source_locator,
+        )
+
+    existing_membership_count = int(
+        connection.execute("SELECT COUNT(*) AS count FROM dataset_documents").fetchone()["count"] or 0
+    )
+    if existing_membership_count > 0:
+        return updated
+
+    productions_by_id: dict[int, sqlite3.Row] = {}
+    if table_exists(connection, "productions"):
+        for row in connection.execute(
+            """
+            SELECT id, dataset_id, rel_root
+            FROM productions
+            ORDER BY id ASC
+            """
+        ).fetchall():
+            productions_by_id[int(row["id"])] = row
+
+    document_columns = table_columns(connection, "documents")
+    required_document_columns = {"id", "dataset_id", "parent_document_id", "source_kind", "source_rel_path", "production_id"}
+    if not required_document_columns.issubset(document_columns):
+        return updated
+
+    rows = connection.execute(
+        """
+        SELECT id, dataset_id, parent_document_id, source_kind, source_rel_path, production_id
+        FROM documents
+        WHERE dataset_id IS NOT NULL
+        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        dataset_id = int(row["dataset_id"])
+        document_id = int(row["id"])
+        source_membership_ids: list[int] = []
+
+        if row["parent_document_id"] is not None:
+            parent_memberships = connection.execute(
+                """
+                SELECT dataset_source_id
+                FROM dataset_documents
+                WHERE dataset_id = ? AND document_id = ? AND dataset_source_id IS NOT NULL
+                ORDER BY dataset_source_id ASC
+                """,
+                (dataset_id, int(row["parent_document_id"])),
+            ).fetchall()
+            source_membership_ids = [int(item["dataset_source_id"]) for item in parent_memberships]
+
+        if not source_membership_ids and row["production_id"] is not None:
+            production_row = productions_by_id.get(int(row["production_id"]))
+            if production_row is not None:
+                dataset_source_row = get_dataset_source_row(
+                    connection,
+                    source_kind=PRODUCTION_SOURCE_KIND,
+                    source_locator=str(production_row["rel_root"]),
+                )
+                if dataset_source_row is not None and int(dataset_source_row["dataset_id"]) == dataset_id:
+                    source_membership_ids.append(int(dataset_source_row["id"]))
+
+        source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
+        source_rel_path = normalize_whitespace(str(row["source_rel_path"] or ""))
+        if not source_membership_ids and source_kind == PST_SOURCE_KIND and source_rel_path:
+            dataset_source_row = get_dataset_source_row(
+                connection,
+                source_kind=PST_SOURCE_KIND,
+                source_locator=source_rel_path,
+            )
+            if dataset_source_row is not None and int(dataset_source_row["dataset_id"]) == dataset_id:
+                source_membership_ids.append(int(dataset_source_row["id"]))
+
+        if not source_membership_ids and source_kind in {FILESYSTEM_SOURCE_KIND, EMAIL_ATTACHMENT_SOURCE_KIND}:
+            dataset_source_row = get_dataset_source_row(
+                connection,
+                source_kind=FILESYSTEM_SOURCE_KIND,
+                source_locator=filesystem_dataset_locator(),
+            )
+            if dataset_source_row is not None and int(dataset_source_row["dataset_id"]) == dataset_id:
+                source_membership_ids.append(int(dataset_source_row["id"]))
+
+        if source_membership_ids:
+            for dataset_source_id in source_membership_ids:
+                ensure_dataset_document_membership(
+                    connection,
+                    dataset_id=dataset_id,
+                    document_id=document_id,
+                    dataset_source_id=dataset_source_id,
+                )
+                updated += 1
+            continue
+
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            dataset_source_id=None,
+        )
+        updated += 1
+
+    return updated
+
+
 def ensure_control_number_batch_row(
     connection: sqlite3.Connection,
     batch_number: int,
@@ -338,7 +639,7 @@ def next_attachment_sequence(connection: sqlite3.Connection, parent_document_id:
 
 
 def ensure_documents_fts(connection: sqlite3.Connection) -> bool:
-    expected_columns = {"document_id", "file_name", "title", "subject", "author", "participants", "recipients"}
+    expected_columns = {"document_id", "file_name", "title", "subject", "author", "custodian", "participants", "recipients"}
     existing_columns = table_columns(connection, "documents_fts")
     if existing_columns == expected_columns:
         return False
@@ -352,6 +653,7 @@ def ensure_documents_fts(connection: sqlite3.Connection) -> bool:
           title,
           subject,
           author,
+          custodian,
           participants,
           recipients
         )
@@ -359,15 +661,15 @@ def ensure_documents_fts(connection: sqlite3.Connection) -> bool:
     )
     rows = connection.execute(
         """
-        SELECT id, file_name, title, subject, author, participants, recipients
+        SELECT id, file_name, title, subject, author, custodian, participants, recipients
         FROM documents
         """
     ).fetchall()
     if rows:
         connection.executemany(
             """
-            INSERT INTO documents_fts (document_id, file_name, title, subject, author, participants, recipients)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO documents_fts (document_id, file_name, title, subject, author, custodian, participants, recipients)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -376,6 +678,7 @@ def ensure_documents_fts(connection: sqlite3.Connection) -> bool:
                     row["title"],
                     row["subject"],
                     row["author"],
+                    row["custodian"],
                     row["participants"],
                     row["recipients"],
                 )
@@ -385,7 +688,19 @@ def ensure_documents_fts(connection: sqlite3.Connection) -> bool:
     return True
 
 
-def apply_schema(connection: sqlite3.Connection) -> dict[str, object]:
+def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> dict[str, object]:
+    prior_schema_version: int | None = None
+    if table_exists(connection, "workspace_meta"):
+        workspace_meta_row = connection.execute(
+            """
+            SELECT schema_version
+            FROM workspace_meta
+            WHERE id = 1
+            """
+        ).fetchone()
+        if workspace_meta_row is not None and workspace_meta_row["schema_version"] is not None:
+            prior_schema_version = int(workspace_meta_row["schema_version"])
+
     rename_table_if_needed(connection, "display_id_batches", "control_number_batches")
     for statement in SCHEMA_STATEMENTS:
         connection.execute(statement)
@@ -398,8 +713,10 @@ def apply_schema(connection: sqlite3.Connection) -> dict[str, object]:
 
     ensure_column(connection, "documents", f"{MANUAL_FIELD_LOCKS_COLUMN} TEXT NOT NULL DEFAULT '[]'")
     ensure_column(connection, "documents", "content_type TEXT")
+    ensure_column(connection, "documents", "custodian TEXT")
     ensure_column(connection, "documents", "participants TEXT")
     ensure_column(connection, "documents", "control_number TEXT")
+    ensure_column(connection, "documents", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     ensure_column(connection, "documents", "parent_document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE")
     ensure_column(connection, "documents", "source_kind TEXT")
     ensure_column(connection, "documents", "source_rel_path TEXT")
@@ -413,6 +730,8 @@ def apply_schema(connection: sqlite3.Connection) -> dict[str, object]:
     ensure_column(connection, "documents", "control_number_batch INTEGER")
     ensure_column(connection, "documents", "control_number_family_sequence INTEGER")
     ensure_column(connection, "documents", "control_number_attachment_sequence INTEGER")
+    ensure_column(connection, "productions", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
+    ensure_column(connection, "container_sources", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     backfilled_legacy_control_number = backfill_legacy_column(
         connection,
         "documents",
@@ -439,11 +758,26 @@ def apply_schema(connection: sqlite3.Connection) -> dict[str, object]:
         "control_number_attachment_sequence",
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_parent_document_id ON documents(parent_document_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_dataset_id ON documents(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_kind ON documents(source_kind)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_rel_path ON documents(source_rel_path)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_production_id ON documents(production_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_begin_bates ON documents(begin_bates)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_end_bates ON documents(end_bates)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_sources_dataset_id ON dataset_sources(dataset_id)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_sources_locator_unique ON dataset_sources(source_kind, source_locator)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_documents_document_id ON dataset_documents(document_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_documents_dataset_id ON dataset_documents(dataset_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_documents_source_id ON dataset_documents(dataset_source_id)")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_documents_membership_unique
+        ON dataset_documents(dataset_id, document_id, COALESCE(dataset_source_id, 0))
+        """
+    )
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_source_locator_unique ON datasets(source_kind, dataset_locator)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_productions_dataset_id ON productions(dataset_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_container_sources_dataset_id ON container_sources(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_container_sources_source_kind ON container_sources(source_kind)")
     connection.execute("DROP INDEX IF EXISTS idx_documents_display_sort")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_control_number_unique ON documents(control_number)")
@@ -463,6 +797,10 @@ def apply_schema(connection: sqlite3.Connection) -> dict[str, object]:
     merged_legacy_locks = merge_legacy_field_locks(connection)
     backfilled_content_type = backfill_content_type(connection)
     backfilled_source_kinds = backfill_source_kinds(connection)
+    dataset_membership_migration_needed = prior_schema_version is None or prior_schema_version < 12
+    backfilled_dataset_ids = backfill_dataset_ids(connection, root) if dataset_membership_migration_needed else 0
+    backfilled_dataset_memberships = backfill_dataset_memberships(connection) if dataset_membership_migration_needed else 0
+    backfilled_custodian = backfill_custodian(connection)
     backfilled_control_numbers = backfill_control_numbers(connection)
     rebuilt_control_number_batches = backfill_control_number_batches(connection)
     rebuilt_documents_fts = ensure_documents_fts(connection)
@@ -470,6 +808,9 @@ def apply_schema(connection: sqlite3.Connection) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
         "backfilled_content_type": backfilled_content_type,
+        "backfilled_custodian": backfilled_custodian,
+        "backfilled_dataset_ids": backfilled_dataset_ids,
+        "backfilled_dataset_memberships": backfilled_dataset_memberships,
         "backfilled_source_kinds": backfilled_source_kinds,
         "backfilled_control_numbers": backfilled_control_numbers,
         "rebuilt_control_number_batches": rebuilt_control_number_batches,
@@ -564,7 +905,7 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
             connection = connect_db(paths["db_path"])
             try:
                 journal_mode = current_journal_mode(connection)
-                schema_status = apply_schema(connection)
+                schema_status = apply_schema(connection, root)
                 registry_status = reconcile_custom_fields_registry(connection, repair=True)
                 workspace_inventory = document_inventory_counts(connection)
             finally:
@@ -635,7 +976,7 @@ def bootstrap(root: Path) -> dict[str, object]:
             connection = connect_db(paths["db_path"])
             try:
                 journal_mode = current_journal_mode(connection)
-                apply_schema(connection)
+                apply_schema(connection, root)
                 registry_status = reconcile_custom_fields_registry(connection, repair=True)
                 tool_sha = sha256_file(paths["tool_path"])
                 write_workspace_meta(connection, tool_sha)

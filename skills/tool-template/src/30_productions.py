@@ -353,6 +353,13 @@ def replace_document_related_rows(
     preview_rows: list[dict[str, object]],
 ) -> None:
     delete_document_related_rows(connection, document_id)
+    custodian = metadata_values.get("custodian")
+    if custodian is None:
+        row = connection.execute(
+            "SELECT custodian FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+        custodian = row["custodian"] if row is not None else None
 
     if preview_rows:
         connection.executemany(
@@ -412,8 +419,8 @@ def replace_document_related_rows(
 
     connection.execute(
         """
-        INSERT INTO documents_fts (document_id, file_name, title, subject, author, participants, recipients)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO documents_fts (document_id, file_name, title, subject, author, custodian, participants, recipients)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             document_id,
@@ -421,6 +428,7 @@ def replace_document_related_rows(
             metadata_values["title"],
             metadata_values["subject"],
             metadata_values["author"],
+            custodian,
             metadata_values["participants"],
             metadata_values["recipients"],
         ),
@@ -467,7 +475,7 @@ def refresh_documents_fts_row(connection: sqlite3.Connection, document_id: int) 
     connection.execute("DELETE FROM documents_fts WHERE document_id = ?", (document_id,))
     row = connection.execute(
         """
-        SELECT id, file_name, title, subject, author, participants, recipients
+        SELECT id, file_name, title, subject, author, custodian, participants, recipients
         FROM documents
         WHERE id = ?
         """,
@@ -477,8 +485,8 @@ def refresh_documents_fts_row(connection: sqlite3.Connection, document_id: int) 
         return
     connection.execute(
         """
-        INSERT INTO documents_fts (document_id, file_name, title, subject, author, participants, recipients)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO documents_fts (document_id, file_name, title, subject, author, custodian, participants, recipients)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["id"],
@@ -486,6 +494,7 @@ def refresh_documents_fts_row(connection: sqlite3.Connection, document_id: int) 
             row["title"],
             row["subject"],
             row["author"],
+            row["custodian"],
             row["participants"],
             row["recipients"],
         ),
@@ -589,6 +598,7 @@ def build_fallback_extract(path: Path) -> dict[str, object]:
         "page_count": None,
         "author": None,
         "content_type": infer_content_type_from_extension(normalize_extension(path)),
+        "custodian": None,
         "date_created": None,
         "date_modified": None,
         "participants": None,
@@ -612,6 +622,7 @@ def upsert_document_row(
     file_name: str,
     parent_document_id: int | None,
     control_number: str,
+    dataset_id: int | None,
     control_number_batch: int | None,
     control_number_family_sequence: int | None,
     control_number_attachment_sequence: int | None,
@@ -619,6 +630,7 @@ def upsert_document_row(
     source_rel_path: str | None = None,
     source_item_id: str | None = None,
     source_folder_path: str | None = None,
+    custodian_override: str | None = None,
     production_id: int | None = None,
     begin_bates: str | None = None,
     end_bates: str | None = None,
@@ -636,10 +648,22 @@ def upsert_document_row(
     file_hash = file_hash_override if file_hash_override is not None else (sha256_file(source_path) if source_path is not None else None)
     file_size = file_size_override if file_size_override is not None else (source_path.stat().st_size if source_path is not None and source_path.exists() else None)
     file_type = file_type_override or normalize_extension(Path(file_name)) or (normalize_extension(source_path) if source_path is not None else None)
+    effective_source_kind = source_kind or (EMAIL_ATTACHMENT_SOURCE_KIND if parent_document_id is not None else FILESYSTEM_SOURCE_KIND)
+    effective_dataset_id = dataset_id
+    if effective_dataset_id is None and existing_row is not None and existing_row["dataset_id"] is not None:
+        effective_dataset_id = int(existing_row["dataset_id"])
+    custodian = extracted.get("custodian")
+    if custodian is None:
+        custodian = infer_source_custodian(
+            source_kind=effective_source_kind,
+            source_rel_path=source_rel_path,
+            parent_custodian=custodian_override,
+        )
     common_values = {
         "control_number": control_number,
+        "dataset_id": effective_dataset_id,
         "parent_document_id": parent_document_id,
-        "source_kind": source_kind or (EMAIL_ATTACHMENT_SOURCE_KIND if parent_document_id is not None else FILESYSTEM_SOURCE_KIND),
+        "source_kind": effective_source_kind,
         "source_rel_path": source_rel_path,
         "source_item_id": source_item_id,
         "source_folder_path": source_folder_path,
@@ -655,6 +679,7 @@ def upsert_document_row(
         "page_count": extracted.get("page_count"),
         "author": extracted.get("author"),
         "content_type": extracted.get("content_type"),
+        "custodian": custodian,
         "date_created": extracted.get("date_created"),
         "date_modified": extracted.get("date_modified"),
         "participants": extracted.get("participants"),
@@ -676,16 +701,17 @@ def upsert_document_row(
         connection.execute(
             """
             INSERT INTO documents (
-              control_number, parent_document_id, source_kind, source_rel_path, source_item_id, source_folder_path,
+              control_number, dataset_id, parent_document_id, source_kind, source_rel_path, source_item_id, source_folder_path,
               production_id, begin_bates, end_bates, begin_attachment, end_attachment,
-              rel_path, file_name, file_type, file_size, page_count, author, date_created,
+              rel_path, file_name, file_type, file_size, page_count, author, custodian, date_created,
               content_type, date_modified, title, subject, participants, recipients, manual_field_locks_json, file_hash,
               content_hash, text_status, lifecycle_status, ingested_at, last_seen_at, updated_at,
               control_number_batch, control_number_family_sequence, control_number_attachment_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 common_values["control_number"],
+                common_values["dataset_id"],
                 common_values["parent_document_id"],
                 common_values["source_kind"],
                 common_values["source_rel_path"],
@@ -702,6 +728,7 @@ def upsert_document_row(
                 common_values["file_size"],
                 common_values["page_count"],
                 common_values["author"],
+                common_values["custodian"],
                 common_values["date_created"],
                 common_values["content_type"],
                 common_values["date_modified"],
@@ -728,10 +755,10 @@ def upsert_document_row(
     connection.execute(
         """
         UPDATE documents
-        SET control_number = ?, parent_document_id = ?, source_kind = ?, source_rel_path = ?, source_item_id = ?, source_folder_path = ?,
+        SET control_number = ?, dataset_id = ?, parent_document_id = ?, source_kind = ?, source_rel_path = ?, source_item_id = ?, source_folder_path = ?,
             production_id = ?, begin_bates = ?, end_bates = ?, begin_attachment = ?, end_attachment = ?,
             rel_path = ?, file_name = ?, file_type = ?, file_size = ?, page_count = ?,
-            author = ?, content_type = ?, date_created = ?, date_modified = ?, title = ?, subject = ?,
+            author = ?, custodian = ?, content_type = ?, date_created = ?, date_modified = ?, title = ?, subject = ?,
             participants = ?, recipients = ?, file_hash = ?, content_hash = ?, text_status = ?, lifecycle_status = ?,
             ingested_at = ?, last_seen_at = ?, updated_at = ?, manual_field_locks_json = ?,
             control_number_batch = ?, control_number_family_sequence = ?, control_number_attachment_sequence = ?
@@ -739,6 +766,7 @@ def upsert_document_row(
         """,
         (
             common_values["control_number"],
+            common_values["dataset_id"],
             common_values["parent_document_id"],
             common_values["source_kind"],
             common_values["source_rel_path"],
@@ -755,6 +783,7 @@ def upsert_document_row(
             common_values["file_size"],
             common_values["page_count"],
             common_values["author"],
+            common_values["custodian"],
             common_values["content_type"],
             common_values["date_created"],
             common_values["date_modified"],
@@ -779,24 +808,53 @@ def upsert_document_row(
     return int(existing_row["id"])
 
 
-def mark_seen_without_reingest(connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+def mark_seen_without_reingest(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    dataset_id: int | None = None,
+    dataset_source_id: int | None = None,
+) -> None:
     now = utc_now()
     connection.execute(
         """
         UPDATE documents
-        SET lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
+        SET dataset_id = COALESCE(?, dataset_id), lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
         WHERE id = ?
         """,
-        (now, now, row["id"]),
+        (dataset_id, now, now, row["id"]),
     )
     connection.execute(
         """
         UPDATE documents
-        SET lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
+        SET dataset_id = COALESCE(?, dataset_id), lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
         WHERE parent_document_id = ? AND lifecycle_status != 'deleted'
         """,
-        (now, now, row["id"]),
+        (dataset_id, now, now, row["id"]),
     )
+    if dataset_id is not None:
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=dataset_id,
+            document_id=int(row["id"]),
+            dataset_source_id=dataset_source_id,
+        )
+        child_rows = connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE parent_document_id = ? AND lifecycle_status != 'deleted'
+            ORDER BY id ASC
+            """,
+            (row["id"],),
+        ).fetchall()
+        for child_row in child_rows:
+            ensure_dataset_document_membership(
+                connection,
+                dataset_id=dataset_id,
+                document_id=int(child_row["id"]),
+                dataset_source_id=dataset_source_id,
+            )
 
 
 def mark_missing_documents(connection: sqlite3.Connection, scanned_rel_paths: set[str]) -> int:
@@ -884,7 +942,16 @@ def reconcile_attachment_documents(
     control_number_batch: int,
     control_number_family_sequence: int,
     attachments: list[dict[str, object]],
+    dataset_memberships: list[tuple[int, int | None]] | None = None,
 ) -> None:
+    parent_row = connection.execute(
+        "SELECT custodian, dataset_id FROM documents WHERE id = ?",
+        (parent_document_id,),
+    ).fetchone()
+    parent_custodian = (
+        normalize_whitespace(str(parent_row["custodian"] or "")) if parent_row is not None else ""
+    ) or None
+    parent_dataset_id = int(parent_row["dataset_id"]) if parent_row is not None and parent_row["dataset_id"] is not None else None
     existing_rows = connection.execute(
         """
         SELECT *
@@ -924,9 +991,11 @@ def reconcile_attachment_documents(
             file_name=str(attachment["file_name"]),
             parent_document_id=parent_document_id,
             control_number=control_number,
+            dataset_id=parent_dataset_id,
             control_number_batch=control_number_batch,
             control_number_family_sequence=control_number_family_sequence,
             control_number_attachment_sequence=attachment_sequence,
+            custodian_override=parent_custodian,
         )
         preview_rows = write_preview_artifacts(paths, child_rel_path, list(extracted.get("preview_artifacts", [])))
         chunks = chunk_text(str(extracted.get("text_content") or ""))
@@ -937,6 +1006,13 @@ def reconcile_attachment_documents(
             chunks,
             preview_rows,
         )
+        for membership_dataset_id, membership_source_id in dataset_memberships or []:
+            ensure_dataset_document_membership(
+                connection,
+                dataset_id=membership_dataset_id,
+                document_id=document_id,
+                dataset_source_id=membership_source_id,
+            )
 
     for row in removed_rows:
         cleanup_document_artifacts(paths, connection, row)
@@ -977,6 +1053,7 @@ def container_source_scan_completed(row: sqlite3.Row | None) -> bool:
 def write_container_source_scan_started(
     connection: sqlite3.Connection,
     *,
+    dataset_id: int | None,
     source_kind: str,
     source_rel_path: str,
     file_size: int | None,
@@ -987,22 +1064,24 @@ def write_container_source_scan_started(
     connection.execute(
         """
         INSERT INTO container_sources (
-          source_kind, source_rel_path, file_size, file_mtime, file_hash, last_scan_started_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+          dataset_id, source_kind, source_rel_path, file_size, file_mtime, file_hash, last_scan_started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_rel_path) DO UPDATE SET
+          dataset_id = excluded.dataset_id,
           source_kind = excluded.source_kind,
           file_size = excluded.file_size,
           file_mtime = excluded.file_mtime,
           file_hash = excluded.file_hash,
           last_scan_started_at = excluded.last_scan_started_at
         """,
-        (source_kind, source_rel_path, file_size, file_mtime, file_hash, scan_started_at),
+        (dataset_id, source_kind, source_rel_path, file_size, file_mtime, file_hash, scan_started_at),
     )
 
 
 def write_container_source_scan_completed(
     connection: sqlite3.Connection,
     *,
+    dataset_id: int | None,
     source_kind: str,
     source_rel_path: str,
     file_size: int | None,
@@ -1015,10 +1094,11 @@ def write_container_source_scan_completed(
     connection.execute(
         """
         INSERT INTO container_sources (
-          source_kind, source_rel_path, file_size, file_mtime, file_hash, message_count,
+          dataset_id, source_kind, source_rel_path, file_size, file_mtime, file_hash, message_count,
           last_scan_started_at, last_scan_completed_at, last_ingested_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_rel_path) DO UPDATE SET
+          dataset_id = excluded.dataset_id,
           source_kind = excluded.source_kind,
           file_size = excluded.file_size,
           file_mtime = excluded.file_mtime,
@@ -1029,6 +1109,7 @@ def write_container_source_scan_completed(
           last_ingested_at = excluded.last_ingested_at
         """,
         (
+            dataset_id,
             source_kind,
             source_rel_path,
             file_size,
@@ -1074,6 +1155,63 @@ def mark_container_source_documents_active(
         [seen_at, seen_at, *parent_ids, *parent_ids],
     )
     return int(cursor.rowcount or 0)
+
+
+def assign_dataset_to_container_documents(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_rel_path: str,
+    dataset_id: int,
+    dataset_source_id: int | None = None,
+) -> None:
+    connection.execute(
+        """
+        UPDATE documents
+        SET dataset_id = ?
+        WHERE (source_kind = ? AND source_rel_path = ?)
+           OR parent_document_id IN (
+                SELECT id
+                FROM documents
+                WHERE source_kind = ? AND source_rel_path = ?
+           )
+        """,
+        (dataset_id, source_kind, source_rel_path, source_kind, source_rel_path),
+    )
+    parent_rows = connection.execute(
+        """
+        SELECT id
+        FROM documents
+        WHERE parent_document_id IS NULL
+          AND source_kind = ?
+          AND source_rel_path = ?
+        ORDER BY id ASC
+        """,
+        (source_kind, source_rel_path),
+    ).fetchall()
+    for parent_row in parent_rows:
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=dataset_id,
+            document_id=int(parent_row["id"]),
+            dataset_source_id=dataset_source_id,
+        )
+        child_rows = connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE parent_document_id = ?
+            ORDER BY id ASC
+            """,
+            (parent_row["id"],),
+        ).fetchall()
+        for child_row in child_rows:
+            ensure_dataset_document_membership(
+                connection,
+                dataset_id=dataset_id,
+                document_id=int(child_row["id"]),
+                dataset_source_id=dataset_source_id,
+            )
 
 
 def existing_pst_rows_by_source_item(
@@ -1220,6 +1358,15 @@ def ingest_pst_source(
     path: Path,
     source_rel_path: str,
 ) -> dict[str, object]:
+    # Salt the scan fingerprint so unchanged PSTs get one corrective reparse when
+    # container-routing rules change (for example, when Teams/system folders are reclassified).
+    source_scan_hash = sha256_text(f"pst-ingest-v2:{sha256_file(path) or ''}")
+    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+        connection,
+        source_kind=PST_SOURCE_KIND,
+        source_locator=source_rel_path,
+        dataset_name=pst_dataset_name(source_rel_path),
+    )
     existing_source = get_container_source_row(connection, PST_SOURCE_KIND, source_rel_path)
     file_size = file_size_bytes(path)
     file_mtime = file_mtime_timestamp(path)
@@ -1233,8 +1380,8 @@ def ingest_pst_source(
     if existing_source is not None and container_source_scan_completed(existing_source):
         same_size = existing_source["file_size"] == file_size
         same_mtime = existing_source["file_mtime"] == file_mtime
-        file_hash = existing_source["file_hash"]
-        if same_size and same_mtime:
+        file_hash = source_scan_hash
+        if same_size and same_mtime and existing_source["file_hash"] == source_scan_hash:
             message_count = int(existing_source["message_count"] or 0)
             if message_count == 0:
                 row = connection.execute(
@@ -1257,8 +1404,16 @@ def ingest_pst_source(
                     source_rel_path=source_rel_path,
                     seen_at=scan_started_at,
                 )
+                assign_dataset_to_container_documents(
+                    connection,
+                    source_kind=PST_SOURCE_KIND,
+                    source_rel_path=source_rel_path,
+                    dataset_id=dataset_id,
+                    dataset_source_id=dataset_source_id,
+                )
                 write_container_source_scan_completed(
                     connection,
+                    dataset_id=dataset_id,
                     source_kind=PST_SOURCE_KIND,
                     source_rel_path=source_rel_path,
                     file_size=file_size,
@@ -1279,9 +1434,7 @@ def ingest_pst_source(
                 "pst_messages_updated": 0,
                 "pst_messages_deleted": 0,
             }
-
-        file_hash = sha256_file(path)
-        if same_size and existing_source["file_hash"] and existing_source["file_hash"] == file_hash:
+        if same_size and existing_source["file_hash"] and existing_source["file_hash"] == source_scan_hash:
             message_count = int(existing_source["message_count"] or 0)
             connection.execute("BEGIN")
             try:
@@ -1291,8 +1444,16 @@ def ingest_pst_source(
                     source_rel_path=source_rel_path,
                     seen_at=scan_started_at,
                 )
+                assign_dataset_to_container_documents(
+                    connection,
+                    source_kind=PST_SOURCE_KIND,
+                    source_rel_path=source_rel_path,
+                    dataset_id=dataset_id,
+                    dataset_source_id=dataset_source_id,
+                )
                 write_container_source_scan_completed(
                     connection,
+                    dataset_id=dataset_id,
                     source_kind=PST_SOURCE_KIND,
                     source_rel_path=source_rel_path,
                     file_size=file_size,
@@ -1314,10 +1475,11 @@ def ingest_pst_source(
                 "pst_messages_deleted": 0,
             }
     else:
-        file_hash = sha256_file(path)
+        file_hash = source_scan_hash
 
     write_container_source_scan_started(
         connection,
+        dataset_id=dataset_id,
         source_kind=PST_SOURCE_KIND,
         source_rel_path=source_rel_path,
         file_size=file_size,
@@ -1335,6 +1497,8 @@ def ingest_pst_source(
 
     for raw_message in iter_pst_messages(path):
         normalized = normalize_pst_message(source_rel_path, raw_message)
+        if normalized is None:
+            continue
         message_count += 1
         existing_row = existing_rows_by_source_item.get(str(normalized["source_item_id"]))
         connection.execute("BEGIN")
@@ -1364,6 +1528,7 @@ def ingest_pst_source(
                 file_name=str(normalized["file_name"]),
                 parent_document_id=None,
                 control_number=control_number,
+                dataset_id=dataset_id,
                 control_number_batch=control_number_batch,
                 control_number_family_sequence=control_number_family_sequence,
                 control_number_attachment_sequence=control_number_attachment_sequence,
@@ -1391,6 +1556,12 @@ def ingest_pst_source(
                 chunks,
                 preview_rows,
             )
+            ensure_dataset_document_membership(
+                connection,
+                dataset_id=dataset_id,
+                document_id=document_id,
+                dataset_source_id=dataset_source_id,
+            )
             reconcile_attachment_documents(
                 connection,
                 paths,
@@ -1399,6 +1570,7 @@ def ingest_pst_source(
                 control_number_batch,
                 control_number_family_sequence,
                 attachments,
+                [(dataset_id, dataset_source_id)],
             )
             connection.commit()
             if existing_row is None:
@@ -1415,6 +1587,7 @@ def ingest_pst_source(
         scan_completed_at = next_monotonic_utc_timestamp([scan_started_at])
         write_container_source_scan_completed(
             connection,
+            dataset_id=dataset_id,
             source_kind=PST_SOURCE_KIND,
             source_rel_path=source_rel_path,
             file_size=file_size,
@@ -1441,6 +1614,7 @@ def ingest_pst_source(
 def upsert_production_row(
     connection: sqlite3.Connection,
     *,
+    dataset_id: int | None,
     rel_root: str,
     production_name: str,
     metadata_load_rel_path: str,
@@ -1460,19 +1634,19 @@ def upsert_production_row(
         connection.execute(
             """
             INSERT INTO productions (
-              rel_root, production_name, metadata_load_rel_path, image_load_rel_path, source_type, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+              dataset_id, rel_root, production_name, metadata_load_rel_path, image_load_rel_path, source_type, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (rel_root, production_name, metadata_load_rel_path, image_load_rel_path, source_type, now, now),
+            (dataset_id, rel_root, production_name, metadata_load_rel_path, image_load_rel_path, source_type, now, now),
         )
         return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
     connection.execute(
         """
         UPDATE productions
-        SET production_name = ?, metadata_load_rel_path = ?, image_load_rel_path = ?, source_type = ?, updated_at = ?
+        SET dataset_id = ?, production_name = ?, metadata_load_rel_path = ?, image_load_rel_path = ?, source_type = ?, updated_at = ?
         WHERE id = ?
         """,
-        (production_name, metadata_load_rel_path, image_load_rel_path, source_type, now, existing_row["id"]),
+        (dataset_id, production_name, metadata_load_rel_path, image_load_rel_path, source_type, now, existing_row["id"]),
     )
     return int(existing_row["id"])
 

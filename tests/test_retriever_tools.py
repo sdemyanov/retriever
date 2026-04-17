@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import io
 import re
 import sqlite3
 import tempfile
 import unittest
 import zipfile
 import base64
+from contextlib import redirect_stderr, redirect_stdout
 from email import policy
 from email.message import EmailMessage
 from pathlib import Path
@@ -80,6 +82,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
     def materialize_workspace_tool(self) -> None:
         self.paths["tool_path"].write_bytes(TOOL_BYTES)
+
+    def run_cli(self, *args: str) -> tuple[int, dict[str, object] | None, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+            mock.patch.object(retriever_tools.sys, "argv", ["retriever_tools.py", *args]),
+        ):
+            exit_code = retriever_tools.main()
+        stdout_text = stdout.getvalue().strip()
+        stderr_text = stderr.getvalue().strip()
+        payload = json.loads(stdout_text or stderr_text) if (stdout_text or stderr_text) else None
+        return exit_code, payload, stdout_text, stderr_text
 
     def create_legacy_documents_table(self, *, with_row: bool) -> None:
         connection = sqlite3.connect(self.paths["db_path"])
@@ -261,6 +277,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
             row = connection.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+            self.assertIsNotNone(row)
+            return row
+        finally:
+            connection.close()
+
+    def fetch_dataset_row(self, dataset_id: int) -> sqlite3.Row:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            row = connection.execute("SELECT * FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
             self.assertIsNotNone(row)
             return row
         finally:
@@ -591,11 +616,25 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         try:
             columns = retriever_tools.table_columns(connection, "documents")
             self.assertIn("content_type", columns)
+            self.assertIn("custodian", columns)
             self.assertIn("participants", columns)
             self.assertIn("control_number", columns)
+            self.assertIn("dataset_id", columns)
             self.assertIn("parent_document_id", columns)
             row = connection.execute(
-                "SELECT content_type, participants, control_number, parent_document_id FROM documents WHERE id = 1"
+                """
+                SELECT content_type, custodian, participants, control_number, dataset_id, parent_document_id
+                FROM documents
+                WHERE id = 1
+                """
+            ).fetchone()
+            dataset_row = connection.execute(
+                """
+                SELECT *
+                FROM datasets
+                WHERE id = ?
+                """,
+                (row["dataset_id"],),
             ).fetchone()
             control_number_batch_row = connection.execute(
                 """
@@ -608,9 +647,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(row["content_type"], "E-Doc")
+        self.assertIsNone(row["custodian"])
         self.assertIsNone(row["participants"])
         self.assertEqual(row["control_number"], "DOC001.00000001")
+        self.assertIsNotNone(row["dataset_id"])
         self.assertIsNone(row["parent_document_id"])
+        self.assertIsNotNone(dataset_row)
+        self.assertEqual(dataset_row["source_kind"], retriever_tools.FILESYSTEM_SOURCE_KIND)
+        self.assertEqual(dataset_row["dataset_locator"], ".")
+        self.assertEqual(dataset_row["dataset_name"], self.root.name)
         self.assertIsNotNone(control_number_batch_row)
         self.assertEqual(control_number_batch_row["next_family_sequence"], 2)
 
@@ -860,6 +905,37 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(search_result["results"][0]["preview_rel_path"].endswith(".html"))
         self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "html")
 
+    def test_ingest_prefers_native_preview_for_chat_like_rtf_files(self) -> None:
+        rtf_path = self.root / "chat-thread.rtf"
+        rtf_path.write_text(
+            (
+                r"{\rtf1\ansi\deff0 {\fonttbl {\f0 Arial;}}\f0 "
+                r"[2026-04-15 09:00] Alice Example: Kickoff thread for launch planning.\par "
+                r"[2026-04-15 09:05] Bob Example: I'll draft the update.\par "
+                r"[2026-04-15 09:07] Alice Example: Great, thanks.\par}"
+            ),
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        row = self.fetch_document_row("chat-thread.rtf")
+        self.assertEqual(row["content_type"], "Chat")
+
+        search_result = retriever_tools.search(self.root, "draft the update", None, None, None, 1, 20)
+        result = search_result["results"][0]
+        self.assertEqual(result["preview_rel_path"], "chat-thread.rtf")
+        self.assertEqual(result["preview_targets"][0]["preview_type"], "native")
+        self.assertGreaterEqual(len(result["preview_targets"]), 2)
+        self.assertEqual(result["preview_targets"][1]["preview_type"], "html")
+        preview_html = Path(result["preview_targets"][1]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("Retriever Chat Preview", preview_html)
+        self.assertIn("Alice Example", preview_html)
+        self.assertIn("Bob Example", preview_html)
+
     def test_ingest_supports_chat_transcript_metadata_for_text_files(self) -> None:
         transcript_path = self.root / "chat-thread.txt"
         transcript_path.write_text(
@@ -881,7 +957,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         row = self.fetch_document_row("chat-thread.txt")
         self.assertEqual(row["content_type"], "Chat")
-        self.assertEqual(row["author"], "Alice Example")
+        self.assertIsNone(row["author"])
         self.assertEqual(row["participants"], "Alice Example, Bob Example")
         self.assertEqual(row["date_created"], "2026-04-15T09:00:00Z")
         self.assertEqual(row["date_modified"], "2026-04-15T09:07:00Z")
@@ -890,7 +966,282 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNone(row["recipients"])
 
         search_result = retriever_tools.search(self.root, "draft the update", None, None, None, 1, 20)
-        self.assertEqual(search_result["results"][0]["file_name"], "chat-thread.txt")
+        result = search_result["results"][0]
+        self.assertEqual(result["file_name"], "chat-thread.txt")
+        self.assertTrue(result["preview_rel_path"].endswith(".html"))
+        self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
+        preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("Retriever Chat Preview", preview_html)
+        self.assertIn("Alice Example", preview_html)
+        self.assertIn("Bob Example", preview_html)
+        self.assertIn("Kickoff thread for launch planning.", preview_html)
+        self.assertIn("Full transcript", preview_html)
+
+    def test_ingest_renders_slack_json_as_named_chat_messages(self) -> None:
+        users_path = self.root / "users.json"
+        users_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                            "first_name": "Sergey",
+                            "color": "9f69e7",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                            "first_name": "Maksim",
+                            "color": "2eb67d",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+        channel_dir = self.root / "general"
+        channel_dir.mkdir()
+        slack_day_path = channel_dir / "2022-12-16.json"
+        slack_day_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "<@U04MAX0001> can we sync?",
+                        "user": "U04SERGEY1",
+                        "ts": "1671235434.237949",
+                    },
+                    {
+                        "type": "message",
+                        "text": "Let's sync at 10:05 :partying_face::christmas_tree:",
+                        "user": "U04MAX0001",
+                        "ts": "1671235734.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        row = self.fetch_document_row("general/2022-12-16.json")
+        self.assertEqual(row["content_type"], "Chat")
+        self.assertIsNone(row["author"])
+        self.assertEqual(row["participants"], "Sergey Demyanov, Maksim Faleev")
+        self.assertEqual(row["date_created"], "2022-12-17T00:03:54Z")
+        self.assertEqual(row["date_modified"], "2022-12-17T00:08:54Z")
+        self.assertEqual(row["title"], "#general - Dec 16, 2022")
+
+        search_result = retriever_tools.search(self.root, "sync", None, None, None, 1, 20)
+        result = next(item for item in search_result["results"] if item["file_name"] == "2022-12-16.json")
+        self.assertTrue(result["preview_rel_path"].endswith(".html"))
+        self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
+        preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("Sergey Demyanov", preview_html)
+        self.assertIn("Maksim Faleev", preview_html)
+        self.assertIn("@Maksim can we sync?", preview_html)
+        self.assertIn("sync at 10:05 🥳🎄", preview_html)
+        self.assertIn("chat-avatar-svg", preview_html)
+        self.assertIn('aria-label="Sergey Demyanov"', preview_html)
+        self.assertIn("#general - Dec 16, 2022", preview_html)
+        self.assertIn("Dec 17, 2022 12:03 AM UTC", preview_html)
+        self.assertIn("[Dec 17, 2022 12:03 AM UTC]", preview_html)
+        self.assertNotIn("<th>Author</th>", preview_html)
+        self.assertNotIn("&quot;type&quot;", preview_html)
+
+    def test_search_parser_accepts_alias_flags_for_paging_and_sorting(self) -> None:
+        parser = retriever_tools.build_parser()
+        args = parser.parse_args(
+            [
+                "search",
+                str(self.root),
+                "",
+                "--limit",
+                "10",
+                "--sort-by",
+                "created_date",
+                "--sort-order",
+                "desc",
+            ]
+        )
+
+        self.assertEqual(args.command, "search")
+        self.assertEqual(args.per_page, 10)
+        self.assertEqual(args.sort, "created_date")
+        self.assertEqual(args.order, "desc")
+
+    def test_search_accepts_created_date_sort_alias(self) -> None:
+        first_path = self.root / "chat-older.txt"
+        first_path.write_text(
+            "\n".join(
+                [
+                    "[2026-04-14 09:00] Alice Example: Earlier thread.",
+                    "[2026-04-14 09:05] Bob Example: Copy that.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        second_path = self.root / "chat-newer.txt"
+        second_path.write_text(
+            "\n".join(
+                [
+                    "[2026-04-15 09:00] Alice Example: Later thread.",
+                    "[2026-04-15 09:05] Bob Example: Drafting now.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        search_result = retriever_tools.search(self.root, "", None, "created_date", "desc", 1, 10)
+        self.assertEqual(search_result["sort"], "date_created")
+        self.assertEqual(search_result["order"], "desc")
+        self.assertEqual(search_result["results"][0]["file_name"], "chat-newer.txt")
+        self.assertEqual(search_result["results"][1]["file_name"], "chat-older.txt")
+
+    def test_dataset_cli_commands_manage_manual_dataset_membership(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("sample dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+
+        exit_code, create_payload, _, _ = self.run_cli("create-dataset", str(self.root), "Review Set")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(create_payload)
+        dataset_id = int(create_payload["dataset"]["id"])
+        self.assertEqual(create_payload["dataset"]["dataset_name"], "Review Set")
+        self.assertEqual(create_payload["dataset"]["source_kind"], retriever_tools.MANUAL_DATASET_SOURCE_KIND)
+
+        exit_code, add_payload, _, _ = self.run_cli(
+            "add-to-dataset",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+            "--doc-id",
+            str(row["id"]),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(add_payload)
+        self.assertEqual(add_payload["added_document_ids"], [row["id"]])
+        self.assertEqual(add_payload["already_present_document_ids"], [])
+
+        dataset_filtered = retriever_tools.search(
+            self.root,
+            "",
+            [["dataset_name", "eq", "Review Set"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(dataset_filtered["total_hits"], 1)
+        self.assertEqual(dataset_filtered["results"][0]["id"], row["id"])
+
+        exit_code, list_payload, _, _ = self.run_cli("list-datasets", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        dataset_names = [item["dataset_name"] for item in list_payload["datasets"]]
+        self.assertIn("Review Set", dataset_names)
+        self.assertIn(self.root.name, dataset_names)
+
+        exit_code, remove_payload, _, _ = self.run_cli(
+            "remove-from-dataset",
+            str(self.root),
+            "--dataset-name",
+            "Review Set",
+            "--doc-id",
+            str(row["id"]),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(remove_payload)
+        self.assertEqual(remove_payload["removed_document_ids"], [row["id"]])
+        self.assertEqual(remove_payload["documents_without_dataset_memberships"], [])
+
+        dataset_filtered = retriever_tools.search(
+            self.root,
+            "",
+            [["dataset_name", "eq", "Review Set"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(dataset_filtered["total_hits"], 0)
+
+        exit_code, delete_payload, _, _ = self.run_cli(
+            "delete-dataset",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(delete_payload)
+        self.assertEqual(delete_payload["deleted_dataset"]["id"], dataset_id)
+
+        exit_code, list_payload, _, _ = self.run_cli("list-datasets", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        dataset_names = [item["dataset_name"] for item in list_payload["datasets"]]
+        self.assertNotIn("Review Set", dataset_names)
+
+    def test_deleting_source_backed_dataset_hides_documents_until_reingest(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("sample dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        original_row = self.fetch_document_row("sample.txt")
+
+        exit_code, delete_payload, _, _ = self.run_cli(
+            "delete-dataset",
+            str(self.root),
+            "--dataset-name",
+            self.root.name,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(delete_payload)
+        self.assertEqual(delete_payload["deleted_dataset"]["dataset_name"], self.root.name)
+        self.assertEqual(delete_payload["documents_without_dataset_memberships"], [original_row["id"]])
+
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(browse_result["total_hits"], 0)
+
+        reingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(reingest_result["skipped"], 1)
+
+        restored_row = self.fetch_document_row("sample.txt")
+        self.assertEqual(restored_row["id"], original_row["id"])
+        self.assertEqual(restored_row["control_number"], original_row["control_number"])
+
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(browse_result["total_hits"], 1)
+        self.assertEqual(browse_result["results"][0]["dataset_name"], self.root.name)
 
     def test_ingest_supports_xls_sheet_previews(self) -> None:
         xls_path = self.root / "ledger.xls"
@@ -1218,6 +1569,118 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 for item in browse_results["results"])
         )
 
+    def test_ingest_reuses_workspace_dataset_on_reingest(self) -> None:
+        alpha_path = self.root / "alpha.txt"
+        alpha_path.write_text("alpha dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_ingest["new"], 1)
+        self.assertEqual(first_ingest["failed"], 0)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        self.assertIsNotNone(alpha_row["dataset_id"])
+        initial_dataset_id = int(alpha_row["dataset_id"])
+        initial_dataset_row = self.fetch_dataset_row(initial_dataset_id)
+        self.assertEqual(initial_dataset_row["source_kind"], retriever_tools.FILESYSTEM_SOURCE_KIND)
+        self.assertEqual(initial_dataset_row["dataset_locator"], ".")
+        self.assertEqual(initial_dataset_row["dataset_name"], self.root.name)
+
+        beta_path = self.root / "beta.txt"
+        beta_path.write_text("beta dataset body\n", encoding="utf-8")
+
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(second_ingest["new"], 1)
+        self.assertEqual(second_ingest["skipped"], 1)
+        self.assertEqual(second_ingest["failed"], 0)
+
+        updated_alpha_row = self.fetch_document_row("alpha.txt")
+        beta_row = self.fetch_document_row("beta.txt")
+        self.assertEqual(updated_alpha_row["dataset_id"], initial_dataset_id)
+        self.assertEqual(beta_row["dataset_id"], initial_dataset_id)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            dataset_rows = connection.execute(
+                """
+                SELECT *
+                FROM datasets
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(dataset_rows), 1)
+        dataset_filtered = retriever_tools.search(
+            self.root,
+            "",
+            [["dataset", "eq", self.root.name]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(dataset_filtered["total_hits"], 2)
+        self.assertTrue(all(item["dataset_name"] == self.root.name for item in dataset_filtered["results"]))
+
+    def test_document_can_belong_to_multiple_datasets_without_duplicate_search_hits(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("sample dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            review_dataset_id = retriever_tools.create_dataset_row(connection, "Review Set")
+            retriever_tools.ensure_dataset_document_membership(
+                connection,
+                dataset_id=review_dataset_id,
+                document_id=int(row["id"]),
+                dataset_source_id=None,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        dataset_filtered = retriever_tools.search(
+            self.root,
+            "",
+            [["dataset_name", "eq", "Review Set"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(dataset_filtered["total_hits"], 1)
+        result = dataset_filtered["results"][0]
+        self.assertEqual(result["id"], row["id"])
+        self.assertEqual(sorted(result["dataset_names"]), ["Review Set", self.root.name])
+        self.assertIsNone(result["dataset_id"])
+        self.assertNotIn("dataset_name", result)
+
+    def test_search_omits_documents_without_dataset_memberships(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("sample dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("DELETE FROM dataset_documents WHERE document_id = ?", (row["id"],))
+            connection.commit()
+        finally:
+            connection.close()
+
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(browse_result["total_hits"], 0)
+
     def test_ingest_pst_creates_message_rows_with_source_context_and_attachment_children(self) -> None:
         pst_path = self.write_fake_pst_file()
         messages = [
@@ -1261,7 +1724,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_row["file_type"], "pst")
         self.assertIsNone(parent_row["file_size"])
         self.assertEqual(parent_row["content_type"], "Email")
+        self.assertEqual(parent_row["custodian"], "mailbox")
         self.assertEqual(sibling_row["source_folder_path"], "Sent Items")
+        self.assertEqual(sibling_row["custodian"], "mailbox")
+        self.assertEqual(child_row["custodian"], "mailbox")
+        self.assertIsNotNone(parent_row["dataset_id"])
+        self.assertEqual(parent_row["dataset_id"], sibling_row["dataset_id"])
+        self.assertEqual(parent_row["dataset_id"], child_row["dataset_id"])
         self.assertTrue(str(child_row["rel_path"]).startswith(".retriever/previews/mailbox.pst/attachments/"))
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
@@ -1270,20 +1739,32 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 "SELECT * FROM container_sources WHERE source_kind = ? AND source_rel_path = ?",
                 (retriever_tools.PST_SOURCE_KIND, "mailbox.pst"),
             ).fetchone()
+            dataset_row = connection.execute(
+                "SELECT * FROM datasets WHERE id = ?",
+                (parent_row["dataset_id"],),
+            ).fetchone()
         finally:
             connection.close()
 
         self.assertIsNotNone(container_row)
+        self.assertEqual(container_row["dataset_id"], parent_row["dataset_id"])
         self.assertEqual(container_row["message_count"], 2)
         self.assertEqual(container_row["file_size"], pst_path.stat().st_size)
         self.assertIsNotNone(container_row["last_scan_completed_at"])
+        self.assertIsNotNone(dataset_row)
+        self.assertEqual(dataset_row["source_kind"], retriever_tools.PST_SOURCE_KIND)
+        self.assertEqual(dataset_row["dataset_locator"], "mailbox.pst")
+        self.assertEqual(dataset_row["dataset_name"], "mailbox.pst")
 
         parent_search = retriever_tools.search(self.root, "PST Parent", None, None, None, 1, 20)
         parent_result = next(item for item in parent_search["results"] if item["id"] == parent_row["id"])
         self.assertEqual(parent_result["attachment_count"], 1)
         self.assertEqual(parent_result["source_rel_path"], "mailbox.pst")
         self.assertEqual(parent_result["source_folder_path"], "Inbox")
+        self.assertEqual(parent_result["dataset_name"], "mailbox.pst")
         self.assertTrue(parent_result["preview_rel_path"].startswith(".retriever/previews/mailbox.pst/messages/"))
+        parent_preview_html = Path(parent_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
 
         pst_only = retriever_tools.search(
             self.root,
@@ -1295,6 +1776,29 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             20,
         )
         self.assertEqual(pst_only["total_hits"], 2)
+        custodian_filtered = retriever_tools.search(
+            self.root,
+            "",
+            [["custodian", "eq", "mailbox"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(custodian_filtered["total_hits"], 3)
+        dataset_filtered = retriever_tools.search(
+            self.root,
+            "",
+            [["dataset_name", "eq", "mailbox.pst"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(dataset_filtered["total_hits"], 3)
+        self.assertTrue(all(item["dataset_name"] == "mailbox.pst" for item in dataset_filtered["results"]))
+        custodian_query = retriever_tools.search(self.root, "mailbox", None, None, None, 1, 20)
+        self.assertEqual(custodian_query["total_hits"], 3)
 
         attachment_search = retriever_tools.search(self.root, "pst attachment body", None, None, None, 1, 20)
         attachment_result = next(item for item in attachment_search["results"] if item["id"] == child_row["id"])
@@ -1332,7 +1836,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-001"))
         self.assertEqual(row["content_type"], "Chat")
-        self.assertEqual(row["author"], "Alice Example")
+        self.assertIsNone(row["author"])
+        self.assertEqual(row["custodian"], "mailbox")
         self.assertEqual(row["participants"], "Alice Example, Bob Example")
         self.assertEqual(row["date_created"], "2026-04-15T09:00:00Z")
         self.assertEqual(row["date_modified"], "2026-04-15T09:07:00Z")
@@ -1340,6 +1845,151 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNone(row["subject"])
         self.assertIsNone(row["recipients"])
         self.assertEqual(row["source_folder_path"], "Conversation History")
+
+        search_result = retriever_tools.search(self.root, "draft the update", None, None, None, 1, 20)
+        result = search_result["results"][0]
+        self.assertTrue(result["preview_rel_path"].startswith(".retriever/previews/mailbox.pst/messages/"))
+        self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
+        preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("Retriever Chat Preview", preview_html)
+        self.assertIn("Alice Example", preview_html)
+        self.assertIn("Bob Example", preview_html)
+        self.assertIn("Kickoff thread for launch planning.", preview_html)
+
+    def test_ingest_pst_routes_teams_messages_to_chat_and_skips_system_folders(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-team-001",
+                subject=None,
+                body_text="hey there",
+                folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                author="Sergey Demyanov",
+                recipients=None,
+                date_created="2026-04-15T09:00:00Z",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-spool-001",
+                subject=None,
+                body_text="",
+                folder_path="Top of Personal Folders/user (Primary)/SubstrateFiles/SPOOLS",
+                author=None,
+                recipients=None,
+                date_created="2026-04-15T09:01:00Z",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-meeting-system-001",
+                subject=None,
+                body_text="<addmember><eventtime>1713916258178</eventtime></addmember>",
+                folder_path="Top of Personal Folders/user (Primary)/SkypeSpacesData/TeamsMeetings",
+                author="19:meeting@unq.gbl.spaces",
+                recipients=None,
+                date_created="2026-04-15T09:02:00Z",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-email-001",
+                subject="Ordinary inbox message",
+                body_text="Parent message body",
+                folder_path="Top of Information Store/Inbox",
+                author="Alice Example <alice@example.com>",
+                recipients="Bob Example <bob@example.com>",
+                date_created="2026-04-15T09:03:00Z",
+            ),
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 2)
+        self.assertEqual(ingest_result["workspace_parent_documents"], 2)
+
+        chat_rel_path = retriever_tools.pst_message_rel_path("mailbox.pst", "pst-team-001")
+        email_rel_path = retriever_tools.pst_message_rel_path("mailbox.pst", "pst-email-001")
+        chat_row = self.fetch_document_row(chat_rel_path)
+        email_row = self.fetch_document_row(email_rel_path)
+
+        self.assertEqual(chat_row["content_type"], "Chat")
+        self.assertIsNone(chat_row["author"])
+        self.assertEqual(chat_row["custodian"], "mailbox")
+        self.assertEqual(chat_row["participants"], "Sergey Demyanov")
+        self.assertEqual(chat_row["title"], "hey there")
+        self.assertEqual(chat_row["source_folder_path"], "Top of Personal Folders/user (Primary)/TeamsMessagesData")
+        self.assertEqual(email_row["content_type"], "Email")
+        self.assertEqual(email_row["custodian"], "mailbox")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            skipped_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM documents
+                    WHERE rel_path IN (?, ?)
+                    """,
+                    (
+                        retriever_tools.pst_message_rel_path("mailbox.pst", "pst-spool-001"),
+                        retriever_tools.pst_message_rel_path("mailbox.pst", "pst-meeting-system-001"),
+                    ),
+                ).fetchone()["count"]
+            )
+        finally:
+            connection.close()
+        self.assertEqual(skipped_count, 0)
+
+        search_result = retriever_tools.search(self.root, "hey there", None, None, None, 1, 20)
+        result = next(item for item in search_result["results"] if item["id"] == chat_row["id"])
+        preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("Retriever Chat Preview", preview_html)
+        self.assertIn("Sergey Demyanov", preview_html)
+        self.assertIn("hey there", preview_html)
+
+    def test_ingest_pst_calendar_folder_uses_calendar_content_type(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-calendar-001",
+                subject="Labor Day",
+                body_text="",
+                folder_path="Top of Information Store/Calendar/United States holidays",
+                author="sergey",
+                recipients=None,
+                date_created="2026-09-07T00:00:00Z",
+                message_class="IPM.Appointment",
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 1)
+
+        row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-calendar-001"))
+        self.assertEqual(row["content_type"], "Calendar")
+        self.assertEqual(row["custodian"], "mailbox")
+        self.assertEqual(row["title"], "Labor Day")
+        self.assertEqual(row["subject"], "Labor Day")
+        self.assertEqual(row["author"], "sergey")
+
+        search_result = retriever_tools.search(
+            self.root,
+            "",
+            [["content_type", "eq", "Calendar"], ["source_kind", "eq", retriever_tools.PST_SOURCE_KIND]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(search_result["total_hits"], 1)
+        preview_html = Path(search_result["results"][0]["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("Retriever Calendar Preview", preview_html)
+        self.assertIn("Labor Day", preview_html)
+        self.assertIn("Sep 7, 2026 12:00 AM UTC", preview_html)
 
     def test_unchanged_pst_source_skips_without_reparsing(self) -> None:
         self.write_fake_pst_file()
@@ -1492,11 +2142,24 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 ORDER BY part_kind ASC, ordinal ASC
                 """
             ).fetchall()
+            dataset_row = connection.execute(
+                """
+                SELECT *
+                FROM datasets
+                WHERE id = (SELECT dataset_id FROM productions WHERE rel_root = ?)
+                """,
+                ("Synthetic_Production",),
+            ).fetchone()
         finally:
             connection.close()
 
         self.assertIsNotNone(production_row)
         self.assertEqual(production_row["production_name"], "Synthetic_Production")
+        self.assertIsNotNone(production_row["dataset_id"])
+        self.assertIsNotNone(dataset_row)
+        self.assertEqual(dataset_row["source_kind"], retriever_tools.PRODUCTION_SOURCE_KIND)
+        self.assertEqual(dataset_row["dataset_locator"], "Synthetic_Production")
+        self.assertEqual(dataset_row["dataset_name"], "Synthetic_Production")
         self.assertTrue(any(row["part_kind"] == "native" for row in source_parts))
 
         parent_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000001.logical")
@@ -1508,6 +2171,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_row["begin_bates"], "PDX000001")
         self.assertEqual(parent_row["end_bates"], "PDX000002")
         self.assertEqual(parent_row["source_kind"], retriever_tools.PRODUCTION_SOURCE_KIND)
+        self.assertEqual(parent_row["dataset_id"], production_row["dataset_id"])
         self.assertEqual(parent_row["content_type"], "Email")
         self.assertEqual(parent_row["author"], "Elena Steven <elena@example.com>")
         self.assertEqual(parent_row["date_created"], "2026-04-14T10:32:00Z")
@@ -1519,12 +2183,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "Elena Steven <elena@example.com>, Harry Montoro <harry@example.com>",
         )
         self.assertEqual(child_row["parent_document_id"], parent_row["id"])
+        self.assertEqual(child_row["dataset_id"], production_row["dataset_id"])
         self.assertEqual(child_row["content_type"], "Email")
         self.assertEqual(child_row["author"], "Review Team")
         self.assertEqual(child_row["date_created"], "2026-04-14T09:00:00Z")
         self.assertEqual(child_row["title"], "Case status update")
+        self.assertEqual(native_row["dataset_id"], production_row["dataset_id"])
         self.assertEqual(native_row["file_name"], "PDX000004.pdf")
         self.assertEqual(native_row["content_type"], "E-Doc")
+        self.assertEqual(image_only_row["dataset_id"], production_row["dataset_id"])
         self.assertEqual(image_only_row["text_status"], "empty")
         self.assertEqual(image_only_row["content_type"], "Image")
         self.assertEqual(image_only_row["page_count"], 2)
@@ -1555,6 +2222,17 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             20,
         )
         self.assertEqual(production_filtered["total_hits"], 4)
+        dataset_filtered = retriever_tools.search(
+            self.root,
+            "",
+            [["dataset", "eq", "Synthetic_Production"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(dataset_filtered["total_hits"], 4)
+        self.assertTrue(all(item["dataset_name"] == "Synthetic_Production" for item in dataset_filtered["results"]))
 
         native_search = retriever_tools.search(self.root, "Native-backed production doc", None, None, None, 1, 20)
         native_result = next(item for item in native_search["results"] if item["control_number"] == "PDX000004")
@@ -1648,6 +2326,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         row = self.fetch_document_row("sample.txt")
         blocked_fields = [
             "control_number",
+            "dataset_id",
             "ingested_at",
             "last_seen_at",
             "parent_document_id",

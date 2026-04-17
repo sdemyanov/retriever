@@ -1,8 +1,8 @@
-# Schema v9
+# Schema v12
 
 ## Versioning
 
-- schema version: `9`
+- schema version: `12`
 - database file: `.retriever/retriever.db`
 - timestamps: UTC ISO 8601 with `Z`
 - booleans: `0` or `1`
@@ -41,6 +41,51 @@ CREATE TABLE IF NOT EXISTS workspace_meta (
 );
 ```
 
+### `datasets`
+
+Named document collections. Source-backed datasets keep their primary source identity here for compatibility and migration, while canonical membership lives in `dataset_documents`.
+
+```sql
+CREATE TABLE IF NOT EXISTS datasets (
+  id INTEGER PRIMARY KEY,
+  source_kind TEXT NOT NULL,
+  dataset_locator TEXT NOT NULL,
+  dataset_name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+### `dataset_sources`
+
+Source bindings that automatically feed a dataset on ingest/reingest.
+
+```sql
+CREATE TABLE IF NOT EXISTS dataset_sources (
+  id INTEGER PRIMARY KEY,
+  dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+  source_kind TEXT NOT NULL,
+  source_locator TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+### `dataset_documents`
+
+Dataset membership rows. One document may belong to many datasets, and one dataset may contain many documents.
+
+```sql
+CREATE TABLE IF NOT EXISTS dataset_documents (
+  id INTEGER PRIMARY KEY,
+  dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  dataset_source_id INTEGER REFERENCES dataset_sources(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
 ### `documents`
 
 Core registry for indexed documents.
@@ -49,8 +94,12 @@ Core registry for indexed documents.
 CREATE TABLE IF NOT EXISTS documents (
   id INTEGER PRIMARY KEY,
   control_number TEXT UNIQUE,
+  dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
   parent_document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
   source_kind TEXT,
+  source_rel_path TEXT,
+  source_item_id TEXT,
+  source_folder_path TEXT,
   production_id INTEGER REFERENCES productions(id) ON DELETE SET NULL,
   begin_bates TEXT,
   end_bates TEXT,
@@ -63,6 +112,7 @@ CREATE TABLE IF NOT EXISTS documents (
   page_count INTEGER,
   author TEXT,
   content_type TEXT,
+  custodian TEXT,
   date_created TEXT,
   date_modified TEXT,
   title TEXT,
@@ -94,12 +144,12 @@ Retriever treats the document columns themselves as the effective values users s
 
 - `manual_field_locks_json` stores a JSON array of user-editable document field names whose current values came from a manual action.
 - This applies to:
-  - editable built-in metadata fields such as `page_count`, `author`, `content_type`, `date_created`, `date_modified`, `title`, `subject`, `participants`, and `recipients`
+  - editable built-in metadata fields such as `page_count`, `author`, `content_type`, `custodian`, `date_created`, `date_modified`, `title`, `subject`, `participants`, and `recipients`
   - custom field columns added to `documents` through `ALTER TABLE`
 - When a user manually edits one of those fields, Retriever updates the column itself and adds that field name to `manual_field_locks_json`.
 - Automated ingest or review may refresh unlocked fields, but it must not overwrite any field named in `manual_field_locks_json`.
 - To accept a newly extracted or AI-produced value later, the lock must be cleared explicitly before or during the overwrite workflow.
-- System-managed columns such as `control_number`, `parent_document_id`, `source_kind`, `production_id`, `begin_bates`, `end_bates`, `begin_attachment`, `end_attachment`, `rel_path`, `file_name`, `file_type`, `file_size`, `file_hash`, `content_hash`, `text_status`, `lifecycle_status`, `ingested_at`, `last_seen_at`, `updated_at`, `control_number_batch`, `control_number_family_sequence`, and `control_number_attachment_sequence` are never manually settable or lockable.
+- System-managed columns such as `control_number`, `dataset_id`, `parent_document_id`, `source_kind`, `production_id`, `begin_bates`, `end_bates`, `begin_attachment`, `end_attachment`, `rel_path`, `file_name`, `file_type`, `file_size`, `file_hash`, `content_hash`, `text_status`, `lifecycle_status`, `ingested_at`, `last_seen_at`, `updated_at`, `control_number_batch`, `control_number_family_sequence`, and `control_number_attachment_sequence` are never manually settable or lockable.
 - `manual_field_locks_json` and the legacy `locked_metadata_fields_json` helper column are also never manually settable or lockable. Lock state must flow through dedicated Retriever behavior, not ad hoc edits to helper JSON.
 
 Because manual values live in the primary document columns, the FTS indexes and normal SQL filters continue to use the user-visible values automatically.
@@ -111,7 +161,7 @@ Retriever distinguishes between user-facing document metadata and internal helpe
 - Default field views should show user-facing document fields plus custom fields:
   - `control_number`
   - `rel_path`, `file_name`, `file_type`, `file_size`
-  - `page_count`, `author`, `content_type`, `date_created`, `date_modified`
+  - `page_count`, `author`, `content_type`, `custodian`, `date_created`, `date_modified`
   - `title`, `subject`, `participants`, `recipients`
   - custom fields registered in `custom_fields_registry`
 - Hide pure bookkeeping/helper columns by default:
@@ -119,13 +169,15 @@ Retriever distinguishes between user-facing document metadata and internal helpe
   - `file_hash`, `content_hash`
   - `text_status`, `lifecycle_status`
   - `ingested_at`, `last_seen_at`, `updated_at`
+  - `dataset_id`
   - `parent_document_id`
-  - `source_kind`, `production_id`
+  - `source_kind`, `source_rel_path`, `source_item_id`, `source_folder_path`, `production_id`
   - `begin_bates`, `end_bates`, `begin_attachment`, `end_attachment`
   - `control_number_batch`, `control_number_family_sequence`, `control_number_attachment_sequence`
   - `manual_field_locks_json`, `locked_metadata_fields_json`
 - If the user explicitly asks for "all fields" or is debugging schema/runtime behavior, show every column and label helper fields as system/read-only instead of silently omitting them.
-- `control_number`, `content_type`, and `participants` are user-facing built-in metadata fields and should remain visible in default field views.
+- `control_number`, `content_type`, `custodian`, and `participants` are user-facing built-in metadata fields and should remain visible in default field views.
+- `dataset_name` is a virtual/user-facing projection derived from `dataset_documents` membership rows; it may be shown or filtered, but it is not stored as a column on `documents`.
 
 #### Control Number rule
 
@@ -150,6 +202,35 @@ Retriever distinguishes between user-facing document metadata and internal helpe
 - Typical override signals include:
   - email-style headers near the start of the document
   - calendar markers such as `BEGIN:VCALENDAR`
+
+#### Custodian rule
+
+`custodian` is a built-in metadata field on `documents`.
+
+- It identifies who the source material was collected from when Retriever can determine that provenance reliably.
+- Retriever should populate it using source-kind-specific rules rather than blindly copying `source_rel_path`.
+- For PST-derived message rows, default `custodian` comes from the owning `.pst` container name without the extension.
+- PST-derived child attachment rows inherit `custodian` from their parent message row.
+- Existing workspaces may require reindex or migration backfill to populate `custodian` on already ingested rows.
+
+#### Dataset rule
+
+Datasets are first-class collections, and document membership is many-to-many.
+
+- Canonical dataset membership lives in `dataset_documents`, not in `documents.dataset_id`.
+- A document may belong to multiple datasets.
+- A dataset may be:
+  - source-backed, through one or more `dataset_sources` rows
+  - manually curated, with explicit `dataset_documents` rows and no `dataset_sources`
+  - mixed, with both source-fed and manual memberships
+- Reingestion of the same source must reuse the existing source-backed dataset instead of allocating a new one.
+- Filesystem ingest uses one source binding per selected workspace root, with `source_kind = filesystem` and `source_locator = '.'`.
+- PST ingest uses one source binding per `.pst` container, with `source_kind = pst` and `source_locator = source_rel_path`.
+- Production ingest uses one source binding per production root, with `source_kind = production` and `source_locator = productions.rel_root`.
+- Derived child attachment rows inherit the same dataset memberships as their source parent at ingest/reingest time.
+- Normal search/browse only returns documents that still have at least one `dataset_documents` membership row.
+- User-facing filtering/display should use `dataset_name`, not the raw compatibility/cache columns.
+- `documents.dataset_id` remains a system-managed compatibility/source-hint field during the transition from the older scalar model and must not be treated as the authoritative membership source.
 
 #### Participants rule
 
@@ -188,6 +269,7 @@ Tracks each ingested processed production root.
 ```sql
 CREATE TABLE IF NOT EXISTS productions (
   id INTEGER PRIMARY KEY,
+  dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
   rel_root TEXT NOT NULL UNIQUE,
   production_name TEXT NOT NULL,
   metadata_load_rel_path TEXT NOT NULL,
@@ -197,6 +279,8 @@ CREATE TABLE IF NOT EXISTS productions (
   updated_at TEXT NOT NULL
 );
 ```
+
+`productions.dataset_id` is a source-backed compatibility/cache pointer to the dataset associated with that production root. Canonical document membership still lives in `dataset_documents`.
 
 ### `document_source_parts`
 
@@ -213,6 +297,28 @@ CREATE TABLE IF NOT EXISTS document_source_parts (
   created_at TEXT NOT NULL
 );
 ```
+
+### `container_sources`
+
+Tracks scanned source containers such as PST files.
+
+```sql
+CREATE TABLE IF NOT EXISTS container_sources (
+  id INTEGER PRIMARY KEY,
+  dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
+  source_kind TEXT NOT NULL,
+  source_rel_path TEXT NOT NULL UNIQUE,
+  file_size INTEGER,
+  file_mtime TEXT,
+  file_hash TEXT,
+  message_count INTEGER,
+  last_scan_started_at TEXT,
+  last_scan_completed_at TEXT,
+  last_ingested_at TEXT
+);
+```
+
+`container_sources.dataset_id` is a source-backed compatibility/cache pointer to the dataset associated with that container source.
 
 ### `document_previews`
 
@@ -258,6 +364,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
   title,
   subject,
   author,
+  custodian,
   participants,
   recipients
 );
@@ -333,7 +440,9 @@ Search does not accept raw SQL filter strings.
 
 - Use repeatable filters in the form `--filter <field> <op> <value>`.
 - `field` must resolve to a built-in `documents` column or a valid `custom_fields_registry.field_name`.
-- Virtual boolean filter fields are also allowed:
+- Virtual filter fields are also allowed:
+  - `dataset_name`
+  - `production_name`
   - `is_attachment`
   - `has_attachments`
 - `op` must be validated against field type.
@@ -350,6 +459,8 @@ Search does not accept raw SQL filter strings.
 - The tool must compile filters into parameterized SQL and must not splice raw user strings into the query.
 - Custom fields participate in structured filtering and sorting in MVP.
 - Virtual filter fields participate in filtering but not sorting.
+- Field aliases may normalize to virtual fields, for example `dataset` and `dataset_label` both resolve to `dataset_name`.
+- `is_attachment` and `has_attachments` are the virtual boolean filters in MVP.
 - `is_attachment eq true` returns child attachment documents.
 - `has_attachments eq true` returns documents that currently have at least one non-deleted child attachment.
 - Full-text search over custom field values is deferred to a later phase.
@@ -374,8 +485,25 @@ CREATE INDEX IF NOT EXISTS idx_documents_file_hash ON documents(file_hash);
 CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash);
 CREATE INDEX IF NOT EXISTS idx_documents_lifecycle_status ON documents(lifecycle_status);
 CREATE INDEX IF NOT EXISTS idx_documents_parent_document_id ON documents(parent_document_id);
+CREATE INDEX IF NOT EXISTS idx_documents_dataset_id ON documents(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_documents_control_number_sort
   ON documents(control_number_batch, control_number_family_sequence, control_number_attachment_sequence);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_source_locator_unique
+  ON datasets(source_kind, dataset_locator);
+CREATE INDEX IF NOT EXISTS idx_dataset_sources_dataset_id
+  ON dataset_sources(dataset_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_sources_locator_unique
+  ON dataset_sources(source_kind, source_locator);
+CREATE INDEX IF NOT EXISTS idx_dataset_documents_document_id
+  ON dataset_documents(document_id);
+CREATE INDEX IF NOT EXISTS idx_dataset_documents_dataset_id
+  ON dataset_documents(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_dataset_documents_source_id
+  ON dataset_documents(dataset_source_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_documents_membership_unique
+  ON dataset_documents(dataset_id, document_id, COALESCE(dataset_source_id, 0));
+CREATE INDEX IF NOT EXISTS idx_productions_dataset_id ON productions(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_container_sources_dataset_id ON container_sources(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_previews_document_id ON document_previews(document_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id, chunk_index);
 ```
@@ -418,6 +546,15 @@ CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id
 - v8 adds the `productions` and `document_source_parts` tables
 - v8 backfills existing non-production rows to `source_kind = filesystem` or `source_kind = email_attachment`
 - v7 keeps future child attachment numbering stable across parent re-ingest
+- v9 adds provenance-aware document columns: `source_rel_path`, `source_item_id`, and `source_folder_path`
+- v10 adds `documents.custodian`
+- v10 rebuilds `documents_fts` with a `custodian` column
+- v10 may backfill derivable `custodian` values from existing source metadata
+- v11 adds the initial scalar dataset model: the `datasets` table plus `documents.dataset_id`, `productions.dataset_id`, and `container_sources.dataset_id`
+- v11 backfills source-backed dataset rows and scalar `dataset_id` assignments for existing documents using source-specific locators
+- v12 adds `dataset_sources` and `dataset_documents`
+- v12 moves canonical dataset membership to `dataset_documents`, while retaining the older scalar dataset fields as compatibility/cache columns
+- v12 backfills source bindings and dataset memberships for pre-v12 workspaces
 - for future migrations with non-obvious tradeoffs, stop and ask the user whether to migrate in place or reindex everything
 - future migrations must preserve user data
 - destructive downgrades are not supported
@@ -433,7 +570,7 @@ Expected JSON shape:
 {
   "overall": "pass",
   "tool_version": "0.9.4",
-  "schema_version": 9,
+  "schema_version": 12,
   "python_version": "3.10.12",
   "pip_version": "25.3",
   "sqlite_version": "3.37.2",
@@ -471,7 +608,7 @@ Expected JSON shape:
 {
   "status": "initialized",
   "workspace_root": "/path/to/workspace",
-  "schema_version": 9,
+  "schema_version": 12,
   "tool_version": "0.9.4",
   "requirements_version": "2026-04-16-phase4-pst",
   "journal_mode": "wal"

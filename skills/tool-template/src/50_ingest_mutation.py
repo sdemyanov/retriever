@@ -3,7 +3,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
-        apply_schema(connection)
+        apply_schema(connection, root)
         reconcile_custom_fields_registry(connection, repair=True)
         resolved_production_root = resolve_production_root_argument(root, production_root)
         signature = production_signature_for_root(root, resolved_production_root)
@@ -14,8 +14,15 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
         image_load_path = Path(signature["image_load_path"]) if signature["image_load_path"] is not None else None
         metadata = parse_production_metadata_load(metadata_load_path)
         image_rows = parse_production_image_load(image_load_path)
+        dataset_id, dataset_source_id = ensure_source_backed_dataset(
+            connection,
+            source_kind=PRODUCTION_SOURCE_KIND,
+            source_locator=str(signature["rel_root"]),
+            dataset_name=production_dataset_name(str(signature["rel_root"]), str(signature["production_name"])),
+        )
         production_id = upsert_production_row(
             connection,
+            dataset_id=dataset_id,
             rel_root=str(signature["rel_root"]),
             production_name=str(signature["production_name"]),
             metadata_load_rel_path=relative_document_path(root, metadata_load_path),
@@ -129,6 +136,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
                     file_name=file_name,
                     parent_document_id=None,
                     control_number=control_number,
+                    dataset_id=dataset_id,
                     control_number_batch=None,
                     control_number_family_sequence=None,
                     control_number_attachment_sequence=None,
@@ -153,6 +161,12 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
                         if isinstance(preferred_native, Path)
                         else (sha256_file(text_path) if text_path is not None and text_path.exists() else None)
                     ),
+                )
+                ensure_dataset_document_membership(
+                    connection,
+                    dataset_id=dataset_id,
+                    document_id=document_id,
+                    dataset_source_id=dataset_source_id,
                 )
                 preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
                 chunks = chunk_text(str(extracted.get("text_content") or ""))
@@ -238,8 +252,15 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
     allowed_types = parse_file_types(raw_file_types)
     connection = connect_db(paths["db_path"])
     try:
-        apply_schema(connection)
+        apply_schema(connection, root)
         reconcile_custom_fields_registry(connection, repair=True)
+        filesystem_dataset_id, filesystem_dataset_source_id = ensure_source_backed_dataset(
+            connection,
+            source_kind=FILESYSTEM_SOURCE_KIND,
+            source_locator=filesystem_dataset_locator(),
+            dataset_name=filesystem_dataset_name(root),
+        )
+        connection.commit()
 
         production_signatures = find_production_root_signatures(root, recursive, connection)
         production_root_paths = [Path(signature["root"]).resolve() for signature in production_signatures]
@@ -321,7 +342,12 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 if existing_row["file_hash"] == file_hash and existing_row["lifecycle_status"] == "active":
                     connection.execute("BEGIN")
                     try:
-                        mark_seen_without_reingest(connection, existing_row)
+                        mark_seen_without_reingest(
+                            connection,
+                            existing_row,
+                            dataset_id=filesystem_dataset_id,
+                            dataset_source_id=filesystem_dataset_source_id,
+                        )
                         connection.commit()
                         stats["skipped"] += 1
                         continue
@@ -363,9 +389,16 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     file_name=path.name,
                     parent_document_id=None,
                     control_number=control_number,
+                    dataset_id=filesystem_dataset_id,
                     control_number_batch=control_number_batch,
                     control_number_family_sequence=control_number_family_sequence,
                     control_number_attachment_sequence=control_number_attachment_sequence,
+                )
+                ensure_dataset_document_membership(
+                    connection,
+                    dataset_id=filesystem_dataset_id,
+                    document_id=document_id,
+                    dataset_source_id=filesystem_dataset_source_id,
                 )
                 preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
                 chunks = chunk_text(str(extracted.get("text_content") or ""))
@@ -378,6 +411,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     control_number_batch,
                     control_number_family_sequence,
                     attachments,
+                    [(filesystem_dataset_id, filesystem_dataset_source_id)],
                 )
                 connection.commit()
                 stats[action] += 1
@@ -440,6 +474,7 @@ def value_from_type(field_type: str, value: str | None) -> object:
 
 
 def resolve_field_definition(connection: sqlite3.Connection, field_name: str) -> dict[str, str]:
+    field_name = FIELD_NAME_ALIASES.get(field_name, field_name)
     if field_name in BUILTIN_FIELD_TYPES:
         return {"field_name": field_name, "field_type": BUILTIN_FIELD_TYPES[field_name], "source": "builtin"}
     if field_name in VIRTUAL_FILTER_FIELD_TYPES:
@@ -482,6 +517,146 @@ def lock_field(connection: sqlite3.Connection, document_id: int, field_name: str
     return locks
 
 
+def list_datasets(root: Path) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        return {
+            "status": "ok",
+            "datasets": list_dataset_summaries(connection),
+        }
+    finally:
+        connection.close()
+
+
+def create_dataset(root: Path, dataset_name: str) -> dict[str, object]:
+    normalized_name = normalize_whitespace(dataset_name)
+    if not normalized_name:
+        raise RetrieverError("Dataset name cannot be empty.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        existing_rows = find_dataset_rows_by_name(connection, normalized_name)
+        if existing_rows:
+            ids = ", ".join(str(row["id"]) for row in existing_rows)
+            raise RetrieverError(
+                f"Dataset name {normalized_name!r} already exists; use the existing dataset id(s): {ids}."
+            )
+        connection.execute("BEGIN")
+        try:
+            dataset_id = create_dataset_row(connection, normalized_name)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "dataset": dataset_summary_by_id(connection, dataset_id),
+        }
+    finally:
+        connection.close()
+
+
+def add_to_dataset(
+    root: Path,
+    document_ids: list[int],
+    *,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
+        connection.execute("BEGIN")
+        try:
+            result = add_documents_to_dataset(
+                connection,
+                dataset_id=int(dataset_row["id"]),
+                document_ids=document_ids,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "requested_document_ids": sorted(dict.fromkeys(int(document_id) for document_id in document_ids)),
+            **result,
+            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"])),
+        }
+    finally:
+        connection.close()
+
+
+def remove_from_dataset(
+    root: Path,
+    document_ids: list[int],
+    *,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
+        connection.execute("BEGIN")
+        try:
+            result = remove_documents_from_dataset(
+                connection,
+                dataset_id=int(dataset_row["id"]),
+                document_ids=document_ids,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "requested_document_ids": sorted(dict.fromkeys(int(document_id) for document_id in document_ids)),
+            **result,
+            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"])),
+        }
+    finally:
+        connection.close()
+
+
+def delete_dataset(
+    root: Path,
+    *,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
+        connection.execute("BEGIN")
+        try:
+            result = delete_dataset_row(connection, int(dataset_row["id"]))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            **result,
+        }
+    finally:
+        connection.close()
+
+
 def add_field(root: Path, raw_field_name: str, field_type: str, instruction: str | None) -> dict[str, object]:
     normalized_field_name = sanitize_field_name(raw_field_name)
     normalized_field_type = field_type.strip().lower()
@@ -492,7 +667,7 @@ def add_field(root: Path, raw_field_name: str, field_type: str, instruction: str
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
-        apply_schema(connection)
+        apply_schema(connection, root)
         reconcile_custom_fields_registry(connection, repair=True)
         columns = table_columns(connection, "documents")
         sql_type = REGISTRY_FIELD_TYPES[normalized_field_type]
@@ -528,7 +703,7 @@ def set_field(root: Path, document_id: int, field_name: str, value: str | None) 
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
-        apply_schema(connection)
+        apply_schema(connection, root)
         field_def = resolve_field_definition(connection, field_name)
         column_name = field_def["field_name"]
         if column_name in SYSTEM_MANAGED_FIELDS:
@@ -543,7 +718,7 @@ def set_field(root: Path, document_id: int, field_name: str, value: str | None) 
                 f"UPDATE documents SET {quote_identifier(column_name)} = ?, updated_at = ? WHERE id = ?",
                 (typed_value, utc_now(), document_id),
             )
-            if column_name in {"author", "participants", "recipients", "subject", "title"}:
+            if column_name in {"author", "custodian", "participants", "recipients", "subject", "title"}:
                 refresh_documents_fts_row(connection, document_id)
             locks = lock_field(connection, document_id, column_name)
             connection.commit()
@@ -560,4 +735,3 @@ def set_field(root: Path, document_id: int, field_name: str, value: str | None) 
             raise
     finally:
         connection.close()
-

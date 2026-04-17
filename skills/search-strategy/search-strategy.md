@@ -5,6 +5,9 @@
 - Use full-text search when the user supplies keywords or phrases.
 - Use browse mode when the user primarily filters by metadata or custom fields.
 - Build filters with repeatable `--filter <field> <op> <value>` clauses.
+- Use the canonical `search` CLI flags `--sort`, `--order`, `--page`, and `--per-page` for sorting and paging.
+- Map "show N" style requests to `--page 1 --per-page N`; do not invent `--limit`.
+- Use canonical built-in field names such as `date_created`, not ad hoc variants like `created_date`.
 
 Supported MVP operators:
 
@@ -30,46 +33,86 @@ Production-aware query behavior:
 - A normalized Bates range such as `SR000123-SR000150` should return all logical documents whose Bates spans overlap that range.
 - Bates range matching must use normalized prefix + numeric parsing, not raw lexicographic string comparison.
 
-## Result presentation
+## OUTPUT FORMAT (mandatory)
 
-Default to a four-column result table unless the user explicitly asks for another format.
-This default layout also applies to ranked browse requests such as "show 10 largest documents", "newest documents", or "oldest emails".
-Do not replace or reorder the default leading columns unless the user explicitly asks for different columns.
-It is fine to append one or more request-relevant columns after `Title preview` when that improves the result, for example adding `Size` to a "largest documents" browse view.
-When `control_number` values are available, show them in a dedicated rightmost `Control number` column instead of folding them into the title link.
+Unless the user explicitly asks for a different layout, every search result set MUST use the standard table format below.
+This is mandatory for all result types: keyword searches, filtered browses, ranked requests ("show 10 largest"), and any other document listing.
+
+### Standard columns — exact order
+
+| Type | Title | Author | Datetime (UTC) | Control Number |
+|------|-------|--------|----------------|----------------|
+
+- `Type` = the document's `content_type`
+- `Title` = **always a clickable link** using the document title; fall back to subject, then file name
+- `Author` = the document's `author` field; show `—` when null
+- `Datetime (UTC)` = best available datetime, preferring `date_created` → `date_modified` → `updated_at`
+- `Control Number` = always the rightmost column when available
+
+### Smart column adjustments
+
+The standard columns are the default, but apply common sense to make the table informative:
+
+- **Empty-column rule**: if a column is null/empty for ALL rows in the result page, replace it with the best available alternative rather than showing a column of `—` dashes. The replacement must occupy the same position in the column order.
+  - `Author` all null → replace with `Participants` if populated; if both are empty, drop the column entirely
+  - `Type` all identical → may be omitted (same as the single-value filter rule)
+  - `Datetime (UTC)` all null → drop the column
+- **Extra columns**: you may add request-relevant columns (e.g. Size for "largest" queries) after Datetime (UTC) and before Control Number
+- **Single-value filter rule**: if the active filters constrain one field to a single value across every shown row, you may omit only that one redundant column
+- Do not add columns that duplicate information already in the standard set
+
+The goal is: every visible column should carry meaningful, varying information for the result set being displayed.
+
+### Correct examples
+
+Mixed result set with authors:
+```
+| Type | Title | Author | Datetime (UTC) | Control Number |
+|------|-------|--------|----------------|----------------|
+| Email | [Re: Q4 Budget Review](computer:///path/to/.retriever/previews/file.html) | John Smith | 2024-03-15 09:22 | DOC001.00000042 |
+| Email | [FW: Contract Draft](computer:///path/to/.retriever/previews/file2.html) | Jane Doe | 2024-03-16 11:05 | DOC001.00000043 |
+
+Documents 1–10 of 85. Ask for the next page to see more.
+```
+
+Slack chat results where Author is null but Participants is populated:
+```
+| Type | Title | Participants | Datetime (UTC) | Control Number |
+|------|-------|--------------|----------------|----------------|
+| Chat | [#general - Dec 16, 2022](computer:///path/to/.retriever/previews/general/2022-12-16.json.html) | Sergey Demyanov, Udit Sood | 2022-12-17 00:03 | DOC003.00000003 |
+| Chat | [#general - Dec 17, 2022](computer:///path/to/.retriever/previews/general/2022-12-17.json.html) | Max, Artur Chakhvadze | 2022-12-17 16:16 | DOC003.00000004 |
+
+Documents 1–10 of 231. Ask for the next page to see more.
+```
+
+### NEVER do any of these
+
+- NEVER add a separate "Link", "View", "Preview", or "Open" column — the Title cell IS the link
+- NEVER show a column of all `—` dashes when a better alternative field is available
+- NEVER reorder the standard column positions (Type is always first, Control Number always last)
+- NEVER show results without a paging summary line
+- NEVER show a bare unlinked title when a preview or native path is available
+- NEVER put a row number `#` column — it is not part of the standard format
+- NEVER fold Control Number into the Title cell
+
+### Post-search checklist — verify before responding
+
+1. Columns follow the standard order: Type | Title | Author-or-substitute | Datetime (UTC) | Control Number
+2. No column is all `—` or all empty — if it is, replace or drop it per the smart column rules
+3. Every Title cell is a clickable `[text](computer://...)` link
+4. Paging summary is present: "Documents X–Y of Z"
+5. If a filter constrains one field to a single value across all rows, that one column may be omitted
+6. Any extra columns go after Datetime (UTC) and before Control Number
+7. Attachment children use `↳` prefix and are indented below their parent row
+
+### Additional rules
+
+- For production-derived documents, keep the produced Bates/control number in the Control Number column rather than replacing it with a generated `DOC...` value
+- For ranked browse requests, keep the standard columns and describe the sort key/order in the heading or summary
+- You may add request-relevant extra columns only when they materially improve the requested view; extra columns go after Datetime (UTC) and before Control Number
+- Keep the primary document column clickable for every row
 
 Whenever you show files, documents, or attachment children, render each shown item as a clickable link that opens in the preview pane. Do not show a bare document name when a preview/open target is available.
-If no generated preview exists, keep the item clickable by linking directly to the source/native file instead of dropping the link.
-
-Default column order:
-
-- `Content type`
-- `Datetime (UTC)`
-- `Author`
-- `Title preview`
-- `Control number` when available, as the rightmost column
-
-Default table rules:
-
-- `Datetime (UTC)` should use the best available document datetime, preferring `date_created`, then `date_modified`, then `updated_at`
-- the `Title preview` cell should contain the primary clickable link for the document
-- use the document title when available; otherwise fall back to subject, then file name
-- do not fold `control_number` into the title cell; show it in a separate `Control number` column when it is available
-- for production-derived documents, keep the produced Bates/control number in that separate `Control number` column rather than replacing it with a generated `DOC...` value
-- the default leading columns must remain, in this order: `Content type`, `Datetime (UTC)`, `Author`, `Title preview`
-- for ranked browse requests, keep those default leading columns and describe the sort key/order in the heading or summary
-- if a ranked browse request benefits from showing the sort metric as a column, append it after `Title preview` but keep `Control number` as the far-right column when that column is shown
-- keep the primary document column clickable for every row
-- show paging summary above or below the table when relevant
-- if the active filters constrain a field to one specific value for every shown row, omit that redundant field/column unless the user explicitly asks to see it
-
-Table format should:
-
-- include only the columns the user asked for, plus file name when needed for navigation
-- keep the primary document column clickable for every row
-- if the user does not ask for different columns, keep the default leading four-column order above
-- if you append helpful extra columns, add them after `Title preview` and before `Control number` when that column is shown
-- when the results are already scoped to a single specific field value, drop that redundant column unless the user explicitly asks to keep it
 
 When the user asks to inspect fields or columns:
 

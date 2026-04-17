@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -72,7 +73,7 @@ except Exception:  # pragma: no cover - required PST backend probe
 
 
 TOOL_VERSION = "0.9.4"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
 REQUIREMENTS_VERSION = "2026-04-16-phase4-pst"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
 MANUAL_FIELD_LOCKS_COLUMN = "manual_field_locks_json"
@@ -246,6 +247,7 @@ TEXT_FILE_TYPES = {"csv", "htm", "html", "ics", "json", "md", "txt", *CURATED_TE
 EDITABLE_BUILTIN_FIELDS = {
     "author",
     "content_type",
+    "custodian",
     "date_created",
     "date_modified",
     "page_count",
@@ -260,6 +262,7 @@ SYSTEM_MANAGED_FIELDS = {
     "control_number_batch",
     "control_number_family_sequence",
     "control_number",
+    "dataset_id",
     "file_hash",
     "file_name",
     "file_size",
@@ -287,6 +290,7 @@ SYSTEM_MANAGED_FIELDS = {
 BUILTIN_FIELD_TYPES = {
     "id": "integer",
     "control_number": "text",
+    "dataset_id": "integer",
     "parent_document_id": "integer",
     "source_kind": "text",
     "source_rel_path": "text",
@@ -304,6 +308,7 @@ BUILTIN_FIELD_TYPES = {
     "page_count": "integer",
     "author": "text",
     "content_type": "text",
+    "custodian": "text",
     "date_created": "date",
     "date_modified": "date",
     "title": "text",
@@ -322,6 +327,13 @@ BUILTIN_FIELD_TYPES = {
     "control_number_family_sequence": "integer",
     "control_number_attachment_sequence": "integer",
 }
+FIELD_NAME_ALIASES = {
+    "dataset": "dataset_name",
+    "dataset_label": "dataset_name",
+    "collected_from": "custodian",
+    "created_date": "date_created",
+    "modified_date": "date_modified",
+}
 REGISTRY_FIELD_TYPES = {
     "boolean": "INTEGER",
     "integer": "INTEGER",
@@ -329,6 +341,7 @@ REGISTRY_FIELD_TYPES = {
     "text": "TEXT",
 }
 VIRTUAL_FILTER_FIELD_TYPES = {
+    "dataset_name": "text",
     "is_attachment": "boolean",
     "has_attachments": "boolean",
     "production_name": "text",
@@ -370,6 +383,7 @@ PRODUCTION_SOURCE_KIND = "production"
 EMAIL_ATTACHMENT_SOURCE_KIND = "email_attachment"
 FILESYSTEM_SOURCE_KIND = "filesystem"
 PST_SOURCE_KIND = "pst"
+MANUAL_DATASET_SOURCE_KIND = "manual"
 PRODUCTION_DAT_HEADER_ALIASES = {
     "begbates": "begin_bates",
     "beginbates": "begin_bates",

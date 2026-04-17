@@ -24,9 +24,40 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS datasets (
+      id INTEGER PRIMARY KEY,
+      source_kind TEXT NOT NULL,
+      dataset_locator TEXT NOT NULL,
+      dataset_name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS dataset_sources (
+      id INTEGER PRIMARY KEY,
+      dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+      source_kind TEXT NOT NULL,
+      source_locator TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS dataset_documents (
+      id INTEGER PRIMARY KEY,
+      dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      dataset_source_id INTEGER REFERENCES dataset_sources(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS documents (
       id INTEGER PRIMARY KEY,
       control_number TEXT UNIQUE,
+      dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
       parent_document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
       source_kind TEXT,
       source_rel_path TEXT,
@@ -44,6 +75,7 @@ SCHEMA_STATEMENTS = [
       page_count INTEGER,
       author TEXT,
       content_type TEXT,
+      custodian TEXT,
       date_created TEXT,
       date_modified TEXT,
       title TEXT,
@@ -66,6 +98,7 @@ SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS productions (
       id INTEGER PRIMARY KEY,
+      dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
       rel_root TEXT NOT NULL UNIQUE,
       production_name TEXT NOT NULL,
       metadata_load_rel_path TEXT NOT NULL,
@@ -89,6 +122,7 @@ SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS container_sources (
       id INTEGER PRIMARY KEY,
+      dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
       source_kind TEXT NOT NULL,
       source_rel_path TEXT NOT NULL UNIQUE,
       file_size INTEGER,
@@ -130,6 +164,7 @@ SCHEMA_STATEMENTS = [
       title,
       subject,
       author,
+      custodian,
       participants,
       recipients
     )
@@ -659,6 +694,609 @@ def container_source_rel_path_from_message_rel_path(rel_path: str | None) -> str
     return Path(*parts[2:messages_index]).as_posix()
 
 
+def infer_source_custodian(
+    *,
+    source_kind: str | None,
+    source_rel_path: str | None,
+    parent_custodian: str | None = None,
+) -> str | None:
+    inherited = normalize_whitespace(str(parent_custodian or ""))
+    if inherited:
+        return inherited
+    normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
+    normalized_source_rel_path = normalize_whitespace(str(source_rel_path or ""))
+    if normalized_source_kind == PST_SOURCE_KIND and normalized_source_rel_path:
+        return normalize_whitespace(Path(normalized_source_rel_path).stem)
+    return None
+
+
+def filesystem_dataset_locator() -> str:
+    return "."
+
+
+def filesystem_dataset_name(root: Path | None = None) -> str:
+    if root is not None:
+        candidate = normalize_whitespace(root.resolve().name)
+        if candidate:
+            return candidate
+    return "Workspace files"
+
+
+def pst_dataset_name(source_rel_path: str) -> str:
+    candidate = normalize_whitespace(Path(source_rel_path).name)
+    return candidate or normalize_whitespace(source_rel_path) or "PST Dataset"
+
+
+def production_dataset_name(rel_root: str, production_name: str | None = None) -> str:
+    preferred = normalize_whitespace(str(production_name or ""))
+    if preferred:
+        return preferred
+    candidate = normalize_whitespace(Path(rel_root).name)
+    return candidate or normalize_whitespace(rel_root) or "Production Dataset"
+
+
+def manual_dataset_locator(dataset_name: str | None = None) -> str:
+    seed = normalize_whitespace(str(dataset_name or "")) or "dataset"
+    return f"manual:{sha256_text(f'{seed}:{utc_now()}')[:16]}"
+
+
+def get_dataset_row(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    dataset_locator: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM datasets
+        WHERE source_kind = ? AND dataset_locator = ?
+        """,
+        (source_kind, dataset_locator),
+    ).fetchone()
+
+
+def ensure_dataset_row(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    dataset_locator: str,
+    dataset_name: str,
+) -> int:
+    now = utc_now()
+    existing_row = get_dataset_row(
+        connection,
+        source_kind=source_kind,
+        dataset_locator=dataset_locator,
+    )
+    if existing_row is None:
+        connection.execute(
+            """
+            INSERT INTO datasets (
+              source_kind, dataset_locator, dataset_name, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (source_kind, dataset_locator, dataset_name, now, now),
+        )
+        return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+    if str(existing_row["dataset_name"]) != dataset_name:
+        connection.execute(
+            """
+            UPDATE datasets
+            SET dataset_name = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (dataset_name, now, existing_row["id"]),
+        )
+    return int(existing_row["id"])
+
+
+def create_dataset_row(
+    connection: sqlite3.Connection,
+    dataset_name: str,
+    *,
+    source_kind: str | None = None,
+    dataset_locator: str | None = None,
+) -> int:
+    normalized_name = normalize_whitespace(dataset_name) or "Dataset"
+    normalized_source_kind = normalize_whitespace(str(source_kind or MANUAL_DATASET_SOURCE_KIND)).lower()
+    normalized_locator = normalize_whitespace(str(dataset_locator or ""))
+    if not normalized_locator:
+        normalized_locator = manual_dataset_locator(normalized_name)
+    return ensure_dataset_row(
+        connection,
+        source_kind=normalized_source_kind or MANUAL_DATASET_SOURCE_KIND,
+        dataset_locator=normalized_locator,
+        dataset_name=normalized_name,
+    )
+
+
+def get_dataset_source_row(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_locator: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM dataset_sources
+        WHERE source_kind = ? AND source_locator = ?
+        """,
+        (source_kind, source_locator),
+    ).fetchone()
+
+
+def ensure_dataset_source_row(
+    connection: sqlite3.Connection,
+    *,
+    dataset_id: int,
+    source_kind: str,
+    source_locator: str,
+) -> int:
+    normalized_source_kind = normalize_whitespace(source_kind).lower()
+    normalized_source_locator = normalize_whitespace(source_locator)
+    if not normalized_source_kind or not normalized_source_locator:
+        raise RetrieverError("Dataset sources require non-empty source_kind and source_locator.")
+    now = utc_now()
+    existing_row = get_dataset_source_row(
+        connection,
+        source_kind=normalized_source_kind,
+        source_locator=normalized_source_locator,
+    )
+    if existing_row is None:
+        connection.execute(
+            """
+            INSERT INTO dataset_sources (
+              dataset_id, source_kind, source_locator, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (dataset_id, normalized_source_kind, normalized_source_locator, now, now),
+        )
+        return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+    if int(existing_row["dataset_id"]) != dataset_id:
+        raise RetrieverError(
+            f"Source {normalized_source_kind}:{normalized_source_locator} is already bound to dataset {existing_row['dataset_id']}."
+        )
+    connection.execute(
+        """
+        UPDATE dataset_sources
+        SET updated_at = ?
+        WHERE id = ?
+        """,
+        (now, existing_row["id"]),
+    )
+    return int(existing_row["id"])
+
+
+def ensure_source_backed_dataset(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_locator: str,
+    dataset_name: str,
+) -> tuple[int, int]:
+    normalized_source_kind = normalize_whitespace(source_kind).lower()
+    normalized_source_locator = normalize_whitespace(source_locator)
+    existing_source = get_dataset_source_row(
+        connection,
+        source_kind=normalized_source_kind,
+        source_locator=normalized_source_locator,
+    )
+    if existing_source is not None:
+        return int(existing_source["dataset_id"]), int(existing_source["id"])
+    dataset_id = ensure_dataset_row(
+        connection,
+        source_kind=normalized_source_kind,
+        dataset_locator=normalized_source_locator,
+        dataset_name=normalize_whitespace(dataset_name) or "Dataset",
+    )
+    dataset_source_id = ensure_dataset_source_row(
+        connection,
+        dataset_id=dataset_id,
+        source_kind=normalized_source_kind,
+        source_locator=normalized_source_locator,
+    )
+    return dataset_id, dataset_source_id
+
+
+def ensure_dataset_document_membership(
+    connection: sqlite3.Connection,
+    *,
+    dataset_id: int,
+    document_id: int,
+    dataset_source_id: int | None = None,
+) -> int:
+    now = utc_now()
+    if dataset_source_id is None:
+        existing_row = connection.execute(
+            """
+            SELECT id
+            FROM dataset_documents
+            WHERE dataset_id = ? AND document_id = ? AND dataset_source_id IS NULL
+            """,
+            (dataset_id, document_id),
+        ).fetchone()
+    else:
+        existing_row = connection.execute(
+            """
+            SELECT id
+            FROM dataset_documents
+            WHERE dataset_id = ? AND document_id = ? AND dataset_source_id = ?
+            """,
+            (dataset_id, document_id, dataset_source_id),
+        ).fetchone()
+    if existing_row is None:
+        connection.execute(
+            """
+            INSERT INTO dataset_documents (
+              dataset_id, document_id, dataset_source_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (dataset_id, document_id, dataset_source_id, now, now),
+        )
+        return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+    return int(existing_row["id"])
+
+
+def get_dataset_row_by_id(connection: sqlite3.Connection, dataset_id: int) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM datasets
+        WHERE id = ?
+        """,
+        (dataset_id,),
+    ).fetchone()
+
+
+def find_dataset_rows_by_name(connection: sqlite3.Connection, dataset_name: str) -> list[sqlite3.Row]:
+    normalized_name = normalize_whitespace(dataset_name)
+    if not normalized_name:
+        return []
+    return connection.execute(
+        """
+        SELECT *
+        FROM datasets
+        WHERE dataset_name = ?
+        ORDER BY id ASC
+        """,
+        (normalized_name,),
+    ).fetchall()
+
+
+def resolve_dataset_row(
+    connection: sqlite3.Connection,
+    *,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+) -> sqlite3.Row:
+    if dataset_id is None and dataset_name is None:
+        raise RetrieverError("Specify either dataset_id or dataset_name.")
+    if dataset_id is not None:
+        row = get_dataset_row_by_id(connection, dataset_id)
+        if row is None:
+            raise RetrieverError(f"Unknown dataset id: {dataset_id}")
+        if dataset_name is not None and normalize_whitespace(str(row["dataset_name"] or "")) != normalize_whitespace(dataset_name):
+            raise RetrieverError(
+                f"Dataset id {dataset_id} is named {row['dataset_name']!r}, not {normalize_whitespace(dataset_name)!r}."
+            )
+        return row
+    matches = find_dataset_rows_by_name(connection, str(dataset_name or ""))
+    if not matches:
+        raise RetrieverError(f"Unknown dataset name: {dataset_name}")
+    if len(matches) > 1:
+        ids = ", ".join(str(row["id"]) for row in matches)
+        raise RetrieverError(
+            f"Dataset name {normalize_whitespace(str(dataset_name or ''))!r} is ambiguous; use --dataset-id. Matching ids: {ids}."
+        )
+    return matches[0]
+
+
+def refresh_document_dataset_cache(connection: sqlite3.Connection, document_id: int) -> int | None:
+    membership_rows = connection.execute(
+        """
+        SELECT DISTINCT dataset_id
+        FROM dataset_documents
+        WHERE document_id = ?
+        ORDER BY dataset_id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    cached_dataset_id = int(membership_rows[0]["dataset_id"]) if len(membership_rows) == 1 else None
+    connection.execute(
+        """
+        UPDATE documents
+        SET dataset_id = ?
+        WHERE id = ?
+        """,
+        (cached_dataset_id, document_id),
+    )
+    return cached_dataset_id
+
+
+def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    dataset_rows = connection.execute(
+        """
+        SELECT *
+        FROM datasets
+        ORDER BY LOWER(dataset_name) ASC, id ASC
+        """
+    ).fetchall()
+    if not dataset_rows:
+        return []
+
+    dataset_ids = [int(row["id"]) for row in dataset_rows]
+    placeholders = ", ".join("?" for _ in dataset_ids)
+    membership_rows = connection.execute(
+        f"""
+        SELECT
+          dataset_id,
+          COUNT(DISTINCT document_id) AS document_count,
+          COUNT(DISTINCT CASE WHEN dataset_source_id IS NULL THEN document_id END) AS manual_document_count,
+          COUNT(DISTINCT CASE WHEN dataset_source_id IS NOT NULL THEN document_id END) AS source_document_count
+        FROM dataset_documents
+        WHERE dataset_id IN ({placeholders})
+        GROUP BY dataset_id
+        """,
+        dataset_ids,
+    ).fetchall()
+    membership_counts = {
+        int(row["dataset_id"]): {
+            "document_count": int(row["document_count"] or 0),
+            "manual_document_count": int(row["manual_document_count"] or 0),
+            "source_document_count": int(row["source_document_count"] or 0),
+        }
+        for row in membership_rows
+    }
+    source_rows = connection.execute(
+        f"""
+        SELECT *
+        FROM dataset_sources
+        WHERE dataset_id IN ({placeholders})
+        ORDER BY dataset_id ASC, source_kind ASC, source_locator ASC, id ASC
+        """,
+        dataset_ids,
+    ).fetchall()
+    sources_by_dataset: dict[int, list[dict[str, object]]] = defaultdict(list)
+    for row in source_rows:
+        sources_by_dataset[int(row["dataset_id"])].append(
+            {
+                "id": int(row["id"]),
+                "source_kind": row["source_kind"],
+                "source_locator": row["source_locator"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+
+    summaries: list[dict[str, object]] = []
+    for row in dataset_rows:
+        dataset_id = int(row["id"])
+        counts = membership_counts.get(
+            dataset_id,
+            {"document_count": 0, "manual_document_count": 0, "source_document_count": 0},
+        )
+        source_bindings = sources_by_dataset.get(dataset_id, [])
+        summaries.append(
+            {
+                "id": dataset_id,
+                "dataset_name": row["dataset_name"],
+                "source_kind": row["source_kind"],
+                "dataset_locator": row["dataset_locator"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "document_count": counts["document_count"],
+                "manual_document_count": counts["manual_document_count"],
+                "source_document_count": counts["source_document_count"],
+                "source_binding_count": len(source_bindings),
+                "source_bindings": source_bindings,
+            }
+        )
+    return summaries
+
+
+def dataset_summary_by_id(connection: sqlite3.Connection, dataset_id: int) -> dict[str, object]:
+    for summary in list_dataset_summaries(connection):
+        if int(summary["id"]) == dataset_id:
+            return summary
+    raise RetrieverError(f"Unknown dataset id: {dataset_id}")
+
+
+def add_documents_to_dataset(
+    connection: sqlite3.Connection,
+    *,
+    dataset_id: int,
+    document_ids: list[int],
+) -> dict[str, list[int]]:
+    if not document_ids:
+        return {"added_document_ids": [], "already_present_document_ids": []}
+
+    unique_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+    placeholders = ", ".join("?" for _ in unique_document_ids)
+    existing_rows = connection.execute(
+        f"""
+        SELECT id
+        FROM documents
+        WHERE id IN ({placeholders})
+        """,
+        unique_document_ids,
+    ).fetchall()
+    existing_ids = {int(row["id"]) for row in existing_rows}
+    missing_ids = [document_id for document_id in unique_document_ids if document_id not in existing_ids]
+    if missing_ids:
+        raise RetrieverError(f"Unknown document ids: {', '.join(str(document_id) for document_id in missing_ids)}")
+
+    current_rows = connection.execute(
+        f"""
+        SELECT DISTINCT document_id
+        FROM dataset_documents
+        WHERE dataset_id = ?
+          AND document_id IN ({placeholders})
+        """,
+        [dataset_id, *unique_document_ids],
+    ).fetchall()
+    current_ids = {int(row["document_id"]) for row in current_rows}
+
+    added_document_ids: list[int] = []
+    already_present_document_ids: list[int] = []
+    for document_id in unique_document_ids:
+        if document_id in current_ids:
+            already_present_document_ids.append(document_id)
+            continue
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            dataset_source_id=None,
+        )
+        refresh_document_dataset_cache(connection, document_id)
+        added_document_ids.append(document_id)
+
+    if added_document_ids:
+        connection.execute(
+            """
+            UPDATE datasets
+            SET updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), dataset_id),
+        )
+
+    return {
+        "added_document_ids": added_document_ids,
+        "already_present_document_ids": already_present_document_ids,
+    }
+
+
+def remove_documents_from_dataset(
+    connection: sqlite3.Connection,
+    *,
+    dataset_id: int,
+    document_ids: list[int],
+) -> dict[str, list[int]]:
+    if not document_ids:
+        return {
+            "removed_document_ids": [],
+            "not_present_document_ids": [],
+            "documents_without_dataset_memberships": [],
+        }
+
+    unique_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+    placeholders = ", ".join("?" for _ in unique_document_ids)
+    existing_rows = connection.execute(
+        f"""
+        SELECT id
+        FROM documents
+        WHERE id IN ({placeholders})
+        """,
+        unique_document_ids,
+    ).fetchall()
+    existing_ids = {int(row["id"]) for row in existing_rows}
+    missing_ids = [document_id for document_id in unique_document_ids if document_id not in existing_ids]
+    if missing_ids:
+        raise RetrieverError(f"Unknown document ids: {', '.join(str(document_id) for document_id in missing_ids)}")
+
+    current_rows = connection.execute(
+        f"""
+        SELECT DISTINCT document_id
+        FROM dataset_documents
+        WHERE dataset_id = ?
+          AND document_id IN ({placeholders})
+        """,
+        [dataset_id, *unique_document_ids],
+    ).fetchall()
+    current_ids = {int(row["document_id"]) for row in current_rows}
+
+    removed_document_ids: list[int] = []
+    not_present_document_ids: list[int] = []
+    documents_without_dataset_memberships: list[int] = []
+    for document_id in unique_document_ids:
+        if document_id not in current_ids:
+            not_present_document_ids.append(document_id)
+            continue
+        connection.execute(
+            """
+            DELETE FROM dataset_documents
+            WHERE dataset_id = ? AND document_id = ?
+            """,
+            (dataset_id, document_id),
+        )
+        cached_dataset_id = refresh_document_dataset_cache(connection, document_id)
+        if cached_dataset_id is None:
+            remaining_membership = connection.execute(
+                """
+                SELECT 1
+                FROM dataset_documents
+                WHERE document_id = ?
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+            if remaining_membership is None:
+                documents_without_dataset_memberships.append(document_id)
+        removed_document_ids.append(document_id)
+
+    if removed_document_ids:
+        connection.execute(
+            """
+            UPDATE datasets
+            SET updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), dataset_id),
+        )
+
+    return {
+        "removed_document_ids": removed_document_ids,
+        "not_present_document_ids": not_present_document_ids,
+        "documents_without_dataset_memberships": documents_without_dataset_memberships,
+    }
+
+
+def delete_dataset_row(connection: sqlite3.Connection, dataset_id: int) -> dict[str, object]:
+    dataset_row = get_dataset_row_by_id(connection, dataset_id)
+    if dataset_row is None:
+        raise RetrieverError(f"Unknown dataset id: {dataset_id}")
+    affected_rows = connection.execute(
+        """
+        SELECT DISTINCT document_id
+        FROM dataset_documents
+        WHERE dataset_id = ?
+        ORDER BY document_id ASC
+        """,
+        (dataset_id,),
+    ).fetchall()
+    affected_document_ids = [int(row["document_id"]) for row in affected_rows]
+    summary = dataset_summary_by_id(connection, dataset_id)
+    connection.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
+
+    documents_without_dataset_memberships: list[int] = []
+    for document_id in affected_document_ids:
+        row = connection.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone()
+        if row is None:
+            continue
+        cached_dataset_id = refresh_document_dataset_cache(connection, document_id)
+        if cached_dataset_id is None:
+            remaining_membership = connection.execute(
+                """
+                SELECT 1
+                FROM dataset_documents
+                WHERE document_id = ?
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+            if remaining_membership is None:
+                documents_without_dataset_memberships.append(document_id)
+
+    return {
+        "deleted_dataset": summary,
+        "affected_document_ids": affected_document_ids,
+        "documents_without_dataset_memberships": documents_without_dataset_memberships,
+    }
+
+
 def pst_message_rel_path(source_rel_path: str, source_item_id: str) -> str:
     encoded = encode_source_item_id_for_path(source_item_id)
     return (
@@ -1009,6 +1647,7 @@ CHAT_TIMESTAMP_HINT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 CHAT_ISO_DATETIME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+CHAT_JSON_FIELD_PATTERN = re.compile(r'^"[^"\n]{1,80}"\s*:\s*')
 CHAT_LINE_PATTERNS = (
     r"^\[(?P<timestamp>[^\]]{4,80})\]\s*(?P<speaker>[^:\n]{2,80}?):\s+(?P<body>\S.*)$",
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\s*(?:AM|PM))?(?:\s*(?:Z|UTC|[+\-]\d{2}:?\d{2}))?)\s*[-,]?\s*(?P<speaker>[^:\n]{2,80}?):\s+(?P<body>\S.*)$",
@@ -1037,6 +1676,72 @@ def parse_chat_timestamp(value: str | None) -> str | None:
     return None
 
 
+def format_chat_preview_timestamp(value: object) -> str | None:
+    raw = normalize_whitespace(str(value or "")).strip("[]()")
+    if not raw:
+        return None
+    parsed = parse_utc_timestamp(raw)
+    if parsed is None:
+        normalized = parse_chat_timestamp(raw)
+        parsed = parse_utc_timestamp(normalized) if normalized else None
+    if parsed is None:
+        return raw
+    return parsed.strftime("%b %d, %Y %I:%M %p UTC").replace(" 0", " ")
+
+
+def chat_avatar_initials(value: str) -> str:
+    letters = [part[0].upper() for part in re.split(r"\s+", value.strip()) if part and part[0].isalnum()]
+    if not letters:
+        return "?"
+    if len(letters) == 1:
+        return letters[0]
+    return f"{letters[0]}{letters[-1]}"
+
+
+CHAT_AVATAR_PALETTE = (
+    ("#dbeafe", "#1d4ed8"),
+    ("#dcfce7", "#166534"),
+    ("#fef3c7", "#92400e"),
+    ("#fce7f3", "#9d174d"),
+    ("#ede9fe", "#6d28d9"),
+    ("#cffafe", "#0f766e"),
+    ("#fee2e2", "#b91c1c"),
+    ("#e0e7ff", "#4338ca"),
+)
+
+
+def normalize_chat_avatar_color(value: object) -> str | None:
+    candidate = normalize_whitespace(str(value or "")).lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{6}", candidate or ""):
+        return f"#{candidate.lower()}"
+    return None
+
+
+def chat_avatar_colors(seed: str, preferred_background: object = None) -> tuple[str, str]:
+    background = normalize_chat_avatar_color(preferred_background)
+    if background:
+        red = int(background[1:3], 16)
+        green = int(background[3:5], 16)
+        blue = int(background[5:7], 16)
+        luminance = (0.2126 * red) + (0.7152 * green) + (0.0722 * blue)
+        return background, ("#ffffff" if luminance < 140 else "#111827")
+    palette_index = int(hashlib.sha1(seed.encode("utf-8")).hexdigest(), 16) % len(CHAT_AVATAR_PALETTE)
+    return CHAT_AVATAR_PALETTE[palette_index]
+
+
+def build_chat_avatar_svg(label: str, background: str, foreground: str, alt_text: str) -> str:
+    return (
+        '<svg class="chat-avatar-svg" xmlns="http://www.w3.org/2000/svg" width="96" height="96" '
+        'viewBox="0 0 96 96" role="img" '
+        f'aria-label="{html.escape(alt_text, quote=True)}">'
+        f'<circle cx="48" cy="48" r="48" fill="{html.escape(background, quote=True)}"/>'
+        f'<text x="50%" y="55%" text-anchor="middle" dominant-baseline="middle" '
+        f'font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" '
+        f'font-size="30" font-weight="700" fill="{html.escape(foreground, quote=True)}">{html.escape(label)}</text>'
+        "</svg>"
+    )
+
+
 def iter_chat_transcript_entries(text: str, max_lines: int = 800) -> list[dict[str, str | None]]:
     if not text:
         return []
@@ -1045,6 +1750,8 @@ def iter_chat_transcript_entries(text: str, max_lines: int = 800) -> list[dict[s
     for raw_line in text.splitlines()[:max_lines]:
         stripped = raw_line.strip()
         if not stripped or len(stripped) > 240:
+            continue
+        if CHAT_JSON_FIELD_PATTERN.match(stripped):
             continue
         for pattern in CHAT_LINE_PATTERNS:
             match = re.match(pattern, stripped, flags=re.IGNORECASE)
@@ -1188,6 +1895,7 @@ def build_html_preview(
     *,
     document_title: str = "Retriever Preview",
     head_html: str | None = None,
+    heading: str = "Retriever Preview",
 ) -> str:
     header_html = "".join(
         f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
@@ -1205,13 +1913,94 @@ def build_html_preview(
         f"<title>{html.escape(document_title)}</title>"
         f"{head_html or ''}"
         "</head><body>"
-        "<h1>Retriever Preview</h1>"
+        f"<h1>{html.escape(heading)}</h1>"
         "<table>"
         f"{header_html}"
         "</table>"
         "<hr/>"
         f"{body_section}"
         "</body></html>"
+    )
+
+
+def build_chat_preview_html(
+    headers: dict[str, str],
+    body_text: str,
+    *,
+    document_title: str = "Retriever Chat Preview",
+    entries: list[dict[str, object]] | None = None,
+) -> str:
+    chat_entries = entries if entries is not None else iter_chat_transcript_entries(body_text, max_lines=4000)
+    head_html = (
+        "<style>"
+        "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; color: #1f2328; }"
+        "h1 { font-size: 1.35rem; margin-bottom: 0.75rem; }"
+        "table { border-collapse: collapse; margin-bottom: 1rem; }"
+        "th { text-align: left; vertical-align: top; padding: 0.25rem 0.75rem 0.25rem 0; color: #57606a; }"
+        "td { padding: 0.25rem 0; }"
+        ".chat-transcript { display: grid; gap: 0.75rem; }"
+        ".chat-message { display: flex; gap: 0.75rem; align-items: flex-start; border: 1px solid #d0d7de; border-radius: 12px; padding: 0.85rem 0.95rem; background: #f6f8fa; }"
+        ".chat-avatar-svg { width: 2.5rem; height: 2.5rem; flex: 0 0 auto; display: block; }"
+        ".chat-main { min-width: 0; flex: 1 1 auto; }"
+        ".chat-meta { display: flex; gap: 0.55rem; align-items: baseline; margin-bottom: 0.25rem; flex-wrap: wrap; }"
+        ".chat-speaker { font-weight: 600; color: #0969da; }"
+        ".chat-time { color: #57606a; font-size: 0.9rem; }"
+        ".chat-body { white-space: pre-wrap; line-height: 1.45; }"
+        ".chat-raw { margin-top: 1rem; }"
+        ".chat-raw summary { cursor: pointer; color: #57606a; }"
+        "</style>"
+    )
+    if chat_entries:
+        rendered_entries: list[str] = []
+        for entry in chat_entries:
+            speaker = normalize_whitespace(str(entry.get("speaker") or "")) or "Unknown"
+            body = str(entry.get("body") or "").strip()
+            if not body:
+                continue
+            timestamp_label = (
+                normalize_whitespace(str(entry.get("timestamp_label") or ""))
+                or format_chat_preview_timestamp(entry.get("timestamp"))
+                or ""
+            )
+            timestamp_html = f'<span class="chat-time">[{html.escape(timestamp_label)}]</span>' if timestamp_label else ""
+            avatar_label = normalize_whitespace(str(entry.get("avatar_label") or "")) or chat_avatar_initials(speaker)
+            avatar_background, avatar_foreground = chat_avatar_colors(
+                speaker,
+                entry.get("avatar_color"),
+            )
+            avatar_html = build_chat_avatar_svg(avatar_label, avatar_background, avatar_foreground, speaker)
+            rendered_entries.append(
+                "<article class=\"chat-message\">"
+                f"{avatar_html}"
+                "<div class=\"chat-main\">"
+                "<div class=\"chat-meta\">"
+                f"<span class=\"chat-speaker\">{html.escape(speaker)}</span>"
+                f"{timestamp_html}"
+                "</div>"
+                f"<div class=\"chat-body\">{html.escape(body)}</div>"
+                "</div>"
+                "</article>"
+            )
+        if rendered_entries:
+            body_section = (
+                "<div class=\"chat-transcript\">"
+                f"{''.join(rendered_entries)}"
+                "</div>"
+                "<details class=\"chat-raw\">"
+                "<summary>Full transcript</summary>"
+                f"<pre>{html.escape(body_text or '')}</pre>"
+                "</details>"
+            )
+        else:
+            body_section = f"<pre>{html.escape(body_text or '')}</pre>"
+    else:
+        body_section = f"<pre>{html.escape(body_text or '')}</pre>"
+    return build_html_preview(
+        headers,
+        body_html=body_section,
+        document_title=document_title,
+        head_html=head_html,
+        heading="Retriever Chat Preview",
     )
 
 

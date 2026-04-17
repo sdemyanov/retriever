@@ -51,6 +51,33 @@ def production_source_part_targets(
     return targets
 
 
+def document_native_target(paths: dict[str, Path], row: sqlite3.Row | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    rel_path = str(row["rel_path"])
+    abs_path = paths["root"] / rel_path
+    if not abs_path.exists():
+        return None
+    return {
+        "rel_path": rel_path,
+        "abs_path": str(abs_path),
+        "preview_type": "native",
+        "label": None,
+        "ordinal": 0,
+    }
+
+
+def document_prefers_native_primary_preview(row: sqlite3.Row | None) -> bool:
+    if row is None:
+        return False
+    if normalize_whitespace(str(row["content_type"] or "")) != "Chat":
+        return False
+    file_type = normalize_whitespace(str(row["file_type"] or "")).lower()
+    if not file_type:
+        file_type = normalize_extension(Path(str(row["file_name"] or row["rel_path"] or "")))
+    return file_type in {"pdf", "docx", "rtf"}
+
+
 def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection: sqlite3.Connection) -> tuple[str, str]:
     preview_rows = connection.execute(
         """
@@ -61,6 +88,9 @@ def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection:
         """,
         (row["id"],),
     ).fetchall()
+    native_target = document_native_target(paths, row)
+    if preview_rows and document_prefers_native_primary_preview(row) and native_target is not None:
+        return str(native_target["rel_path"]), str(native_target["abs_path"])
     if preview_rows:
         rel_preview = preview_rows[0]["rel_preview_path"]
         rel_path = str(Path(".retriever") / rel_preview)
@@ -74,6 +104,7 @@ def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection:
 
 
 def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: str, connection: sqlite3.Connection) -> list[dict[str, object]]:
+    document_row = connection.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
     preview_rows = connection.execute(
         """
         SELECT rel_preview_path, preview_type, label, ordinal
@@ -96,18 +127,22 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
         ]
 
     targets: list[dict[str, object]] = []
-    for row in preview_rows:
-        rel_preview = str(Path(".retriever") / row["rel_preview_path"])
+    if document_prefers_native_primary_preview(document_row):
+        native_target = document_native_target(paths, document_row)
+        if native_target is not None:
+            targets.append(native_target)
+    for preview_row in preview_rows:
+        rel_preview = str(Path(".retriever") / preview_row["rel_preview_path"])
         targets.append(
             {
                 "rel_path": rel_preview,
-                "abs_path": str(paths["state_dir"] / row["rel_preview_path"]),
-                "preview_type": row["preview_type"],
-                "label": row["label"],
-                "ordinal": row["ordinal"],
+                "abs_path": str(paths["state_dir"] / preview_row["rel_preview_path"]),
+                "preview_type": preview_row["preview_type"],
+                "label": preview_row["label"],
+                "ordinal": preview_row["ordinal"],
             }
         )
-    source_targets = production_source_part_targets(paths, connection, connection.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone())
+    source_targets = production_source_part_targets(paths, connection, document_row)
     for target in source_targets:
         if target["rel_path"] not in {existing["rel_path"] for existing in targets}:
             targets.append(target)
@@ -155,12 +190,337 @@ def chunk_text(text: str, max_chars: int = CHUNK_TARGET_CHARS, overlap: int = CH
     return chunks
 
 
+SLACK_USER_DIRECTORY_CACHE: dict[str, dict[str, dict[str, str | None]]] = {}
+SLACK_USER_MENTION_PATTERN = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
+SLACK_CHANNEL_MENTION_PATTERN = re.compile(r"<#([A-Z0-9]+)(?:\|([^>]+))?>")
+SLACK_SPECIAL_MENTION_PATTERN = re.compile(r"<!([a-z]+)(?:\|[^>]+)?>")
+SLACK_NAMED_LINK_PATTERN = re.compile(r"<([^>|]+)\|([^>]+)>")
+SLACK_BARE_LINK_PATTERN = re.compile(r"<(https?://[^>]+)>")
+SLACK_EMOJI_SHORTCODE_PATTERN = re.compile(r":([a-z0-9_+\-]+):")
+SLACK_EMOJI_NAME_ALIASES = {
+    "+1": "THUMBS UP SIGN",
+    "-1": "THUMBS DOWN SIGN",
+    "100": "HUNDRED POINTS SYMBOL",
+    "christmas_tree": "🎄",
+    "clap": "CLAPPING HANDS SIGN",
+    "eyes": "EYES",
+    "fire": "FIRE",
+    "grin": "GRINNING FACE WITH SMILING EYES",
+    "heart": "HEAVY BLACK HEART",
+    "joy": "FACE WITH TEARS OF JOY",
+    "ok_hand": "OK HAND SIGN",
+    "partying_face": "🥳",
+    "pray": "PERSON WITH FOLDED HANDS",
+    "rocket": "ROCKET",
+    "smile": "SMILING FACE WITH OPEN MOUTH",
+    "sob": "LOUDLY CRYING FACE",
+    "tada": "PARTY POPPER",
+    "thinking_face": "THINKING FACE",
+    "thumbsdown": "THUMBS DOWN SIGN",
+    "thumbsup": "THUMBS UP SIGN",
+    "warning": "WARNING SIGN",
+    "wave": "WAVING HAND SIGN",
+    "white_check_mark": "WHITE HEAVY CHECK MARK",
+}
+
+
+def choose_slack_text(*values: object) -> str | None:
+    for value in values:
+        normalized = normalize_whitespace(str(value or ""))
+        if normalized:
+            return normalized
+    return None
+
+
+def replace_slack_emoji_shortcodes(text: str) -> str:
+    def replace_match(match: re.Match[str]) -> str:
+        token = match.group(1).lower()
+        candidate_names = [
+            SLACK_EMOJI_NAME_ALIASES.get(token),
+            token.replace("_", " ").replace("-", " ").upper(),
+        ]
+        for candidate_name in candidate_names:
+            if not candidate_name:
+                continue
+            if any(ord(character) > 127 for character in candidate_name):
+                return candidate_name
+            try:
+                return unicodedata.lookup(candidate_name)
+            except KeyError:
+                continue
+        return match.group(0)
+
+    return SLACK_EMOJI_SHORTCODE_PATTERN.sub(replace_match, text)
+
+
+def normalize_slack_user_info(
+    user_record: dict[str, object] | None = None,
+    inline_profile: dict[str, object] | None = None,
+) -> dict[str, str | None]:
+    record = user_record or {}
+    profile = dict(record.get("profile") if isinstance(record.get("profile"), dict) else {})
+    if inline_profile:
+        for key, value in inline_profile.items():
+            if value not in (None, ""):
+                profile[key] = value
+    first_name = choose_slack_text(profile.get("first_name"), record.get("first_name"))
+    last_name = choose_slack_text(profile.get("last_name"), record.get("last_name"))
+    combined_name = " ".join(part for part in [first_name, last_name] if part)
+    speaker_name = choose_slack_text(
+        profile.get("real_name"),
+        record.get("real_name"),
+        profile.get("display_name"),
+        combined_name,
+        profile.get("name"),
+        record.get("name"),
+    )
+    mention_name = choose_slack_text(
+        profile.get("display_name"),
+        first_name,
+        profile.get("name"),
+        record.get("name"),
+        speaker_name,
+    )
+    return {
+        "avatar_color": choose_slack_text(profile.get("color"), record.get("color")),
+        "speaker_name": speaker_name,
+        "mention_name": mention_name,
+    }
+
+
+def slack_export_root_for_path(path: Path) -> Path | None:
+    current = path.parent
+    while True:
+        if (current / "users.json").exists():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def load_slack_user_directory(export_root: Path | None) -> dict[str, dict[str, str | None]]:
+    if export_root is None:
+        return {}
+    cache_key = str(export_root)
+    cached = SLACK_USER_DIRECTORY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    users_path = export_root / "users.json"
+    directory: dict[str, dict[str, str | None]] = {}
+    try:
+        raw_users = json.loads(users_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raw_users = None
+    if isinstance(raw_users, list):
+        for item in raw_users:
+            if not isinstance(item, dict):
+                continue
+            user_id = choose_slack_text(item.get("id"))
+            if not user_id:
+                continue
+            directory[user_id] = normalize_slack_user_info(item)
+    SLACK_USER_DIRECTORY_CACHE[cache_key] = directory
+    return directory
+
+
+def resolve_slack_user_info(
+    user_id: str | None,
+    user_directory: dict[str, dict[str, str | None]],
+    inline_profile: dict[str, object] | None = None,
+) -> dict[str, str | None]:
+    resolved = dict(user_directory.get(user_id or "", {}))
+    inline_info = normalize_slack_user_info({}, inline_profile) if inline_profile else {}
+    for key, value in inline_info.items():
+        if value:
+            resolved[key] = value
+    if user_id and not resolved.get("speaker_name"):
+        resolved["speaker_name"] = user_id
+    if user_id and not resolved.get("mention_name"):
+        resolved["mention_name"] = user_id
+    return resolved
+
+
+def format_slack_document_title(path: Path) -> str:
+    channel_name = normalize_whitespace(path.parent.name)
+    if channel_name and not channel_name.startswith("#"):
+        channel_name = f"#{channel_name}"
+    day_token = normalize_whitespace(path.stem)
+    try:
+        day_label = date.fromisoformat(day_token).strftime("%b %d, %Y").replace(" 0", " ")
+    except ValueError:
+        day_label = day_token
+    if channel_name and day_label:
+        return f"{channel_name} - {day_label}"
+    return channel_name or day_label or "Slack conversation"
+
+
+def normalize_slack_timestamp(value: object) -> str | None:
+    raw = normalize_whitespace(str(value or ""))
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def render_slack_text(text: str, user_directory: dict[str, dict[str, str | None]]) -> str:
+    rendered = str(text or "")
+    rendered = SLACK_USER_MENTION_PATTERN.sub(
+        lambda match: f"@{resolve_slack_user_info(match.group(1), user_directory).get('mention_name') or match.group(1)}",
+        rendered,
+    )
+    rendered = SLACK_CHANNEL_MENTION_PATTERN.sub(lambda match: f"#{match.group(2) or match.group(1)}", rendered)
+    rendered = SLACK_SPECIAL_MENTION_PATTERN.sub(lambda match: f"@{match.group(1)}", rendered)
+    rendered = SLACK_NAMED_LINK_PATTERN.sub(lambda match: match.group(2), rendered)
+    rendered = SLACK_BARE_LINK_PATTERN.sub(lambda match: match.group(1), rendered)
+    return normalize_whitespace(replace_slack_emoji_shortcodes(rendered))
+
+
+def slack_message_actor_info(
+    message: dict[str, object],
+    user_directory: dict[str, dict[str, str | None]],
+) -> dict[str, str | None]:
+    user_id = choose_slack_text(message.get("user"))
+    user_profile = message.get("user_profile") if isinstance(message.get("user_profile"), dict) else None
+    if user_id:
+        return resolve_slack_user_info(user_id, user_directory, user_profile)
+    bot_profile = message.get("bot_profile") if isinstance(message.get("bot_profile"), dict) else None
+    if bot_profile:
+        actor_info = normalize_slack_user_info({}, bot_profile)
+        if not actor_info.get("speaker_name"):
+            actor_info["speaker_name"] = "Slack bot"
+        return actor_info
+    speaker_name = (
+        choose_slack_text(message.get("username"))
+        or choose_slack_text(message.get("subtype"))
+        or "Slack message"
+    )
+    return {
+        "avatar_color": None,
+        "mention_name": speaker_name,
+        "speaker_name": speaker_name,
+    }
+
+
+def iter_slack_export_entries(
+    raw_value: object,
+    user_directory: dict[str, dict[str, str | None]],
+) -> list[dict[str, object]]:
+    candidate_items = raw_value.get("messages") if isinstance(raw_value, dict) else raw_value
+    if not isinstance(candidate_items, list):
+        return []
+
+    entries: list[dict[str, object]] = []
+    for item in candidate_items:
+        if not isinstance(item, dict):
+            continue
+        if normalize_whitespace(str(item.get("type") or "")).lower() != "message":
+            continue
+        body = render_slack_text(choose_slack_text(item.get("text")) or "", user_directory)
+        if not body:
+            continue
+        actor_info = slack_message_actor_info(item, user_directory)
+        speaker = actor_info.get("speaker_name") or "Slack message"
+        timestamp = normalize_slack_timestamp(item.get("ts"))
+        entries.append(
+            {
+                "avatar_color": actor_info.get("avatar_color"),
+                "speaker": speaker,
+                "body": body,
+                "timestamp": timestamp,
+                "timestamp_label": format_chat_preview_timestamp(timestamp),
+                "avatar_label": chat_avatar_initials(speaker),
+            }
+        )
+    return entries
+
+
+def extract_slack_chat_json_payload(path: Path, decoded_text: str) -> dict[str, object] | None:
+    try:
+        raw_value = json.loads(decoded_text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    candidate_items = raw_value.get("messages") if isinstance(raw_value, dict) else raw_value
+    if not isinstance(candidate_items, list):
+        return None
+
+    message_like_count = sum(
+        1
+        for item in candidate_items
+        if isinstance(item, dict)
+        and normalize_whitespace(str(item.get("type") or "")).lower() == "message"
+        and item.get("ts") is not None
+        and any(item.get(key) is not None for key in ("text", "user", "user_profile", "subtype"))
+    )
+    if message_like_count == 0:
+        return None
+
+    user_directory = load_slack_user_directory(slack_export_root_for_path(path))
+    entries = iter_slack_export_entries(raw_value, user_directory)
+    if not entries:
+        return None
+
+    participants: list[str] = []
+    seen: set[str] = set()
+    first_body: str | None = None
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
+    timestamped_matches = 0
+    transcript_lines: list[str] = []
+
+    for entry in entries:
+        speaker = normalize_whitespace(str(entry.get("speaker") or "")) or "Unknown"
+        key = speaker.lower()
+        if key not in seen:
+            seen.add(key)
+            participants.append(speaker)
+        body = str(entry.get("body") or "").strip()
+        if first_body is None and body:
+            first_body = body
+        timestamp = entry.get("timestamp")
+        if isinstance(timestamp, str) and timestamp:
+            timestamped_matches += 1
+            if first_timestamp is None:
+                first_timestamp = timestamp
+            last_timestamp = timestamp
+            transcript_lines.append(f"[{timestamp}] {speaker}: {body}")
+        else:
+            transcript_lines.append(f"{speaker}: {body}")
+
+    return {
+        "text_content": normalize_whitespace("\n".join(transcript_lines)),
+        "chat_metadata": {
+            "author": None,
+            "participants": ", ".join(participants) or None,
+            "date_created": first_timestamp,
+            "date_modified": last_timestamp if last_timestamp and last_timestamp != first_timestamp else None,
+            "title": format_slack_document_title(path),
+            "message_count": len(entries),
+            "timestamped_message_count": timestamped_matches,
+        },
+        "chat_entries": entries,
+    }
+
+
 def extract_plain_text_file(path: Path) -> dict[str, object]:
     decoded, text_status, _ = decode_bytes(path.read_bytes())
     file_type = normalize_extension(path)
-    text_content = strip_html_tags(decoded) if file_type in {"htm", "html"} else normalize_whitespace(decoded)
-    email_headers = extract_email_like_headers(text_content)
-    chat_metadata = extract_chat_transcript_metadata(text_content)
+    structured_chat = extract_slack_chat_json_payload(path, decoded) if file_type == "json" else None
+    text_content = (
+        str(structured_chat["text_content"])
+        if structured_chat and structured_chat.get("text_content")
+        else (strip_html_tags(decoded) if file_type in {"htm", "html"} else normalize_whitespace(decoded))
+    )
+    email_headers = {} if structured_chat else extract_email_like_headers(text_content)
+    chat_metadata = (
+        dict(structured_chat["chat_metadata"])
+        if structured_chat and isinstance(structured_chat.get("chat_metadata"), dict)
+        else extract_chat_transcript_metadata(text_content)
+    )
+    chat_entries = structured_chat.get("chat_entries") if structured_chat and isinstance(structured_chat.get("chat_entries"), list) else None
     participants = extract_email_chain_participants(
         text_content,
         [email_headers.get("author"), email_headers.get("recipients")] if email_headers else None,
@@ -168,9 +528,26 @@ def extract_plain_text_file(path: Path) -> dict[str, object]:
     title = email_headers.get("title") if email_headers else (str(chat_metadata["title"]) if chat_metadata and chat_metadata.get("title") else None)
     if title is None and file_type in {"md", "txt"} and text_content:
         title = text_content.splitlines()[0][:200]
+    resolved_author = None if chat_metadata else (email_headers.get("author") if email_headers else None)
+    preview_artifacts = (
+        build_chat_preview_artifacts(
+            title=title,
+            author=resolved_author,
+            participants=participants,
+            date_created=(email_headers.get("date_created") if email_headers else None)
+            or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None),
+            date_modified=str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None,
+            text_body=text_content,
+            preview_file_name=f"{path.name}.html",
+            chat_metadata=chat_metadata,
+            chat_entries=chat_entries,
+        )
+        if chat_metadata
+        else []
+    )
     return {
         "page_count": None,
-        "author": (email_headers.get("author") if email_headers else None) or (str(chat_metadata["author"]) if chat_metadata and chat_metadata.get("author") else None),
+        "author": resolved_author,
         "content_type": determine_content_type(path, text_content, email_headers=email_headers, chat_metadata=chat_metadata),
         "date_created": (email_headers.get("date_created") if email_headers else None) or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None),
         "date_modified": str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None,
@@ -180,7 +557,7 @@ def extract_plain_text_file(path: Path) -> dict[str, object]:
         "recipients": email_headers.get("recipients") if email_headers else None,
         "text_content": text_content,
         "text_status": "empty" if not text_content else text_status,
-        "preview_artifacts": [],
+        "preview_artifacts": preview_artifacts,
     }
 
 
@@ -214,13 +591,34 @@ def extract_rtf_file(path: Path) -> dict[str, object]:
     title = email_headers.get("title") if email_headers else (str(chat_metadata["title"]) if chat_metadata and chat_metadata.get("title") else None)
     if title is None and text_content:
         title = text_content.splitlines()[0][:200]
-    preview = build_html_preview(
-        {},
-        body_text=text_content,
+    resolved_author = None if chat_metadata else (email_headers.get("author") if email_headers else None)
+    preview_artifacts = (
+        build_chat_preview_artifacts(
+            title=title,
+            author=resolved_author,
+            participants=participants,
+            date_created=(email_headers.get("date_created") if email_headers else None)
+            or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None),
+            date_modified=str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None,
+            text_body=text_content,
+            preview_file_name=f"{path.name}.html",
+            chat_metadata=chat_metadata,
+            label="text",
+        )
+        if chat_metadata
+        else [
+            {
+                "file_name": f"{path.name}.html",
+                "preview_type": "html",
+                "label": "text",
+                "ordinal": 0,
+                "content": build_html_preview({}, body_text=text_content),
+            }
+        ]
     )
     return {
         "page_count": None,
-        "author": (email_headers.get("author") if email_headers else None) or (str(chat_metadata["author"]) if chat_metadata and chat_metadata.get("author") else None),
+        "author": resolved_author,
         "content_type": determine_content_type(
             path,
             text_content,
@@ -236,15 +634,7 @@ def extract_rtf_file(path: Path) -> dict[str, object]:
         "recipients": email_headers.get("recipients") if email_headers else None,
         "text_content": text_content,
         "text_status": "empty" if not text_content else text_status,
-        "preview_artifacts": [
-            {
-                "file_name": f"{path.name}.html",
-                "preview_type": "html",
-                "label": "text",
-                "ordinal": 0,
-                "content": preview,
-            }
-        ],
+        "preview_artifacts": preview_artifacts,
     }
 
 
@@ -260,11 +650,33 @@ def extract_pdf_file(path: Path) -> dict[str, object]:
             text_content,
             [email_headers.get("author"), email_headers.get("recipients")] if email_headers else None,
         ) or (str(chat_metadata["participants"]) if chat_metadata and chat_metadata.get("participants") else None) or extract_chat_participants(text_content)
+        resolved_author = (
+            None
+            if chat_metadata
+            else (email_headers.get("author") if email_headers else None) or metadata.get("Author")
+        )
+        preview_artifacts = (
+            build_chat_preview_artifacts(
+                title=(email_headers.get("title") if email_headers else None)
+                or (str(chat_metadata["title"]) if chat_metadata and chat_metadata.get("title") else None)
+                or metadata.get("Title"),
+                author=resolved_author,
+                participants=participants,
+                date_created=(email_headers.get("date_created") if email_headers else None)
+                or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None)
+                or normalize_datetime(metadata.get("CreationDate")),
+                date_modified=(str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None)
+                or normalize_datetime(metadata.get("ModDate")),
+                text_body=text_content,
+                preview_file_name=f"{path.name}.html",
+                chat_metadata=chat_metadata,
+            )
+            if chat_metadata
+            else []
+        )
         return {
             "page_count": len(pdf.pages),
-            "author": (email_headers.get("author") if email_headers else None)
-            or (str(chat_metadata["author"]) if chat_metadata and chat_metadata.get("author") else None)
-            or metadata.get("Author"),
+            "author": resolved_author,
             "content_type": determine_content_type(
                 path,
                 text_content,
@@ -285,7 +697,7 @@ def extract_pdf_file(path: Path) -> dict[str, object]:
             "recipients": email_headers.get("recipients") if email_headers else None,
             "text_content": text_content,
             "text_status": "empty" if not text_content else "ok",
-            "preview_artifacts": [],
+            "preview_artifacts": preview_artifacts,
         }
 
 
@@ -300,12 +712,34 @@ def extract_docx_file(path: Path) -> dict[str, object]:
         text_content,
         [email_headers.get("author"), email_headers.get("recipients")] if email_headers else None,
     ) or (str(chat_metadata["participants"]) if chat_metadata and chat_metadata.get("participants") else None) or extract_chat_participants(text_content)
+    resolved_author = (
+        None
+        if chat_metadata
+        else (email_headers.get("author") if email_headers else None) or props.author or None
+    )
+    preview_artifacts = (
+        build_chat_preview_artifacts(
+            title=(email_headers.get("title") if email_headers else None)
+            or (str(chat_metadata["title"]) if chat_metadata and chat_metadata.get("title") else None)
+            or props.title
+            or None,
+            author=resolved_author,
+            participants=participants,
+            date_created=(email_headers.get("date_created") if email_headers else None)
+            or (str(chat_metadata["date_created"]) if chat_metadata and chat_metadata.get("date_created") else None)
+            or normalize_datetime(props.created),
+            date_modified=(str(chat_metadata["date_modified"]) if chat_metadata and chat_metadata.get("date_modified") else None)
+            or normalize_datetime(props.modified),
+            text_body=text_content,
+            preview_file_name=f"{path.name}.html",
+            chat_metadata=chat_metadata,
+        )
+        if chat_metadata
+        else []
+    )
     return {
         "page_count": None,
-        "author": (email_headers.get("author") if email_headers else None)
-        or (str(chat_metadata["author"]) if chat_metadata and chat_metadata.get("author") else None)
-        or props.author
-        or None,
+        "author": resolved_author,
         "content_type": determine_content_type(
             path,
             text_content,
@@ -327,7 +761,7 @@ def extract_docx_file(path: Path) -> dict[str, object]:
         "recipients": email_headers.get("recipients") if email_headers else None,
         "text_content": text_content,
         "text_status": "empty" if not text_content else "ok",
-        "preview_artifacts": [],
+        "preview_artifacts": preview_artifacts,
     }
 
 
@@ -562,7 +996,7 @@ def build_email_extracted_payload(
         {
             "From": author or "",
             "To": recipients or "",
-            "Date": date_created or "",
+            "Date": format_chat_preview_timestamp(date_created) or date_created or "",
             "Subject": subject or "",
         },
         body_html=normalized_html,
@@ -593,6 +1027,46 @@ def build_email_extracted_payload(
     }
 
 
+def build_chat_preview_artifacts(
+    *,
+    title: str | None,
+    author: str | None,
+    participants: str | None,
+    date_created: str | None,
+    date_modified: str | None,
+    text_body: str | None,
+    preview_file_name: str,
+    chat_metadata: dict[str, object] | None = None,
+    chat_entries: list[dict[str, object]] | None = None,
+    label: str = "conversation",
+) -> list[dict[str, object]]:
+    normalized_text = normalize_whitespace(str(text_body or ""))
+    metadata = chat_metadata or extract_chat_transcript_metadata(normalized_text) or {}
+    headers = {
+        "Author": author or "",
+        "Participants": participants or "",
+        "Started": format_chat_preview_timestamp(date_created) or date_created or "",
+        "Updated": format_chat_preview_timestamp(date_modified) or date_modified or "",
+        "Title": title or "",
+        "Messages": str(metadata["message_count"]) if metadata.get("message_count") is not None else "",
+    }
+    preview = build_chat_preview_html(
+        headers,
+        normalized_text,
+        document_title=title or "Retriever Chat Preview",
+        entries=chat_entries,
+    )
+    return [
+        {
+            "file_name": preview_file_name,
+            "preview_type": "html",
+            "label": label,
+            "ordinal": 0,
+            "content": preview,
+        }
+    ]
+
+
 def build_chat_extracted_payload(
     *,
     title: str | None,
@@ -603,6 +1077,7 @@ def build_chat_extracted_payload(
     attachments: list[dict[str, object]] | None,
     preview_file_name: str,
     chat_metadata: dict[str, object] | None = None,
+    chat_entries: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     normalized_html = None if html_body is None else str(html_body)
     normalized_text = normalize_whitespace(str(text_body or ""))
@@ -615,24 +1090,12 @@ def build_chat_extracted_payload(
         if metadata.get("participants")
         else extract_chat_participants(normalized_text)
     )
-    resolved_author = str(metadata["author"]) if metadata.get("author") else author
     resolved_date_created = str(metadata["date_created"]) if metadata.get("date_created") else date_created
     resolved_date_modified = str(metadata["date_modified"]) if metadata.get("date_modified") else None
     resolved_title = title or (str(metadata["title"]) if metadata.get("title") else None)
-    preview = build_html_preview(
-        {
-            "Author": resolved_author or "",
-            "Participants": participants or "",
-            "Started": resolved_date_created or "",
-            "Updated": resolved_date_modified or "",
-            "Title": resolved_title or "",
-        },
-        body_html=normalized_html,
-        body_text=normalized_text,
-    )
     return {
         "page_count": 1,
-        "author": resolved_author,
+        "author": None,
         "content_type": "Chat",
         "date_created": resolved_date_created,
         "date_modified": resolved_date_modified,
@@ -643,11 +1106,66 @@ def build_chat_extracted_payload(
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
         "attachments": list(attachments or []),
+        "preview_artifacts": build_chat_preview_artifacts(
+            title=resolved_title,
+            author=None,
+            participants=participants,
+            date_created=resolved_date_created,
+            date_modified=resolved_date_modified,
+            text_body=normalized_text,
+            preview_file_name=preview_file_name,
+            chat_metadata=metadata,
+            chat_entries=chat_entries,
+        ),
+    }
+
+
+def build_calendar_extracted_payload(
+    *,
+    subject: str | None,
+    author: str | None,
+    recipients: str | None,
+    date_created: str | None,
+    text_body: str | None,
+    html_body: str | None,
+    attachments: list[dict[str, object]] | None,
+    preview_file_name: str,
+) -> dict[str, object]:
+    normalized_html = None if html_body is None else str(html_body)
+    normalized_text = normalize_whitespace(str(text_body or ""))
+    if not normalized_text and normalized_html:
+        normalized_text = strip_html_tags(normalized_html)
+    normalized_text = normalize_whitespace(normalized_text)
+    preview = build_html_preview(
+        {
+            "Organizer": author or "",
+            "Date": format_chat_preview_timestamp(date_created) or date_created or "",
+            "Title": subject or "",
+            "Attendees": recipients or "",
+        },
+        body_html=normalized_html,
+        body_text=normalized_text,
+        document_title=subject or "Retriever Calendar Preview",
+        heading="Retriever Calendar Preview",
+    )
+    return {
+        "page_count": 1,
+        "author": author,
+        "content_type": "Calendar",
+        "date_created": date_created,
+        "date_modified": None,
+        "participants": author or None,
+        "title": subject or None,
+        "subject": subject or None,
+        "recipients": recipients or None,
+        "text_content": normalized_text,
+        "text_status": "empty" if not normalized_text else "ok",
+        "attachments": list(attachments or []),
         "preview_artifacts": [
             {
                 "file_name": preview_file_name,
                 "preview_type": "html",
-                "label": "conversation",
+                "label": "calendar",
                 "ordinal": 0,
                 "content": preview,
             }
@@ -655,17 +1173,106 @@ def build_chat_extracted_payload(
     }
 
 
-def pst_message_prefers_chat_payload(message_dict: dict[str, object], chat_metadata: dict[str, object] | None) -> bool:
-    if not chat_metadata:
-        return False
+def normalize_pst_folder_marker(folder_path: object) -> str:
+    normalized = normalize_whitespace(str(folder_path or "")).strip().strip("/")
+    if not normalized:
+        return "/"
+    return f"/{normalized.lower()}/"
+
+
+def pst_folder_path_contains(folder_path: object, marker: str) -> bool:
+    return marker in normalize_pst_folder_marker(folder_path)
+
+
+def infer_pst_chat_title(subject: str | None, text_body: str | None) -> str | None:
+    normalized_subject = normalize_whitespace(str(subject or ""))
+    if normalized_subject:
+        return normalized_subject
+    normalized_text = normalize_whitespace(str(text_body or ""))
+    if not normalized_text:
+        return None
+    if len(normalized_text) <= 120:
+        return normalized_text
+    return normalized_text[:117].rstrip() + "..."
+
+
+def synthesize_pst_chat_entries(
+    *,
+    author: str | None,
+    date_created: str | None,
+    text_body: str | None,
+    chat_metadata: dict[str, object] | None,
+) -> list[dict[str, object]] | None:
+    if chat_metadata:
+        try:
+            if int(chat_metadata.get("message_count") or 0) > 1:
+                return None
+        except Exception:
+            pass
+    speaker = normalize_whitespace(str(author or ""))
+    body = normalize_whitespace(str(text_body or ""))
+    if not speaker or not body:
+        return None
+    return [
+        {
+            "speaker": speaker,
+            "body": body,
+            "timestamp": date_created,
+            "timestamp_label": format_chat_preview_timestamp(date_created),
+            "avatar_label": chat_avatar_initials(speaker),
+        }
+    ]
+
+
+def synthesize_pst_chat_metadata(
+    *,
+    subject: str | None,
+    author: str | None,
+    date_created: str | None,
+    text_body: str | None,
+    chat_metadata: dict[str, object] | None,
+    chat_entries: list[dict[str, object]] | None,
+) -> dict[str, object] | None:
+    metadata = dict(chat_metadata or {})
+    resolved_title = infer_pst_chat_title(subject, text_body)
+    if resolved_title and not metadata.get("title"):
+        metadata["title"] = resolved_title
+    normalized_author = normalize_whitespace(str(author or ""))
+    if normalized_author and not metadata.get("participants"):
+        metadata["participants"] = normalized_author
+    if date_created and not metadata.get("date_created"):
+        metadata["date_created"] = date_created
+    if date_created and not metadata.get("date_modified") and chat_entries is not None:
+        metadata["date_modified"] = date_created
+    if chat_entries is not None and not metadata.get("message_count"):
+        metadata["message_count"] = len(chat_entries)
+    return metadata or None
+
+
+def classify_pst_message_kind(message_dict: dict[str, object], chat_metadata: dict[str, object] | None) -> str:
+    folder_path = message_dict.get("folder_path")
+    if pst_folder_path_contains(folder_path, "/substratefiles/spools/"):
+        return "skip"
+    if pst_folder_path_contains(folder_path, "/skypespacesdata/teamsmeetings/"):
+        return "skip"
+    if pst_folder_path_contains(folder_path, "/teamsmessagesdata/"):
+        return "chat"
+    if pst_folder_path_contains(folder_path, "/conversation history/"):
+        return "chat"
     message_class = normalize_whitespace(
         str(message_dict.get("message_class") or message_dict.get("item_class") or "")
     )
     lowered_class = message_class.lower() if message_class else ""
+    if lowered_class.startswith("ipm.appointment") or "appointment" in lowered_class:
+        return "calendar"
     if any(token in lowered_class for token in ("conversation", "chat", "im")):
-        return True
+        return "chat"
+    if pst_folder_path_contains(folder_path, "/calendar/"):
+        return "calendar"
+    if not chat_metadata:
+        return "email"
     recipients = normalize_whitespace(str(message_dict.get("recipients") or ""))
-    return not recipients
+    return "chat" if not recipients else "email"
 
 
 def parse_email_message(
@@ -1001,7 +1608,7 @@ def iter_pst_messages(path: Path):
             pass
 
 
-def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object]) -> dict[str, object]:
+def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object]) -> dict[str, object] | None:
     source_item_id = normalize_source_item_id(
         message_dict.get("source_item_id")
         or message_dict.get("entry_identifier")
@@ -1045,7 +1652,24 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
     normalized_html_body = None if html_body is None else str(html_body)
     chat_text = normalized_text_body or (strip_html_tags(normalized_html_body) if normalized_html_body else "")
     chat_metadata = extract_chat_transcript_metadata(chat_text)
-    if pst_message_prefers_chat_payload(message_dict, chat_metadata):
+    message_kind = classify_pst_message_kind(message_dict, chat_metadata)
+    if message_kind == "skip":
+        return None
+    if message_kind == "chat":
+        chat_entries = synthesize_pst_chat_entries(
+            author=normalized_author,
+            date_created=normalized_date_created,
+            text_body=chat_text,
+            chat_metadata=chat_metadata,
+        )
+        resolved_chat_metadata = synthesize_pst_chat_metadata(
+            subject=normalized_subject,
+            author=normalized_author,
+            date_created=normalized_date_created,
+            text_body=chat_text,
+            chat_metadata=chat_metadata,
+            chat_entries=chat_entries,
+        )
         extracted = build_chat_extracted_payload(
             title=normalized_subject,
             author=normalized_author,
@@ -1054,7 +1678,19 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
             html_body=normalized_html_body,
             attachments=normalized_attachments,
             preview_file_name=pst_preview_file_name(source_item_id),
-            chat_metadata=chat_metadata,
+            chat_metadata=resolved_chat_metadata,
+            chat_entries=chat_entries,
+        )
+    elif message_kind == "calendar":
+        extracted = build_calendar_extracted_payload(
+            subject=normalized_subject,
+            author=normalized_author,
+            recipients=normalized_recipients,
+            date_created=normalized_date_created,
+            text_body=normalized_text_body,
+            html_body=normalized_html_body,
+            attachments=normalized_attachments,
+            preview_file_name=pst_preview_file_name(source_item_id),
         )
     else:
         extracted = build_email_extracted_payload(
