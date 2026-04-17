@@ -186,6 +186,221 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS jobs (
+      id INTEGER PRIMARY KEY,
+      job_name TEXT NOT NULL UNIQUE,
+      job_kind TEXT NOT NULL,
+      description TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      archived_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS job_outputs (
+      id INTEGER PRIMARY KEY,
+      job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      output_name TEXT NOT NULL,
+      value_type TEXT NOT NULL DEFAULT 'text',
+      bound_custom_field TEXT,
+      description TEXT,
+      ordinal INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(job_id, output_name)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS job_versions (
+      id INTEGER PRIMARY KEY,
+      job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL,
+      display_name TEXT NOT NULL,
+      instruction_text TEXT NOT NULL DEFAULT '',
+      instruction_hash TEXT NOT NULL,
+      response_schema_json TEXT,
+      provider TEXT NOT NULL,
+      model TEXT,
+      parameters_json TEXT NOT NULL DEFAULT '{}',
+      input_basis TEXT NOT NULL,
+      segment_profile TEXT,
+      aggregation_strategy TEXT,
+      created_at TEXT NOT NULL,
+      archived_at TEXT,
+      UNIQUE(job_id, version)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS text_revisions (
+      id INTEGER PRIMARY KEY,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      revision_kind TEXT NOT NULL,
+      language TEXT,
+      parent_revision_id INTEGER REFERENCES text_revisions(id) ON DELETE SET NULL,
+      created_by_job_version_id INTEGER REFERENCES job_versions(id) ON DELETE SET NULL,
+      storage_rel_path TEXT,
+      content_hash TEXT NOT NULL,
+      char_count INTEGER,
+      token_estimate INTEGER,
+      quality_score REAL,
+      provider_metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      retracted_at TEXT,
+      retraction_reason TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS text_revision_segments (
+      id INTEGER PRIMARY KEY,
+      revision_id INTEGER NOT NULL REFERENCES text_revisions(id) ON DELETE CASCADE,
+      segment_profile TEXT NOT NULL,
+      level INTEGER NOT NULL DEFAULT 0,
+      parent_segment_id INTEGER REFERENCES text_revision_segments(id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL,
+      char_start INTEGER NOT NULL,
+      char_end INTEGER NOT NULL,
+      token_estimate INTEGER,
+      text_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(revision_id, segment_profile, level, ordinal)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS runs (
+      id INTEGER PRIMARY KEY,
+      job_version_id INTEGER NOT NULL REFERENCES job_versions(id) ON DELETE CASCADE,
+      from_run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+      selector_json TEXT NOT NULL,
+      exclude_selector_json TEXT NOT NULL DEFAULT '{}',
+      family_mode TEXT NOT NULL DEFAULT 'exact',
+      seed_limit INTEGER,
+      status TEXT NOT NULL DEFAULT 'planned',
+      planned_count INTEGER NOT NULL DEFAULT 0,
+      completed_count INTEGER NOT NULL DEFAULT 0,
+      failed_count INTEGER NOT NULL DEFAULT 0,
+      skipped_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      canceled_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS run_snapshot_documents (
+      id INTEGER PRIMARY KEY,
+      run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL,
+      inclusion_reason_json TEXT NOT NULL DEFAULT '{}',
+      pinned_input_revision_id INTEGER REFERENCES text_revisions(id) ON DELETE SET NULL,
+      pinned_input_identity TEXT NOT NULL,
+      pinned_content_hash TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(run_id, document_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS run_items (
+      id INTEGER PRIMARY KEY,
+      run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      run_snapshot_document_id INTEGER REFERENCES run_snapshot_documents(id) ON DELETE CASCADE,
+      item_kind TEXT NOT NULL,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      segment_id INTEGER REFERENCES text_revision_segments(id) ON DELETE CASCADE,
+      input_identity TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS attempts (
+      id INTEGER PRIMARY KEY,
+      run_item_id INTEGER NOT NULL REFERENCES run_items(id) ON DELETE CASCADE,
+      attempt_number INTEGER NOT NULL,
+      provider_request_id TEXT,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      cost_cents INTEGER,
+      latency_ms INTEGER,
+      provider_metadata_json TEXT NOT NULL DEFAULT '{}',
+      error_summary TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(run_item_id, attempt_number)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS results (
+      id INTEGER PRIMARY KEY,
+      run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      job_version_id INTEGER NOT NULL REFERENCES job_versions(id) ON DELETE CASCADE,
+      input_revision_id INTEGER REFERENCES text_revisions(id) ON DELETE SET NULL,
+      input_identity TEXT NOT NULL,
+      raw_output_json TEXT,
+      normalized_output_json TEXT,
+      created_text_revision_id INTEGER REFERENCES text_revisions(id) ON DELETE SET NULL,
+      provider_metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      retracted_at TEXT,
+      retraction_reason TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS result_outputs (
+      id INTEGER PRIMARY KEY,
+      result_id INTEGER NOT NULL REFERENCES results(id) ON DELETE CASCADE,
+      job_output_id INTEGER NOT NULL REFERENCES job_outputs(id) ON DELETE CASCADE,
+      output_value_json TEXT NOT NULL,
+      display_value TEXT,
+      score REAL,
+      created_at TEXT NOT NULL,
+      UNIQUE(result_id, job_output_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS embedding_vectors (
+      id INTEGER PRIMARY KEY,
+      job_version_id INTEGER NOT NULL REFERENCES job_versions(id) ON DELETE CASCADE,
+      revision_id INTEGER REFERENCES text_revisions(id) ON DELETE CASCADE,
+      segment_id INTEGER NOT NULL REFERENCES text_revision_segments(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      level INTEGER NOT NULL DEFAULT 0,
+      vector_blob BLOB NOT NULL,
+      encoding TEXT NOT NULL DEFAULT 'float32-le',
+      dimensions INTEGER NOT NULL,
+      distance_metric TEXT NOT NULL DEFAULT 'cosine',
+      provider_metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      retracted_at TEXT,
+      retraction_reason TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS publications (
+      id INTEGER PRIMARY KEY,
+      result_output_id INTEGER NOT NULL REFERENCES result_outputs(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      job_output_id INTEGER NOT NULL REFERENCES job_outputs(id) ON DELETE CASCADE,
+      custom_field_name TEXT NOT NULL,
+      published_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS text_revision_activation_events (
+      id INTEGER PRIMARY KEY,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      text_revision_id INTEGER NOT NULL REFERENCES text_revisions(id) ON DELETE CASCADE,
+      activated_by_job_version_id INTEGER REFERENCES job_versions(id) ON DELETE SET NULL,
+      source_result_id INTEGER REFERENCES results(id) ON DELETE SET NULL,
+      activation_policy TEXT,
+      created_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS control_number_batches (
       batch_number INTEGER PRIMARY KEY,
       next_family_sequence INTEGER NOT NULL DEFAULT 1,

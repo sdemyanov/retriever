@@ -740,6 +740,11 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "documents", "control_number_batch INTEGER")
     ensure_column(connection, "documents", "control_number_family_sequence INTEGER")
     ensure_column(connection, "documents", "control_number_attachment_sequence INTEGER")
+    ensure_column(connection, "documents", "source_text_revision_id INTEGER REFERENCES text_revisions(id) ON DELETE SET NULL")
+    ensure_column(connection, "documents", "active_search_text_revision_id INTEGER REFERENCES text_revisions(id) ON DELETE SET NULL")
+    ensure_column(connection, "documents", "active_text_source_kind TEXT")
+    ensure_column(connection, "documents", "active_text_language TEXT")
+    ensure_column(connection, "documents", "active_text_quality_score REAL")
     ensure_column(connection, "productions", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     ensure_column(connection, "container_sources", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     backfilled_legacy_control_number = backfill_legacy_column(
@@ -774,6 +779,10 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_production_id ON documents(production_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_begin_bates ON documents(begin_bates)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_end_bates ON documents(end_bates)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_text_revision_id ON documents(source_text_revision_id)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_documents_active_search_text_revision_id ON documents(active_search_text_revision_id)"
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_sources_dataset_id ON dataset_sources(dataset_id)")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_sources_locator_unique ON dataset_sources(source_kind, source_locator)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_documents_document_id ON dataset_documents(document_id)")
@@ -802,6 +811,64 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         """
         CREATE INDEX IF NOT EXISTS idx_documents_control_number_sort
         ON documents(control_number_batch, control_number_family_sequence, control_number_attachment_sequence)
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_job_outputs_job_id ON job_outputs(job_id, ordinal)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_job_versions_job_id ON job_versions(job_id, version DESC)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_job_version_id ON runs(job_version_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_from_run_id ON runs(from_run_id)")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_run_snapshot_documents_run_id_ordinal
+        ON run_snapshot_documents(run_id, ordinal, id)
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_snapshot_documents_document_id ON run_snapshot_documents(document_id)"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_run_id_status ON run_items(run_id, status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_document_id ON run_items(document_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_attempts_run_item_id ON attempts(run_item_id, attempt_number)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_job_version_id ON results(job_version_id, created_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_document_id ON results(document_id, created_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_input_revision_id ON results(input_revision_id)")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_results_active_identity_unique
+        ON results(document_id, job_version_id, input_identity)
+        WHERE retracted_at IS NULL
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_result_outputs_result_id ON result_outputs(result_id)")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_text_revisions_document_created_at
+        ON text_revisions(document_id, created_at, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_text_revision_segments_revision_profile
+        ON text_revision_segments(revision_id, segment_profile, level, ordinal)
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_vectors_active_segment_unique
+        ON embedding_vectors(job_version_id, segment_id)
+        WHERE retracted_at IS NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_publications_document_field
+        ON publications(document_id, custom_field_name, published_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_text_revision_activation_events_document_created_at
+        ON text_revision_activation_events(document_id, created_at, id)
         """
     )
     merged_legacy_locks = merge_legacy_field_locks(connection)

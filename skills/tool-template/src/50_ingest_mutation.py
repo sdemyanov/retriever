@@ -707,6 +707,214 @@ def delete_dataset(
         connection.close()
 
 
+def list_jobs(root: Path) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        return {
+            "status": "ok",
+            "jobs": list_job_summaries(connection),
+        }
+    finally:
+        connection.close()
+
+
+def create_job(root: Path, raw_job_name: str, job_kind: str, description: str | None) -> dict[str, object]:
+    job_name = sanitize_processing_identifier(raw_job_name, label="Job name", prefix="job")
+    normalized_kind = normalize_job_kind(job_kind)
+    normalized_description = normalize_whitespace(description) if description and description.strip() else None
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        existing_row = find_job_row_by_name(connection, job_name)
+        if existing_row is not None:
+            raise RetrieverError(f"Job {job_name!r} already exists.")
+        connection.execute("BEGIN")
+        try:
+            job_id = create_job_row(
+                connection,
+                job_name=job_name,
+                job_kind=normalized_kind,
+                description=normalized_description,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "job": job_summary_by_id(connection, job_id),
+        }
+    finally:
+        connection.close()
+
+
+def add_job_output(
+    root: Path,
+    raw_job_name: str,
+    raw_output_name: str,
+    value_type: str,
+    *,
+    bound_custom_field: str | None = None,
+    description: str | None = None,
+) -> dict[str, object]:
+    job_name = sanitize_processing_identifier(raw_job_name, label="Job name", prefix="job")
+    output_name = sanitize_processing_identifier(raw_output_name, label="Job output name", prefix="output")
+    normalized_value_type = normalize_job_output_value_type(value_type)
+    normalized_description = normalize_whitespace(description) if description and description.strip() else None
+    normalized_bound_field = None
+    if bound_custom_field and bound_custom_field.strip():
+        normalized_bound_field = sanitize_field_name(bound_custom_field)
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        job_row = require_job_row_by_name(connection, job_name)
+        connection.execute("BEGIN")
+        try:
+            output_id, created = upsert_job_output_row(
+                connection,
+                job_id=int(job_row["id"]),
+                output_name=output_name,
+                value_type=normalized_value_type,
+                bound_custom_field=normalized_bound_field,
+                description=normalized_description,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        output_row = connection.execute(
+            """
+            SELECT *
+            FROM job_outputs
+            WHERE id = ?
+            """,
+            (output_id,),
+        ).fetchone()
+        assert output_row is not None
+        return {
+            "status": "ok",
+            "created": created,
+            "job": job_summary_by_id(connection, int(job_row["id"])),
+            "job_output": job_output_row_to_payload(output_row),
+        }
+    finally:
+        connection.close()
+
+
+def list_job_versions(root: Path, raw_job_name: str) -> dict[str, object]:
+    job_name = sanitize_processing_identifier(raw_job_name, label="Job name", prefix="job")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        job_row = require_job_row_by_name(connection, job_name)
+        return {
+            "status": "ok",
+            "job": job_summary_by_id(connection, int(job_row["id"])),
+            "job_versions": job_versions_for_job(connection, int(job_row["id"])),
+        }
+    finally:
+        connection.close()
+
+
+def create_job_version(
+    root: Path,
+    raw_job_name: str,
+    *,
+    instruction: str | None,
+    provider: str,
+    model: str | None,
+    input_basis: str,
+    response_schema_json: str | None,
+    parameters_json: str | None,
+    segment_profile: str | None,
+    aggregation_strategy: str | None,
+    display_name: str | None,
+) -> dict[str, object]:
+    job_name = sanitize_processing_identifier(raw_job_name, label="Job name", prefix="job")
+    normalized_provider = normalize_whitespace(provider)
+    if not normalized_provider:
+        raise RetrieverError("Provider cannot be empty.")
+    normalized_input_basis = normalize_job_input_basis(input_basis)
+    normalized_instruction = (instruction or "").strip()
+    normalized_model = normalize_whitespace(model) if model and model.strip() else None
+    normalized_segment_profile = (
+        sanitize_processing_identifier(segment_profile, label="Segment profile", prefix="profile")
+        if segment_profile and segment_profile.strip()
+        else None
+    )
+    normalized_aggregation = (
+        sanitize_processing_identifier(aggregation_strategy, label="Aggregation strategy", prefix="aggregation")
+        if aggregation_strategy and aggregation_strategy.strip()
+        else None
+    )
+    normalized_display_name = normalize_whitespace(display_name) if display_name and display_name.strip() else None
+    parsed_response_schema = parse_json_argument(
+        response_schema_json,
+        label="Response schema",
+        default=None,
+    )
+    response_schema_text = None if parsed_response_schema is None else compact_json_text(parsed_response_schema)
+    parameters = parse_json_object_argument(
+        parameters_json,
+        label="Parameters",
+        default={},
+    )
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        job_row = require_job_row_by_name(connection, job_name)
+        connection.execute("BEGIN")
+        try:
+            version_id = create_job_version_row(
+                connection,
+                job_id=int(job_row["id"]),
+                job_name=job_name,
+                instruction_text=normalized_instruction,
+                response_schema_json=response_schema_text,
+                provider=normalized_provider,
+                model=normalized_model,
+                parameters_json=compact_json_text(parameters),
+                input_basis=normalized_input_basis,
+                segment_profile=normalized_segment_profile,
+                aggregation_strategy=normalized_aggregation,
+                display_name=normalized_display_name,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        version_row = connection.execute(
+            """
+            SELECT *
+            FROM job_versions
+            WHERE id = ?
+            """,
+            (version_id,),
+        ).fetchone()
+        assert version_row is not None
+        return {
+            "status": "ok",
+            "job": job_summary_by_id(connection, int(job_row["id"])),
+            "job_version": job_version_row_to_payload(version_row),
+        }
+    finally:
+        connection.close()
+
+
 def get_custom_field_registry_row(connection: sqlite3.Connection, field_name: str) -> sqlite3.Row | None:
     return connection.execute(
         """

@@ -708,6 +708,293 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(runtime["schema_version"], retriever_tools.SCHEMA_VERSION)
         self.assertEqual(runtime["template_sha256"], retriever_tools.sha256_file(self.paths["tool_path"]))
 
+    def test_bootstrap_initializes_processing_schema_and_job_crud(self) -> None:
+        result = retriever_tools.bootstrap(self.root)
+        self.assertEqual(result["schema_version"], retriever_tools.SCHEMA_VERSION)
+
+        exit_code, create_job_payload, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Contract Metadata",
+            "structured_extraction",
+            "--description",
+            "Extract key contract facts",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(create_job_payload)
+        self.assertEqual(create_job_payload["job"]["job_name"], "contract_metadata")
+        self.assertEqual(create_job_payload["job"]["job_kind"], "structured_extraction")
+
+        exit_code, add_output_payload, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "contract_metadata",
+            "Governing Law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(add_output_payload)
+        self.assertEqual(add_output_payload["job_output"]["output_name"], "governing_law")
+        self.assertTrue(add_output_payload["created"])
+
+        exit_code, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "contract_metadata",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Extract the governing law field.",
+            "--response-schema-json",
+            "{\"type\":\"object\",\"properties\":{\"governing_law\":{\"type\":\"string\"}}}",
+            "--parameters-json",
+            "{\"temperature\":0}",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["version"], 1)
+        self.assertEqual(create_version_payload["job_version"]["provider"], "openai")
+        self.assertEqual(create_version_payload["job_version"]["parameters"], {"temperature": 0})
+        self.assertEqual(
+            create_version_payload["job_version"]["response_schema"]["type"],
+            "object",
+        )
+
+        exit_code, list_jobs_payload, _, _ = self.run_cli("list-jobs", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_jobs_payload)
+        self.assertEqual(len(list_jobs_payload["jobs"]), 1)
+        self.assertEqual(list_jobs_payload["jobs"][0]["latest_job_version"]["version"], 1)
+        self.assertEqual(list_jobs_payload["jobs"][0]["outputs"][0]["output_name"], "governing_law")
+
+        exit_code, versions_payload, _, _ = self.run_cli("list-job-versions", str(self.root), "contract_metadata")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(versions_payload)
+        self.assertEqual(len(versions_payload["job_versions"]), 1)
+        self.assertEqual(versions_payload["job_versions"][0]["display_name"], "contract_metadata v1")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_columns = retriever_tools.table_columns(connection, "documents")
+            self.assertIn("source_text_revision_id", document_columns)
+            self.assertIn("active_search_text_revision_id", document_columns)
+            self.assertIn("active_text_source_kind", document_columns)
+            self.assertIn("active_text_language", document_columns)
+            self.assertIn("active_text_quality_score", document_columns)
+
+            expected_tables = {
+                "jobs",
+                "job_outputs",
+                "job_versions",
+                "runs",
+                "run_snapshot_documents",
+                "run_items",
+                "attempts",
+                "results",
+                "result_outputs",
+                "text_revisions",
+                "text_revision_segments",
+                "embedding_vectors",
+                "publications",
+                "text_revision_activation_events",
+            }
+            actual_tables = {
+                row["name"]
+                for row in connection.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                    """
+                ).fetchall()
+            }
+            self.assertTrue(expected_tables.issubset(actual_tables))
+
+            job_row = connection.execute(
+                "SELECT id FROM jobs WHERE job_name = ?",
+                ("contract_metadata",),
+            ).fetchone()
+            self.assertIsNotNone(job_row)
+            job_version_row = connection.execute(
+                "SELECT id FROM job_versions WHERE job_id = ? AND version = 1",
+                (job_row["id"],),
+            ).fetchone()
+            self.assertIsNotNone(job_version_row)
+
+            document_cursor = connection.execute(
+                """
+                INSERT INTO documents (rel_path, file_name, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                ("sample.txt", "sample.txt", "2026-04-17T00:00:00Z"),
+            )
+            document_id = int(document_cursor.lastrowid)
+            text_revision_cursor = connection.execute(
+                """
+                INSERT INTO text_revisions (
+                  document_id,
+                  revision_kind,
+                  language,
+                  parent_revision_id,
+                  created_by_job_version_id,
+                  storage_rel_path,
+                  content_hash,
+                  char_count,
+                  token_estimate,
+                  quality_score,
+                  provider_metadata_json,
+                  created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    "source_extract",
+                    "en",
+                    None,
+                    None,
+                    None,
+                    retriever_tools.sha256_text("alpha"),
+                    5,
+                    1,
+                    None,
+                    "{}",
+                    "2026-04-17T00:00:00Z",
+                ),
+            )
+            input_revision_id = int(text_revision_cursor.lastrowid)
+            input_identity = retriever_tools.build_text_revision_input_identity(input_revision_id)
+
+            connection.execute(
+                """
+                INSERT INTO results (
+                  run_id,
+                  document_id,
+                  job_version_id,
+                  input_revision_id,
+                  input_identity,
+                  raw_output_json,
+                  normalized_output_json,
+                  created_text_revision_id,
+                  provider_metadata_json,
+                  created_at,
+                  retracted_at,
+                  retraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None,
+                    document_id,
+                    int(job_version_row["id"]),
+                    input_revision_id,
+                    input_identity,
+                    "{\"governing_law\":\"Delaware\"}",
+                    "{\"governing_law\":\"Delaware\"}",
+                    None,
+                    "{}",
+                    "2026-04-17T00:00:00Z",
+                    None,
+                    None,
+                ),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO results (
+                      run_id,
+                      document_id,
+                      job_version_id,
+                      input_revision_id,
+                      input_identity,
+                      raw_output_json,
+                      normalized_output_json,
+                      created_text_revision_id,
+                      provider_metadata_json,
+                      created_at,
+                      retracted_at,
+                      retraction_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        None,
+                        document_id,
+                        int(job_version_row["id"]),
+                        input_revision_id,
+                        input_identity,
+                        "{\"governing_law\":\"Delaware\"}",
+                        "{\"governing_law\":\"Delaware\"}",
+                        None,
+                        "{}",
+                        "2026-04-17T00:00:01Z",
+                        None,
+                        None,
+                    ),
+                )
+
+            connection.execute(
+                """
+                UPDATE results
+                SET retracted_at = ?, retraction_reason = ?
+                WHERE document_id = ? AND job_version_id = ? AND input_identity = ?
+                """,
+                (
+                    "2026-04-17T00:00:02Z",
+                    "Superseded during testing",
+                    document_id,
+                    int(job_version_row["id"]),
+                    input_identity,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO results (
+                  run_id,
+                  document_id,
+                  job_version_id,
+                  input_revision_id,
+                  input_identity,
+                  raw_output_json,
+                  normalized_output_json,
+                  created_text_revision_id,
+                  provider_metadata_json,
+                  created_at,
+                  retracted_at,
+                  retraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None,
+                    document_id,
+                    int(job_version_row["id"]),
+                    input_revision_id,
+                    input_identity,
+                    "{\"governing_law\":\"New York\"}",
+                    "{\"governing_law\":\"New York\"}",
+                    None,
+                    "{}",
+                    "2026-04-17T00:00:03Z",
+                    None,
+                    None,
+                ),
+            )
+            connection.commit()
+
+            active_count_row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM results
+                WHERE document_id = ? AND job_version_id = ? AND input_identity = ? AND retracted_at IS NULL
+                """,
+                (document_id, int(job_version_row["id"]), input_identity),
+            ).fetchone()
+            self.assertEqual(active_count_row["count"], 1)
+        finally:
+            connection.close()
+
     def test_connect_db_falls_back_to_delete_when_wal_fails(self) -> None:
         class FakeCursor:
             def __init__(self, row):

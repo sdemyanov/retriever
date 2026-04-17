@@ -10,6 +10,8 @@ FRAGMENT_FILENAMES = [
     "20_extractors.py",
     "30_productions.py",
     "40_schema_runtime.py",
+    "45_processing_core.py",
+    "46_processing_store.py",
     "50_ingest_mutation.py",
     "60_search_cli.py",
 ]
