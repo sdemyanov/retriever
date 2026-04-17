@@ -202,7 +202,13 @@ def backfill_dataset_ids(connection: sqlite3.Connection, root: Path | None = Non
             source_rel_path = str(row["source_rel_path"] or "")
             if not source_kind or not source_rel_path:
                 continue
-            dataset_name = pst_dataset_name(source_rel_path) if source_kind == PST_SOURCE_KIND else source_rel_path
+            dataset_name = (
+                pst_dataset_name(source_rel_path)
+                if source_kind == PST_SOURCE_KIND
+                else mbox_dataset_name(source_rel_path)
+                if source_kind == MBOX_SOURCE_KIND
+                else source_rel_path
+            )
             dataset_id = ensure_dataset_row(
                 connection,
                 source_kind=source_kind,
@@ -265,12 +271,16 @@ def backfill_dataset_ids(connection: sqlite3.Connection, root: Path | None = Non
                     dataset_id = int(production_row["dataset_id"])
         source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
         source_rel_path = normalize_whitespace(str(row["source_rel_path"] or ""))
-        if dataset_id is None and source_kind == PST_SOURCE_KIND and source_rel_path:
+        if dataset_id is None and source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and source_rel_path:
             dataset_id = ensure_dataset_row(
                 connection,
-                source_kind=PST_SOURCE_KIND,
+                source_kind=source_kind,
                 dataset_locator=source_rel_path,
-                dataset_name=pst_dataset_name(source_rel_path),
+                dataset_name=(
+                    pst_dataset_name(source_rel_path)
+                    if source_kind == PST_SOURCE_KIND
+                    else mbox_dataset_name(source_rel_path)
+                ),
             )
         if dataset_id is None:
             if filesystem_dataset_id is None:
@@ -374,10 +384,10 @@ def backfill_dataset_memberships(connection: sqlite3.Connection) -> int:
 
         source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
         source_rel_path = normalize_whitespace(str(row["source_rel_path"] or ""))
-        if not source_membership_ids and source_kind == PST_SOURCE_KIND and source_rel_path:
+        if not source_membership_ids and source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and source_rel_path:
             dataset_source_row = get_dataset_source_row(
                 connection,
-                source_kind=PST_SOURCE_KIND,
+                source_kind=source_kind,
                 source_locator=source_rel_path,
             )
             if dataset_source_row is not None and int(dataset_source_row["dataset_id"]) == dataset_id:

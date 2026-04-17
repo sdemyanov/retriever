@@ -278,6 +278,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         ]
         scanned_rel_paths: set[str] = set()
         scanned_pst_source_rel_paths: set[str] = set()
+        scanned_mbox_source_rel_paths: set[str] = set()
         scanned_items: list[dict[str, object]] = []
         for path in scanned_files:
             rel_path = relative_document_path(root, path)
@@ -285,12 +286,14 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             scanned_rel_paths.add(rel_path)
             if file_type == PST_SOURCE_KIND:
                 scanned_pst_source_rel_paths.add(rel_path)
+            if file_type == MBOX_SOURCE_KIND:
+                scanned_mbox_source_rel_paths.add(rel_path)
             scanned_items.append(
                 {
                     "path": path,
                     "rel_path": rel_path,
                     "file_type": file_type,
-                    "file_hash": None if file_type == PST_SOURCE_KIND else sha256_file(path),
+                    "file_hash": None if file_type in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} else sha256_file(path),
                 }
             )
 
@@ -321,6 +324,12 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             "pst_messages_deleted": 0,
             "pst_sources_missing": 0,
             "pst_documents_missing": 0,
+            "mbox_sources_skipped": 0,
+            "mbox_messages_created": 0,
+            "mbox_messages_updated": 0,
+            "mbox_messages_deleted": 0,
+            "mbox_sources_missing": 0,
+            "mbox_documents_missing": 0,
         }
         failures: list[dict[str, str]] = []
         current_ingestion_batch: int | None = None
@@ -338,6 +347,19 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     stats["pst_messages_created"] += int(pst_result["pst_messages_created"])
                     stats["pst_messages_updated"] += int(pst_result["pst_messages_updated"])
                     stats["pst_messages_deleted"] += int(pst_result["pst_messages_deleted"])
+                    continue
+                except Exception as exc:
+                    stats["failed"] += 1
+                    failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
+                    continue
+            if file_type == MBOX_SOURCE_KIND:
+                try:
+                    mbox_result = ingest_mbox_source(connection, paths, path, rel_path)
+                    stats[str(mbox_result["action"])] += 1
+                    stats["mbox_sources_skipped"] += int(mbox_result["mbox_sources_skipped"])
+                    stats["mbox_messages_created"] += int(mbox_result["mbox_messages_created"])
+                    stats["mbox_messages_updated"] += int(mbox_result["mbox_messages_updated"])
+                    stats["mbox_messages_deleted"] += int(mbox_result["mbox_messages_deleted"])
                     continue
                 except Exception as exc:
                     stats["failed"] += 1
@@ -432,11 +454,17 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         filesystem_missing = mark_missing_documents(connection, scanned_rel_paths)
         pst_sources_missing = 0
         pst_documents_missing = 0
+        mbox_sources_missing = 0
+        mbox_documents_missing = 0
         if allowed_types is None or PST_SOURCE_KIND in allowed_types:
             pst_sources_missing, pst_documents_missing = mark_missing_pst_documents(connection, scanned_pst_source_rel_paths)
+        if allowed_types is None or MBOX_SOURCE_KIND in allowed_types:
+            mbox_sources_missing, mbox_documents_missing = mark_missing_mbox_documents(connection, scanned_mbox_source_rel_paths)
         stats["pst_sources_missing"] = pst_sources_missing
         stats["pst_documents_missing"] = pst_documents_missing
-        stats["missing"] = filesystem_missing + pst_sources_missing
+        stats["mbox_sources_missing"] = mbox_sources_missing
+        stats["mbox_documents_missing"] = mbox_documents_missing
+        stats["missing"] = filesystem_missing + pst_sources_missing + mbox_sources_missing
         connection.execute("BEGIN")
         try:
             pruned_unused_filesystem_dataset = prune_unused_filesystem_dataset(connection)
