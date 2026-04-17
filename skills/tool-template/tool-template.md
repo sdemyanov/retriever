@@ -2,13 +2,13 @@
 
 ## Template metadata
 
-- tool version: `0.10.0`
+- tool version: `0.10.1`
 - schema version: `12`
 - requirements version: `2026-04-16-phase4-pst`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `ea4535d94a62fab890ee7d781c56747f769482faaf14c6c4d3cce91ba9a9e0dc`
+- source checksum (SHA256): `fdea73ceac89d2889eddea4baea600cf1d238946003dfcdc5d604f21b3349933`
 
 ## Current command surface
 
@@ -36,6 +36,11 @@ The current template implements:
 - `delete-dataset`
 
 Stats, export, and review commands remain later-phase work.
+
+## Output modes
+
+- `search`, `search-docs`, `get-doc`, and `search-chunks` return compact JSON by default to keep model context small.
+- Add `--verbose` when you need full document/source metadata, preview target variants, attachment-child payloads, or raw chunk text.
 
 ## Materialization rules
 
