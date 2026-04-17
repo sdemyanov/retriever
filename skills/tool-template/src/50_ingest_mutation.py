@@ -848,6 +848,9 @@ def create_run(
                 run_id=run_id,
                 snapshot_rows=snapshot_rows,
             )
+            if normalize_job_kind(str(job_row["job_kind"])) == "ocr":
+                materialize_run_items_for_run(connection, paths, root, run_id)
+            refresh_run_progress(connection, run_id)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1625,7 +1628,7 @@ def create_job_version(
     provider: str | None,
     capability: str | None,
     model: str | None,
-    input_basis: str,
+    input_basis: str | None,
     response_schema_json: str | None,
     parameters_json: str | None,
     segment_profile: str | None,
@@ -1634,7 +1637,6 @@ def create_job_version(
 ) -> dict[str, object]:
     job_name = sanitize_processing_identifier(raw_job_name, label="Job name", prefix="job")
     normalized_provider = normalize_whitespace(provider) if provider and provider.strip() else "cowork_agent"
-    normalized_input_basis = normalize_job_input_basis(input_basis)
     normalized_instruction = (instruction or "").strip()
     normalized_model = normalize_whitespace(model) if model and model.strip() else None
     normalized_segment_profile = (
@@ -1670,6 +1672,11 @@ def create_job_version(
             normalize_job_capability(capability)
             if capability and capability.strip()
             else default_job_capability_for_kind(str(job_row["job_kind"]))
+        )
+        normalized_input_basis = (
+            normalize_job_input_basis(input_basis)
+            if input_basis and input_basis.strip()
+            else default_job_input_basis_for_kind(str(job_row["job_kind"]))
         )
         connection.execute("BEGIN")
         try:

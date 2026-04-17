@@ -2294,9 +2294,8 @@ def build_parser() -> argparse.ArgumentParser:
     create_job_version_parser.add_argument("--model", help="Optional model name")
     create_job_version_parser.add_argument(
         "--input-basis",
-        default="active_search_text",
         choices=sorted(JOB_INPUT_BASES),
-        help="Primary input basis for this version",
+        help="Primary input basis for this version; defaults from job kind when omitted",
     )
     create_job_version_parser.add_argument("--response-schema-json", help="Optional JSON schema payload")
     create_job_version_parser.add_argument("--parameters-json", help="Optional provider parameters as JSON object")

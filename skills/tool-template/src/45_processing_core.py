@@ -77,6 +77,20 @@ def default_job_capability_for_kind(job_kind: str) -> str:
     )
 
 
+def default_job_input_basis_for_kind(job_kind: str) -> str:
+    normalized_kind = normalize_job_kind(job_kind)
+    if normalized_kind == "ocr":
+        return "source_parts"
+    if normalized_kind in {"structured_extraction", "translation", "embedding"}:
+        return "active_search_text"
+    if normalized_kind == "image_description":
+        return "source_parts"
+    raise RetrieverError(
+        f"Job kind {normalized_kind!r} does not have a default input basis. "
+        "Pass an explicit input basis when creating the job version."
+    )
+
+
 def normalize_job_input_basis(input_basis: str) -> str:
     normalized = normalize_whitespace(input_basis).lower()
     if normalized not in JOB_INPUT_BASES:

@@ -1863,14 +1863,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "create-job-version",
             str(self.root),
             "production_ocr",
-            "--input-basis",
-            "source_parts",
             "--instruction",
             "OCR each page image and preserve reading order.",
         )
         self.assertEqual(create_version_exit, 0)
         self.assertIsNotNone(create_version_payload)
         self.assertEqual(create_version_payload["job_version"]["capability"], "vision_ocr")
+        self.assertEqual(create_version_payload["job_version"]["input_basis"], "source_parts")
         job_version_id = int(create_version_payload["job_version"]["id"])
 
         create_run_exit, create_run_payload, _, _ = self.run_cli(
@@ -1987,6 +1986,213 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual([int(row["page_number"]) for row in page_item_rows], [1, 2])
         self.assertTrue(all(str(row["status"]) == "completed" for row in page_item_rows))
         self.assertTrue(all(int(row["result_id"]) == int(result_payload["id"]) for row in page_item_rows))
+
+    def test_ocr_source_parts_uses_native_pdf_parts_for_production_docs(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        native_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000004.logical")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Native PDF OCR", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "native_pdf_ocr",
+            "--instruction",
+            "OCR the native production PDF.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["input_basis"], "source_parts")
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(native_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+        self.assertEqual(create_run_payload["run"]["planned_count"], 1)
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "native-ocr-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        self.assertEqual(len(claim_payload["run_items"]), 1)
+        run_item = claim_payload["run_items"][0]
+        self.assertEqual(run_item["item_kind"], "page")
+        self.assertEqual(run_item["page_number"], 1)
+        self.assertTrue(
+            str(run_item["input_artifact_rel_path"]).startswith(
+                f".retriever/jobs/ocr/run-{run_id}/doc-{native_row['id']}/page-0001"
+            )
+        )
+        self.assertTrue(str(run_item["input_artifact_rel_path"]).endswith(".png"))
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item["id"]),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(context_payload["context"]["input"]["kind"], "ocr_page_image")
+        self.assertEqual(context_payload["context"]["input"]["page_number"], 1)
+        self.assertTrue(str(context_payload["context"]["input"]["artifact_rel_path"]).endswith(".png"))
+        self.assertTrue(str(context_payload["context"]["input"]["artifact_path"]).endswith(".png"))
+
+    def test_ocr_run_freezes_artifacts_at_create_run_and_reuses_them_from_prior_run(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            source_part_rows = connection.execute(
+                """
+                SELECT rel_source_path
+                FROM document_source_parts
+                WHERE document_id = ?
+                  AND part_kind = 'image'
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (image_only_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(source_part_rows), 2)
+        source_part_paths = [str(row["rel_source_path"]) for row in source_part_rows]
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Frozen OCR", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "frozen_ocr",
+            "--instruction",
+            "OCR the document pages.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["input_basis"], "source_parts")
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        first_run_id = int(create_run_payload["run"]["id"])
+        self.assertEqual(create_run_payload["run"]["planned_count"], 2)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            first_run_item_rows = connection.execute(
+                """
+                SELECT page_number, input_artifact_rel_path
+                FROM run_items
+                WHERE run_id = ?
+                ORDER BY page_number ASC, id ASC
+                """,
+                (first_run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual([int(row["page_number"]) for row in first_run_item_rows], [1, 2])
+        first_run_artifact_paths = [str(row["input_artifact_rel_path"]) for row in first_run_item_rows]
+        self.assertTrue(all(path.startswith(f".retriever/jobs/ocr/run-{first_run_id}/doc-{image_only_row['id']}/") for path in first_run_artifact_paths))
+        self.assertTrue(all(path not in source_part_paths for path in first_run_artifact_paths))
+
+        self.write_tiff_fixture(self.root / source_part_paths[0], (17, 34, 51))
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(first_run_id),
+            "--claimed-by",
+            "freeze-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        self.assertEqual(len(claim_payload["run_items"]), 2)
+        first_run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(first_run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(
+            context_payload["context"]["input"]["artifact_rel_path"],
+            first_run_artifact_paths[0],
+        )
+
+        second_run_exit, second_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--from-run-id",
+            str(first_run_id),
+        )
+        self.assertEqual(second_run_exit, 0)
+        self.assertIsNotNone(second_run_payload)
+        second_run_id = int(second_run_payload["run"]["id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            second_run_item_rows = connection.execute(
+                """
+                SELECT page_number, input_artifact_rel_path
+                FROM run_items
+                WHERE run_id = ?
+                ORDER BY page_number ASC, id ASC
+                """,
+                (second_run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual([int(row["page_number"]) for row in second_run_item_rows], [1, 2])
+        self.assertEqual(
+            [str(row["input_artifact_rel_path"]) for row in second_run_item_rows],
+            first_run_artifact_paths,
+        )
 
     def test_execute_openai_structured_extraction_run_uses_provider_api(self) -> None:
         note_path = self.root / "party.txt"
