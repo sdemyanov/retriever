@@ -705,7 +705,7 @@ def infer_source_custodian(
         return inherited
     normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
     normalized_source_rel_path = normalize_whitespace(str(source_rel_path or ""))
-    if normalized_source_kind == PST_SOURCE_KIND and normalized_source_rel_path:
+    if normalized_source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and normalized_source_rel_path:
         return normalize_whitespace(Path(normalized_source_rel_path).stem)
     return None
 
@@ -722,9 +722,17 @@ def filesystem_dataset_name(root: Path | None = None) -> str:
     return "Workspace files"
 
 
-def pst_dataset_name(source_rel_path: str) -> str:
+def container_dataset_name(source_rel_path: str, fallback_label: str) -> str:
     candidate = normalize_whitespace(Path(source_rel_path).name)
-    return candidate or normalize_whitespace(source_rel_path) or "PST Dataset"
+    return candidate or normalize_whitespace(source_rel_path) or fallback_label
+
+
+def pst_dataset_name(source_rel_path: str) -> str:
+    return container_dataset_name(source_rel_path, "PST Dataset")
+
+
+def mbox_dataset_name(source_rel_path: str) -> str:
+    return container_dataset_name(source_rel_path, "MBOX Dataset")
 
 
 def production_dataset_name(rel_root: str, production_name: str | None = None) -> str:
@@ -1335,23 +1343,47 @@ def prune_unused_filesystem_dataset(connection: sqlite3.Connection) -> bool:
     return True
 
 
-def pst_message_rel_path(source_rel_path: str, source_item_id: str) -> str:
+def container_message_rel_path(source_rel_path: str, source_item_id: str, file_suffix: str) -> str:
     encoded = encode_source_item_id_for_path(source_item_id)
     return (
         Path(".retriever")
         / "sources"
         / Path(source_rel_path)
         / "messages"
-        / f"{encoded}.pstmsg"
+        / f"{encoded}.{file_suffix}"
     ).as_posix()
 
 
-def pst_preview_file_name(source_item_id: str) -> str:
+def pst_message_rel_path(source_rel_path: str, source_item_id: str) -> str:
+    return container_message_rel_path(source_rel_path, source_item_id, "pstmsg")
+
+
+def mbox_message_rel_path(source_rel_path: str, source_item_id: str) -> str:
+    return container_message_rel_path(source_rel_path, source_item_id, "mboxmsg")
+
+
+def container_preview_file_name(source_item_id: str) -> str:
     return f"{encode_source_item_id_for_path(source_item_id)}.html"
 
 
+def pst_preview_file_name(source_item_id: str) -> str:
+    return container_preview_file_name(source_item_id)
+
+
+def mbox_preview_file_name(source_item_id: str) -> str:
+    return container_preview_file_name(source_item_id)
+
+
+def container_message_file_name(source_item_id: str, file_suffix: str) -> str:
+    return f"{encode_source_item_id_for_path(source_item_id)}.{file_suffix}"
+
+
 def pst_message_file_name(source_item_id: str) -> str:
-    return f"{encode_source_item_id_for_path(source_item_id)}.pstmsg"
+    return container_message_file_name(source_item_id, "pstmsg")
+
+
+def mbox_message_file_name(source_item_id: str) -> str:
+    return container_message_file_name(source_item_id, "mboxmsg")
 
 
 def sanitize_storage_filename(file_name: str) -> str:

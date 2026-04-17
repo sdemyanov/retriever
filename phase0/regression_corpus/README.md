@@ -15,6 +15,7 @@ This directory contains Phase 0 sample files used by [runtime_probe.py](/Users/s
 - `sample_latin1.csv`: non-UTF-8 CSV sample for fallback decoding
 - `sample_utf8.eml`: UTF-8 email sample
 - `sample_latin1.eml`: ISO-8859-1 email sample
+- `sample_utf8.mbox`: UTF-8 MBOX sample with two messages
 - `sample_invalid.msg`: intentionally invalid Outlook MSG fixture for failure-path testing
 
 ## Current Gap

@@ -1214,8 +1214,10 @@ def assign_dataset_to_container_documents(
             )
 
 
-def existing_pst_rows_by_source_item(
+def existing_container_rows_by_source_item(
     connection: sqlite3.Connection,
+    *,
+    source_kind: str,
     source_rel_path: str,
 ) -> dict[str, sqlite3.Row]:
     rows = connection.execute(
@@ -1228,14 +1230,16 @@ def existing_pst_rows_by_source_item(
           AND source_item_id IS NOT NULL
         ORDER BY id ASC
         """,
-        (PST_SOURCE_KIND, source_rel_path),
+        (source_kind, source_rel_path),
     ).fetchall()
     return {str(row["source_item_id"]): row for row in rows}
 
 
-def retire_pst_unseen_messages(
+def retire_unseen_container_messages(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
+    *,
+    source_kind: str,
     source_rel_path: str,
     scan_started_at: str,
 ) -> int:
@@ -1250,7 +1254,7 @@ def retire_pst_unseen_messages(
           AND (last_seen_at IS NULL OR last_seen_at != ?)
         ORDER BY id ASC
         """,
-        (PST_SOURCE_KIND, source_rel_path, scan_started_at),
+        (source_kind, source_rel_path, scan_started_at),
     ).fetchall()
     if not parent_rows:
         return 0
@@ -1285,8 +1289,10 @@ def retire_pst_unseen_messages(
     return len(parent_rows)
 
 
-def mark_missing_pst_documents(
+def mark_missing_container_documents(
     connection: sqlite3.Connection,
+    *,
+    source_kind: str,
     scanned_source_rel_paths: set[str],
 ) -> tuple[int, int]:
     source_rows = connection.execute(
@@ -1296,7 +1302,7 @@ def mark_missing_pst_documents(
         WHERE source_kind = ?
         ORDER BY source_rel_path ASC
         """,
-        (PST_SOURCE_KIND,),
+        (source_kind,),
     ).fetchall()
     sources_missing = 0
     documents_missing = 0
@@ -1315,7 +1321,7 @@ def mark_missing_pst_documents(
               AND lifecycle_status NOT IN ('missing', 'deleted')
             ORDER BY id ASC
             """,
-            (PST_SOURCE_KIND, source_rel_path),
+            (source_kind, source_rel_path),
         ).fetchall()
         if not parent_rows:
             continue
@@ -1352,22 +1358,27 @@ def mark_missing_pst_documents(
     return sources_missing, documents_missing
 
 
-def ingest_pst_source(
+def ingest_container_source(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
     path: Path,
     source_rel_path: str,
+    *,
+    source_kind: str,
+    scan_hash_salt: str,
+    dataset_name: str,
+    iter_messages,
+    normalize_message,
+    file_type_override: str,
 ) -> dict[str, object]:
-    # Salt the scan fingerprint so unchanged PSTs get one corrective reparse when
-    # container-routing rules change (for example, when Teams/system folders are reclassified).
-    source_scan_hash = sha256_text(f"pst-ingest-v3:{sha256_file(path) or ''}")
+    source_scan_hash = sha256_text(f"{scan_hash_salt}:{sha256_file(path) or ''}")
     dataset_id, dataset_source_id = ensure_source_backed_dataset(
         connection,
-        source_kind=PST_SOURCE_KIND,
+        source_kind=source_kind,
         source_locator=source_rel_path,
-        dataset_name=pst_dataset_name(source_rel_path),
+        dataset_name=dataset_name,
     )
-    existing_source = get_container_source_row(connection, PST_SOURCE_KIND, source_rel_path)
+    existing_source = get_container_source_row(connection, source_kind, source_rel_path)
     file_size = file_size_bytes(path)
     file_mtime = file_mtime_timestamp(path)
     scan_started_at = next_monotonic_utc_timestamp(
@@ -1393,20 +1404,20 @@ def ingest_pst_source(
                       AND source_rel_path = ?
                       AND lifecycle_status != 'deleted'
                     """,
-                    (PST_SOURCE_KIND, source_rel_path),
+                    (source_kind, source_rel_path),
                 ).fetchone()
                 message_count = int(row["count"] or 0)
             connection.execute("BEGIN")
             try:
                 mark_container_source_documents_active(
                     connection,
-                    source_kind=PST_SOURCE_KIND,
+                    source_kind=source_kind,
                     source_rel_path=source_rel_path,
                     seen_at=scan_started_at,
                 )
                 assign_dataset_to_container_documents(
                     connection,
-                    source_kind=PST_SOURCE_KIND,
+                    source_kind=source_kind,
                     source_rel_path=source_rel_path,
                     dataset_id=dataset_id,
                     dataset_source_id=dataset_source_id,
@@ -1414,7 +1425,7 @@ def ingest_pst_source(
                 write_container_source_scan_completed(
                     connection,
                     dataset_id=dataset_id,
-                    source_kind=PST_SOURCE_KIND,
+                    source_kind=source_kind,
                     source_rel_path=source_rel_path,
                     file_size=file_size,
                     file_mtime=file_mtime,
@@ -1429,10 +1440,10 @@ def ingest_pst_source(
                 raise
             return {
                 "action": "skipped",
-                "pst_sources_skipped": 1,
-                "pst_messages_created": 0,
-                "pst_messages_updated": 0,
-                "pst_messages_deleted": 0,
+                "container_sources_skipped": 1,
+                "container_messages_created": 0,
+                "container_messages_updated": 0,
+                "container_messages_deleted": 0,
             }
         if same_size and existing_source["file_hash"] and existing_source["file_hash"] == source_scan_hash:
             message_count = int(existing_source["message_count"] or 0)
@@ -1440,13 +1451,13 @@ def ingest_pst_source(
             try:
                 mark_container_source_documents_active(
                     connection,
-                    source_kind=PST_SOURCE_KIND,
+                    source_kind=source_kind,
                     source_rel_path=source_rel_path,
                     seen_at=scan_started_at,
                 )
                 assign_dataset_to_container_documents(
                     connection,
-                    source_kind=PST_SOURCE_KIND,
+                    source_kind=source_kind,
                     source_rel_path=source_rel_path,
                     dataset_id=dataset_id,
                     dataset_source_id=dataset_source_id,
@@ -1454,7 +1465,7 @@ def ingest_pst_source(
                 write_container_source_scan_completed(
                     connection,
                     dataset_id=dataset_id,
-                    source_kind=PST_SOURCE_KIND,
+                    source_kind=source_kind,
                     source_rel_path=source_rel_path,
                     file_size=file_size,
                     file_mtime=file_mtime,
@@ -1469,10 +1480,10 @@ def ingest_pst_source(
                 raise
             return {
                 "action": "skipped",
-                "pst_sources_skipped": 1,
-                "pst_messages_created": 0,
-                "pst_messages_updated": 0,
-                "pst_messages_deleted": 0,
+                "container_sources_skipped": 1,
+                "container_messages_created": 0,
+                "container_messages_updated": 0,
+                "container_messages_deleted": 0,
             }
     else:
         file_hash = source_scan_hash
@@ -1480,7 +1491,7 @@ def ingest_pst_source(
     write_container_source_scan_started(
         connection,
         dataset_id=dataset_id,
-        source_kind=PST_SOURCE_KIND,
+        source_kind=source_kind,
         source_rel_path=source_rel_path,
         file_size=file_size,
         file_mtime=file_mtime,
@@ -1489,14 +1500,18 @@ def ingest_pst_source(
     )
     connection.commit()
 
-    existing_rows_by_source_item = existing_pst_rows_by_source_item(connection, source_rel_path)
+    existing_rows_by_source_item = existing_container_rows_by_source_item(
+        connection,
+        source_kind=source_kind,
+        source_rel_path=source_rel_path,
+    )
     current_ingestion_batch: int | None = None
-    pst_messages_created = 0
-    pst_messages_updated = 0
+    container_messages_created = 0
+    container_messages_updated = 0
     message_count = 0
 
-    for raw_message in iter_pst_messages(path):
-        normalized = normalize_pst_message(source_rel_path, raw_message)
+    for raw_message in iter_messages(path):
+        normalized = normalize_message(source_rel_path, raw_message)
         if normalized is None:
             continue
         message_count += 1
@@ -1532,7 +1547,7 @@ def ingest_pst_source(
                 control_number_batch=control_number_batch,
                 control_number_family_sequence=control_number_family_sequence,
                 control_number_attachment_sequence=control_number_attachment_sequence,
-                source_kind=PST_SOURCE_KIND,
+                source_kind=source_kind,
                 source_rel_path=source_rel_path,
                 source_item_id=str(normalized["source_item_id"]),
                 source_folder_path=(
@@ -1540,9 +1555,13 @@ def ingest_pst_source(
                     if normalized.get("source_folder_path") is not None
                     else None
                 ),
-                file_type_override=PST_SOURCE_KIND,
+                file_type_override=file_type_override,
                 file_size_override=None,
-                file_hash_override=str(normalized["file_hash"]),
+                file_hash_override=(
+                    str(normalized["file_hash"])
+                    if normalized.get("file_hash") is not None
+                    else None
+                ),
                 ingested_at_override=scan_started_at,
                 last_seen_at_override=scan_started_at,
                 updated_at_override=scan_started_at,
@@ -1574,21 +1593,27 @@ def ingest_pst_source(
             )
             connection.commit()
             if existing_row is None:
-                pst_messages_created += 1
+                container_messages_created += 1
             else:
-                pst_messages_updated += 1
+                container_messages_updated += 1
         except Exception:
             connection.rollback()
             raise
 
     connection.execute("BEGIN")
     try:
-        pst_messages_deleted = retire_pst_unseen_messages(connection, paths, source_rel_path, scan_started_at)
+        container_messages_deleted = retire_unseen_container_messages(
+            connection,
+            paths,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+            scan_started_at=scan_started_at,
+        )
         scan_completed_at = next_monotonic_utc_timestamp([scan_started_at])
         write_container_source_scan_completed(
             connection,
             dataset_id=dataset_id,
-            source_kind=PST_SOURCE_KIND,
+            source_kind=source_kind,
             source_rel_path=source_rel_path,
             file_size=file_size,
             file_mtime=file_mtime,
@@ -1604,10 +1629,88 @@ def ingest_pst_source(
 
     return {
         "action": "new" if existing_source is None else "updated",
-        "pst_sources_skipped": 0,
-        "pst_messages_created": pst_messages_created,
-        "pst_messages_updated": pst_messages_updated,
-        "pst_messages_deleted": pst_messages_deleted,
+        "container_sources_skipped": 0,
+        "container_messages_created": container_messages_created,
+        "container_messages_updated": container_messages_updated,
+        "container_messages_deleted": container_messages_deleted,
+    }
+
+
+def mark_missing_pst_documents(
+    connection: sqlite3.Connection,
+    scanned_source_rel_paths: set[str],
+) -> tuple[int, int]:
+    return mark_missing_container_documents(
+        connection,
+        source_kind=PST_SOURCE_KIND,
+        scanned_source_rel_paths=scanned_source_rel_paths,
+    )
+
+
+def mark_missing_mbox_documents(
+    connection: sqlite3.Connection,
+    scanned_source_rel_paths: set[str],
+) -> tuple[int, int]:
+    return mark_missing_container_documents(
+        connection,
+        source_kind=MBOX_SOURCE_KIND,
+        scanned_source_rel_paths=scanned_source_rel_paths,
+    )
+
+
+def ingest_pst_source(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    path: Path,
+    source_rel_path: str,
+) -> dict[str, object]:
+    # Salt the scan fingerprint so unchanged PSTs get one corrective reparse when
+    # container-routing rules change (for example, when Teams/system folders are reclassified).
+    result = ingest_container_source(
+        connection,
+        paths,
+        path,
+        source_rel_path,
+        source_kind=PST_SOURCE_KIND,
+        scan_hash_salt="pst-ingest-v3",
+        dataset_name=pst_dataset_name(source_rel_path),
+        iter_messages=iter_pst_messages,
+        normalize_message=normalize_pst_message,
+        file_type_override=PST_SOURCE_KIND,
+    )
+    return {
+        "action": result["action"],
+        "pst_sources_skipped": result["container_sources_skipped"],
+        "pst_messages_created": result["container_messages_created"],
+        "pst_messages_updated": result["container_messages_updated"],
+        "pst_messages_deleted": result["container_messages_deleted"],
+    }
+
+
+def ingest_mbox_source(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    path: Path,
+    source_rel_path: str,
+) -> dict[str, object]:
+    result = ingest_container_source(
+        connection,
+        paths,
+        path,
+        source_rel_path,
+        source_kind=MBOX_SOURCE_KIND,
+        scan_hash_salt="mbox-ingest-v1",
+        dataset_name=mbox_dataset_name(source_rel_path),
+        iter_messages=iter_mbox_messages,
+        normalize_message=normalize_mbox_message,
+        file_type_override=MBOX_SOURCE_KIND,
+    )
+    return {
+        "action": result["action"],
+        "mbox_sources_skipped": result["container_sources_skipped"],
+        "mbox_messages_created": result["container_messages_created"],
+        "mbox_messages_updated": result["container_messages_updated"],
+        "mbox_messages_deleted": result["container_messages_deleted"],
     }
 
 

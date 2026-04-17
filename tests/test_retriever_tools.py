@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import io
+import mailbox
 import re
 import sqlite3
 import tempfile
@@ -22,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "retriever_tools.py"
 BUNDLER_PATH = REPO_ROOT / "skills" / "tool-template" / "bundle_retriever_tools.py"
 TOOL_TEMPLATE_PATH = REPO_ROOT / "skills" / "tool-template" / "tool-template.md"
+REGRESSION_CORPUS_ROOT = REPO_ROOT / "phase0" / "regression_corpus"
 
 retriever_tools = None
 TOOL_BYTES = b""
@@ -331,6 +333,46 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         path = self.root / name
         path.write_bytes(content)
         return path
+
+    def write_fake_mbox_file(self, messages: list[EmailMessage], name: str = "mailbox.mbox") -> Path:
+        path = self.root / name
+        if path.exists():
+            path.unlink()
+        archive = mailbox.mbox(str(path), create=True)
+        try:
+            for message in messages:
+                archive.add(message)
+            archive.flush()
+        finally:
+            archive.close()
+        return path
+
+    def build_fake_mbox_message(
+        self,
+        *,
+        subject: str | None,
+        body_text: str,
+        message_id: str | None,
+        author: str | None = "Alice Example <alice@example.com>",
+        recipients: str | None = "Bob Example <bob@example.com>",
+        date_created: str = "Tue, 14 Apr 2026 10:00:00 +0000",
+        attachment_name: str | None = None,
+        attachment_text: str | None = None,
+    ) -> EmailMessage:
+        message = EmailMessage(policy=policy.default)
+        if author is not None:
+            message["From"] = author
+        if recipients is not None:
+            message["To"] = recipients
+        if subject is not None:
+            message["Subject"] = subject
+        message["Date"] = date_created
+        if message_id is not None:
+            message["Message-ID"] = message_id
+        message.set_content(body_text)
+        if attachment_name is not None and attachment_text is not None:
+            message.add_attachment(attachment_text, subtype="plain", filename=attachment_name)
+        return message
 
     def build_fake_pst_message(
         self,
@@ -1681,6 +1723,312 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
         self.assertEqual(browse_result["total_hits"], 0)
+
+    def test_ingest_mbox_creates_message_rows_with_source_context_and_attachment_children(self) -> None:
+        mbox_path = self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="MBOX Parent",
+                    body_text="Parent message body",
+                    message_id="<mbox-msg-001@example.com>",
+                    attachment_name="notes.txt",
+                    attachment_text="mbox attachment body",
+                ),
+                self.build_fake_mbox_message(
+                    subject="MBOX Sibling",
+                    body_text="Sibling body text",
+                    message_id="<mbox-msg-002@example.com>",
+                    date_created="Tue, 14 Apr 2026 10:05:00 +0000",
+                ),
+            ]
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["mbox_messages_created"], 2)
+        self.assertEqual(ingest_result["workspace_parent_documents"], 2)
+        self.assertEqual(ingest_result["workspace_attachment_children"], 1)
+        self.assertEqual(ingest_result["workspace_documents_total"], 3)
+
+        parent_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-msg-001@example.com>")
+        sibling_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-msg-002@example.com>")
+        parent_row = self.fetch_document_row(parent_rel_path)
+        sibling_row = self.fetch_document_row(sibling_rel_path)
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        dataset_row = self.fetch_dataset_row(int(parent_row["dataset_id"]))
+
+        self.assertEqual(parent_row["source_kind"], retriever_tools.MBOX_SOURCE_KIND)
+        self.assertEqual(parent_row["source_rel_path"], "mailbox.mbox")
+        self.assertEqual(parent_row["source_item_id"], "<mbox-msg-001@example.com>")
+        self.assertIsNone(parent_row["source_folder_path"])
+        self.assertEqual(parent_row["file_type"], "mbox")
+        self.assertIsNone(parent_row["file_size"])
+        self.assertEqual(parent_row["content_type"], "Email")
+        self.assertEqual(parent_row["custodian"], "mailbox")
+        self.assertEqual(sibling_row["custodian"], "mailbox")
+        self.assertEqual(child_row["custodian"], "mailbox")
+        self.assertEqual(parent_row["dataset_id"], sibling_row["dataset_id"])
+        self.assertEqual(parent_row["dataset_id"], child_row["dataset_id"])
+        self.assertTrue(str(child_row["rel_path"]).startswith(".retriever/previews/mailbox.mbox/attachments/"))
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            container_row = connection.execute(
+                "SELECT * FROM container_sources WHERE source_kind = ? AND source_rel_path = ?",
+                (retriever_tools.MBOX_SOURCE_KIND, "mailbox.mbox"),
+            ).fetchone()
+            dataset_rows = connection.execute(
+                """
+                SELECT *
+                FROM datasets
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(container_row)
+        self.assertEqual(container_row["dataset_id"], parent_row["dataset_id"])
+        self.assertEqual(container_row["message_count"], 2)
+        self.assertEqual(container_row["file_size"], mbox_path.stat().st_size)
+        self.assertIsNotNone(container_row["last_scan_completed_at"])
+        self.assertEqual(dataset_row["source_kind"], retriever_tools.MBOX_SOURCE_KIND)
+        self.assertEqual(dataset_row["dataset_locator"], "mailbox.mbox")
+        self.assertEqual(dataset_row["dataset_name"], "mailbox.mbox")
+        self.assertEqual(len(dataset_rows), 1)
+        self.assertTrue(all(row["source_kind"] == retriever_tools.MBOX_SOURCE_KIND for row in dataset_rows))
+
+        parent_search = retriever_tools.search(self.root, "MBOX Parent", None, None, None, 1, 20)
+        parent_result = next(item for item in parent_search["results"] if item["id"] == parent_row["id"])
+        self.assertEqual(parent_result["attachment_count"], 1)
+        self.assertEqual(parent_result["source_rel_path"], "mailbox.mbox")
+        self.assertEqual(parent_result["dataset_name"], "mailbox.mbox")
+        self.assertTrue(parent_result["preview_rel_path"].startswith(".retriever/previews/mailbox.mbox/messages/"))
+        parent_preview_html = Path(parent_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
+
+        mbox_only = retriever_tools.search(
+            self.root,
+            "",
+            [["source_kind", "eq", retriever_tools.MBOX_SOURCE_KIND]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(mbox_only["total_hits"], 2)
+        dataset_filtered = retriever_tools.search(
+            self.root,
+            "",
+            [["dataset_name", "eq", "mailbox.mbox"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(dataset_filtered["total_hits"], 3)
+        self.assertTrue(all(item["dataset_name"] == "mailbox.mbox" for item in dataset_filtered["results"]))
+        attachment_search = retriever_tools.search(self.root, "mbox attachment body", None, None, None, 1, 20)
+        attachment_result = next(item for item in attachment_search["results"] if item["id"] == child_row["id"])
+        self.assertEqual(attachment_result["parent"]["control_number"], parent_row["control_number"])
+
+    def test_ingest_mbox_fixture_file_is_searchable(self) -> None:
+        fixture_source = REGRESSION_CORPUS_ROOT / "sample_utf8.mbox"
+        fixture_target = self.root / fixture_source.name
+        fixture_target.write_bytes(fixture_source.read_bytes())
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["mbox_messages_created"], 2)
+
+        fixture_search = retriever_tools.search(self.root, "retriever regression fixture", None, None, None, 1, 20)
+        self.assertEqual(fixture_search["total_hits"], 1)
+        result = fixture_search["results"][0]
+        self.assertEqual(result["source_kind"], retriever_tools.MBOX_SOURCE_KIND)
+        self.assertEqual(result["dataset_name"], "sample_utf8.mbox")
+
+    def test_ingest_mbox_without_message_id_uses_stable_fallback_source_item_id(self) -> None:
+        first_messages = [
+            self.build_fake_mbox_message(
+                subject="Missing ID Parent",
+                body_text="Fallback source id body",
+                message_id=None,
+            )
+        ]
+        self.write_fake_mbox_file(first_messages)
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["new"], 1)
+        self.assertEqual(first_ingest["mbox_messages_created"], 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            first_row = connection.execute(
+                """
+                SELECT *
+                FROM documents
+                WHERE parent_document_id IS NULL
+                  AND source_kind = ?
+                  AND source_rel_path = ?
+                ORDER BY id ASC
+                """,
+                (retriever_tools.MBOX_SOURCE_KIND, "mailbox.mbox"),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(first_row)
+        fallback_source_item_id = str(first_row["source_item_id"])
+        self.assertTrue(fallback_source_item_id.startswith("mbox-hash:"))
+        original_control_number = str(first_row["control_number"])
+
+        second_messages = [
+            self.build_fake_mbox_message(
+                subject="Missing ID Parent",
+                body_text="Fallback source id body",
+                message_id=None,
+            ),
+            self.build_fake_mbox_message(
+                subject="Sibling",
+                body_text="Sibling body text",
+                message_id="<mbox-msg-002@example.com>",
+                date_created="Tue, 14 Apr 2026 10:05:00 +0000",
+            ),
+        ]
+        self.write_fake_mbox_file(second_messages)
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["updated"], 1)
+        self.assertEqual(second_ingest["mbox_messages_created"], 1)
+        self.assertEqual(second_ingest["mbox_messages_updated"], 1)
+
+        updated_row = self.fetch_document_row(
+            retriever_tools.mbox_message_rel_path("mailbox.mbox", fallback_source_item_id)
+        )
+        self.assertEqual(updated_row["control_number"], original_control_number)
+
+    def test_unchanged_mbox_source_skips_without_reparsing(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="MBOX Parent",
+                    body_text="Parent message body",
+                    message_id="<mbox-msg-001@example.com>",
+                )
+            ]
+        )
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["new"], 1)
+        with mock.patch.object(
+            retriever_tools,
+            "iter_mbox_messages",
+            side_effect=AssertionError("MBOX iterator should not run on unchanged source"),
+        ):
+            second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["skipped"], 1)
+        self.assertEqual(second_ingest["mbox_sources_skipped"], 1)
+        self.assertEqual(second_ingest["failed"], 0)
+        browse_results = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(browse_results["total_hits"], 1)
+
+    def test_changed_mbox_reingest_preserves_control_numbers_and_retires_removed_messages(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Original MBOX Parent",
+                    body_text="Parent v1",
+                    message_id="<mbox-msg-001@example.com>",
+                    attachment_name="notes.txt",
+                    attachment_text="stable attachment body",
+                ),
+                self.build_fake_mbox_message(
+                    subject="Removed later",
+                    body_text="Remove me",
+                    message_id="<mbox-msg-002@example.com>",
+                    date_created="Tue, 14 Apr 2026 10:05:00 +0000",
+                ),
+            ]
+        )
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["mbox_messages_created"], 2)
+        parent_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-msg-001@example.com>")
+        removed_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-msg-002@example.com>")
+        parent_row = self.fetch_document_row(parent_rel_path)
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        retriever_tools.set_field(self.root, parent_row["id"], "title", "Manual MBOX Title")
+
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Updated MBOX Parent",
+                    body_text="Parent v2",
+                    message_id="<mbox-msg-001@example.com>",
+                    attachment_name="notes.txt",
+                    attachment_text="stable attachment body",
+                )
+            ]
+        )
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["updated"], 1)
+        self.assertEqual(second_ingest["mbox_messages_updated"], 1)
+        self.assertEqual(second_ingest["mbox_messages_deleted"], 1)
+
+        updated_parent = self.fetch_document_row(parent_rel_path)
+        updated_child = self.fetch_child_rows(updated_parent["id"])[0]
+        retired_row = self.fetch_document_row(removed_rel_path)
+        self.assertEqual(updated_parent["control_number"], parent_row["control_number"])
+        self.assertEqual(updated_parent["title"], "Manual MBOX Title")
+        self.assertEqual(updated_child["id"], child_row["id"])
+        self.assertEqual(updated_child["control_number"], child_row["control_number"])
+        self.assertEqual(retired_row["lifecycle_status"], "deleted")
+
+    def test_missing_mbox_source_marks_messages_and_children_missing(self) -> None:
+        mbox_path = self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="MBOX Parent",
+                    body_text="Parent body",
+                    message_id="<mbox-msg-001@example.com>",
+                    attachment_name="notes.txt",
+                    attachment_text="attachment body",
+                )
+            ]
+        )
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["mbox_messages_created"], 1)
+        parent_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-msg-001@example.com>")
+        parent_row = self.fetch_document_row(parent_rel_path)
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+
+        mbox_path.unlink()
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["missing"], 1)
+        self.assertEqual(second_ingest["mbox_sources_missing"], 1)
+        self.assertEqual(second_ingest["mbox_documents_missing"], 2)
+        missing_parent = self.fetch_document_row(parent_rel_path)
+        missing_child = self.fetch_document_by_id(child_row["id"])
+        self.assertEqual(missing_parent["lifecycle_status"], "missing")
+        self.assertEqual(missing_child["lifecycle_status"], "missing")
 
     def test_ingest_pst_creates_message_rows_with_source_context_and_attachment_children(self) -> None:
         pst_path = self.write_fake_pst_file()
