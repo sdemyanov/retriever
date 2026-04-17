@@ -1237,6 +1237,27 @@ def resolve_workspace_artifact_path(root: Path, rel_path: str | None) -> Path | 
     return (root / normalized).resolve()
 
 
+def freeze_ocr_source_artifact(
+    paths: dict[str, Path],
+    root: Path,
+    *,
+    source_rel_path: str,
+    run_id: int,
+    document_id: int,
+    page_number: int,
+) -> str:
+    source_path = resolve_workspace_artifact_path(root, source_rel_path)
+    if source_path is None or not source_path.exists():
+        raise RetrieverError(f"OCR source artifact is missing: {source_rel_path!r}")
+    output_dir = paths["jobs_dir"] / "ocr" / f"run-{run_id}" / f"doc-{document_id}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_name = f"page-{page_number:04d}-{source_path.name}"
+    output_path = output_dir / output_name
+    if not output_path.exists():
+        output_path.write_bytes(source_path.read_bytes())
+    return workspace_relative_artifact_path(paths, output_path)
+
+
 def render_pdf_pages_for_ocr(
     paths: dict[str, Path],
     *,
@@ -1275,24 +1296,77 @@ def ocr_page_item_specs_for_document(
 ) -> list[dict[str, object]]:
     input_basis = str(job_version_row["input_basis"])
     if input_basis == "source_parts":
-        image_part_rows = connection.execute(
+        source_part_rows = connection.execute(
             """
-            SELECT rel_source_path, ordinal
+            SELECT part_kind, rel_source_path, ordinal
             FROM document_source_parts
             WHERE document_id = ?
-              AND part_kind = 'image'
-            ORDER BY ordinal ASC, id ASC
+              AND part_kind IN ('image', 'native')
+            ORDER BY CASE part_kind WHEN 'image' THEN 0 WHEN 'native' THEN 1 ELSE 2 END ASC, ordinal ASC, id ASC
             """,
             (document_row["id"],),
         ).fetchall()
+        image_part_rows = [row for row in source_part_rows if str(row["part_kind"]) == "image"]
         if image_part_rows:
             return [
                 {
                     "page_number": int(row["ordinal"] or index),
-                    "input_artifact_rel_path": str(row["rel_source_path"]),
+                    "input_artifact_rel_path": freeze_ocr_source_artifact(
+                        paths,
+                        root,
+                        source_rel_path=str(row["rel_source_path"]),
+                        run_id=run_id,
+                        document_id=int(document_row["id"]),
+                        page_number=int(row["ordinal"] or index),
+                    ),
                 }
                 for index, row in enumerate(image_part_rows, start=1)
             ]
+        native_part_row = next((row for row in source_part_rows if str(row["part_kind"]) == "native"), None)
+        if native_part_row is not None:
+            native_source_rel_path = str(native_part_row["rel_source_path"])
+            native_source_path = resolve_workspace_artifact_path(root, native_source_rel_path)
+            if native_source_path is None or not native_source_path.exists():
+                raise RetrieverError(
+                    f"Document {document_row['id']} has no accessible native source part for OCR: {native_source_rel_path!r}."
+                )
+            native_file_type = normalize_extension(native_source_path)
+            if native_file_type == "pdf":
+                parameters = decode_json_text(job_version_row["parameters_json"], default={}) or {}
+                rendering_settings = parameters.get("rendering_settings") if isinstance(parameters, dict) else None
+                resolution = DEFAULT_OCR_RENDER_RESOLUTION
+                if isinstance(rendering_settings, dict) and rendering_settings.get("resolution") is not None:
+                    try:
+                        resolution = max(72, int(rendering_settings["resolution"]))
+                    except (TypeError, ValueError):
+                        resolution = DEFAULT_OCR_RENDER_RESOLUTION
+                return render_pdf_pages_for_ocr(
+                    paths,
+                    source_path=native_source_path,
+                    run_id=run_id,
+                    document_id=int(document_row["id"]),
+                    resolution=resolution,
+                )
+            if native_file_type in IMAGE_NATIVE_PREVIEW_FILE_TYPES:
+                return [
+                    {
+                        "page_number": 1,
+                        "input_artifact_rel_path": freeze_ocr_source_artifact(
+                            paths,
+                            root,
+                            source_rel_path=native_source_rel_path,
+                            run_id=run_id,
+                            document_id=int(document_row["id"]),
+                            page_number=1,
+                        ),
+                    }
+                ]
+            raise RetrieverError(
+                f"Document {document_row['id']} native source part is not OCR-capable: {native_file_type!r}."
+            )
+        raise RetrieverError(
+            f"Document {document_row['id']} has source parts but no image/native OCR source parts."
+        )
     source_path = resolve_workspace_artifact_path(root, str(document_row["rel_path"]))
     if source_path is None or not source_path.exists():
         raise RetrieverError(f"Document {document_row['id']} has no accessible source path for OCR.")
@@ -1317,12 +1391,46 @@ def ocr_page_item_specs_for_document(
         return [
             {
                 "page_number": 1,
-                "input_artifact_rel_path": str(document_row["rel_path"]),
+                "input_artifact_rel_path": freeze_ocr_source_artifact(
+                    paths,
+                    root,
+                    source_rel_path=str(document_row["rel_path"]),
+                    run_id=run_id,
+                    document_id=int(document_row["id"]),
+                    page_number=1,
+                ),
             }
         ]
     raise RetrieverError(
         f"OCR page materialization does not know how to prepare document {document_row['id']} with file type {file_type!r}."
     )
+
+
+def prior_run_ocr_page_item_specs(
+    connection: sqlite3.Connection,
+    *,
+    from_run_id: int,
+    document_id: int,
+) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT page_number, input_artifact_rel_path
+        FROM run_items
+        WHERE run_id = ?
+          AND document_id = ?
+          AND item_kind = 'page'
+          AND input_artifact_rel_path IS NOT NULL
+        ORDER BY page_number ASC, id ASC
+        """,
+        (from_run_id, document_id),
+    ).fetchall()
+    return [
+        {
+            "page_number": int(row["page_number"] or 0),
+            "input_artifact_rel_path": str(row["input_artifact_rel_path"]),
+        }
+        for row in rows
+    ]
 
 
 def materialize_run_items_for_run(
@@ -1331,6 +1439,18 @@ def materialize_run_items_for_run(
     root: Path,
     run_id: int,
 ) -> list[sqlite3.Row]:
+    existing_rows = connection.execute(
+        """
+        SELECT *
+        FROM run_items
+        WHERE run_id = ?
+        ORDER BY id ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    if existing_rows:
+        return existing_rows
+
     run_row = require_run_row_by_id(connection, run_id)
     job_version_row = require_job_version_row_by_id(connection, int(run_row["job_version_id"]))
     job_row = connection.execute(
@@ -1365,14 +1485,25 @@ def materialize_run_items_for_run(
         if document_row is None:
             continue
         if job_kind == "ocr":
-            page_specs = ocr_page_item_specs_for_document(
-                connection,
-                paths,
-                root,
-                run_id=run_id,
-                document_row=document_row,
-                job_version_row=job_version_row,
+            from_run_id = int(run_row["from_run_id"]) if run_row["from_run_id"] is not None else None
+            page_specs = (
+                prior_run_ocr_page_item_specs(
+                    connection,
+                    from_run_id=from_run_id,
+                    document_id=int(snapshot_row["document_id"]),
+                )
+                if from_run_id is not None
+                else []
             )
+            if not page_specs:
+                page_specs = ocr_page_item_specs_for_document(
+                    connection,
+                    paths,
+                    root,
+                    run_id=run_id,
+                    document_row=document_row,
+                    job_version_row=job_version_row,
+                )
             for page_spec in page_specs:
                 materialized_rows.append(
                     ensure_run_item_row(
