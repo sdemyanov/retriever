@@ -3216,5 +3216,87 @@ class CidInliningTests(unittest.TestCase):
         self.assertNotIn('src="cid:icon"', preview_content)
 
 
+class FilesystemIngestRevisionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory(prefix="retriever-fs-rev-")
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.paths = retriever_tools.workspace_paths(self.root)
+
+    def _sample_eml(self) -> Path:
+        path = self.root / "sample.eml"
+        message = EmailMessage()
+        message["From"] = "Sender <sender@example.com>"
+        message["To"] = "Receiver <receiver@example.com>"
+        message["Subject"] = "Salt fingerprint test"
+        message["Date"] = "Tue, 14 Apr 2026 10:00:00 +0000"
+        message.set_content("Body.")
+        path.write_bytes(message.as_bytes(policy=policy.default))
+        return path
+
+    def test_fingerprint_is_salted_and_differs_from_raw_sha(self) -> None:
+        path = self._sample_eml()
+        raw = retriever_tools.sha256_file(path)
+        salted = retriever_tools.filesystem_ingest_fingerprint(path)
+        self.assertIsNotNone(salted)
+        self.assertNotEqual(salted, raw)
+        expected = retriever_tools.sha256_text(
+            f"{retriever_tools.FILESYSTEM_INGEST_REVISION}:{raw}"
+        )
+        self.assertEqual(salted, expected)
+
+    def test_ingest_stores_salted_fingerprint_in_file_hash(self) -> None:
+        path = self._sample_eml()
+        retriever_tools.bootstrap(self.root)
+        retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        connection = sqlite3.connect(str(self.paths["db_path"]))
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                "SELECT file_hash FROM documents WHERE rel_path = ?", ("sample.eml",)
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(row["file_hash"], retriever_tools.filesystem_ingest_fingerprint(path))
+
+    def test_revision_bump_forces_reingest_of_unchanged_files(self) -> None:
+        path = self._sample_eml()
+        retriever_tools.bootstrap(self.root)
+        retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        connection = sqlite3.connect(str(self.paths["db_path"]))
+        connection.row_factory = sqlite3.Row
+        try:
+            original_hash = connection.execute(
+                "SELECT file_hash FROM documents WHERE rel_path = ?", ("sample.eml",)
+            ).fetchone()["file_hash"]
+            connection.execute(
+                "UPDATE documents SET file_hash = ? WHERE rel_path = ?",
+                ("sha256-from-an-older-revision-" + "0" * 40, "sample.eml"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["skipped"], 0)
+
+        connection = sqlite3.connect(str(self.paths["db_path"]))
+        connection.row_factory = sqlite3.Row
+        try:
+            refreshed_hash = connection.execute(
+                "SELECT file_hash FROM documents WHERE rel_path = ?", ("sample.eml",)
+            ).fetchone()["file_hash"]
+        finally:
+            connection.close()
+        self.assertEqual(refreshed_hash, original_hash)
+
+        third_run = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(third_run["updated"], 0)
+        self.assertEqual(third_run["skipped"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

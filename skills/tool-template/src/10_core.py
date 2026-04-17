@@ -263,6 +263,18 @@ def sha256_json_value(value: object) -> str:
     return sha256_text(json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
 
 
+# Bump this when a preview-format or extractor change requires one corrective reparse
+# for already-ingested filesystem documents whose source files haven't changed.
+FILESYSTEM_INGEST_REVISION = "fs-ingest-v1"
+
+
+def filesystem_ingest_fingerprint(path: Path) -> str | None:
+    raw_hash = sha256_file(path)
+    if raw_hash is None:
+        return None
+    return sha256_text(f"{FILESYSTEM_INGEST_REVISION}:{raw_hash}")
+
+
 def run_command(command: list[str]) -> tuple[bool, str]:
     try:
         completed = subprocess.run(command, check=True, capture_output=True, text=True)
