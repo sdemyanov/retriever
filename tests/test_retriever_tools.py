@@ -13,6 +13,7 @@ import base64
 from contextlib import redirect_stderr, redirect_stdout
 from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 from pathlib import Path
 from unittest import mock
 
@@ -1743,6 +1744,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 "SELECT * FROM datasets WHERE id = ?",
                 (parent_row["dataset_id"],),
             ).fetchone()
+            dataset_rows = connection.execute(
+                """
+                SELECT *
+                FROM datasets
+                ORDER BY id ASC
+                """
+            ).fetchall()
         finally:
             connection.close()
 
@@ -1755,6 +1763,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(dataset_row["source_kind"], retriever_tools.PST_SOURCE_KIND)
         self.assertEqual(dataset_row["dataset_locator"], "mailbox.pst")
         self.assertEqual(dataset_row["dataset_name"], "mailbox.pst")
+        self.assertEqual(len(dataset_rows), 1)
+        self.assertTrue(all(row["source_kind"] == retriever_tools.PST_SOURCE_KIND for row in dataset_rows))
 
         parent_search = retriever_tools.search(self.root, "PST Parent", None, None, None, 1, 20)
         parent_result = next(item for item in parent_search["results"] if item["id"] == parent_row["id"])
@@ -1803,6 +1813,62 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachment_search = retriever_tools.search(self.root, "pst attachment body", None, None, None, 1, 20)
         attachment_result = next(item for item in attachment_search["results"] if item["id"] == child_row["id"])
         self.assertEqual(attachment_result["parent"]["control_number"], parent_row["control_number"])
+
+    def test_pst_only_ingest_prunes_stale_empty_filesystem_dataset(self) -> None:
+        self.write_fake_pst_file()
+        retriever_tools.bootstrap(self.root)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            stale_dataset_id, stale_dataset_source_id = retriever_tools.ensure_source_backed_dataset(
+                connection,
+                source_kind=retriever_tools.FILESYSTEM_SOURCE_KIND,
+                source_locator=retriever_tools.filesystem_dataset_locator(),
+                dataset_name=retriever_tools.filesystem_dataset_name(self.root),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-msg-001",
+                subject="PST Parent",
+                body_text="Parent message body",
+                folder_path="Inbox",
+            )
+        ]
+
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pruned_unused_filesystem_dataset"], 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            dataset_rows = connection.execute(
+                """
+                SELECT *
+                FROM datasets
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            stale_dataset_row = connection.execute(
+                "SELECT * FROM datasets WHERE id = ?",
+                (stale_dataset_id,),
+            ).fetchone()
+            stale_dataset_source_row = connection.execute(
+                "SELECT * FROM dataset_sources WHERE id = ?",
+                (stale_dataset_source_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIsNone(stale_dataset_row)
+        self.assertIsNone(stale_dataset_source_row)
+        self.assertEqual(len(dataset_rows), 1)
+        self.assertEqual(dataset_rows[0]["source_kind"], retriever_tools.PST_SOURCE_KIND)
 
     def test_ingest_pst_chat_like_message_uses_chat_document_metadata(self) -> None:
         self.write_fake_pst_file()
@@ -2315,6 +2381,338 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         retired_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
         self.assertEqual(retired_row["lifecycle_status"], "deleted")
 
+    def test_search_docs_cli_alias_matches_search(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("termination notice appears here\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        search_exit, search_payload, _, _ = self.run_cli("search", str(self.root), "termination")
+        search_docs_exit, search_docs_payload, _, _ = self.run_cli("search-docs", str(self.root), "termination")
+
+        self.assertEqual(search_exit, 0)
+        self.assertEqual(search_docs_exit, 0)
+        self.assertIsNotNone(search_payload)
+        self.assertIsNotNone(search_docs_payload)
+        self.assertEqual(search_docs_payload["query"], search_payload["query"])
+        self.assertEqual(search_docs_payload["sort"], search_payload["sort"])
+        self.assertEqual(search_docs_payload["total_hits"], search_payload["total_hits"])
+        self.assertEqual(
+            [item["id"] for item in search_docs_payload["results"]],
+            [item["id"] for item in search_payload["results"]],
+        )
+
+    def test_catalog_lists_dataset_name_and_date_granularities(self) -> None:
+        retriever_tools.bootstrap(self.root)
+        retriever_tools.add_field(self.root, "effective_date", "date", "Contract effective date")
+
+        exit_code, payload, _, _ = self.run_cli("catalog", str(self.root))
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        intrinsic = {item["name"]: item for item in payload["intrinsic"]}
+        custom = {item["name"]: item for item in payload["custom"]}
+        virtual = {item["name"]: item for item in payload["virtual"]}
+
+        self.assertIn("date_created", intrinsic)
+        self.assertEqual(intrinsic["date_created"]["date_granularities"], ["year", "quarter", "month", "week"])
+        self.assertEqual(custom["effective_date"]["type"], "date")
+        self.assertEqual(custom["effective_date"]["date_granularities"], ["year", "quarter", "month", "week"])
+        self.assertTrue(virtual["dataset_name"]["aggregatable"])
+        self.assertEqual(virtual["dataset_name"]["description"], retriever_tools.VIRTUAL_FIELD_DESCRIPTIONS["dataset_name"])
+
+    def test_get_doc_and_list_chunks_return_summary_and_exact_chunk_text(self) -> None:
+        paragraph = "Termination notice requires careful review and supporting detail. "
+        body = "\n".join(f"Section {index}: {paragraph * 70}" for index in range(1, 8)) + "\n"
+        document_path = self.root / "long.txt"
+        document_path.write_text(body, encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("long.txt")
+        expected_chunks = retriever_tools.chunk_text(body)
+        self.assertGreater(len(expected_chunks), 2)
+
+        exit_code, get_payload, _, _ = self.run_cli(
+            "get-doc",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--include-text",
+            "summary",
+            "--chunk",
+            "0",
+            "--chunk",
+            "1",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(get_payload)
+        self.assertEqual(get_payload["chunk_count"], len(expected_chunks))
+        self.assertEqual(
+            get_payload["text_summary"],
+            retriever_tools.normalize_whitespace(body)[: retriever_tools.GET_DOC_SUMMARY_CHARS],
+        )
+        self.assertEqual(get_payload["chunks"][0]["chunk_index"], 0)
+        self.assertEqual(get_payload["chunks"][0]["text"], expected_chunks[0]["text_content"])
+        self.assertEqual(get_payload["chunks"][1]["chunk_index"], 1)
+        self.assertEqual(get_payload["chunks"][1]["text"], expected_chunks[1]["text_content"])
+
+        exit_code, list_payload, _, _ = self.run_cli(
+            "list-chunks",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--page",
+            "1",
+            "--per-page",
+            "1",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        self.assertEqual(list_payload["total_chunks"], len(expected_chunks))
+        self.assertEqual(list_payload["total_pages"], len(expected_chunks))
+        self.assertEqual(list_payload["chunks"][0]["chunk_index"], 0)
+        self.assertEqual(
+            list_payload["chunks"][0]["snippet"],
+            retriever_tools.chunk_preview_text(expected_chunks[0]["text_content"]),
+        )
+
+    def test_search_chunks_supports_citations_and_distinct_doc_count_mode(self) -> None:
+        (self.root / "nda-one.txt").write_text("Termination notice must be delivered within thirty days.\n", encoding="utf-8")
+        (self.root / "nda-two.txt").write_text("The agreement has a termination notice period of sixty days.\n", encoding="utf-8")
+        (self.root / "other.txt").write_text("Unrelated payment processing clause.\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 3)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "search-chunks",
+            str(self.root),
+            "termination",
+            "--top-k",
+            "5",
+            "--per-doc-cap",
+            "1",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(len(payload["results"]), 2)
+        for item in payload["results"]:
+            self.assertIn("citation", item)
+            self.assertEqual(item["citation"]["document_id"], item["document_id"])
+            self.assertEqual(item["citation"]["chunk_index"], item["chunk_index"])
+            self.assertTrue(item["citation"]["snippet"])
+
+        exit_code, count_payload, _, _ = self.run_cli(
+            "search-chunks",
+            str(self.root),
+            "termination",
+            "--count-only",
+            "--distinct-docs",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(count_payload)
+        self.assertEqual(count_payload["documents_with_hits"], 2)
+        self.assertEqual(count_payload["total_docs_filtered"], 3)
+        self.assertEqual(count_payload["count_mode"], "distinct-documents")
+
+    def test_set_field_validates_custom_date_fields(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("hello\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+
+        exit_code, payload, _, _ = self.run_cli("add-field", str(self.root), "effective_date", "date")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "set-field",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--field",
+            "effective_date",
+            "--value",
+            "2026-04-16",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+
+        updated_row = self.fetch_document_row("sample.txt")
+        self.assertEqual(updated_row["effective_date"], "2026-04-16")
+
+        exit_code, error_payload, _, _ = self.run_cli(
+            "set-field",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--field",
+            "effective_date",
+            "--value",
+            "next Tuesday",
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertIsNotNone(error_payload)
+        self.assertIn("Expected ISO date value", error_payload["error"])
+
+    def test_promote_field_type_supports_week_aggregate_without_reingest(self) -> None:
+        (self.root / "contract-a.txt").write_text("Contract A\n", encoding="utf-8")
+        (self.root / "contract-b.txt").write_text("Contract B\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_row = self.fetch_document_row("contract-a.txt")
+        second_row = self.fetch_document_row("contract-b.txt")
+
+        self.assertEqual(self.run_cli("add-field", str(self.root), "effective_date", "text")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "set-field",
+                str(self.root),
+                "--doc-id",
+                str(first_row["id"]),
+                "--field",
+                "effective_date",
+                "--value",
+                "2026-04-01",
+            )[0],
+            0,
+        )
+        self.assertEqual(
+            self.run_cli(
+                "set-field",
+                str(self.root),
+                "--doc-id",
+                str(second_row["id"]),
+                "--field",
+                "effective_date",
+                "--value",
+                "2026-04-15",
+            )[0],
+            0,
+        )
+
+        exit_code, promote_payload, _, _ = self.run_cli(
+            "promote-field-type",
+            str(self.root),
+            "effective_date",
+            "date",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(promote_payload)
+        self.assertEqual(promote_payload["status"], "ok")
+        self.assertTrue(promote_payload["promotion_applied"])
+        self.assertEqual(promote_payload["documents_with_values"], 2)
+
+        aggregate_payload = retriever_tools.aggregate(
+            self.root,
+            None,
+            ["week:effective_date"],
+            "count",
+            None,
+            None,
+            20,
+            False,
+        )
+        self.assertEqual(aggregate_payload["graph"]["type"], "line")
+        self.assertEqual(len(aggregate_payload["buckets"]), 2)
+        self.assertTrue(all(str(bucket["week"]).startswith("2026-W") for bucket in aggregate_payload["buckets"]))
+
+    def test_promote_field_type_blocks_invalid_existing_values(self) -> None:
+        document_path = self.root / "contract.txt"
+        document_path.write_text("Contract text\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("contract.txt")
+        self.assertEqual(self.run_cli("add-field", str(self.root), "effective_date", "text")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "set-field",
+                str(self.root),
+                "--doc-id",
+                str(row["id"]),
+                "--field",
+                "effective_date",
+                "--value",
+                "tomorrow",
+            )[0],
+            0,
+        )
+
+        exit_code, payload, _, _ = self.run_cli(
+            "promote-field-type",
+            str(self.root),
+            "effective_date",
+            "date",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertFalse(payload["promotion_applied"])
+        self.assertEqual(payload["invalid_value_samples"][0]["value"], "tomorrow")
+
+    def test_aggregate_groups_by_dataset_name_and_explain_flag(self) -> None:
+        (self.root / "doc-one.txt").write_text("alpha\n", encoding="utf-8")
+        (self.root / "doc-two.txt").write_text("beta\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_row = self.fetch_document_row("doc-one.txt")
+        create_exit, create_payload, _, _ = self.run_cli("create-dataset", str(self.root), "Review Set")
+        self.assertEqual(create_exit, 0)
+        self.assertIsNotNone(create_payload)
+        dataset_id = int(create_payload["dataset"]["id"])
+
+        add_exit, _, _, _ = self.run_cli(
+            "add-to-dataset",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+            "--doc-id",
+            str(first_row["id"]),
+        )
+        self.assertEqual(add_exit, 0)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "aggregate",
+            str(self.root),
+            "--group-by",
+            "dataset_name",
+            "--explain",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        bucket_map = {item["dataset_name"]: item["count"] for item in payload["buckets"]}
+        self.assertEqual(bucket_map[self.root.name], 2)
+        self.assertEqual(bucket_map["Review Set"], 1)
+        self.assertIn("sql", payload)
+        self.assertIn("COUNT(DISTINCT d.id)", payload["sql"])
+        self.assertIn("JOIN datasets ds", payload["sql"])
+
     def test_set_field_rejects_system_managed_fields(self) -> None:
         document_path = self.root / "sample.txt"
         document_path.write_text("hello\n", encoding="utf-8")
@@ -2339,6 +2737,135 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 with self.assertRaises(retriever_tools.RetrieverError) as context:
                     retriever_tools.set_field(self.root, row["id"], field_name, "override")
                 self.assertIn("system-managed", str(context.exception))
+
+
+class CidInliningTests(unittest.TestCase):
+    PNG_PIXEL = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9mQAAAAASUVORK5CYII="
+    )
+
+    def test_sniff_image_mime_type_detects_common_formats(self) -> None:
+        self.assertEqual(retriever_tools.sniff_image_mime_type(self.PNG_PIXEL), "image/png")
+        self.assertEqual(retriever_tools.sniff_image_mime_type(b"\xff\xd8\xff\xe0..."), "image/jpeg")
+        self.assertEqual(retriever_tools.sniff_image_mime_type(b"GIF89a...."), "image/gif")
+        self.assertIsNone(retriever_tools.sniff_image_mime_type(b"not-an-image"))
+
+    def test_normalize_content_id_strips_brackets_and_whitespace(self) -> None:
+        self.assertEqual(retriever_tools.normalize_content_id("  <foo@bar>  "), "foo@bar")
+        self.assertEqual(retriever_tools.normalize_content_id("plain"), "plain")
+        self.assertIsNone(retriever_tools.normalize_content_id(""))
+        self.assertIsNone(retriever_tools.normalize_content_id(None))
+        self.assertEqual(retriever_tools.normalize_content_id(b"<inline>"), "inline")
+
+    def test_inline_cid_references_swaps_src_with_data_uri(self) -> None:
+        html_body = (
+            '<p>hi</p>'
+            '<img src="cid:logo_icon">'
+            "<img src='cid:LOGO_ICON'>"
+            '<td background="cid:logo_icon">x</td>'
+        )
+        attachments = [
+            {
+                "file_name": "logo.png",
+                "payload": self.PNG_PIXEL,
+                "content_id": "<logo_icon>",
+            },
+        ]
+        result = retriever_tools.inline_cid_references_in_html(html_body, attachments)
+        self.assertIsNotNone(result)
+        self.assertNotIn("cid:logo_icon", result)
+        self.assertNotIn("cid:LOGO_ICON", result)
+        self.assertEqual(result.count("data:image/png;base64,"), 3)
+
+    def test_inline_cid_references_leaves_unknown_cids_intact(self) -> None:
+        html_body = '<img src="cid:present"><img src="cid:missing">'
+        attachments = [
+            {
+                "file_name": "present.png",
+                "payload": self.PNG_PIXEL,
+                "content_id": "present",
+            },
+        ]
+        result = retriever_tools.inline_cid_references_in_html(html_body, attachments)
+        self.assertIn("data:image/png;base64,", result)
+        self.assertIn('src="cid:missing"', result)
+
+    def test_inline_cid_references_noop_without_attachments_or_html(self) -> None:
+        self.assertEqual(retriever_tools.inline_cid_references_in_html("<p>x</p>", []), "<p>x</p>")
+        self.assertEqual(retriever_tools.inline_cid_references_in_html("<p>x</p>", None), "<p>x</p>")
+        self.assertIsNone(retriever_tools.inline_cid_references_in_html(None, [{"content_id": "x", "payload": b""}]))
+        html_body = '<img src="cid:logo">'
+        attachments_missing_cid = [{"file_name": "logo.png", "payload": self.PNG_PIXEL}]
+        self.assertEqual(
+            retriever_tools.inline_cid_references_in_html(html_body, attachments_missing_cid),
+            html_body,
+        )
+
+    def test_inline_cid_references_sniffs_mime_when_extension_missing(self) -> None:
+        html_body = '<img src="cid:bareref">'
+        attachments = [
+            {
+                "file_name": "",
+                "payload": self.PNG_PIXEL,
+                "content_id": "bareref",
+            },
+        ]
+        result = retriever_tools.inline_cid_references_in_html(html_body, attachments)
+        self.assertIn("data:image/png;base64,", result)
+
+    def test_extract_eml_attachments_captures_content_id(self) -> None:
+        boundary = "boundary-inline-test"
+        encoded_png = base64.b64encode(self.PNG_PIXEL).decode("ascii")
+        raw_message = (
+            "From: sender@example.com\r\n"
+            "To: recipient@example.com\r\n"
+            "Subject: Inline icon test\r\n"
+            "MIME-Version: 1.0\r\n"
+            f'Content-Type: multipart/related; boundary="{boundary}"\r\n'
+            "\r\n"
+            f"--{boundary}\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "\r\n"
+            '<html><body><img src="cid:logo-icon" alt="logo"/></body></html>\r\n'
+            f"--{boundary}\r\n"
+            "Content-Type: image/png\r\n"
+            "Content-Transfer-Encoding: base64\r\n"
+            "Content-ID: <logo-icon>\r\n"
+            'Content-Disposition: inline; filename="logo.png"\r\n'
+            "\r\n"
+            f"{encoded_png}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("ascii")
+
+        parsed = BytesParser(policy=policy.default).parsebytes(raw_message)
+        attachments = retriever_tools.extract_eml_attachments(parsed)
+        self.assertTrue(any(a.get("content_id") == "logo-icon" for a in attachments))
+        self.assertTrue(any(a.get("is_inline") is True for a in attachments))
+
+    def test_build_email_extracted_payload_inlines_cid_images_in_preview(self) -> None:
+        html_body = '<html><body><img src="cid:icon"/></body></html>'
+        attachments = [
+            {
+                "file_name": "icon.png",
+                "ordinal": 1,
+                "payload": self.PNG_PIXEL,
+                "file_hash": "deadbeef",
+                "content_id": "icon",
+            }
+        ]
+        payload = retriever_tools.build_email_extracted_payload(
+            subject="Test",
+            author="a@example.com",
+            recipients="b@example.com",
+            date_created="2026-04-16T00:00:00Z",
+            text_body="See icon.",
+            html_body=html_body,
+            attachments=attachments,
+            preview_file_name="msg.html",
+        )
+        preview_content = payload["preview_artifacts"][0]["content"]
+        self.assertIn("data:image/png;base64,", preview_content)
+        self.assertNotIn('src="cid:icon"', preview_content)
 
 
 if __name__ == "__main__":

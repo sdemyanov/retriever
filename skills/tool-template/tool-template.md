@@ -2,13 +2,13 @@
 
 ## Template metadata
 
-- tool version: `0.9.4`
-- schema version: `9`
+- tool version: `0.10.0`
+- schema version: `12`
 - requirements version: `2026-04-16-phase4-pst`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `6cab7c3a092457ecce1d11f386f1a8cef7ff29d7610061e724bf58d47b7b7bc5`
+- source checksum (SHA256): `ea4535d94a62fab890ee7d781c56747f769482faaf14c6c4d3cce91ba9a9e0dc`
 
 ## Current command surface
 
@@ -20,8 +20,20 @@ The current template implements:
 - `ingest`
 - `ingest-production`
 - `search`
+- `search-docs`
+- `catalog`
+- `get-doc`
+- `list-chunks`
+- `search-chunks`
+- `aggregate`
 - `add-field`
+- `promote-field-type`
 - `set-field`
+- `list-datasets`
+- `create-dataset`
+- `add-to-dataset`
+- `remove-from-dataset`
+- `delete-dataset`
 
 Stats, export, and review commands remain later-phase work.
 

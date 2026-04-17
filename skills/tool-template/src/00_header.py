@@ -72,7 +72,7 @@ except Exception:  # pragma: no cover - required PST backend probe
     pypff = None
 
 
-TOOL_VERSION = "0.9.4"
+TOOL_VERSION = "0.10.0"
 SCHEMA_VERSION = 12
 REQUIREMENTS_VERSION = "2026-04-16-phase4-pst"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
@@ -82,6 +82,18 @@ CHUNK_TARGET_CHARS = 3200
 CHUNK_OVERLAP_CHARS = 250
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
+DEFAULT_CHUNK_PAGE_SIZE = 50
+MAX_CHUNK_PAGE_SIZE = 200
+GET_DOC_SUMMARY_CHARS = 1200
+MAX_GET_DOC_CHUNKS = 10
+MAX_GET_DOC_TEXT_CHARS = 30000
+DEFAULT_CHUNK_SEARCH_TOP_K = 12
+MAX_CHUNK_SEARCH_TOP_K = 50
+DEFAULT_CHUNK_SEARCH_PER_DOC_CAP = 3
+MAX_CHUNK_SEARCH_PER_DOC_CAP = 10
+MAX_CHUNK_SEARCH_TEXT_CHARS = 100000
+DEFAULT_AGGREGATE_LIMIT = 20
+MAX_AGGREGATE_LIMIT = 200
 CONTROL_NUMBER_PREFIX = "DOC"
 CONTROL_NUMBER_BATCH_WIDTH = 3
 CONTROL_NUMBER_FAMILY_WIDTH = 8
@@ -336,6 +348,7 @@ FIELD_NAME_ALIASES = {
 }
 REGISTRY_FIELD_TYPES = {
     "boolean": "INTEGER",
+    "date": "TEXT",
     "integer": "INTEGER",
     "real": "REAL",
     "text": "TEXT",
@@ -345,6 +358,49 @@ VIRTUAL_FILTER_FIELD_TYPES = {
     "is_attachment": "boolean",
     "has_attachments": "boolean",
     "production_name": "text",
+}
+CATALOG_EXCLUDED_BUILTIN_FIELDS = {
+    "content_hash",
+    "dataset_id",
+    "file_hash",
+    "id",
+    MANUAL_FIELD_LOCKS_COLUMN,
+    LEGACY_METADATA_LOCKS_COLUMN,
+    "production_id",
+}
+CATALOG_EXCLUDED_CUSTOM_FIELDS = {
+    MANUAL_FIELD_LOCKS_COLUMN,
+    LEGACY_METADATA_LOCKS_COLUMN,
+}
+AGGREGATABLE_VIRTUAL_FIELDS = {"dataset_name"}
+BUILTIN_FIELD_DESCRIPTIONS = {
+    "author": "Document author from file metadata",
+    "begin_bates": "Beginning Bates label for a production document",
+    "content_type": "Normalized content category such as Email, E-Doc, or Chat",
+    "control_number": "Stable document label used for review and export",
+    "custodian": "Custodian or mailbox owner associated with the document",
+    "date_created": "ISO date the document was created",
+    "date_modified": "ISO date the document was last modified",
+    "end_bates": "Ending Bates label for a production document",
+    "file_name": "Document file name",
+    "file_size": "File size in bytes",
+    "file_type": "Normalized file extension such as pdf, docx, or eml",
+    "page_count": "Page or sheet count when available",
+    "participants": "Participants extracted from chat or email-style content",
+    "recipients": "Recipients extracted from message metadata",
+    "rel_path": "Workspace-relative document path",
+    "source_folder_path": "Container-relative source folder path for PST-style items",
+    "source_kind": "Origin kind such as filesystem, production, email_attachment, or pst",
+    "source_rel_path": "Source-relative path used to derive the document",
+    "subject": "Email or message subject line",
+    "title": "Document title from metadata or content",
+    "updated_at": "ISO timestamp when Retriever last updated the document row",
+}
+VIRTUAL_FIELD_DESCRIPTIONS = {
+    "dataset_name": "Logical dataset label for PSTs, productions, and manual document sets",
+    "has_attachments": "Whether the document has one or more attachment child documents",
+    "is_attachment": "Whether the document is an attachment child document",
+    "production_name": "Friendly production name for production-derived documents",
 }
 CONTENT_TYPE_EXTENSION_GROUPS = [
     ("Email", "dbx eml emlx mbox msg nsf ost p7m p7s pst tnef vcf"),

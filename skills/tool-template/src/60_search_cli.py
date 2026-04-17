@@ -34,7 +34,9 @@ def build_filter_clause(alias: str, field_def: dict[str, str], operator: str, va
 
     typed_value = value_from_type(field_type if field_type in {"integer", "real", "boolean"} else "text", value)
     if field_type == "date":
-        typed_value = value
+        typed_value = normalize_date_field_value(str(value or ""))
+        if typed_value is None:
+            raise RetrieverError(f"Expected ISO date value, got {value!r}")
 
     comparators = {
         "eq": "=",
@@ -353,6 +355,183 @@ def fetch_document_dataset_memberships(
     return memberships
 
 
+def chunk_preview_text(text: object, *, max_chars: int = 220) -> str:
+    normalized = normalize_whitespace(str(text or ""))
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def document_chunk_rows(connection: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT id, document_id, chunk_index, char_start, char_end, token_estimate, text_content
+        FROM document_chunks
+        WHERE document_id = ?
+        ORDER BY chunk_index ASC
+        """,
+        (document_id,),
+    ).fetchall()
+
+
+def reconstruct_document_text_prefix(chunk_rows: list[sqlite3.Row], max_chars: int) -> str | None:
+    if not chunk_rows or max_chars <= 0:
+        return None
+    parts: list[str] = []
+    current_end = 0
+    total_length = 0
+    for row in chunk_rows:
+        chunk_text = str(row["text_content"] or "")
+        chunk_start = int(row["char_start"])
+        if not chunk_text:
+            continue
+        overlap = max(0, current_end - chunk_start)
+        append_text = chunk_text[overlap:]
+        if not append_text:
+            continue
+        remaining = max_chars - total_length
+        if remaining <= 0:
+            break
+        parts.append(append_text[:remaining])
+        total_length += len(parts[-1])
+        current_end = max(current_end, chunk_start + len(chunk_text))
+        if total_length >= max_chars:
+            break
+    combined = "".join(parts)
+    return combined or None
+
+
+def document_overview_payload(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    include_parent_context: bool = True,
+    include_attachment_context: bool = True,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "document_id": int(row["id"]),
+        "control_number": row["control_number"],
+        "dataset_id": row["dataset_id"],
+        "parent_document_id": row["parent_document_id"],
+        "source_kind": row["source_kind"],
+        "source_rel_path": row["source_rel_path"],
+        "source_item_id": row["source_item_id"],
+        "source_folder_path": row["source_folder_path"],
+        "production_id": row["production_id"],
+        **document_path_payload(paths, connection, row),
+        "file_name": row["file_name"],
+        "file_type": row["file_type"],
+        "metadata": {
+            "author": row["author"],
+            "begin_attachment": row["begin_attachment"],
+            "begin_bates": row["begin_bates"],
+            "content_type": row["content_type"],
+            "custodian": row["custodian"],
+            "dataset_id": row["dataset_id"],
+            "date_created": row["date_created"],
+            "date_modified": row["date_modified"],
+            "end_attachment": row["end_attachment"],
+            "end_bates": row["end_bates"],
+            "page_count": row["page_count"],
+            "participants": row["participants"],
+            "recipients": row["recipients"],
+            "source_kind": row["source_kind"],
+            "source_rel_path": row["source_rel_path"],
+            "source_item_id": row["source_item_id"],
+            "source_folder_path": row["source_folder_path"],
+            "subject": row["subject"],
+            "title": row["title"],
+            "updated_at": row["updated_at"],
+        },
+        "manual_field_locks": normalize_string_list(row[MANUAL_FIELD_LOCKS_COLUMN]),
+    }
+    dataset_memberships = fetch_document_dataset_memberships(connection, [row]).get(int(row["id"]), {"ids": [], "names": []})
+    dataset_ids = [int(dataset_id) for dataset_id in dataset_memberships["ids"]]
+    dataset_names = [str(dataset_name) for dataset_name in dataset_memberships["names"]]
+    payload["dataset_ids"] = dataset_ids
+    payload["dataset_names"] = dataset_names
+    if len(dataset_ids) == 1:
+        payload["dataset_id"] = dataset_ids[0]
+        payload["metadata"]["dataset_id"] = dataset_ids[0]
+    else:
+        payload["dataset_id"] = None
+        payload["metadata"]["dataset_id"] = None
+    if len(dataset_names) == 1:
+        payload["dataset_name"] = dataset_names[0]
+        payload["metadata"]["dataset_name"] = dataset_names[0]
+    if row["production_id"] is not None:
+        production_name = fetch_production_names(connection, [row]).get(int(row["production_id"]))
+        payload["production_name"] = production_name
+        payload["metadata"]["production_name"] = production_name
+    if include_attachment_context and row["parent_document_id"] is None:
+        attachments = fetch_attachment_summaries(connection, paths, [int(row["id"])]).get(int(row["id"]), [])
+        payload["attachment_count"] = len(attachments)
+        payload["attachments"] = attachments
+    if include_parent_context and row["parent_document_id"] is not None:
+        payload["parent"] = fetch_parent_summaries(connection, [row]).get(int(row["parent_document_id"]))
+    return payload
+
+
+def build_chunk_citation_payload(
+    row: sqlite3.Row,
+    *,
+    preview_rel_path: str,
+    preview_abs_path: str,
+    chunk_index: int,
+    char_start: int,
+    char_end: int,
+    snippet: str,
+) -> dict[str, object]:
+    return {
+        "document_id": int(row["id"]),
+        "control_number": row["control_number"],
+        "file_name": row["file_name"],
+        "chunk_index": chunk_index,
+        "char_start": char_start,
+        "char_end": char_end,
+        "snippet": snippet,
+        "preview_rel_path": preview_rel_path,
+        "preview_abs_path": preview_abs_path,
+    }
+
+
+def filter_operators_for_field_type(field_type: str) -> list[str]:
+    if field_type in {"integer", "real", "date"}:
+        return ["eq", "neq", "gt", "gte", "lt", "lte", "is-null", "not-null"]
+    if field_type == "boolean":
+        return ["eq", "neq", "is-null", "not-null"]
+    return ["eq", "neq", "contains", "is-null", "not-null"]
+
+
+def catalog_description_for_field(field_name: str, *, source: str, instruction: object = None) -> str:
+    if source == "builtin":
+        return BUILTIN_FIELD_DESCRIPTIONS.get(field_name, normalize_whitespace(field_name.replace("_", " ")))
+    if source == "virtual":
+        return VIRTUAL_FIELD_DESCRIPTIONS.get(field_name, normalize_whitespace(field_name.replace("_", " ")))
+    if isinstance(instruction, str) and normalize_whitespace(instruction):
+        return normalize_whitespace(instruction)
+    return normalize_whitespace(field_name.replace("_", " "))
+
+
+def catalog_field_entry(
+    field_name: str,
+    field_type: str,
+    *,
+    source: str,
+    instruction: object = None,
+) -> dict[str, object]:
+    return {
+        "name": field_name,
+        "type": field_type,
+        "description": catalog_description_for_field(field_name, source=source, instruction=instruction),
+        "filter_operators": filter_operators_for_field_type(field_type),
+        "sortable": source != "virtual",
+        "aggregatable": source != "virtual" or field_name in AGGREGATABLE_VIRTUAL_FIELDS,
+        "date_granularities": ["year", "quarter", "month", "week"] if field_type == "date" else [],
+    }
+
+
 def search_bates(
     connection: sqlite3.Connection,
     query_begin: str,
@@ -653,10 +832,626 @@ def search(
         connection.close()
 
 
+def search_docs(
+    root: Path,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+    page: int,
+    per_page: int,
+) -> dict[str, object]:
+    return search(root, query, raw_filters, sort_field, order, page, per_page)
+
+
+def catalog(root: Path) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        reconcile_custom_fields_registry(connection, repair=True)
+        intrinsic = [
+            catalog_field_entry(field_name, field_type, source="builtin")
+            for field_name, field_type in sorted(BUILTIN_FIELD_TYPES.items())
+            if field_name not in CATALOG_EXCLUDED_BUILTIN_FIELDS
+        ]
+        custom_rows = connection.execute(
+            """
+            SELECT field_name, field_type, instruction
+            FROM custom_fields_registry
+            ORDER BY field_name ASC
+            """
+        ).fetchall()
+        columns = table_columns(connection, "documents")
+        custom = [
+            catalog_field_entry(str(row["field_name"]), str(row["field_type"]), source="custom", instruction=row["instruction"])
+            for row in custom_rows
+            if row["field_name"] in columns and row["field_name"] not in CATALOG_EXCLUDED_CUSTOM_FIELDS
+        ]
+        virtual = [
+            catalog_field_entry(field_name, field_type, source="virtual")
+            for field_name, field_type in sorted(VIRTUAL_FILTER_FIELD_TYPES.items())
+        ]
+        return {
+            "status": "ok",
+            "intrinsic": intrinsic,
+            "custom": custom,
+            "virtual": virtual,
+        }
+    finally:
+        connection.close()
+
+
+def get_doc(
+    root: Path,
+    document_id: int,
+    include_text: str,
+    chunk_indexes: list[int] | None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = connection.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE id = ? AND lifecycle_status NOT IN ('missing', 'deleted')
+            """,
+            (document_id,),
+        ).fetchone()
+        if row is None:
+            raise RetrieverError(f"Unknown active document id: {document_id}")
+
+        chunk_rows = document_chunk_rows(connection, document_id)
+        requested_chunk_indexes = sorted(dict.fromkeys(int(chunk_index) for chunk_index in (chunk_indexes or [])))
+        if len(requested_chunk_indexes) > MAX_GET_DOC_CHUNKS:
+            raise RetrieverError(f"Requested too many chunks; max is {MAX_GET_DOC_CHUNKS}.")
+        chunk_rows_by_index = {int(chunk_row["chunk_index"]): chunk_row for chunk_row in chunk_rows}
+        missing_chunk_indexes = [chunk_index for chunk_index in requested_chunk_indexes if chunk_index not in chunk_rows_by_index]
+        if missing_chunk_indexes:
+            raise RetrieverError(
+                f"Unknown chunk indexes for document {document_id}: {', '.join(str(chunk_index) for chunk_index in missing_chunk_indexes)}"
+            )
+
+        exact_chunks: list[dict[str, object]] = []
+        total_text_chars = 0
+        preview_rel_path, preview_abs_path = default_preview_target(paths, row, connection)
+        for chunk_index in requested_chunk_indexes:
+            chunk_row = chunk_rows_by_index[chunk_index]
+            text_content = str(chunk_row["text_content"] or "")
+            total_text_chars += len(text_content)
+            if total_text_chars > MAX_GET_DOC_TEXT_CHARS:
+                raise RetrieverError(f"Requested chunk text exceeds the {MAX_GET_DOC_TEXT_CHARS}-character limit.")
+            snippet = chunk_preview_text(text_content)
+            exact_chunks.append(
+                {
+                    "chunk_index": int(chunk_row["chunk_index"]),
+                    "char_start": int(chunk_row["char_start"]),
+                    "char_end": int(chunk_row["char_end"]),
+                    "token_estimate": chunk_row["token_estimate"],
+                    "text": text_content,
+                    "snippet": snippet,
+                    "citation": build_chunk_citation_payload(
+                        row,
+                        preview_rel_path=preview_rel_path,
+                        preview_abs_path=preview_abs_path,
+                        chunk_index=int(chunk_row["chunk_index"]),
+                        char_start=int(chunk_row["char_start"]),
+                        char_end=int(chunk_row["char_end"]),
+                        snippet=snippet,
+                    ),
+                }
+            )
+
+        text_summary = None
+        normalized_include_text = include_text.strip().lower()
+        if normalized_include_text == "summary":
+            text_summary = reconstruct_document_text_prefix(chunk_rows, GET_DOC_SUMMARY_CHARS)
+        elif normalized_include_text != "none":
+            raise RetrieverError(f"Unsupported include-text mode: {include_text}")
+
+        return {
+            "status": "ok",
+            "document": document_overview_payload(paths, connection, row),
+            "chunk_count": len(chunk_rows),
+            "include_text": normalized_include_text,
+            "text_summary": text_summary,
+            "chunks": exact_chunks,
+        }
+    finally:
+        connection.close()
+
+
+def list_chunks(root: Path, document_id: int, page: int, per_page: int) -> dict[str, object]:
+    if page < 1:
+        raise RetrieverError("Page must be >= 1.")
+    if per_page < 1:
+        raise RetrieverError("per-page must be >= 1.")
+    per_page = min(per_page, MAX_CHUNK_PAGE_SIZE)
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = connection.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE id = ? AND lifecycle_status NOT IN ('missing', 'deleted')
+            """,
+            (document_id,),
+        ).fetchone()
+        if row is None:
+            raise RetrieverError(f"Unknown active document id: {document_id}")
+
+        chunk_rows = document_chunk_rows(connection, document_id)
+        total_chunks = len(chunk_rows)
+        total_pages = max(1, (total_chunks + per_page - 1) // per_page)
+        start = (page - 1) * per_page
+        end = start + per_page
+        paged_rows = chunk_rows[start:end]
+        return {
+            "status": "ok",
+            "document": {
+                "document_id": int(row["id"]),
+                "control_number": row["control_number"],
+                "file_name": row["file_name"],
+            },
+            "page": page,
+            "per_page": per_page,
+            "total_chunks": total_chunks,
+            "total_pages": total_pages,
+            "chunks": [
+                {
+                    "chunk_index": int(chunk_row["chunk_index"]),
+                    "char_start": int(chunk_row["char_start"]),
+                    "char_end": int(chunk_row["char_end"]),
+                    "token_estimate": chunk_row["token_estimate"],
+                    "snippet": chunk_preview_text(chunk_row["text_content"]),
+                }
+                for chunk_row in paged_rows
+            ],
+        }
+    finally:
+        connection.close()
+
+
+def search_chunk_rows(
+    connection: sqlite3.Connection,
+    query: str,
+    clauses: list[str],
+    params: list[object],
+) -> list[sqlite3.Row]:
+    query_value = query.strip()
+    if not query_value:
+        raise RetrieverError("search-chunks requires a non-empty query.")
+    where_clause = " AND ".join(clauses)
+    sql = f"""
+        SELECT
+          d.*,
+          dc.id AS chunk_row_id,
+          dc.chunk_index,
+          dc.char_start,
+          dc.char_end,
+          dc.token_estimate,
+          dc.text_content,
+          bm25(chunks_fts) AS rank
+        FROM chunks_fts
+        JOIN document_chunks dc ON dc.id = CAST(chunks_fts.chunk_id AS INTEGER)
+        JOIN documents d ON d.id = dc.document_id
+        WHERE chunks_fts MATCH ? AND {where_clause}
+    """
+    try:
+        return connection.execute(sql, [query_value, *params]).fetchall()
+    except sqlite3.OperationalError:
+        return connection.execute(sql, [f'"{query_value}"', *params]).fetchall()
+
+
+def sort_chunk_match_rows(rows: list[sqlite3.Row], sort_field: str | None, order: str | None) -> list[sqlite3.Row]:
+    normalized_sort_field = (sort_field or "relevance").lower()
+    normalized_order = (order or ("asc" if normalized_sort_field == "relevance" else "desc")).lower()
+    if normalized_sort_field not in {"relevance", "date_created", "date_modified"}:
+        raise RetrieverError(f"Unsupported chunk sort field: {sort_field}")
+    stable_rows = sorted(rows, key=lambda row: (int(row["id"]), int(row["chunk_index"])))
+    if normalized_sort_field == "relevance":
+        return sorted(stable_rows, key=lambda row: float(row["rank"]), reverse=normalized_order == "desc")
+    ranked_rows = sorted(stable_rows, key=lambda row: float(row["rank"]))
+    return sorted(ranked_rows, key=lambda row: coerce_sort_value(row[normalized_sort_field]), reverse=normalized_order == "desc")
+
+
+def count_distinct_chunk_documents(
+    connection: sqlite3.Connection,
+    query: str,
+    clauses: list[str],
+    params: list[object],
+) -> int:
+    query_value = query.strip()
+    where_clause = " AND ".join(clauses)
+    sql = f"""
+        SELECT COUNT(DISTINCT d.id) AS count
+        FROM chunks_fts
+        JOIN document_chunks dc ON dc.id = CAST(chunks_fts.chunk_id AS INTEGER)
+        JOIN documents d ON d.id = dc.document_id
+        WHERE chunks_fts MATCH ? AND {where_clause}
+    """
+    try:
+        row = connection.execute(sql, [query_value, *params]).fetchone()
+    except sqlite3.OperationalError:
+        row = connection.execute(sql, [f'"{query_value}"', *params]).fetchone()
+    return int(row["count"] or 0)
+
+
+def count_filtered_documents(
+    connection: sqlite3.Connection,
+    clauses: list[str],
+    params: list[object],
+) -> int:
+    row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM documents d
+        WHERE {' AND '.join(clauses)}
+        """,
+        params,
+    ).fetchone()
+    return int(row["count"] or 0)
+
+
+def search_chunks(
+    root: Path,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+    top_k: int,
+    per_doc_cap: int,
+    *,
+    count_only: bool = False,
+    distinct_docs: bool = False,
+) -> dict[str, object]:
+    if top_k < 1:
+        raise RetrieverError("top-k must be >= 1.")
+    if per_doc_cap < 1:
+        raise RetrieverError("per-doc-cap must be >= 1.")
+    top_k = min(top_k, MAX_CHUNK_SEARCH_TOP_K)
+    per_doc_cap = min(per_doc_cap, MAX_CHUNK_SEARCH_PER_DOC_CAP)
+    if distinct_docs and not count_only:
+        raise RetrieverError("--distinct-docs requires --count-only.")
+    if count_only and not distinct_docs:
+        raise RetrieverError("--count-only currently requires --distinct-docs.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+        if count_only:
+            return {
+                "query": query,
+                "filters": filter_summary,
+                "documents_with_hits": count_distinct_chunk_documents(connection, query, clauses, params),
+                "total_docs_filtered": count_filtered_documents(connection, clauses, params),
+                "count_mode": "distinct-documents",
+            }
+
+        raw_rows = search_chunk_rows(connection, query, clauses, params)
+        grouped_rows: dict[int, list[sqlite3.Row]] = defaultdict(list)
+        for row in sorted(raw_rows, key=lambda item: (float(item["rank"]), int(item["chunk_index"]))):
+            grouped_rows[int(row["id"])].append(row)
+        selected_rows: list[sqlite3.Row] = []
+        for rows in grouped_rows.values():
+            selected_rows.extend(rows[:per_doc_cap])
+
+        sorted_rows = sort_chunk_match_rows(selected_rows, sort_field, order)
+        returned_rows: list[sqlite3.Row] = []
+        total_text_chars = 0
+        for row in sorted_rows:
+            text_content = str(row["text_content"] or "")
+            if len(returned_rows) >= top_k:
+                break
+            if returned_rows and total_text_chars + len(text_content) > MAX_CHUNK_SEARCH_TEXT_CHARS:
+                break
+            total_text_chars += len(text_content)
+            returned_rows.append(row)
+
+        results: list[dict[str, object]] = []
+        dataset_memberships = fetch_document_dataset_memberships(connection, returned_rows)
+        production_names = fetch_production_names(connection, returned_rows)
+        parent_summaries = fetch_parent_summaries(
+            connection,
+            [row for row in returned_rows if row["parent_document_id"] is not None],
+        )
+        for row in returned_rows:
+            preview_rel_path, preview_abs_path = default_preview_target(paths, row, connection)
+            snippet = make_snippet(str(row["text_content"] or ""), query)
+            result = {
+                **document_path_payload(paths, connection, row),
+                "document_id": int(row["id"]),
+                "control_number": row["control_number"],
+                "file_name": row["file_name"],
+                "file_type": row["file_type"],
+                "chunk_index": int(row["chunk_index"]),
+                "char_start": int(row["char_start"]),
+                "char_end": int(row["char_end"]),
+                "token_estimate": row["token_estimate"],
+                "text": str(row["text_content"] or ""),
+                "snippet": snippet,
+                "rank": float(row["rank"]),
+                "metadata": {
+                    "author": row["author"],
+                    "content_type": row["content_type"],
+                    "custodian": row["custodian"],
+                    "date_created": row["date_created"],
+                    "date_modified": row["date_modified"],
+                    "participants": row["participants"],
+                    "recipients": row["recipients"],
+                    "subject": row["subject"],
+                    "title": row["title"],
+                    "updated_at": row["updated_at"],
+                },
+                "citation": build_chunk_citation_payload(
+                    row,
+                    preview_rel_path=preview_rel_path,
+                    preview_abs_path=preview_abs_path,
+                    chunk_index=int(row["chunk_index"]),
+                    char_start=int(row["char_start"]),
+                    char_end=int(row["char_end"]),
+                    snippet=snippet,
+                ),
+            }
+            membership = dataset_memberships.get(int(row["id"]), {"ids": [], "names": []})
+            dataset_ids = [int(dataset_id) for dataset_id in membership["ids"]]
+            dataset_names = [str(dataset_name) for dataset_name in membership["names"]]
+            result["dataset_ids"] = dataset_ids
+            result["dataset_names"] = dataset_names
+            if len(dataset_ids) == 1:
+                result["dataset_id"] = dataset_ids[0]
+            if len(dataset_names) == 1:
+                result["dataset_name"] = dataset_names[0]
+            if row["production_id"] is not None:
+                result["production_name"] = production_names.get(int(row["production_id"]))
+            if row["parent_document_id"] is not None:
+                result["parent"] = parent_summaries.get(int(row["parent_document_id"]))
+            results.append(result)
+
+        normalized_sort = (sort_field or "relevance").lower()
+        normalized_order = (order or ("asc" if normalized_sort == "relevance" else "desc")).lower()
+        return {
+            "query": query,
+            "filters": filter_summary,
+            "sort": normalized_sort,
+            "order": normalized_order,
+            "top_k": top_k,
+            "per_doc_cap": per_doc_cap,
+            "total_matches": len(raw_rows),
+            "results": results,
+        }
+    finally:
+        connection.close()
+
+
+def aggregate_output_name(base_name: str, used_names: set[str]) -> str:
+    candidate = base_name
+    if candidate not in used_names:
+        used_names.add(candidate)
+        return candidate
+    suffix = 2
+    while f"{base_name}_{suffix}" in used_names:
+        suffix += 1
+    candidate = f"{base_name}_{suffix}"
+    used_names.add(candidate)
+    return candidate
+
+
+def aggregate_date_base_expr(field_name: str) -> str:
+    return f"substr(COALESCE(d.{quote_identifier(field_name)}, ''), 1, 10)"
+
+
+def resolve_aggregate_group(
+    connection: sqlite3.Connection,
+    raw_group: str,
+    used_names: set[str],
+) -> dict[str, object]:
+    token = normalize_whitespace(raw_group)
+    if not token:
+        raise RetrieverError("Empty group-by expression.")
+    temporal_match = re.fullmatch(r"(year|quarter|month|week):([A-Za-z0-9_]+)", token)
+    if temporal_match:
+        granularity = temporal_match.group(1)
+        field_name = temporal_match.group(2)
+        field_def = resolve_field_definition(connection, field_name)
+        if field_def["field_type"] != "date":
+            raise RetrieverError(f"Date bucket '{token}' requires a date-typed field.")
+        if field_def.get("source") == "virtual":
+            raise RetrieverError(f"Date bucket '{token}' cannot target a virtual field.")
+        date_expr = aggregate_date_base_expr(field_def["field_name"])
+        if granularity == "year":
+            select_sql = f"NULLIF(substr({date_expr}, 1, 4), '')"
+        elif granularity == "month":
+            select_sql = f"NULLIF(substr({date_expr}, 1, 7), '')"
+        elif granularity == "quarter":
+            select_sql = (
+                f"CASE WHEN length({date_expr}) >= 7 THEN "
+                f"substr({date_expr}, 1, 4) || '-Q' || "
+                f"CASE "
+                f"WHEN CAST(substr({date_expr}, 6, 2) AS INTEGER) BETWEEN 1 AND 3 THEN '1' "
+                f"WHEN CAST(substr({date_expr}, 6, 2) AS INTEGER) BETWEEN 4 AND 6 THEN '2' "
+                f"WHEN CAST(substr({date_expr}, 6, 2) AS INTEGER) BETWEEN 7 AND 9 THEN '3' "
+                f"WHEN CAST(substr({date_expr}, 6, 2) AS INTEGER) BETWEEN 10 AND 12 THEN '4' "
+                f"ELSE NULL END "
+                f"ELSE NULL END"
+            )
+        else:
+            select_sql = f"CASE WHEN length({date_expr}) = 10 THEN strftime('%Y-W%W', {date_expr}) ELSE NULL END"
+        output_name = aggregate_output_name(granularity, used_names)
+        return {
+            "token": token,
+            "output_name": output_name,
+            "select_sql": select_sql,
+            "group_sql": select_sql,
+            "join_dataset": False,
+            "is_temporal": True,
+        }
+
+    field_def = resolve_field_definition(connection, token)
+    if field_def.get("source") == "virtual":
+        if field_def["field_name"] not in AGGREGATABLE_VIRTUAL_FIELDS:
+            raise RetrieverError(f"Field '{token}' is not aggregatable.")
+        if field_def["field_name"] == "dataset_name":
+            output_name = aggregate_output_name("dataset_name", used_names)
+            return {
+                "token": token,
+                "output_name": output_name,
+                "select_sql": "ds.dataset_name",
+                "group_sql": "ds.dataset_name",
+                "join_dataset": True,
+                "is_temporal": False,
+            }
+        raise RetrieverError(f"Unsupported aggregatable virtual field: {token}")
+
+    column_expr = f"d.{quote_identifier(field_def['field_name'])}"
+    output_name = aggregate_output_name(field_def["field_name"], used_names)
+    return {
+        "token": token,
+        "output_name": output_name,
+        "select_sql": column_expr,
+        "group_sql": column_expr,
+        "join_dataset": False,
+        "is_temporal": False,
+    }
+
+
+def graph_metadata_for_buckets(group_defs: list[dict[str, object]], buckets: list[dict[str, object]]) -> dict[str, object]:
+    graph_type = "bar"
+    if any(bool(group_def["is_temporal"]) for group_def in group_defs):
+        graph_type = "line"
+    elif len(group_defs) == 1 and len(buckets) <= 6:
+        graph_type = "pie"
+    description = "Count by " + ", ".join(str(group_def["output_name"]).replace("_", " ") for group_def in group_defs)
+    graph: dict[str, object] = {
+        "type": graph_type,
+        "x_axis": group_defs[0]["output_name"] if group_defs else None,
+        "y_axis": "count",
+        "description": description,
+    }
+    if len(group_defs) > 1:
+        graph["series"] = group_defs[1]["output_name"]
+    return graph
+
+
+def aggregate(
+    root: Path,
+    raw_filters: list[list[str]] | None,
+    raw_group_bys: list[str],
+    metric: str,
+    order_by: str | None,
+    order: str | None,
+    limit: int,
+    explain: bool,
+) -> dict[str, object]:
+    if not raw_group_bys:
+        raise RetrieverError("aggregate requires at least one --group-by.")
+    if metric.strip().lower() != "count":
+        raise RetrieverError("aggregate currently supports only metric=count.")
+    if limit < 1:
+        raise RetrieverError("limit must be >= 1.")
+    limit = min(limit, MAX_AGGREGATE_LIMIT)
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+        used_names: set[str] = set()
+        group_defs = [resolve_aggregate_group(connection, raw_group, used_names) for raw_group in raw_group_bys]
+        joins: list[str] = []
+        if any(bool(group_def["join_dataset"]) for group_def in group_defs):
+            joins.extend(
+                [
+                    "JOIN dataset_documents dd ON dd.document_id = d.id",
+                    "JOIN datasets ds ON ds.id = dd.dataset_id",
+                ]
+            )
+        select_parts = [f"{group_def['select_sql']} AS {quote_identifier(str(group_def['output_name']))}" for group_def in group_defs]
+        select_parts.append(("COUNT(DISTINCT d.id)" if joins else "COUNT(*)") + " AS count")
+        group_parts = [str(group_def["group_sql"]) for group_def in group_defs]
+        sql = (
+            f"SELECT {', '.join(select_parts)} "
+            f"FROM documents d {' '.join(joins)} "
+            f"WHERE {' AND '.join(clauses)} "
+            f"GROUP BY {', '.join(group_parts)}"
+        )
+
+        order_name_map = {
+            "metric": "count",
+            **{str(group_def["token"]): str(group_def["output_name"]) for group_def in group_defs},
+            **{str(group_def["output_name"]): str(group_def["output_name"]) for group_def in group_defs},
+        }
+        resolved_order_by = order_name_map.get(order_by or "", None) if order_by else "count"
+        if resolved_order_by is None:
+            raise RetrieverError(f"Unsupported aggregate order-by: {order_by}")
+        normalized_order = (order or ("desc" if resolved_order_by == "count" else "asc")).lower()
+        sql += f" ORDER BY {quote_identifier(resolved_order_by)} {normalized_order.upper()}"
+        if group_defs:
+            for group_def in group_defs:
+                if str(group_def["output_name"]) == resolved_order_by:
+                    continue
+                sql += f", {quote_identifier(str(group_def['output_name']))} ASC"
+        sql += " LIMIT ?"
+
+        rows = connection.execute(sql, [*params, limit]).fetchall()
+        buckets = []
+        for row in rows:
+            bucket = {str(group_def["output_name"]): row[str(group_def["output_name"])] for group_def in group_defs}
+            bucket["count"] = int(row["count"] or 0)
+            buckets.append(bucket)
+        payload = {
+            "filters": filter_summary,
+            "metric": "count",
+            "group_by": [str(group_def["token"]) for group_def in group_defs],
+            "buckets": buckets,
+            "graph": graph_metadata_for_buckets(group_defs, buckets),
+        }
+        if explain:
+            payload["sql"] = sql.replace(" ?", f" {limit}")
+        return payload
+    finally:
+        connection.close()
+
+
 def add_dataset_selector_arguments(parser: argparse.ArgumentParser) -> None:
     selector_group = parser.add_mutually_exclusive_group(required=True)
     selector_group.add_argument("--dataset-id", type=int, help="Dataset id")
     selector_group.add_argument("--dataset-name", help="Exact dataset name")
+
+
+def add_search_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("workspace", help="Workspace root path")
+    parser.add_argument("query", nargs="?", default="", help="Keyword query text")
+    parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        nargs="+",
+        help="Repeatable filter in the form <field> <op> <value>",
+    )
+    parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field or 'relevance'")
+    parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
+    parser.add_argument("--page", type=int, default=1, help="1-based result page")
+    parser.add_argument(
+        "--per-page",
+        "--limit",
+        dest="per_page",
+        type=int,
+        default=DEFAULT_PAGE_SIZE,
+        help="Results per page",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -683,19 +1478,97 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_production_parser.add_argument("production_root", help="Production root directory inside the workspace")
 
     search_parser = subparsers.add_parser("search", help="Search indexed documents")
-    search_parser.add_argument("workspace", help="Workspace root path")
-    search_parser.add_argument("query", nargs="?", default="", help="Keyword query text")
-    search_parser.add_argument(
+    add_search_arguments(search_parser)
+
+    search_docs_parser = subparsers.add_parser("search-docs", help="Search indexed documents at the document level")
+    add_search_arguments(search_docs_parser)
+
+    catalog_parser = subparsers.add_parser("catalog", help="Describe searchable, filterable, and aggregatable fields")
+    catalog_parser.add_argument("workspace", help="Workspace root path")
+
+    get_doc_parser = subparsers.add_parser("get-doc", help="Fetch one document with optional summary text or exact chunks")
+    get_doc_parser.add_argument("workspace", help="Workspace root path")
+    get_doc_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
+    get_doc_parser.add_argument(
+        "--include-text",
+        choices=("none", "summary"),
+        default="none",
+        help="Include no extracted text or a deterministic summary prefix",
+    )
+    get_doc_parser.add_argument(
+        "--chunk",
+        dest="chunk_indexes",
+        action="append",
+        type=int,
+        help="Exact chunk index to include (repeatable)",
+    )
+
+    list_chunks_parser = subparsers.add_parser("list-chunks", help="List chunk metadata for one document")
+    list_chunks_parser.add_argument("workspace", help="Workspace root path")
+    list_chunks_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
+    list_chunks_parser.add_argument("--page", type=int, default=1, help="1-based chunk page")
+    list_chunks_parser.add_argument(
+        "--per-page",
+        "--limit",
+        dest="per_page",
+        type=int,
+        default=DEFAULT_CHUNK_PAGE_SIZE,
+        help="Chunks per page",
+    )
+
+    search_chunks_parser = subparsers.add_parser("search-chunks", help="Search matching text chunks with citations")
+    search_chunks_parser.add_argument("workspace", help="Workspace root path")
+    search_chunks_parser.add_argument("query", help="Keyword query text")
+    search_chunks_parser.add_argument(
         "--filter",
         dest="filters",
         action="append",
         nargs="+",
         help="Repeatable filter in the form <field> <op> <value>",
     )
-    search_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field or 'relevance'")
-    search_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
-    search_parser.add_argument("--page", type=int, default=1, help="1-based result page")
-    search_parser.add_argument("--per-page", "--limit", dest="per_page", type=int, default=DEFAULT_PAGE_SIZE, help="Results per page")
+    search_chunks_parser.add_argument(
+        "--sort",
+        "--sort-by",
+        dest="sort",
+        choices=("relevance", "date_created", "date_modified"),
+        help="Chunk result sort field",
+    )
+    search_chunks_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
+    search_chunks_parser.add_argument("--top-k", type=int, default=DEFAULT_CHUNK_SEARCH_TOP_K, help="Maximum chunks to return")
+    search_chunks_parser.add_argument(
+        "--per-doc-cap",
+        type=int,
+        default=DEFAULT_CHUNK_SEARCH_PER_DOC_CAP,
+        help="Maximum chunks to keep from any one document",
+    )
+    search_chunks_parser.add_argument("--count-only", action="store_true", help="Return counts instead of chunk payloads")
+    search_chunks_parser.add_argument(
+        "--distinct-docs",
+        action="store_true",
+        help="Count distinct documents with matching chunks when used with --count-only",
+    )
+
+    aggregate_parser = subparsers.add_parser("aggregate", help="Run bounded metadata aggregations across documents")
+    aggregate_parser.add_argument("workspace", help="Workspace root path")
+    aggregate_parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        nargs="+",
+        help="Repeatable filter in the form <field> <op> <value>",
+    )
+    aggregate_parser.add_argument(
+        "--group-by",
+        dest="group_bys",
+        action="append",
+        required=True,
+        help="Grouping expression, e.g. dataset_name or month:effective_date",
+    )
+    aggregate_parser.add_argument("--metric", default="count", help="Aggregation metric")
+    aggregate_parser.add_argument("--order-by", help="Bucket field name or 'metric'")
+    aggregate_parser.add_argument("--order", choices=("asc", "desc"), help="Sort order")
+    aggregate_parser.add_argument("--limit", type=int, default=DEFAULT_AGGREGATE_LIMIT, help="Maximum buckets to return")
+    aggregate_parser.add_argument("--explain", action="store_true", help="Include generated SQL in the response")
 
     list_datasets_parser = subparsers.add_parser("list-datasets", help="List datasets in the workspace")
     list_datasets_parser.add_argument("workspace", help="Workspace root path")
@@ -723,6 +1596,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_field_parser.add_argument("field_name", help="Field name")
     add_field_parser.add_argument("field_type", choices=sorted(REGISTRY_FIELD_TYPES), help="Field type")
     add_field_parser.add_argument("--instruction", help="Field extraction instruction")
+
+    promote_field_parser = subparsers.add_parser("promote-field-type", help="Promote a custom field type in place")
+    promote_field_parser.add_argument("workspace", help="Workspace root path")
+    promote_field_parser.add_argument("field_name", help="Existing custom field name")
+    promote_field_parser.add_argument("target_field_type", choices=("date",), help="Target field type")
 
     set_field_parser = subparsers.add_parser("set-field", help="Set a field value on one document")
     set_field_parser.add_argument("workspace", help="Workspace root path")
@@ -765,6 +1643,79 @@ def main() -> int:
             print(
                 json.dumps(
                     search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "search-docs":
+            print(
+                json.dumps(
+                    search_docs(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "catalog":
+            print(json.dumps(catalog(root), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "get-doc":
+            print(
+                json.dumps(
+                    get_doc(root, args.document_id, args.include_text, args.chunk_indexes),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "list-chunks":
+            print(
+                json.dumps(
+                    list_chunks(root, args.document_id, args.page, args.per_page),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "search-chunks":
+            print(
+                json.dumps(
+                    search_chunks(
+                        root,
+                        args.query,
+                        args.filters,
+                        args.sort,
+                        args.order,
+                        args.top_k,
+                        args.per_doc_cap,
+                        count_only=args.count_only,
+                        distinct_docs=args.distinct_docs,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "aggregate":
+            print(
+                json.dumps(
+                    aggregate(
+                        root,
+                        args.filters,
+                        args.group_bys,
+                        args.metric,
+                        args.order_by,
+                        args.order,
+                        args.limit,
+                        args.explain,
+                    ),
                     indent=2,
                     sort_keys=True,
                 )
@@ -825,6 +1776,16 @@ def main() -> int:
 
         if args.command == "add-field":
             print(json.dumps(add_field(root, args.field_name, args.field_type, args.instruction), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "promote-field-type":
+            print(
+                json.dumps(
+                    promote_field_type(root, args.field_name, args.target_field_type),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
 
         if args.command == "set-field":

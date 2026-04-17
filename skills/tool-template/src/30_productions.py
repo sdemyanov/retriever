@@ -1360,7 +1360,7 @@ def ingest_pst_source(
 ) -> dict[str, object]:
     # Salt the scan fingerprint so unchanged PSTs get one corrective reparse when
     # container-routing rules change (for example, when Teams/system folders are reclassified).
-    source_scan_hash = sha256_text(f"pst-ingest-v2:{sha256_file(path) or ''}")
+    source_scan_hash = sha256_text(f"pst-ingest-v3:{sha256_file(path) or ''}")
     dataset_id, dataset_source_id = ensure_source_backed_dataset(
         connection,
         source_kind=PST_SOURCE_KIND,

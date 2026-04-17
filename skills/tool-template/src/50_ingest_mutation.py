@@ -254,13 +254,20 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
     try:
         apply_schema(connection, root)
         reconcile_custom_fields_registry(connection, repair=True)
-        filesystem_dataset_id, filesystem_dataset_source_id = ensure_source_backed_dataset(
-            connection,
-            source_kind=FILESYSTEM_SOURCE_KIND,
-            source_locator=filesystem_dataset_locator(),
-            dataset_name=filesystem_dataset_name(root),
-        )
-        connection.commit()
+        filesystem_dataset_id: int | None = None
+        filesystem_dataset_source_id: int | None = None
+
+        def ensure_filesystem_dataset() -> tuple[int, int]:
+            nonlocal filesystem_dataset_id, filesystem_dataset_source_id
+            if filesystem_dataset_id is None or filesystem_dataset_source_id is None:
+                filesystem_dataset_id, filesystem_dataset_source_id = ensure_source_backed_dataset(
+                    connection,
+                    source_kind=FILESYSTEM_SOURCE_KIND,
+                    source_locator=filesystem_dataset_locator(),
+                    dataset_name=filesystem_dataset_name(root),
+                )
+                connection.commit()
+            return filesystem_dataset_id, filesystem_dataset_source_id
 
         production_signatures = find_production_root_signatures(root, recursive, connection)
         production_root_paths = [Path(signature["root"]).resolve() for signature in production_signatures]
@@ -340,6 +347,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             action = "new"
             if existing_row is not None:
                 if existing_row["file_hash"] == file_hash and existing_row["lifecycle_status"] == "active":
+                    filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
                     connection.execute("BEGIN")
                     try:
                         mark_seen_without_reingest(
@@ -361,6 +369,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     existing_row = rename_candidates.pop(0)
                     action = "renamed"
 
+            filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
             connection.execute("BEGIN")
             try:
                 extracted_payload = extract_document(path, include_attachments=True)
@@ -428,11 +437,19 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         stats["pst_sources_missing"] = pst_sources_missing
         stats["pst_documents_missing"] = pst_documents_missing
         stats["missing"] = filesystem_missing + pst_sources_missing
+        connection.execute("BEGIN")
+        try:
+            pruned_unused_filesystem_dataset = prune_unused_filesystem_dataset(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         workspace_inventory = document_inventory_counts(connection)
         result = dict(stats)
         result["failures"] = failures
         result["scanned"] = len(scanned_items)
         result["scanned_files"] = len(scanned_items)
+        result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
         result["skipped_production_roots"] = [str(signature["rel_root"]) for signature in production_signatures]
         if production_signatures:
             result["warnings"] = [
@@ -451,6 +468,11 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
 def value_from_type(field_type: str, value: str | None) -> object:
     if value is None:
         return None
+    if field_type == "date":
+        normalized = normalize_date_field_value(value)
+        if normalized is None:
+            raise RetrieverError(f"Expected ISO date value, got {value!r}")
+        return normalized
     if field_type == "integer":
         try:
             return int(value)
@@ -657,6 +679,17 @@ def delete_dataset(
         connection.close()
 
 
+def get_custom_field_registry_row(connection: sqlite3.Connection, field_name: str) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT field_name, field_type, instruction, created_at
+        FROM custom_fields_registry
+        WHERE field_name = ?
+        """,
+        (field_name,),
+    ).fetchone()
+
+
 def add_field(root: Path, raw_field_name: str, field_type: str, instruction: str | None) -> dict[str, object]:
     normalized_field_name = sanitize_field_name(raw_field_name)
     normalized_field_type = field_type.strip().lower()
@@ -670,6 +703,15 @@ def add_field(root: Path, raw_field_name: str, field_type: str, instruction: str
         apply_schema(connection, root)
         reconcile_custom_fields_registry(connection, repair=True)
         columns = table_columns(connection, "documents")
+        existing_registry_row = get_custom_field_registry_row(connection, normalized_field_name)
+        if existing_registry_row is not None and existing_registry_row["field_type"] != normalized_field_type:
+            if existing_registry_row["field_type"] == "text" and normalized_field_type == "date":
+                raise RetrieverError(
+                    f"Field '{normalized_field_name}' already exists as text; use promote-field-type to validate and promote it to date."
+                )
+            raise RetrieverError(
+                f"Field '{normalized_field_name}' already exists with type {existing_registry_row['field_type']!r}."
+            )
         sql_type = REGISTRY_FIELD_TYPES[normalized_field_type]
         if normalized_field_name not in columns:
             connection.execute(
@@ -693,6 +735,112 @@ def add_field(root: Path, raw_field_name: str, field_type: str, instruction: str
             "field_type": normalized_field_type,
             "instruction": instruction,
             "custom_field_registry": registry_status,
+        }
+    finally:
+        connection.close()
+
+
+def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) -> dict[str, object]:
+    normalized_field_name = sanitize_field_name(raw_field_name)
+    normalized_target_type = target_field_type.strip().lower()
+    if normalized_target_type != "date":
+        raise RetrieverError("Only text -> date field promotion is supported right now.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        reconcile_custom_fields_registry(connection, repair=True)
+        registry_row = get_custom_field_registry_row(connection, normalized_field_name)
+        if registry_row is None:
+            raise RetrieverError(f"Unknown custom field: {normalized_field_name}")
+        current_type = str(registry_row["field_type"])
+        if current_type == normalized_target_type:
+            return {
+                "status": "ok",
+                "field_name": normalized_field_name,
+                "from_type": current_type,
+                "to_type": normalized_target_type,
+                "normalized_values_updated": 0,
+                "documents_checked": 0,
+                "documents_with_values": 0,
+                "promotion_applied": False,
+            }
+        if current_type != "text":
+            raise RetrieverError(
+                f"Field '{normalized_field_name}' has type {current_type!r}; only text -> date promotion is supported."
+            )
+        if normalized_field_name not in table_columns(connection, "documents"):
+            raise RetrieverError(f"Field column '{normalized_field_name}' does not exist on documents.")
+
+        value_rows = connection.execute(
+            f"""
+            SELECT id, {quote_identifier(normalized_field_name)} AS value
+            FROM documents
+            WHERE {quote_identifier(normalized_field_name)} IS NOT NULL
+              AND TRIM(CAST({quote_identifier(normalized_field_name)} AS TEXT)) != ''
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+        invalid_values: list[dict[str, object]] = []
+        normalized_updates: list[tuple[str, int]] = []
+        for row in value_rows:
+            raw_value = str(row["value"])
+            normalized_value = normalize_date_field_value(raw_value)
+            if normalized_value is None:
+                if len(invalid_values) < 10:
+                    invalid_values.append({"document_id": int(row["id"]), "value": raw_value})
+                continue
+            if normalized_value != raw_value:
+                normalized_updates.append((normalized_value, int(row["id"])))
+
+        if invalid_values:
+            return {
+                "status": "blocked",
+                "field_name": normalized_field_name,
+                "from_type": current_type,
+                "to_type": normalized_target_type,
+                "documents_checked": len(value_rows),
+                "documents_with_values": len(value_rows),
+                "invalid_value_samples": invalid_values,
+                "promotion_applied": False,
+            }
+
+        connection.execute("BEGIN")
+        try:
+            for normalized_value, document_id in normalized_updates:
+                connection.execute(
+                    f"""
+                    UPDATE documents
+                    SET {quote_identifier(normalized_field_name)} = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (normalized_value, utc_now(), document_id),
+                )
+            connection.execute(
+                """
+                UPDATE custom_fields_registry
+                SET field_type = ?
+                WHERE field_name = ?
+                """,
+                (normalized_target_type, normalized_field_name),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        return {
+            "status": "ok",
+            "field_name": normalized_field_name,
+            "from_type": current_type,
+            "to_type": normalized_target_type,
+            "documents_checked": len(value_rows),
+            "documents_with_values": len(value_rows),
+            "normalized_values_updated": len(normalized_updates),
+            "promotion_applied": True,
         }
     finally:
         connection.close()

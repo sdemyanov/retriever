@@ -1297,6 +1297,44 @@ def delete_dataset_row(connection: sqlite3.Connection, dataset_id: int) -> dict[
     }
 
 
+def prune_unused_filesystem_dataset(connection: sqlite3.Connection) -> bool:
+    dataset_source_row = get_dataset_source_row(
+        connection,
+        source_kind=FILESYSTEM_SOURCE_KIND,
+        source_locator=filesystem_dataset_locator(),
+    )
+    if dataset_source_row is None:
+        return False
+
+    dataset_id = int(dataset_source_row["dataset_id"])
+    membership_row = connection.execute(
+        """
+        SELECT 1
+        FROM dataset_documents
+        WHERE dataset_id = ?
+        LIMIT 1
+        """,
+        (dataset_id,),
+    ).fetchone()
+    if membership_row is not None:
+        return False
+
+    filesystem_document_row = connection.execute(
+        """
+        SELECT 1
+        FROM documents
+        WHERE COALESCE(source_kind, ?) = ?
+        LIMIT 1
+        """,
+        (FILESYSTEM_SOURCE_KIND, FILESYSTEM_SOURCE_KIND),
+    ).fetchone()
+    if filesystem_document_row is not None:
+        return False
+
+    connection.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
+    return True
+
+
 def pst_message_rel_path(source_rel_path: str, source_item_id: str) -> str:
     encoded = encode_source_item_id_for_path(source_item_id)
     return (
@@ -1332,6 +1370,8 @@ def infer_content_type_from_extension(file_type: str) -> str | None:
 
 def infer_registry_field_type(sqlite_type: str | None) -> str:
     type_name = (sqlite_type or "").upper()
+    if "DATE" in type_name or "TIME" in type_name:
+        return "date"
     if "INT" in type_name:
         return "integer"
     if any(marker in type_name for marker in ("REAL", "FLOA", "DOUB")):
@@ -1397,6 +1437,32 @@ def parse_iso_datetime(value: str) -> str | None:
     else:
         dt = dt.astimezone(timezone.utc)
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def normalize_date_field_value(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        normalized = value
+        if normalized.tzinfo is None:
+            normalized = normalized.replace(tzinfo=timezone.utc)
+        else:
+            normalized = normalized.astimezone(timezone.utc)
+        return normalized.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    if not isinstance(value, str):
+        return None
+
+    raw = value.strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        try:
+            return date.fromisoformat(raw).isoformat()
+        except ValueError:
+            return None
+    return parse_iso_datetime(raw)
 
 
 def normalize_datetime(value: object) -> str | None:
@@ -1886,6 +1952,96 @@ def dependency_guard(module: object | None, package_name: str, file_type: str) -
         raise RetrieverError(
             f"Missing dependency for .{file_type} parsing: install {package_name} before ingesting this file type."
         )
+
+
+CID_REFERENCE_PATTERN = re.compile(
+    r"""(?i)(\b(?:src|background)\s*=\s*)(["'])cid:([^"']+)\2"""
+)
+
+
+def sniff_image_mime_type(payload: bytes) -> str | None:
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) < 4:
+        return None
+    data = bytes(payload)
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "image/gif"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"II*\x00") or data.startswith(b"MM\x00*"):
+        return "image/tiff"
+    return None
+
+
+def normalize_content_id(raw: object) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = bytes(raw).decode("utf-8")
+        except Exception:
+            raw = bytes(raw).decode("utf-8", errors="replace")
+    value = str(raw).strip()
+    if not value:
+        return None
+    value = value.strip("<>").strip()
+    return value or None
+
+
+def build_cid_data_uri_map(attachments: list[dict[str, object]] | None) -> dict[str, str]:
+    if not attachments:
+        return {}
+    mapping: dict[str, str] = {}
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        content_id = normalize_content_id(attachment.get("content_id"))
+        if not content_id:
+            continue
+        payload = attachment.get("payload")
+        if not isinstance(payload, (bytes, bytearray)):
+            continue
+        payload_bytes = bytes(payload)
+        file_name = str(attachment.get("file_name") or "")
+        mime_type = ooxml_image_mime_type(file_name) or sniff_image_mime_type(payload_bytes)
+        if not mime_type:
+            guessed, _ = mimetypes.guess_type(file_name)
+            if guessed and guessed.startswith("image/"):
+                mime_type = guessed
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        encoded = base64.b64encode(payload_bytes).decode("ascii")
+        mapping[content_id.lower()] = f"data:{mime_type};base64,{encoded}"
+    return mapping
+
+
+def inline_cid_references_in_html(
+    html_body: str | None,
+    attachments: list[dict[str, object]] | None,
+) -> str | None:
+    if not html_body:
+        return html_body
+    cid_map = build_cid_data_uri_map(attachments)
+    if not cid_map:
+        return html_body
+
+    def _replace(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        quote = match.group(2)
+        cid = normalize_content_id(match.group(3))
+        if not cid:
+            return match.group(0)
+        replacement = cid_map.get(cid.lower())
+        if not replacement:
+            return match.group(0)
+        return f"{prefix}{quote}{replacement}{quote}"
+
+    return CID_REFERENCE_PATTERN.sub(_replace, html_body)
 
 
 def build_html_preview(

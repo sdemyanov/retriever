@@ -907,7 +907,9 @@ def extract_eml_attachments(message: object) -> list[dict[str, object]]:
             continue
         disposition = (part.get_content_disposition() or "").lower()
         file_name = part.get_filename()
-        if disposition != "attachment" and not file_name:
+        content_id = normalize_content_id(part.get("Content-ID"))
+        is_inline = disposition == "inline" or (content_id is not None and disposition != "attachment")
+        if disposition != "attachment" and not file_name and not content_id:
             continue
         payload = coerce_email_part_payload(part)
         if payload is None:
@@ -918,6 +920,8 @@ def extract_eml_attachments(message: object) -> list[dict[str, object]]:
                 "ordinal": ordinal,
                 "payload": payload,
                 "file_hash": sha256_bytes(payload),
+                "content_id": content_id,
+                "is_inline": is_inline,
             }
         )
         ordinal += 1
@@ -947,6 +951,15 @@ def extract_msg_attachment_payload(attachment: object) -> bytes | None:
     return None
 
 
+def extract_msg_attachment_content_id(attachment: object) -> str | None:
+    for attr_name in ("cid", "contentId", "content_id"):
+        raw = getattr(attachment, attr_name, None)
+        normalized = normalize_content_id(raw)
+        if normalized:
+            return normalized
+    return None
+
+
 def extract_msg_attachments(message: object) -> list[dict[str, object]]:
     attachments: list[dict[str, object]] = []
     ordinal = 1
@@ -966,6 +979,7 @@ def extract_msg_attachments(message: object) -> list[dict[str, object]]:
                 "ordinal": ordinal,
                 "payload": payload,
                 "file_hash": sha256_bytes(payload),
+                "content_id": extract_msg_attachment_content_id(attachment),
             }
         )
         ordinal += 1
@@ -992,6 +1006,7 @@ def build_email_extracted_payload(
         normalized_text,
         [author, recipients or None],
     )
+    preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
     preview = build_html_preview(
         {
             "From": author or "",
@@ -999,7 +1014,7 @@ def build_email_extracted_payload(
             "Date": format_chat_preview_timestamp(date_created) or date_created or "",
             "Subject": subject or "",
         },
-        body_html=normalized_html,
+        body_html=preview_html_body,
         body_text=normalized_text,
     )
     return {
@@ -1136,6 +1151,7 @@ def build_calendar_extracted_payload(
     if not normalized_text and normalized_html:
         normalized_text = strip_html_tags(normalized_html)
     normalized_text = normalize_whitespace(normalized_text)
+    preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
     preview = build_html_preview(
         {
             "Organizer": author or "",
@@ -1143,7 +1159,7 @@ def build_calendar_extracted_payload(
             "Title": subject or "",
             "Attendees": recipients or "",
         },
-        body_html=normalized_html,
+        body_html=preview_html_body,
         body_text=normalized_text,
         document_title=subject or "Retriever Calendar Preview",
         heading="Retriever Calendar Preview",
@@ -1419,6 +1435,86 @@ def coerce_pst_attachment_payload(attachment: object) -> bytes | None:
     return None
 
 
+PST_PROP_ATTACH_CONTENT_ID = 0x3712
+
+
+def decode_pst_record_entry_value(entry: object) -> str | None:
+    data = getattr(entry, "data", None)
+    if isinstance(data, (bytes, bytearray)):
+        value_type = None
+        try:
+            value_type = int(getattr(entry, "value_type", 0) or 0)
+        except Exception:
+            value_type = None
+        raw = bytes(data)
+        try:
+            if value_type == 0x001F:
+                decoded = raw.decode("utf-16-le", errors="replace")
+            elif value_type == 0x001E:
+                decoded = raw.decode("utf-8", errors="replace")
+            else:
+                try:
+                    decoded = raw.decode("utf-16-le")
+                except UnicodeDecodeError:
+                    decoded = raw.decode("utf-8", errors="replace")
+        except Exception:
+            decoded = raw.decode("utf-8", errors="replace")
+        return decoded.rstrip("\x00").strip() or None
+    for method_name in ("get_data_as_string",):
+        method = getattr(entry, method_name, None)
+        if callable(method):
+            try:
+                value = method()
+            except Exception:
+                continue
+            if value:
+                text = value.decode("utf-8", errors="replace") if isinstance(value, (bytes, bytearray)) else str(value)
+                text = text.rstrip("\x00").strip()
+                if text:
+                    return text
+    if data is not None:
+        text = str(data).rstrip("\x00").strip()
+        return text or None
+    return None
+
+
+def pst_attachment_content_id(attachment: object) -> str | None:
+    for attr_name in ("content_id", "attach_content_id", "long_content_id"):
+        direct = getattr(attachment, attr_name, None)
+        normalized = normalize_content_id(direct)
+        if normalized:
+            return normalized
+    record_sets = getattr(attachment, "record_sets", None)
+    if record_sets is None:
+        return None
+    try:
+        record_sets_iter = list(record_sets)
+    except Exception:
+        return None
+    for record_set in record_sets_iter:
+        for entries_attr in ("entries", "record_entries"):
+            entries = getattr(record_set, entries_attr, None)
+            if entries is None:
+                continue
+            try:
+                entries_iter = list(entries)
+            except Exception:
+                continue
+            for entry in entries_iter:
+                try:
+                    entry_type = int(getattr(entry, "entry_type", 0) or 0)
+                except Exception:
+                    continue
+                if entry_type != PST_PROP_ATTACH_CONTENT_ID:
+                    continue
+                decoded = decode_pst_record_entry_value(entry)
+                normalized = normalize_content_id(decoded)
+                if normalized:
+                    return normalized
+            break
+    return None
+
+
 def pst_message_folder_path(raw_value: object) -> str | None:
     if raw_value is None:
         return None
@@ -1569,6 +1665,7 @@ def iter_pst_messages(path: Path):
                         "ordinal": ordinal,
                         "payload": payload,
                         "file_hash": sha256_bytes(payload),
+                        "content_id": pst_attachment_content_id(attachment),
                     }
                 )
 
@@ -1617,14 +1714,17 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
     normalized_attachments: list[dict[str, object]] = []
     for ordinal, raw_attachment in enumerate(list(message_dict.get("attachments") or []), start=1):
         raw_name = None
+        raw_content_id: object = None
         if isinstance(raw_attachment, dict):
             raw_name = raw_attachment.get("file_name") or raw_attachment.get("name") or raw_attachment.get("filename")
+            raw_content_id = raw_attachment.get("content_id")
         else:
             for attr_name in ("name", "filename", "long_filename"):
                 value = getattr(raw_attachment, attr_name, None)
                 if value:
                     raw_name = value
                     break
+            raw_content_id = pst_attachment_content_id(raw_attachment)
         payload = coerce_pst_attachment_payload(raw_attachment)
         if payload is None:
             continue
@@ -1640,6 +1740,7 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
                 "ordinal": attachment_ordinal,
                 "payload": payload,
                 "file_hash": sha256_bytes(payload),
+                "content_id": normalize_content_id(raw_content_id),
             }
         )
 
