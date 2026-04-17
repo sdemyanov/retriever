@@ -2101,6 +2101,50 @@ def build_parser() -> argparse.ArgumentParser:
     delete_dataset_parser.add_argument("workspace", help="Workspace root path")
     add_dataset_selector_arguments(delete_dataset_parser)
 
+    list_jobs_parser = subparsers.add_parser("list-jobs", help="List configured processing jobs")
+    list_jobs_parser.add_argument("workspace", help="Workspace root path")
+
+    create_job_parser = subparsers.add_parser("create-job", help="Create a processing job")
+    create_job_parser.add_argument("workspace", help="Workspace root path")
+    create_job_parser.add_argument("job_name", help="Job name")
+    create_job_parser.add_argument("job_kind", choices=sorted(JOB_KINDS), help="Job kind")
+    create_job_parser.add_argument("--description", help="Optional job description")
+
+    add_job_output_parser = subparsers.add_parser("add-job-output", help="Create or update a job output")
+    add_job_output_parser.add_argument("workspace", help="Workspace root path")
+    add_job_output_parser.add_argument("job_name", help="Existing job name")
+    add_job_output_parser.add_argument("output_name", help="Job output name")
+    add_job_output_parser.add_argument(
+        "--value-type",
+        default="text",
+        choices=sorted(JOB_OUTPUT_VALUE_TYPES),
+        help="Logical output value type",
+    )
+    add_job_output_parser.add_argument("--bind-custom-field", dest="bound_custom_field", help="Optional custom field binding")
+    add_job_output_parser.add_argument("--description", help="Optional output description")
+
+    list_job_versions_parser = subparsers.add_parser("list-job-versions", help="List versions for one job")
+    list_job_versions_parser.add_argument("workspace", help="Workspace root path")
+    list_job_versions_parser.add_argument("job_name", help="Existing job name")
+
+    create_job_version_parser = subparsers.add_parser("create-job-version", help="Create a new immutable job version")
+    create_job_version_parser.add_argument("workspace", help="Workspace root path")
+    create_job_version_parser.add_argument("job_name", help="Existing job name")
+    create_job_version_parser.add_argument("--instruction", help="Optional job instruction text")
+    create_job_version_parser.add_argument("--provider", required=True, help="Provider identifier")
+    create_job_version_parser.add_argument("--model", help="Optional model name")
+    create_job_version_parser.add_argument(
+        "--input-basis",
+        default="active_search_text",
+        choices=sorted(JOB_INPUT_BASES),
+        help="Primary input basis for this version",
+    )
+    create_job_version_parser.add_argument("--response-schema-json", help="Optional JSON schema payload")
+    create_job_version_parser.add_argument("--parameters-json", help="Optional provider parameters as JSON object")
+    create_job_version_parser.add_argument("--segment-profile", help="Optional segment profile name")
+    create_job_version_parser.add_argument("--aggregation-strategy", help="Optional aggregation strategy")
+    create_job_version_parser.add_argument("--display-name", help="Optional display name override")
+
     add_field_parser = subparsers.add_parser("add-field", help="Add a custom document field")
     add_field_parser.add_argument("workspace", help="Workspace root path")
     add_field_parser.add_argument("field_name", help="Field name")
@@ -2260,6 +2304,63 @@ def main() -> int:
                     dataset_name=args.dataset_name,
                 ),
             )
+
+        if args.command == "list-jobs":
+            print(json.dumps(list_jobs(root), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "create-job":
+            print(
+                json.dumps(
+                    create_job(root, args.job_name, args.job_kind, args.description),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "add-job-output":
+            print(
+                json.dumps(
+                    add_job_output(
+                        root,
+                        args.job_name,
+                        args.output_name,
+                        args.value_type,
+                        bound_custom_field=args.bound_custom_field,
+                        description=args.description,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "list-job-versions":
+            print(json.dumps(list_job_versions(root, args.job_name), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "create-job-version":
+            print(
+                json.dumps(
+                    create_job_version(
+                        root,
+                        args.job_name,
+                        instruction=args.instruction,
+                        provider=args.provider,
+                        model=args.model,
+                        input_basis=args.input_basis,
+                        response_schema_json=args.response_schema_json,
+                        parameters_json=args.parameters_json,
+                        segment_profile=args.segment_profile,
+                        aggregation_strategy=args.aggregation_strategy,
+                        display_name=args.display_name,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
 
         if args.command == "add-field":
             return emit_cli_payload("add-field", add_field(root, args.field_name, args.field_type, args.instruction))

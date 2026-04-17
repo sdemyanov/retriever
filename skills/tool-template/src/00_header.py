@@ -74,7 +74,7 @@ except Exception:  # pragma: no cover - required PST backend probe
 
 
 TOOL_VERSION = "0.11.0"
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 REQUIREMENTS_VERSION = "2026-04-16-phase4-pst"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
 MANUAL_FIELD_LOCKS_COLUMN = "manual_field_locks_json"
@@ -271,6 +271,10 @@ EDITABLE_BUILTIN_FIELDS = {
     "title",
 }
 SYSTEM_MANAGED_FIELDS = {
+    "active_search_text_revision_id",
+    "active_text_language",
+    "active_text_quality_score",
+    "active_text_source_kind",
     "content_hash",
     "control_number_attachment_sequence",
     "control_number_batch",
@@ -298,6 +302,7 @@ SYSTEM_MANAGED_FIELDS = {
     "source_item_id",
     "source_rel_path",
     "source_kind",
+    "source_text_revision_id",
     "text_status",
     "updated_at",
 }
@@ -332,6 +337,11 @@ BUILTIN_FIELD_TYPES = {
     MANUAL_FIELD_LOCKS_COLUMN: "text",
     "file_hash": "text",
     "content_hash": "text",
+    "source_text_revision_id": "integer",
+    "active_search_text_revision_id": "integer",
+    "active_text_source_kind": "text",
+    "active_text_language": "text",
+    "active_text_quality_score": "real",
     "text_status": "text",
     "lifecycle_status": "text",
     "ingested_at": "date",
@@ -362,6 +372,10 @@ VIRTUAL_FILTER_FIELD_TYPES = {
     "production_name": "text",
 }
 CATALOG_EXCLUDED_BUILTIN_FIELDS = {
+    "active_search_text_revision_id",
+    "active_text_language",
+    "active_text_quality_score",
+    "active_text_source_kind",
     "content_hash",
     "dataset_id",
     "file_hash",
@@ -369,6 +383,7 @@ CATALOG_EXCLUDED_BUILTIN_FIELDS = {
     MANUAL_FIELD_LOCKS_COLUMN,
     LEGACY_METADATA_LOCKS_COLUMN,
     "production_id",
+    "source_text_revision_id",
 }
 CATALOG_EXCLUDED_CUSTOM_FIELDS = {
     MANUAL_FIELD_LOCKS_COLUMN,
