@@ -5,7 +5,7 @@ description: >
   It defines the pinned generated retriever_tools.py bundle, checksum expectations, and
   the current command surface.
 metadata:
-  version: "0.9.4"
+  version: "0.9.5"
 ---
 
 # Retriever Tool Template
@@ -30,3 +30,4 @@ Use this skill when a task needs the exact workspace tool bundle.
 - If the canonical checksum changes, replace the unmodified workspace copy and run `bootstrap` before any ingest, even if the version string is unchanged.
 - Bump version metadata when releasing schema or tool changes, but do not rely on version alone to trigger workspace upgrades.
 - If the source changes, update `tool-template.md` and the workspace skill references too.
+- When multiple Retriever tool calls are already independent, emit them in one assistant turn rather than serializing them across turns.

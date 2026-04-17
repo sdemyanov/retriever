@@ -139,6 +139,13 @@ When the user asks to inspect fields or columns:
 - Prefix attachment title rows with `↳` and keep the attachment title itself clickable.
 - Matching attachments may still appear as standalone hits; when they do, render them with the same `↳` attachment marker and include parent email context when available.
 - If the user asks to "show" files or documents, every listed result should include a clickable link, not just the top result.
+- Retriever search commands now return compact JSON by default; rerun with `--verbose` when you need attachment child rows, alternate preview targets, or the full metadata/source payload.
+
+## Parallel follow-ups
+
+- If a search, aggregate, or SQL step already gave you multiple independent paths or IDs, fan out the follow-up reads in one assistant turn rather than serializing them.
+- Batch independent Retriever reads the same way you would batch independent grep or sqlite calls: one gating query first, then one batched follow-up turn once the inputs are known.
+- Keep dependent steps serialized only when later arguments genuinely depend on earlier results.
 
 ## Sorting
 

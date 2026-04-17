@@ -362,6 +362,165 @@ def chunk_preview_text(text: object, *, max_chars: int = 220) -> str:
     return normalized[: max_chars - 3].rstrip() + "..."
 
 
+COMPACT_METADATA_FIELDS = (
+    "author",
+    "content_type",
+    "custodian",
+    "date_created",
+    "date_modified",
+    "participants",
+    "recipients",
+    "subject",
+    "title",
+    "updated_at",
+)
+
+
+def payload_has_meaningful_value(value: object) -> bool:
+    return value not in (None, "", [], {})
+
+
+def compact_metadata_payload(metadata: object) -> dict[str, object]:
+    if not isinstance(metadata, dict):
+        return {}
+    return {
+        key: metadata[key]
+        for key in COMPACT_METADATA_FIELDS
+        if key in metadata and payload_has_meaningful_value(metadata[key])
+    }
+
+
+def compact_search_result_payload(item: dict[str, object]) -> dict[str, object]:
+    compact: dict[str, object] = {"id": item["id"]}
+    for key in ("control_number", "file_name", "file_type", "preview_rel_path", "preview_abs_path", "snippet", "rank"):
+        if key in item and payload_has_meaningful_value(item[key]):
+            compact[key] = item[key]
+
+    metadata = compact_metadata_payload(item.get("metadata"))
+    if metadata:
+        compact["metadata"] = metadata
+    if payload_has_meaningful_value(item.get("dataset_name")):
+        compact["dataset_name"] = item["dataset_name"]
+    elif payload_has_meaningful_value(item.get("dataset_names")):
+        compact["dataset_names"] = item["dataset_names"]
+    if payload_has_meaningful_value(item.get("production_name")):
+        compact["production_name"] = item["production_name"]
+    if int(item.get("attachment_count") or 0) > 0:
+        compact["attachment_count"] = int(item["attachment_count"])
+    if payload_has_meaningful_value(item.get("parent")):
+        compact["parent"] = item["parent"]
+    return compact
+
+
+def compact_document_overview_payload(item: object) -> object:
+    if not isinstance(item, dict):
+        return item
+    compact: dict[str, object] = {"document_id": item["document_id"]}
+    for key in ("control_number", "file_name", "file_type", "preview_rel_path", "preview_abs_path"):
+        if key in item and payload_has_meaningful_value(item[key]):
+            compact[key] = item[key]
+
+    metadata = compact_metadata_payload(item.get("metadata"))
+    if metadata:
+        compact["metadata"] = metadata
+    if payload_has_meaningful_value(item.get("dataset_name")):
+        compact["dataset_name"] = item["dataset_name"]
+    elif payload_has_meaningful_value(item.get("dataset_names")):
+        compact["dataset_names"] = item["dataset_names"]
+    if payload_has_meaningful_value(item.get("production_name")):
+        compact["production_name"] = item["production_name"]
+    if int(item.get("attachment_count") or 0) > 0:
+        compact["attachment_count"] = int(item["attachment_count"])
+    if payload_has_meaningful_value(item.get("parent")):
+        compact["parent"] = item["parent"]
+    return compact
+
+
+def compact_search_payload(payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "query": payload["query"],
+        "filters": payload["filters"],
+        "sort": payload["sort"],
+        "order": payload["order"],
+        "page": payload["page"],
+        "per_page": payload["per_page"],
+        "total_hits": payload["total_hits"],
+        "total_pages": payload["total_pages"],
+        "results": [compact_search_result_payload(item) for item in payload["results"]],
+    }
+
+
+def compact_get_doc_payload(payload: dict[str, object]) -> dict[str, object]:
+    compact = {
+        "status": payload["status"],
+        "document": compact_document_overview_payload(payload["document"]),
+        "chunk_count": payload["chunk_count"],
+        "include_text": payload["include_text"],
+        "chunks": payload["chunks"],
+    }
+    if payload.get("text_summary") is not None:
+        compact["text_summary"] = payload["text_summary"]
+    return compact
+
+
+def compact_search_chunk_result_payload(item: dict[str, object]) -> dict[str, object]:
+    compact: dict[str, object] = {
+        "document_id": item["document_id"],
+        "chunk_index": item["chunk_index"],
+        "char_start": item["char_start"],
+        "char_end": item["char_end"],
+        "citation": item["citation"],
+    }
+    for key in ("control_number", "file_name", "file_type", "token_estimate", "snippet", "rank"):
+        if key in item and payload_has_meaningful_value(item[key]):
+            compact[key] = item[key]
+
+    metadata = compact_metadata_payload(item.get("metadata"))
+    if metadata:
+        compact["metadata"] = metadata
+    if payload_has_meaningful_value(item.get("dataset_name")):
+        compact["dataset_name"] = item["dataset_name"]
+    elif payload_has_meaningful_value(item.get("dataset_names")):
+        compact["dataset_names"] = item["dataset_names"]
+    if payload_has_meaningful_value(item.get("production_name")):
+        compact["production_name"] = item["production_name"]
+    if payload_has_meaningful_value(item.get("parent")):
+        compact["parent"] = item["parent"]
+    return compact
+
+
+def compact_search_chunks_payload(payload: dict[str, object]) -> dict[str, object]:
+    if "results" not in payload:
+        return payload
+    return {
+        "query": payload["query"],
+        "filters": payload["filters"],
+        "sort": payload["sort"],
+        "order": payload["order"],
+        "top_k": payload["top_k"],
+        "per_doc_cap": payload["per_doc_cap"],
+        "total_matches": payload["total_matches"],
+        "results": [compact_search_chunk_result_payload(item) for item in payload["results"]],
+    }
+
+
+def prepare_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> dict[str, object]:
+    if verbose:
+        return payload
+    if command in {"search", "search-docs"}:
+        return compact_search_payload(payload)
+    if command == "get-doc":
+        return compact_get_doc_payload(payload)
+    if command == "search-chunks":
+        return compact_search_chunks_payload(payload)
+    return payload
+
+
+def emit_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> int:
+    print(json.dumps(prepare_cli_payload(command, payload, verbose=verbose), indent=2, sort_keys=True))
+    return 0
+
+
 def document_chunk_rows(connection: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
     return connection.execute(
         """
@@ -1760,6 +1919,11 @@ def add_search_arguments(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_PAGE_SIZE,
         help="Results per page",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Return the full payload instead of the default compact JSON",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1838,6 +2002,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Exact chunk index to include (repeatable)",
     )
+    get_doc_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Return the full document context instead of the default compact JSON",
+    )
 
     list_chunks_parser = subparsers.add_parser("list-chunks", help="List chunk metadata for one document")
     list_chunks_parser.add_argument("workspace", help="Workspace root path")
@@ -1882,6 +2051,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--distinct-docs",
         action="store_true",
         help="Count distinct documents with matching chunks when used with --count-only",
+    )
+    search_chunks_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Return raw chunk text and the full document context instead of the default compact JSON",
     )
 
     aggregate_parser = subparsers.add_parser("aggregate", help="Run bounded metadata aggregations across documents")
@@ -1960,44 +2134,33 @@ def main() -> int:
         root = Path(args.workspace).expanduser().resolve()
 
         if args.command == "doctor":
-            print(json.dumps(doctor(root, args.quick), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("doctor", doctor(root, args.quick))
 
         if args.command == "bootstrap":
-            print(json.dumps(bootstrap(root), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("bootstrap", bootstrap(root))
 
         if args.command == "ingest":
-            print(json.dumps(ingest(root, args.recursive, args.file_types), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types))
 
         if args.command == "ingest-production":
-            print(json.dumps(ingest_production(root, args.production_root), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("ingest-production", ingest_production(root, args.production_root))
 
         if args.command == "search":
-            print(
-                json.dumps(
-                    search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "search",
+                search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
+                verbose=args.verbose,
             )
-            return 0
 
         if args.command == "search-docs":
-            print(
-                json.dumps(
-                    search_docs(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "search-docs",
+                search_docs(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
+                verbose=args.verbose,
             )
-            return 0
 
         if args.command == "catalog":
-            print(json.dumps(catalog(root), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("catalog", catalog(root))
 
         if args.command == "export-csv":
             print(
@@ -2019,133 +2182,93 @@ def main() -> int:
             return 0
 
         if args.command == "get-doc":
-            print(
-                json.dumps(
-                    get_doc(root, args.document_id, args.include_text, args.chunk_indexes),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "get-doc",
+                get_doc(root, args.document_id, args.include_text, args.chunk_indexes),
+                verbose=args.verbose,
             )
-            return 0
 
         if args.command == "list-chunks":
-            print(
-                json.dumps(
-                    list_chunks(root, args.document_id, args.page, args.per_page),
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-            return 0
+            return emit_cli_payload("list-chunks", list_chunks(root, args.document_id, args.page, args.per_page))
 
         if args.command == "search-chunks":
-            print(
-                json.dumps(
-                    search_chunks(
-                        root,
-                        args.query,
-                        args.filters,
-                        args.sort,
-                        args.order,
-                        args.top_k,
-                        args.per_doc_cap,
-                        count_only=args.count_only,
-                        distinct_docs=args.distinct_docs,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "search-chunks",
+                search_chunks(
+                    root,
+                    args.query,
+                    args.filters,
+                    args.sort,
+                    args.order,
+                    args.top_k,
+                    args.per_doc_cap,
+                    count_only=args.count_only,
+                    distinct_docs=args.distinct_docs,
+                ),
+                verbose=args.verbose,
             )
-            return 0
 
         if args.command == "aggregate":
-            print(
-                json.dumps(
-                    aggregate(
-                        root,
-                        args.filters,
-                        args.group_bys,
-                        args.metric,
-                        args.order_by,
-                        args.order,
-                        args.limit,
-                        args.explain,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "aggregate",
+                aggregate(
+                    root,
+                    args.filters,
+                    args.group_bys,
+                    args.metric,
+                    args.order_by,
+                    args.order,
+                    args.limit,
+                    args.explain,
+                ),
             )
-            return 0
 
         if args.command == "list-datasets":
-            print(json.dumps(list_datasets(root), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("list-datasets", list_datasets(root))
 
         if args.command == "create-dataset":
-            print(json.dumps(create_dataset(root, args.dataset_name), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("create-dataset", create_dataset(root, args.dataset_name))
 
         if args.command == "add-to-dataset":
-            print(
-                json.dumps(
-                    add_to_dataset(
-                        root,
-                        args.document_ids,
-                        dataset_id=args.dataset_id,
-                        dataset_name=args.dataset_name,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "add-to-dataset",
+                add_to_dataset(
+                    root,
+                    args.document_ids,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                ),
             )
-            return 0
 
         if args.command == "remove-from-dataset":
-            print(
-                json.dumps(
-                    remove_from_dataset(
-                        root,
-                        args.document_ids,
-                        dataset_id=args.dataset_id,
-                        dataset_name=args.dataset_name,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "remove-from-dataset",
+                remove_from_dataset(
+                    root,
+                    args.document_ids,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                ),
             )
-            return 0
 
         if args.command == "delete-dataset":
-            print(
-                json.dumps(
-                    delete_dataset(
-                        root,
-                        dataset_id=args.dataset_id,
-                        dataset_name=args.dataset_name,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "delete-dataset",
+                delete_dataset(
+                    root,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                ),
             )
-            return 0
 
         if args.command == "add-field":
-            print(json.dumps(add_field(root, args.field_name, args.field_type, args.instruction), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("add-field", add_field(root, args.field_name, args.field_type, args.instruction))
 
         if args.command == "promote-field-type":
-            print(
-                json.dumps(
-                    promote_field_type(root, args.field_name, args.target_field_type),
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-            return 0
+            return emit_cli_payload("promote-field-type", promote_field_type(root, args.field_name, args.target_field_type))
 
         if args.command == "set-field":
-            print(json.dumps(set_field(root, args.doc_id, args.field, args.value), indent=2, sort_keys=True))
-            return 0
+            return emit_cli_payload("set-field", set_field(root, args.doc_id, args.field, args.value))
 
         parser.error(f"Unknown command: {args.command}")
         return 2

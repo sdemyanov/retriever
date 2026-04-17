@@ -8,7 +8,7 @@
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `daf15dfd7ec2b745276aa15998f94d37bd94add969751798e96892fc1ff90dd8`
+- source checksum (SHA256): `bde7f2fa7e7e1ac7caa667353dcfe1b51ad2431b62eb8807014c0e0c0b493a80`
 
 ## Current command surface
 
@@ -37,6 +37,11 @@ The current template implements:
 - `delete-dataset`
 
 Stats and review commands remain later-phase work.
+
+## Output modes
+
+- `search`, `search-docs`, `get-doc`, and `search-chunks` return compact JSON by default to keep model context small.
+- Add `--verbose` when you need full document/source metadata, preview target variants, attachment-child payloads, or raw chunk text.
 
 ## Materialization rules
 

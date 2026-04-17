@@ -1291,13 +1291,12 @@ def classify_pst_message_kind(message_dict: dict[str, object], chat_metadata: di
     return "chat" if not recipients else "email"
 
 
-def parse_email_message(
-    data: bytes,
+def extract_parsed_email_message(
+    message: object,
     *,
     include_attachments: bool = True,
     preview_file_name: str = "message.html",
 ) -> dict[str, object]:
-    message = BytesParser(policy=policy.default).parsebytes(data)
     subject = message.get("Subject")
     author = message.get("From")
     recipients = ", ".join(part for part in [message.get("To"), message.get("Cc"), message.get("Bcc")] if part)
@@ -1329,6 +1328,20 @@ def parse_email_message(
         text_body=text_body,
         html_body=html_content,
         attachments=extract_eml_attachments(message) if include_attachments else [],
+        preview_file_name=preview_file_name,
+    )
+
+
+def parse_email_message(
+    data: bytes,
+    *,
+    include_attachments: bool = True,
+    preview_file_name: str = "message.html",
+) -> dict[str, object]:
+    message = BytesParser(policy=policy.default).parsebytes(data)
+    return extract_parsed_email_message(
+        message,
+        include_attachments=include_attachments,
         preview_file_name=preview_file_name,
     )
 
@@ -1370,6 +1383,33 @@ def extract_msg_file(path: Path, include_attachments: bool = True) -> dict[str, 
             pass
 
 
+def iter_mbox_messages(path: Path):
+    archive = mailbox.mbox(str(path), factory=mailbox.mboxMessage, create=False)
+    duplicate_counts: dict[str, int] = defaultdict(int)
+    try:
+        for _, raw_message in archive.iteritems():
+            payload_bytes = raw_message.as_bytes(policy=policy.default, unixfrom=False)
+            payload_hash = sha256_bytes(payload_bytes)
+            parsed_message = BytesParser(policy=policy.default).parsebytes(payload_bytes)
+            explicit_source_item_id = normalize_whitespace(
+                str(parsed_message.get("Message-ID") or parsed_message.get("Message-Id") or "")
+            ) or None
+            base_source_item_id = explicit_source_item_id or f"mbox-hash:{payload_hash}"
+            duplicate_counts[base_source_item_id] += 1
+            occurrence = duplicate_counts[base_source_item_id]
+            stable_source_item_id = base_source_item_id if occurrence == 1 else f"{base_source_item_id}#{occurrence}"
+            yield {
+                "source_item_id": stable_source_item_id,
+                "payload_hash": payload_hash,
+                "parsed_message": parsed_message,
+            }
+    finally:
+        try:
+            archive.close()
+        except Exception:
+            pass
+
+
 def container_message_payload_hash(message_payload: dict[str, object]) -> str:
     attachment_manifest: list[dict[str, object]] = []
     for ordinal, attachment in enumerate(list(message_payload.get("attachments") or []), start=1):
@@ -1397,6 +1437,38 @@ def container_message_payload_hash(message_payload: dict[str, object]) -> str:
             "attachments": attachment_manifest,
         }
     )
+
+
+def normalize_mbox_message(source_rel_path: str, message_dict: dict[str, object]) -> dict[str, object]:
+    parsed_message = message_dict.get("parsed_message")
+    if parsed_message is None:
+        raise RetrieverError(f"MBOX message is missing a parsed message payload in {source_rel_path}")
+    source_item_id = normalize_source_item_id(message_dict.get("source_item_id") or parsed_message.get("Message-ID"))
+    extracted = extract_parsed_email_message(
+        parsed_message,
+        include_attachments=True,
+        preview_file_name=mbox_preview_file_name(source_item_id),
+    )
+    payload_hash = normalize_whitespace(str(message_dict.get("payload_hash") or "")) or None
+    return {
+        "rel_path": mbox_message_rel_path(source_rel_path, source_item_id),
+        "file_name": mbox_message_file_name(source_item_id),
+        "file_hash": payload_hash
+        or container_message_payload_hash(
+            {
+                "subject": extracted.get("subject"),
+                "author": extracted.get("author"),
+                "recipients": extracted.get("recipients"),
+                "date_created": extracted.get("date_created"),
+                "text_body": extracted.get("text_content"),
+                "attachments": extracted.get("attachments"),
+            }
+        ),
+        "source_rel_path": source_rel_path,
+        "source_item_id": source_item_id,
+        "source_folder_path": None,
+        "extracted": extracted,
+    }
 
 
 def coerce_pst_attachment_payload(attachment: object) -> bytes | None:
@@ -1849,6 +1921,8 @@ def extract_document(path: Path, include_attachments: bool = True) -> dict[str, 
         return extract_eml_file(path, include_attachments=include_attachments)
     if file_type == "msg":
         return extract_msg_file(path, include_attachments=include_attachments)
+    if file_type == "mbox":
+        raise RetrieverError("MBOX sources must be ingested through the container ingest pipeline.")
     if file_type == "pst":
         raise RetrieverError("PST sources must be ingested through the container ingest pipeline.")
     raise RetrieverError(f"Unsupported file type: .{file_type}")

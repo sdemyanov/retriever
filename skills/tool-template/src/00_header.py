@@ -8,6 +8,7 @@ import hashlib
 import html
 import io
 import json
+import mailbox
 import mimetypes
 import posixpath
 import platform
@@ -172,6 +173,7 @@ SUPPORTED_FILE_TYPES = {
     "jsx",
     "kt",
     "less",
+    "mbox",
     "md",
     "msg",
     "pdf",
@@ -389,15 +391,15 @@ BUILTIN_FIELD_DESCRIPTIONS = {
     "participants": "Participants extracted from chat or email-style content",
     "recipients": "Recipients extracted from message metadata",
     "rel_path": "Workspace-relative document path",
-    "source_folder_path": "Container-relative source folder path for PST-style items",
-    "source_kind": "Origin kind such as filesystem, production, email_attachment, or pst",
+    "source_folder_path": "Container-relative source folder path for container-derived items",
+    "source_kind": "Origin kind such as filesystem, production, email_attachment, pst, or mbox",
     "source_rel_path": "Source-relative path used to derive the document",
     "subject": "Email or message subject line",
     "title": "Document title from metadata or content",
     "updated_at": "ISO timestamp when Retriever last updated the document row",
 }
 VIRTUAL_FIELD_DESCRIPTIONS = {
-    "dataset_name": "Logical dataset label for PSTs, productions, and manual document sets",
+    "dataset_name": "Logical dataset label for PSTs, MBOXes, productions, and manual document sets",
     "has_attachments": "Whether the document has one or more attachment child documents",
     "is_attachment": "Whether the document is an attachment child document",
     "production_name": "Friendly production name for production-derived documents",
@@ -438,6 +440,7 @@ PPTX_NOTES_RELATIONSHIP_TYPE = "http://schemas.openxmlformats.org/officeDocument
 PRODUCTION_SOURCE_KIND = "production"
 EMAIL_ATTACHMENT_SOURCE_KIND = "email_attachment"
 FILESYSTEM_SOURCE_KIND = "filesystem"
+MBOX_SOURCE_KIND = "mbox"
 PST_SOURCE_KIND = "pst"
 MANUAL_DATASET_SOURCE_KIND = "manual"
 PRODUCTION_DAT_HEADER_ALIASES = {
