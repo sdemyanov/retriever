@@ -5,6 +5,11 @@ JOB_KINDS = {
     "structured_extraction",
     "translation",
 }
+JOB_CAPABILITIES = {
+    "text_structured",
+    "text_translation",
+    "vision_ocr",
+}
 JOB_INPUT_BASES = {
     "active_search_text",
     "source_extract",
@@ -21,8 +26,14 @@ JOB_OUTPUT_VALUE_TYPES = {
     "text",
 }
 RUN_FAMILY_MODES = {"exact", "with_family"}
-RUN_ITEM_KINDS = {"document", "segment"}
+RUN_ITEM_KINDS = {"document", "page", "segment"}
+RUN_ITEM_STATUSES = {"completed", "failed", "pending", "running", "skipped"}
 RUN_STATUSES = {"canceled", "completed", "failed", "planned", "running"}
+TEXT_REVISION_ACTIVATION_POLICIES = {"always", "if_empty", "if_poor", "manual"}
+DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS = 900
+DEFAULT_RUN_ITEM_CONTEXT_INLINE_BYTES = 50 * 1024
+DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE = 10
+DEFAULT_OCR_RENDER_RESOLUTION = 150
 
 
 def sanitize_processing_identifier(raw_name: str, *, label: str, prefix: str) -> str:
@@ -41,6 +52,29 @@ def normalize_job_kind(job_kind: str) -> str:
             f"Unsupported job kind: {job_kind!r}. Expected one of {', '.join(sorted(JOB_KINDS))}."
         )
     return normalized
+
+
+def normalize_job_capability(capability: str) -> str:
+    normalized = normalize_whitespace(capability).lower()
+    if normalized not in JOB_CAPABILITIES:
+        raise RetrieverError(
+            f"Unsupported capability: {capability!r}. Expected one of {', '.join(sorted(JOB_CAPABILITIES))}."
+        )
+    return normalized
+
+
+def default_job_capability_for_kind(job_kind: str) -> str:
+    normalized_kind = normalize_job_kind(job_kind)
+    if normalized_kind == "structured_extraction":
+        return "text_structured"
+    if normalized_kind == "translation":
+        return "text_translation"
+    if normalized_kind == "ocr":
+        return "vision_ocr"
+    raise RetrieverError(
+        f"Job kind {normalized_kind!r} does not have a default Cowork capability. "
+        "Pass an explicit capability when creating the job version."
+    )
 
 
 def normalize_job_input_basis(input_basis: str) -> str:
@@ -76,6 +110,25 @@ def normalize_run_item_kind(item_kind: str) -> str:
     if normalized not in RUN_ITEM_KINDS:
         raise RetrieverError(
             f"Unsupported run item kind: {item_kind!r}. Expected one of {', '.join(sorted(RUN_ITEM_KINDS))}."
+        )
+    return normalized
+
+
+def normalize_run_item_status(status: str) -> str:
+    normalized = normalize_whitespace(status).lower()
+    if normalized not in RUN_ITEM_STATUSES:
+        raise RetrieverError(
+            f"Unsupported run item status: {status!r}. Expected one of {', '.join(sorted(RUN_ITEM_STATUSES))}."
+        )
+    return normalized
+
+
+def normalize_text_revision_activation_policy(policy: str) -> str:
+    normalized = normalize_whitespace(policy).lower()
+    if normalized not in TEXT_REVISION_ACTIVATION_POLICIES:
+        raise RetrieverError(
+            f"Unsupported activation policy: {policy!r}. "
+            f"Expected one of {', '.join(sorted(TEXT_REVISION_ACTIVATION_POLICIES))}."
         )
     return normalized
 

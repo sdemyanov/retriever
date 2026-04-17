@@ -219,6 +219,7 @@ SCHEMA_STATEMENTS = [
       instruction_text TEXT NOT NULL DEFAULT '',
       instruction_hash TEXT NOT NULL,
       response_schema_json TEXT,
+      capability TEXT NOT NULL,
       provider TEXT NOT NULL,
       model TEXT,
       parameters_json TEXT NOT NULL DEFAULT '{}',
@@ -306,14 +307,35 @@ SCHEMA_STATEMENTS = [
       run_snapshot_document_id INTEGER REFERENCES run_snapshot_documents(id) ON DELETE CASCADE,
       item_kind TEXT NOT NULL,
       document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      page_number INTEGER,
       segment_id INTEGER REFERENCES text_revision_segments(id) ON DELETE CASCADE,
+      input_artifact_rel_path TEXT,
       input_identity TEXT NOT NULL,
+      result_id INTEGER REFERENCES results(id) ON DELETE SET NULL,
       status TEXT NOT NULL DEFAULT 'pending',
+      claimed_by TEXT,
+      claimed_at TEXT,
+      last_heartbeat_at TEXT,
       attempt_count INTEGER NOT NULL DEFAULT 0,
       last_error TEXT,
       created_at TEXT NOT NULL,
       started_at TEXT,
       completed_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ocr_page_outputs (
+      id INTEGER PRIMARY KEY,
+      run_item_id INTEGER NOT NULL REFERENCES run_items(id) ON DELETE CASCADE,
+      run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      page_number INTEGER NOT NULL,
+      text_content TEXT NOT NULL,
+      raw_output_json TEXT,
+      normalized_output_json TEXT,
+      provider_metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      UNIQUE(run_item_id)
     )
     """,
     """
@@ -493,6 +515,7 @@ def workspace_paths(root: Path) -> dict[str, Path]:
         "state_dir": state_dir,
         "db_path": state_dir / "retriever.db",
         "previews_dir": state_dir / "previews",
+        "text_revisions_dir": state_dir / "text-revisions",
         "bin_dir": state_dir / "bin",
         "tool_path": state_dir / "bin" / "retriever_tools.py",
         "backups_dir": state_dir / "bin" / "backups",
@@ -504,7 +527,7 @@ def workspace_paths(root: Path) -> dict[str, Path]:
 
 def ensure_layout(paths: dict[str, Path]) -> None:
     paths["state_dir"].mkdir(parents=True, exist_ok=True)
-    for key in ("previews_dir", "bin_dir", "backups_dir", "jobs_dir", "logs_dir"):
+    for key in ("previews_dir", "text_revisions_dir", "bin_dir", "backups_dir", "jobs_dir", "logs_dir"):
         paths[key].mkdir(parents=True, exist_ok=True)
 
 
