@@ -2404,6 +2404,35 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             [item["id"] for item in search_payload["results"]],
         )
 
+    def test_search_cli_defaults_to_compact_payload_with_verbose_escape_hatch(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("termination notice appears here\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        compact_exit, compact_payload, _, _ = self.run_cli("search", str(self.root), "termination")
+        verbose_exit, verbose_payload, _, _ = self.run_cli("search", str(self.root), "termination", "--verbose")
+
+        self.assertEqual(compact_exit, 0)
+        self.assertEqual(verbose_exit, 0)
+        self.assertIsNotNone(compact_payload)
+        self.assertIsNotNone(verbose_payload)
+
+        compact_result = compact_payload["results"][0]
+        verbose_result = verbose_payload["results"][0]
+
+        self.assertNotIn("preview_targets", compact_result)
+        self.assertNotIn("manual_field_locks", compact_result)
+        self.assertIn("content_type", compact_result["metadata"])
+        self.assertIn("updated_at", compact_result["metadata"])
+        self.assertNotIn("page_count", compact_result["metadata"])
+        self.assertIn("preview_abs_path", compact_result)
+        self.assertIn("preview_targets", verbose_result)
+        self.assertIn("manual_field_locks", verbose_result)
+        self.assertIn("page_count", verbose_result["metadata"])
+
     def test_catalog_lists_dataset_name_and_date_granularities(self) -> None:
         retriever_tools.bootstrap(self.root)
         retriever_tools.add_field(self.root, "effective_date", "date", "Contract effective date")
@@ -2482,6 +2511,55 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             list_payload["chunks"][0]["snippet"],
             retriever_tools.chunk_preview_text(expected_chunks[0]["text_content"]),
         )
+
+    def test_get_doc_and_search_chunks_cli_default_to_compact_payloads(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("Termination notice appears here.\nSupporting detail follows.\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+
+        get_exit, get_payload, _, _ = self.run_cli("get-doc", str(self.root), "--doc-id", str(row["id"]))
+        get_verbose_exit, get_verbose_payload, _, _ = self.run_cli(
+            "get-doc",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--verbose",
+        )
+
+        self.assertEqual(get_exit, 0)
+        self.assertEqual(get_verbose_exit, 0)
+        self.assertIsNotNone(get_payload)
+        self.assertIsNotNone(get_verbose_payload)
+        self.assertNotIn("preview_targets", get_payload["document"])
+        self.assertNotIn("manual_field_locks", get_payload["document"])
+        self.assertIn("preview_targets", get_verbose_payload["document"])
+        self.assertIn("manual_field_locks", get_verbose_payload["document"])
+
+        chunk_exit, chunk_payload, _, _ = self.run_cli("search-chunks", str(self.root), "termination")
+        chunk_verbose_exit, chunk_verbose_payload, _, _ = self.run_cli(
+            "search-chunks",
+            str(self.root),
+            "termination",
+            "--verbose",
+        )
+
+        self.assertEqual(chunk_exit, 0)
+        self.assertEqual(chunk_verbose_exit, 0)
+        self.assertIsNotNone(chunk_payload)
+        self.assertIsNotNone(chunk_verbose_payload)
+
+        compact_result = chunk_payload["results"][0]
+        verbose_result = chunk_verbose_payload["results"][0]
+        self.assertNotIn("text", compact_result)
+        self.assertNotIn("preview_targets", compact_result)
+        self.assertIn("citation", compact_result)
+        self.assertIn("text", verbose_result)
+        self.assertIn("preview_targets", verbose_result)
 
     def test_search_chunks_supports_citations_and_distinct_doc_count_mode(self) -> None:
         (self.root / "nda-one.txt").write_text("Termination notice must be delivered within thirty days.\n", encoding="utf-8")

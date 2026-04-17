@@ -5,7 +5,7 @@ description: >
   or browse search results. It runs Retriever's search command with structured
   filters and presents results using the search-strategy contract.
 metadata:
-  version: "0.9.4"
+  version: "0.9.5"
 ---
 
 # Retriever Search
@@ -33,6 +33,7 @@ Use this skill when the user says things like:
 - Validate field names against built-in document columns or registered custom fields.
 - Use browse mode when the user is mostly filtering, and keyword search when they provide terms.
 - For a single Bates/control token or a Bates range expression, prefer the Bates-aware search path over plain keyword FTS.
+- Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
 - **Mandatory output format** — render every result set as the standard table from search-strategy.md:
 
   ```

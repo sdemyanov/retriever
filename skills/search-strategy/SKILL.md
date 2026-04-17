@@ -5,7 +5,7 @@ description: >
   into structured search filters. It defines paging, sorting, preview-link behavior,
   and the default result formats for browsing versus targeted lookups.
 metadata:
-  version: "0.9.4"
+  version: "0.9.5"
 ---
 
 # Retriever Search Strategy
@@ -26,3 +26,5 @@ Read [search-strategy.md](search-strategy.md) before presenting search results o
 - If the active filters constrain a field to one specific value across the shown rows, you may omit only that one redundant field from the standard columns unless the user explicitly asks to see it.
 - When `control_number` values are available, show them in a separate rightmost `Control number` column rather than embedding them in the title link.
 - Show the active query and filters clearly so the user knows what they are looking at.
+- Use Retriever's default compact search payload first; rerun with `--verbose` only when you need attachment child rows, alternate preview targets, or extended metadata that compact mode omits.
+- When a search or DB step yields multiple independent follow-up paths, issue those reads/searches in one assistant turn instead of one-by-one.
