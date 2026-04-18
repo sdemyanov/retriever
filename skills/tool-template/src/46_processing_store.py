@@ -841,12 +841,26 @@ def activate_text_revision_for_document(
         activation_policy=normalized_policy,
         created_at=now,
     )
+
+    # Best-effort: regenerate the production preview so the on-disk HTML
+    # reflects the newly active text. Failures never roll back activation.
+    try:
+        preview_regen = regenerate_production_preview_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+            text_content=text_content,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort regen
+        preview_regen = {"status": "failed", "error": str(exc)}
+
     return {
         "status": "ok",
         "document_id": int(document_id),
         "text_revision": text_revision_summary_by_id(connection, int(text_revision_id)),
         "activation_event_id": activation_event_id,
         "activation_policy": normalized_policy,
+        "preview_regen": preview_regen,
     }
 
 
