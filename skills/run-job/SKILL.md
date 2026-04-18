@@ -42,6 +42,8 @@ Whether running inline or in a subagent, use the same tool commands:
 
 Claim only small batches at a time. A good default is `5`.
 
+Do not use `execute-run` for the normal Cowork path. That command remains the legacy direct executor for deterministic tests and future external-provider work.
+
 ## Cancellation
 
 - Before claiming a new batch, check `run-status`.

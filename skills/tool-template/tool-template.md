@@ -2,13 +2,13 @@
 
 ## Template metadata
 
-- tool version: `0.13.0`
+- tool version: `0.13.3`
 - schema version: `15`
 - requirements version: `2026-04-16-phase4-pst`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `40f112b1887dc172678f50f10dad1f624c51ab70abf340d3facadd2f314c937c`
+- source checksum (SHA256): `da0a791d5198355edcad99fab66c583de8b0d94da665c392519c89b4de494989`
 
 ## Current command surface
 
@@ -57,6 +57,15 @@ The current template implements:
 - `activate-text-revision`
 
 Stats and review commands remain later-phase work.
+
+For Cowork-agent execution, prefer the queue path:
+
+- `claim-run-items`
+- `get-run-item-context`
+- `complete-run-item`
+- `fail-run-item`
+
+`execute-run` remains the legacy direct executor for deterministic tests and future external-provider work.
 
 ## Output modes
 
