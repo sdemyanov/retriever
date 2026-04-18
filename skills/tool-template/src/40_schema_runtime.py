@@ -648,6 +648,29 @@ def next_attachment_sequence(connection: sqlite3.Connection, parent_document_id:
     return int(row["max_attachment_sequence"] or 0) + 1
 
 
+def backfill_internal_rel_path_prefix(connection: sqlite3.Connection) -> int:
+    """Rewrite synthetic rel_paths that still use the legacy ``.retriever/`` prefix.
+
+    Container-derived messages, production logical documents, and attachment
+    blobs used to be stored with a leading ``.retriever/`` so that
+    ``<root>/<rel_path>`` would happen to resolve to the real file under the
+    state directory. That made it look like the workspace's opaque state
+    directory contained indexed documents, which confused scans and searches.
+    The canonical synthetic prefix is now ``_retriever/`` and path resolution
+    translates that back to the state directory explicitly.
+    """
+    if not table_exists(connection, "documents"):
+        return 0
+    cursor = connection.execute(
+        """
+        UPDATE documents
+        SET rel_path = '_retriever/' || substr(rel_path, length('.retriever/') + 1)
+        WHERE rel_path LIKE '.retriever/%'
+        """
+    )
+    return int(cursor.rowcount or 0)
+
+
 def ensure_documents_fts(connection: sqlite3.Connection) -> bool:
     expected_columns = {"document_id", "file_name", "title", "subject", "author", "custodian", "participants", "recipients"}
     existing_columns = table_columns(connection, "documents_fts")
@@ -919,6 +942,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     merged_legacy_locks = merge_legacy_field_locks(connection)
     backfilled_content_type = backfill_content_type(connection)
     backfilled_source_kinds = backfill_source_kinds(connection)
+    rewrote_internal_rel_path_prefix = backfill_internal_rel_path_prefix(connection)
     dataset_membership_migration_needed = prior_schema_version is None or prior_schema_version < 12
     backfilled_dataset_ids = backfill_dataset_ids(connection, root) if dataset_membership_migration_needed else 0
     backfilled_dataset_memberships = backfill_dataset_memberships(connection) if dataset_membership_migration_needed else 0
@@ -934,6 +958,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         "backfilled_dataset_ids": backfilled_dataset_ids,
         "backfilled_dataset_memberships": backfilled_dataset_memberships,
         "backfilled_source_kinds": backfilled_source_kinds,
+        "rewrote_internal_rel_path_prefix": rewrote_internal_rel_path_prefix,
         "backfilled_control_numbers": backfilled_control_numbers,
         "rebuilt_control_number_batches": rebuilt_control_number_batches,
         "backfilled_legacy_control_number": backfilled_legacy_control_number,
