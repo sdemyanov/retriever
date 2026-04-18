@@ -1,3 +1,13 @@
+---
+name: run-job
+description: >
+  Use this skill when the user wants to execute a planned Retriever processing run
+  inline or in the background. It decides between inline execution and spawning a
+  subagent, and drives the claim / complete / heartbeat loop against the processing DB.
+metadata:
+  version: "0.9.5"
+---
+
 # Run Job
 
 Use this skill when the user wants to execute a planned Retriever processing run inline or in the background.
