@@ -992,6 +992,85 @@ def claim_run_items(
         connection.close()
 
 
+def prepare_run_batch(
+    root: Path,
+    *,
+    run_id: int,
+    claimed_by: str,
+    limit: int | None = None,
+    stale_after_seconds: int = DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+) -> dict[str, object]:
+    if limit is not None and limit < 1:
+        raise RetrieverError("Claim limit must be >= 1.")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            materialize_run_items_for_run(connection, paths, root, run_id)
+            reused_count = reuse_active_results_for_run(connection, run_id)
+            initial_run_payload = run_status_by_id(connection, run_id)
+            initial_worker_payload = build_run_worker_payload(
+                connection,
+                run_id,
+                run_payload=initial_run_payload,
+                claimed_by=claimed_by,
+            )
+            effective_limit = limit if limit is not None else int(initial_worker_payload["recommended_batch_size"])
+            claimed_rows: list[sqlite3.Row] = []
+            batch_payloads: list[dict[str, object]] = []
+
+            if initial_worker_payload["next_action"] == "claim":
+                claimed_rows = claim_run_item_rows(
+                    connection,
+                    run_id=run_id,
+                    claimed_by=claimed_by,
+                    limit=effective_limit,
+                    stale_after_seconds=stale_after_seconds,
+                )
+                batch_payloads = [
+                    {
+                        "run_item": run_item_row_to_payload(row),
+                        "context": build_run_item_context_payload(connection, paths, root, row),
+                    }
+                    for row in claimed_rows
+                ]
+
+            current_run_payload = run_status_by_id(connection, run_id)
+            worker_payload = build_run_worker_payload(
+                connection,
+                run_id,
+                run_payload=current_run_payload,
+                claimed_by=claimed_by,
+            )
+            if batch_payloads:
+                worker_payload["next_action"] = "process_batch"
+                worker_payload["stop_reason"] = None
+            elif worker_payload["next_action"] == "claim":
+                worker_payload["next_action"] = "stop"
+                worker_payload["stop_reason"] = "no_claimable_items"
+            worker_payload["prepared_batch_size"] = len(batch_payloads)
+
+            payload = {
+                "status": "ok",
+                "run": current_run_payload,
+                "worker": worker_payload,
+                "claimed_by": normalize_whitespace(claimed_by),
+                "requested_limit": effective_limit,
+                "reused_count": reused_count,
+                "batch": batch_payloads,
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
 def get_run_item_context(root: Path, *, run_item_id: int) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)

@@ -2192,6 +2192,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reclaim running items whose heartbeat is older than this many seconds",
     )
 
+    prepare_run_batch_parser = subparsers.add_parser(
+        "prepare-run-batch",
+        help="Claim one worker batch and return execution contexts plus worker hints",
+    )
+    prepare_run_batch_parser.add_argument("workspace", help="Workspace root path")
+    prepare_run_batch_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    prepare_run_batch_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier claiming the batch")
+    prepare_run_batch_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Optional maximum number of run items to claim; defaults to the worker recommendation",
+    )
+    prepare_run_batch_parser.add_argument(
+        "--stale-seconds",
+        type=int,
+        default=DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+        help="Reclaim running items whose heartbeat is older than this many seconds",
+    )
+
     get_run_item_context_parser = subparsers.add_parser("get-run-item-context", help="Load the execution context for one run item")
     get_run_item_context_parser.add_argument("workspace", help="Workspace root path")
     get_run_item_context_parser.add_argument("--run-item-id", type=int, required=True, help="Run item id")
@@ -2541,6 +2560,22 @@ def main() -> int:
             print(
                 json.dumps(
                     claim_run_items(
+                        root,
+                        run_id=args.run_id,
+                        claimed_by=args.claimed_by,
+                        limit=args.limit,
+                        stale_after_seconds=args.stale_seconds,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "prepare-run-batch":
+            print(
+                json.dumps(
+                    prepare_run_batch(
                         root,
                         run_id=args.run_id,
                         claimed_by=args.claimed_by,
