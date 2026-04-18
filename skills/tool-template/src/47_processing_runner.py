@@ -499,12 +499,57 @@ def plan_run_snapshot_rows(
     family_mode: str,
     seed_limit: int | None,
 ) -> list[dict[str, object]]:
+    selected_documents, frozen_inputs_by_document_id = plan_selected_documents(
+        connection,
+        selector=selector,
+        exclude_selector=exclude_selector,
+        family_mode=family_mode,
+        seed_limit=seed_limit,
+    )
+    if not selected_documents:
+        return []
+
+    snapshot_rows: list[dict[str, object]] = []
+    for selected_document in selected_documents:
+        document_id = int(selected_document["document_id"])
+        document_row = selected_document["document_row"]
+        frozen_inputs = frozen_inputs_by_document_id.get(document_id, {})
+        pinned_input = compute_document_input_reference_for_job_version(
+            connection,
+            root=root,
+            document_row=document_row,
+            job_row=job_row,
+            job_version_row=job_version_row,
+            frozen_input_revision_id=frozen_inputs.get("pinned_input_revision_id"),
+            frozen_content_hash=frozen_inputs.get("pinned_content_hash"),
+        )
+        snapshot_rows.append(
+            {
+                "document_id": document_id,
+                "ordinal": int(selected_document["ordinal"]),
+                "inclusion_reason": selected_document["inclusion_reason"],
+                "pinned_input_revision_id": pinned_input["pinned_input_revision_id"],
+                "pinned_input_identity": pinned_input["pinned_input_identity"],
+                "pinned_content_hash": pinned_input["pinned_content_hash"],
+            }
+        )
+    return snapshot_rows
+
+
+def plan_selected_documents(
+    connection: sqlite3.Connection,
+    *,
+    selector: dict[str, object],
+    exclude_selector: dict[str, object],
+    family_mode: str,
+    seed_limit: int | None,
+) -> tuple[list[dict[str, object]], dict[int, dict[str, object]]]:
     seed_document_ids, reasons_by_document_id, frozen_inputs_by_document_id = resolve_seed_documents_for_selector(
         connection,
         selector,
     )
     if not seed_document_ids:
-        return []
+        return [], frozen_inputs_by_document_id
 
     excluded_document_ids, _, _ = resolve_seed_documents_for_selector(connection, exclude_selector)
     excluded_document_id_set = {int(document_id) for document_id in excluded_document_ids}
@@ -517,7 +562,7 @@ def plan_run_snapshot_rows(
         final_document_ids = list(seed_document_ids)
     final_document_ids = apply_excluded_document_ids(final_document_ids, excluded_document_id_set)
     if not final_document_ids:
-        return []
+        return [], frozen_inputs_by_document_id
 
     document_rows = connection.execute(
         f"""
@@ -529,32 +574,20 @@ def plan_run_snapshot_rows(
         final_document_ids,
     ).fetchall()
     document_row_by_id = {int(row["id"]): row for row in document_rows}
-    snapshot_rows: list[dict[str, object]] = []
+    selected_documents: list[dict[str, object]] = []
     for ordinal, document_id in enumerate(final_document_ids):
         document_row = document_row_by_id.get(int(document_id))
         if document_row is None:
             continue
-        frozen_inputs = frozen_inputs_by_document_id.get(int(document_id), {})
-        pinned_input = compute_document_input_reference_for_job_version(
-            connection,
-            root=root,
-            document_row=document_row,
-            job_row=job_row,
-            job_version_row=job_version_row,
-            frozen_input_revision_id=frozen_inputs.get("pinned_input_revision_id"),
-            frozen_content_hash=frozen_inputs.get("pinned_content_hash"),
-        )
-        snapshot_rows.append(
+        selected_documents.append(
             {
                 "document_id": int(document_id),
                 "ordinal": ordinal,
+                "document_row": document_row,
                 "inclusion_reason": reasons_by_document_id.get(int(document_id), {"direct_reasons": [], "family_seed_document_ids": []}),
-                "pinned_input_revision_id": pinned_input["pinned_input_revision_id"],
-                "pinned_input_identity": pinned_input["pinned_input_identity"],
-                "pinned_content_hash": pinned_input["pinned_content_hash"],
             }
         )
-    return snapshot_rows
+    return selected_documents, frozen_inputs_by_document_id
 
 
 def load_run_snapshot_rows(connection: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:

@@ -5,7 +5,7 @@ description: >
   "test retriever", "is retriever installed", or "check retriever".
   Confirms the Retriever plugin is installed and responding.
 metadata:
-  version: "0.13.4"
+  version: "0.13.5"
 ---
 
 # Retriever Ping
@@ -14,7 +14,7 @@ Reply in plain text with exactly this structure:
 
 ```
 Retriever plugin smoke test OK.
-Version: 0.13.4
+Version: 0.13.5
 Skill: ping
 ```
 

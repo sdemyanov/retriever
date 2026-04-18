@@ -1208,7 +1208,7 @@ def resolve_export_output_path(paths: dict[str, Path], raw_output_path: str) -> 
     workspace_root = paths["root"].resolve()
     if path_within(resolved_path, workspace_root) and not path_within(resolved_path, exports_dir):
         raise RetrieverError(
-            f"Workspace-internal output paths must live under {exports_dir} to avoid re-ingesting exported CSVs."
+            f"Workspace-internal output paths must live under {exports_dir} to avoid re-ingesting exported artifacts."
         )
     return resolved_path
 
@@ -1343,6 +1343,808 @@ def export_csv(
             "field_count": len(field_defs),
             "fields": field_defs,
             "selector": selector,
+            "overwrote_existing_file": overwrote_existing_file,
+            "file_size": file_size_bytes(output_path),
+        }
+    finally:
+        connection.close()
+
+
+def normalize_archive_member_path(raw_rel_path: str, *, label: str = "Archive member path") -> str:
+    normalized = normalize_whitespace(raw_rel_path)
+    if not normalized:
+        raise RetrieverError(f"{label} cannot be empty.")
+    candidate = Path(normalized)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise RetrieverError(f"{label} must stay within the archive root: {raw_rel_path!r}")
+    return candidate.as_posix()
+
+
+def add_archive_file_once(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    source_path: Path,
+    archive_rel_path: str,
+) -> str:
+    member_path = normalize_archive_member_path(archive_rel_path)
+    if member_path in written_member_paths:
+        return member_path
+    archive.write(source_path, arcname=member_path)
+    written_member_paths.add(member_path)
+    return member_path
+
+
+def add_archive_bytes_once(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    payload_bytes: bytes,
+    archive_rel_path: str,
+) -> str:
+    member_path = normalize_archive_member_path(archive_rel_path)
+    if member_path in written_member_paths:
+        return member_path
+    archive.writestr(member_path, payload_bytes)
+    written_member_paths.add(member_path)
+    return member_path
+
+
+def document_preview_rows(connection: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT rel_preview_path, preview_type, label, ordinal, created_at
+        FROM document_previews
+        WHERE document_id = ?
+        ORDER BY ordinal ASC, id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+
+
+def document_source_part_rows(connection: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT part_kind, rel_source_path, ordinal, label, created_at
+        FROM document_source_parts
+        WHERE document_id = ?
+        ORDER BY
+          CASE part_kind WHEN 'native' THEN 0 WHEN 'image' THEN 1 ELSE 2 END ASC,
+          ordinal ASC,
+          id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+
+
+def document_text_revision_rows(connection: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT *
+        FROM text_revisions
+        WHERE document_id = ?
+        ORDER BY id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+
+
+def document_source_text_body(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+) -> str | None:
+    revision_ids: list[int] = []
+    for field_name in ("source_text_revision_id", "active_search_text_revision_id"):
+        if field_name in row.keys() and row[field_name] is not None:
+            revision_id = int(row[field_name])
+            if revision_id not in revision_ids:
+                revision_ids.append(revision_id)
+    for revision_id in revision_ids:
+        revision_row = connection.execute(
+            """
+            SELECT storage_rel_path
+            FROM text_revisions
+            WHERE id = ?
+            """,
+            (revision_id,),
+        ).fetchone()
+        if revision_row is None:
+            continue
+        revision_body = read_text_revision_body(paths, revision_row["storage_rel_path"])
+        if revision_body is not None:
+            return revision_body
+    chunk_rows = document_chunk_rows(connection, int(row["id"]))
+    if not chunk_rows:
+        return None
+    return "\n\n".join(str(chunk_row["text_content"] or "") for chunk_row in chunk_rows)
+
+
+def build_synthetic_document_export_payload(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+    *,
+    preview_rows: list[sqlite3.Row],
+    source_part_rows: list[sqlite3.Row],
+) -> bytes:
+    payload = {
+        "document_id": int(row["id"]),
+        "control_number": row["control_number"],
+        "rel_path": row["rel_path"],
+        "file_name": row["file_name"],
+        "file_type": row["file_type"],
+        "source_kind": row["source_kind"],
+        "source_rel_path": row["source_rel_path"],
+        "source_item_id": row["source_item_id"],
+        "production_id": row["production_id"],
+        "parent_document_id": row["parent_document_id"],
+        "metadata": {
+            "author": row["author"],
+            "content_type": row["content_type"],
+            "custodian": row["custodian"],
+            "date_created": row["date_created"],
+            "date_modified": row["date_modified"],
+            "participants": row["participants"],
+            "recipients": row["recipients"],
+            "subject": row["subject"],
+            "title": row["title"],
+            "updated_at": row["updated_at"],
+        },
+        "preview_rel_paths": [
+            str(Path(".retriever") / str(preview_row["rel_preview_path"]))
+            for preview_row in preview_rows
+        ],
+        "source_part_rel_paths": [
+            str(source_part_row["rel_source_path"])
+            for source_part_row in source_part_rows
+        ],
+        "text_content": document_source_text_body(connection, paths, row),
+    }
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def archive_document_files(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+) -> tuple[dict[str, object], list[str]]:
+    document_id = int(row["id"])
+    rel_path = normalize_archive_member_path(str(row["rel_path"]), label=f"Document {document_id} rel_path")
+    preview_rows = document_preview_rows(connection, document_id)
+    source_part_rows = document_source_part_rows(connection, document_id)
+    warnings: list[str] = []
+    exported_rel_paths: list[str] = []
+    preview_rel_paths: list[str] = []
+    source_part_entries: list[dict[str, object]] = []
+
+    source_path = resolve_workspace_artifact_path(paths["root"], str(row["rel_path"]))
+    if source_path is not None and source_path.exists():
+        exported_rel_paths.append(add_archive_file_once(archive, written_member_paths, source_path, rel_path))
+        document_entry_kind = "copied"
+    else:
+        descriptor_bytes = build_synthetic_document_export_payload(
+            connection,
+            paths,
+            row,
+            preview_rows=preview_rows,
+            source_part_rows=source_part_rows,
+        )
+        exported_rel_paths.append(add_archive_bytes_once(archive, written_member_paths, descriptor_bytes, rel_path))
+        document_entry_kind = "synthetic"
+        if str(row["source_kind"] or "") not in {PRODUCTION_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND}:
+            warnings.append(
+                f"Document {document_id} has no on-disk primary artifact at {row['rel_path']}; wrote a synthetic descriptor instead."
+            )
+
+    for preview_row in preview_rows:
+        preview_source_path = paths["state_dir"] / str(preview_row["rel_preview_path"])
+        archive_rel_path = normalize_archive_member_path(
+            str(Path(".retriever") / str(preview_row["rel_preview_path"])),
+            label=f"Preview path for document {document_id}",
+        )
+        if not preview_source_path.exists():
+            warnings.append(
+                f"Preview artifact is missing for document {document_id}: {archive_rel_path}"
+            )
+            continue
+        preview_rel_paths.append(add_archive_file_once(archive, written_member_paths, preview_source_path, archive_rel_path))
+        if archive_rel_path not in exported_rel_paths:
+            exported_rel_paths.append(archive_rel_path)
+
+    for source_part_row in source_part_rows:
+        source_rel_path = normalize_archive_member_path(
+            str(source_part_row["rel_source_path"]),
+            label=f"Source part path for document {document_id}",
+        )
+        source_part_entry = {
+            "part_kind": str(source_part_row["part_kind"]),
+            "rel_path": source_rel_path,
+            "ordinal": int(source_part_row["ordinal"] or 0),
+            "label": source_part_row["label"],
+        }
+        source_part_path = resolve_workspace_artifact_path(paths["root"], str(source_part_row["rel_source_path"]))
+        if source_part_path is None or not source_part_path.exists():
+            source_part_entry["missing"] = True
+            warnings.append(
+                f"Source part is missing for document {document_id}: {source_rel_path}"
+            )
+            source_part_entries.append(source_part_entry)
+            continue
+        source_part_entry["archive_rel_path"] = add_archive_file_once(
+            archive,
+            written_member_paths,
+            source_part_path,
+            source_rel_path,
+        )
+        if source_part_entry["archive_rel_path"] not in exported_rel_paths:
+            exported_rel_paths.append(str(source_part_entry["archive_rel_path"]))
+        source_part_entries.append(source_part_entry)
+
+    return (
+        {
+            "document_id": document_id,
+            "control_number": row["control_number"],
+            "file_name": row["file_name"],
+            "file_type": row["file_type"],
+            "rel_path": rel_path,
+            "source_kind": row["source_kind"],
+            "parent_document_id": row["parent_document_id"],
+            "document_entry_kind": document_entry_kind,
+            "preview_rel_paths": preview_rel_paths,
+            "source_part_entries": source_part_entries,
+            "exported_rel_paths": exported_rel_paths,
+        },
+        warnings,
+    )
+
+
+def archive_document_text_revisions(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_id: int,
+) -> tuple[list[dict[str, object]], list[str]]:
+    entries: list[dict[str, object]] = []
+    warnings: list[str] = []
+    for revision_row in document_text_revision_rows(connection, document_id):
+        entry = {
+            "id": int(revision_row["id"]),
+            "revision_kind": revision_row["revision_kind"],
+            "storage_rel_path": revision_row["storage_rel_path"],
+        }
+        storage_rel_path = normalize_whitespace(str(revision_row["storage_rel_path"] or ""))
+        if not storage_rel_path:
+            entries.append(entry)
+            continue
+        source_path = paths["state_dir"] / storage_rel_path
+        archive_rel_path = normalize_archive_member_path(
+            str(Path(".retriever") / storage_rel_path),
+            label=f"Text revision path for document {document_id}",
+        )
+        if not source_path.exists():
+            warnings.append(
+                f"Text revision body is missing for document {document_id}: {archive_rel_path}"
+            )
+            entries.append(entry)
+            continue
+        entry["archive_rel_path"] = add_archive_file_once(
+            archive,
+            written_member_paths,
+            source_path,
+            archive_rel_path,
+        )
+        entries.append(entry)
+    return entries, warnings
+
+
+def sqlite_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {str(key): row[key] for key in row.keys()}
+
+
+def table_column_names_in_order(connection: sqlite3.Connection, table_name: str) -> list[str]:
+    return [str(row["name"]) for row in table_info(connection, table_name)]
+
+
+def insert_row_dicts(
+    connection: sqlite3.Connection,
+    table_name: str,
+    row_dicts: list[dict[str, object]],
+    *,
+    column_names: list[str] | None = None,
+) -> None:
+    if not row_dicts:
+        return
+    ordered_columns = column_names or table_column_names_in_order(connection, table_name)
+    usable_columns = [column_name for column_name in ordered_columns if any(column_name in row_dict for row_dict in row_dicts)]
+    if not usable_columns:
+        return
+    placeholders = ", ".join("?" for _ in usable_columns)
+    connection.executemany(
+        f"""
+        INSERT INTO {quote_identifier(table_name)} ({', '.join(quote_identifier(column_name) for column_name in usable_columns)})
+        VALUES ({placeholders})
+        """,
+        [[row_dict.get(column_name) for column_name in usable_columns] for row_dict in row_dicts],
+    )
+
+
+def portable_context_parent_rows(
+    connection: sqlite3.Connection,
+    selected_document_rows: list[sqlite3.Row],
+) -> list[sqlite3.Row]:
+    selected_document_ids = {int(row["id"]) for row in selected_document_rows}
+    parent_ids = sorted(
+        {
+            int(row["parent_document_id"])
+            for row in selected_document_rows
+            if row["parent_document_id"] is not None and int(row["parent_document_id"]) not in selected_document_ids
+        }
+    )
+    if not parent_ids:
+        return []
+    placeholders = ", ".join("?" for _ in parent_ids)
+    return connection.execute(
+        f"""
+        SELECT *
+        FROM documents
+        WHERE id IN ({placeholders})
+        ORDER BY id ASC
+        """,
+        parent_ids,
+    ).fetchall()
+
+
+def portable_document_row_dict(
+    row: sqlite3.Row,
+    *,
+    preserve_text_revisions: bool,
+) -> dict[str, object]:
+    payload = sqlite_row_to_dict(row)
+    if not preserve_text_revisions:
+        for field_name in (
+            "source_text_revision_id",
+            "active_search_text_revision_id",
+            "active_text_source_kind",
+            "active_text_language",
+            "active_text_quality_score",
+        ):
+            if field_name in payload:
+                payload[field_name] = None
+    return payload
+
+
+def build_portable_workspace_db(
+    source_connection: sqlite3.Connection,
+    portable_root: Path,
+    selected_document_rows: list[sqlite3.Row],
+) -> dict[str, object]:
+    portable_paths = workspace_paths(portable_root)
+    ensure_layout(portable_paths)
+    target_connection = sqlite3.connect(portable_paths["db_path"])
+    target_connection.row_factory = sqlite3.Row
+    target_connection.execute("PRAGMA busy_timeout = 5000")
+    target_connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        apply_schema(target_connection, portable_root)
+
+        custom_field_rows = source_connection.execute(
+            """
+            SELECT *
+            FROM custom_fields_registry
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        for custom_field_row in custom_field_rows:
+            field_name = str(custom_field_row["field_name"])
+            sql_type = REGISTRY_FIELD_TYPES.get(str(custom_field_row["field_type"]))
+            if sql_type is None:
+                raise RetrieverError(f"Unsupported custom field type for portable export: {custom_field_row['field_type']!r}")
+            target_connection.execute(
+                f"ALTER TABLE documents ADD COLUMN {quote_identifier(field_name)} {sql_type}"
+            )
+        insert_row_dicts(
+            target_connection,
+            "custom_fields_registry",
+            [sqlite_row_to_dict(row) for row in custom_field_rows],
+        )
+
+        selected_document_ids = sorted({int(row["id"]) for row in selected_document_rows})
+        context_parent_rows = portable_context_parent_rows(source_connection, selected_document_rows)
+        retained_row_by_id = {
+            int(row["id"]): row
+            for row in [*context_parent_rows, *selected_document_rows]
+        }
+        retained_rows = sorted(
+            retained_row_by_id.values(),
+            key=lambda row: (0 if row["parent_document_id"] is None else 1, int(row["id"])),
+        )
+        stub_document_ids = sorted(
+            document_id for document_id in retained_row_by_id if document_id not in selected_document_ids
+        )
+
+        dataset_document_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM dataset_documents
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM dataset_documents
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        dataset_ids = sorted(
+            {
+                int(row["dataset_id"])
+                for row in retained_rows
+                if row["dataset_id"] is not None
+            }
+            | {
+                int(row["dataset_id"])
+                for row in dataset_document_rows
+                if row["dataset_id"] is not None
+            }
+        )
+        dataset_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM datasets
+            WHERE id IN ({', '.join('?' for _ in dataset_ids)})
+            ORDER BY id ASC
+            """ if dataset_ids else """
+            SELECT *
+            FROM datasets
+            WHERE 0
+            """,
+            dataset_ids,
+        ).fetchall()
+        dataset_source_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM dataset_sources
+            WHERE dataset_id IN ({', '.join('?' for _ in dataset_ids)})
+            ORDER BY id ASC
+            """ if dataset_ids else """
+            SELECT *
+            FROM dataset_sources
+            WHERE 0
+            """,
+            dataset_ids,
+        ).fetchall()
+        production_ids = sorted({int(row["production_id"]) for row in retained_rows if row["production_id"] is not None})
+        production_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM productions
+            WHERE id IN ({', '.join('?' for _ in production_ids)})
+            ORDER BY id ASC
+            """ if production_ids else """
+            SELECT *
+            FROM productions
+            WHERE 0
+            """,
+            production_ids,
+        ).fetchall()
+        container_pairs = sorted(
+            {
+                (str(row["source_kind"]), str(row["source_rel_path"]))
+                for row in retained_rows
+                if normalize_whitespace(str(row["source_kind"] or "")).lower() in {PST_SOURCE_KIND, MBOX_SOURCE_KIND}
+                and normalize_whitespace(str(row["source_rel_path"] or ""))
+            }
+        )
+        container_source_rows: list[sqlite3.Row] = []
+        for source_kind, source_rel_path in container_pairs:
+            row = source_connection.execute(
+                """
+                SELECT *
+                FROM container_sources
+                WHERE source_kind = ? AND source_rel_path = ?
+                """,
+                (source_kind, source_rel_path),
+            ).fetchone()
+            if row is not None:
+                container_source_rows.append(row)
+
+        preview_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM document_previews
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM document_previews
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        source_part_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM document_source_parts
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM document_source_parts
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        chunk_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM document_chunks
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM document_chunks
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        text_revision_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM text_revisions
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM text_revisions
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        text_revision_ids = [int(row["id"]) for row in text_revision_rows]
+        text_revision_segment_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM text_revision_segments
+            WHERE revision_id IN ({', '.join('?' for _ in text_revision_ids)})
+            ORDER BY id ASC
+            """ if text_revision_ids else """
+            SELECT *
+            FROM text_revision_segments
+            WHERE 0
+            """,
+            text_revision_ids,
+        ).fetchall()
+
+        target_connection.execute("PRAGMA foreign_keys = OFF")
+        target_connection.execute("BEGIN")
+        try:
+            insert_row_dicts(target_connection, "datasets", [sqlite_row_to_dict(row) for row in dataset_rows])
+            insert_row_dicts(target_connection, "dataset_sources", [sqlite_row_to_dict(row) for row in dataset_source_rows])
+            insert_row_dicts(target_connection, "productions", [sqlite_row_to_dict(row) for row in production_rows])
+            insert_row_dicts(target_connection, "container_sources", [sqlite_row_to_dict(row) for row in container_source_rows])
+            insert_row_dicts(
+                target_connection,
+                "documents",
+                [
+                    portable_document_row_dict(
+                        row,
+                        preserve_text_revisions=int(row["id"]) not in set(stub_document_ids),
+                    )
+                    for row in retained_rows
+                ],
+                column_names=table_column_names_in_order(target_connection, "documents"),
+            )
+            insert_row_dicts(target_connection, "dataset_documents", [sqlite_row_to_dict(row) for row in dataset_document_rows])
+            insert_row_dicts(target_connection, "document_previews", [sqlite_row_to_dict(row) for row in preview_rows])
+            insert_row_dicts(target_connection, "document_source_parts", [sqlite_row_to_dict(row) for row in source_part_rows])
+            insert_row_dicts(
+                target_connection,
+                "text_revisions",
+                [
+                    {
+                        **sqlite_row_to_dict(row),
+                        "created_by_job_version_id": None,
+                    }
+                    for row in text_revision_rows
+                ],
+            )
+            insert_row_dicts(
+                target_connection,
+                "text_revision_segments",
+                [sqlite_row_to_dict(row) for row in text_revision_segment_rows],
+            )
+            insert_row_dicts(target_connection, "document_chunks", [sqlite_row_to_dict(row) for row in chunk_rows])
+            for document_id in selected_document_ids:
+                refresh_documents_fts_row(target_connection, document_id)
+            if chunk_rows:
+                target_connection.executemany(
+                    """
+                    INSERT INTO chunks_fts (chunk_id, document_id, text_content)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        (row["id"], row["document_id"], row["text_content"])
+                        for row in chunk_rows
+                    ],
+                )
+            target_connection.commit()
+        except Exception:
+            target_connection.rollback()
+            raise
+        target_connection.execute("PRAGMA foreign_keys = ON")
+        foreign_key_issues = target_connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_issues:
+            raise RetrieverError(f"Portable workspace export failed foreign key validation: {foreign_key_issues[0]}")
+        return {
+            "db_path": portable_paths["db_path"],
+            "selected_document_ids": selected_document_ids,
+            "retained_document_ids": [int(row["id"]) for row in retained_rows],
+            "stub_document_ids": stub_document_ids,
+        }
+    finally:
+        target_connection.close()
+
+
+def export_archive(
+    root: Path,
+    raw_output_path: str,
+    *,
+    dataset_ids: list[int] | None = None,
+    dataset_names: list[str] | None = None,
+    document_ids: list[int] | None = None,
+    control_numbers: list[str] | None = None,
+    query: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    from_run_id: int | None = None,
+    exclude_dataset_ids: list[int] | None = None,
+    exclude_dataset_names: list[str] | None = None,
+    exclude_document_ids: list[int] | None = None,
+    exclude_control_numbers: list[str] | None = None,
+    exclude_query: str | None = None,
+    exclude_filters: list[list[str]] | None = None,
+    family_mode: str = "exact",
+    seed_limit: int | None = None,
+    portable_workspace: bool = False,
+) -> dict[str, object]:
+    normalized_family_mode = normalize_run_family_mode(family_mode)
+    if seed_limit is not None and seed_limit < 1:
+        raise RetrieverError("Archive limit must be >= 1.")
+
+    selector = normalize_run_selector_spec(
+        dataset_ids=dataset_ids,
+        dataset_names=dataset_names,
+        document_ids=document_ids,
+        control_numbers=control_numbers,
+        query=query,
+        raw_filters=raw_filters,
+        from_run_id=from_run_id,
+    )
+    exclude_selector = normalize_run_selector_spec(
+        dataset_ids=exclude_dataset_ids,
+        dataset_names=exclude_dataset_names,
+        document_ids=exclude_document_ids,
+        control_numbers=exclude_control_numbers,
+        query=exclude_query,
+        raw_filters=exclude_filters,
+        from_run_id=None,
+    )
+    if not selector_has_inputs(selector):
+        raise RetrieverError("Archive selector must include at least one inclusion input.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        output_path = resolve_export_output_path(paths, raw_output_path)
+        selected_documents, _ = plan_selected_documents(
+            connection,
+            selector=selector,
+            exclude_selector=exclude_selector,
+            family_mode=normalized_family_mode,
+            seed_limit=seed_limit,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        overwrote_existing_file = output_path.exists()
+        written_member_paths: set[str] = set()
+        manifest_document_entries: list[dict[str, object]] = []
+        warnings: list[str] = []
+        created_at = utc_now()
+
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for selected_document in selected_documents:
+                document_row = selected_document["document_row"]
+                manifest_entry, document_warnings = archive_document_files(
+                    archive,
+                    written_member_paths,
+                    connection,
+                    paths,
+                    document_row,
+                )
+                manifest_entry["ordinal"] = int(selected_document["ordinal"])
+                manifest_entry["inclusion_reason"] = selected_document["inclusion_reason"]
+                if portable_workspace:
+                    revision_entries, revision_warnings = archive_document_text_revisions(
+                        archive,
+                        written_member_paths,
+                        connection,
+                        paths,
+                        int(document_row["id"]),
+                    )
+                    manifest_entry["text_revision_entries"] = revision_entries
+                    warnings.extend(revision_warnings)
+                manifest_document_entries.append(manifest_entry)
+                warnings.extend(document_warnings)
+
+            portable_workspace_payload = None
+            if portable_workspace:
+                with tempfile.TemporaryDirectory(prefix="retriever-portable-workspace-") as tempdir:
+                    portable_root = Path(tempdir) / "workspace"
+                    portable_workspace_payload = build_portable_workspace_db(
+                        connection,
+                        portable_root,
+                        [selected_document["document_row"] for selected_document in selected_documents],
+                    )
+                    add_archive_file_once(
+                        archive,
+                        written_member_paths,
+                        Path(portable_workspace_payload["db_path"]),
+                        ".retriever/retriever.db",
+                    )
+
+            manifest_payload = {
+                "status": "ok",
+                "created_at": created_at,
+                "selector": selector,
+                "exclude_selector": exclude_selector,
+                "family_mode": normalized_family_mode,
+                "seed_limit": seed_limit,
+                "document_count": len(selected_documents),
+                "portable_workspace": portable_workspace,
+                "portable_workspace_document_ids": (
+                    portable_workspace_payload["selected_document_ids"]
+                    if portable_workspace_payload is not None
+                    else []
+                ),
+                "portable_workspace_stub_document_ids": (
+                    portable_workspace_payload["stub_document_ids"]
+                    if portable_workspace_payload is not None
+                    else []
+                ),
+                "documents": manifest_document_entries,
+                "warnings": warnings,
+            }
+            add_archive_bytes_once(
+                archive,
+                written_member_paths,
+                (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                ".retriever/export-manifest.json",
+            )
+
+        output_rel_path = None
+        try:
+            output_rel_path = output_path.relative_to(root).as_posix()
+        except ValueError:
+            output_rel_path = None
+
+        return {
+            "status": "ok",
+            "created_at": created_at,
+            "output_path": str(output_path),
+            "output_rel_path": output_rel_path,
+            "document_count": len(selected_documents),
+            "selector": selector,
+            "exclude_selector": exclude_selector,
+            "family_mode": normalized_family_mode,
+            "seed_limit": seed_limit,
+            "portable_workspace": portable_workspace,
+            "manifest_rel_path": ".retriever/export-manifest.json",
+            "archive_member_count": len(written_member_paths),
+            "documents": manifest_document_entries,
+            "warnings": warnings,
             "overwrote_existing_file": overwrote_existing_file,
             "file_size": file_size_bytes(output_path),
         }
@@ -2010,6 +2812,30 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field for search-based export or 'relevance'")
     export_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
 
+    export_archive_parser = subparsers.add_parser(
+        "export-archive",
+        help="Write selected documents, previews, and source artifacts to a zip archive",
+    )
+    export_archive_parser.add_argument("workspace", help="Workspace root path")
+    export_archive_parser.add_argument(
+        "output_path",
+        help="Zip file path; relative paths resolve under .retriever/exports",
+    )
+    add_run_selector_arguments(export_archive_parser)
+    add_run_selector_arguments(export_archive_parser, prefix="exclude")
+    export_archive_parser.add_argument(
+        "--family-mode",
+        default="exact",
+        choices=sorted(RUN_FAMILY_MODES),
+        help="Whether to include only seed docs or their family members too",
+    )
+    export_archive_parser.add_argument("--limit", dest="seed_limit", type=int, help="Limit the directly matched seed set")
+    export_archive_parser.add_argument(
+        "--portable-workspace",
+        action="store_true",
+        help="Include a curated subset .retriever/retriever.db for the exported documents",
+    )
+
     get_doc_parser = subparsers.add_parser("get-doc", help="Fetch one document with optional summary text or exact chunks")
     get_doc_parser.add_argument("workspace", help="Workspace root path")
     get_doc_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
@@ -2398,6 +3224,35 @@ def main() -> int:
                         args.filters,
                         args.sort,
                         args.order,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "export-archive":
+            print(
+                json.dumps(
+                    export_archive(
+                        root,
+                        args.output_path,
+                        dataset_ids=args.dataset_ids,
+                        dataset_names=args.dataset_names,
+                        document_ids=args.document_ids,
+                        control_numbers=args.control_numbers,
+                        query=args.query,
+                        raw_filters=args.filters,
+                        from_run_id=args.from_run_id,
+                        exclude_dataset_ids=args.exclude_dataset_ids,
+                        exclude_dataset_names=args.exclude_dataset_names,
+                        exclude_document_ids=args.exclude_document_ids,
+                        exclude_control_numbers=args.exclude_control_numbers,
+                        exclude_query=args.exclude_query,
+                        exclude_filters=args.exclude_filters,
+                        family_mode=args.family_mode,
+                        seed_limit=args.seed_limit,
+                        portable_workspace=args.portable_workspace,
                     ),
                     indent=2,
                     sort_keys=True,

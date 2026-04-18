@@ -2,13 +2,13 @@
 
 ## Template metadata
 
-- tool version: `0.13.4`
+- tool version: `0.13.5`
 - schema version: `15`
 - requirements version: `2026-04-16-phase4-pst`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `6b6f3b07ffef0617b1267d0a26ae23fd2f5d37e4f4ba1154b03ac300a045107d`
+- source checksum (SHA256): `d555925ad14a8b9b795d0327c3ab197053255a7bf7ea43c8c44e301f0f7ee7bf`
 
 ## Current command surface
 
@@ -23,6 +23,7 @@ The current template implements:
 - `search-docs`
 - `catalog`
 - `export-csv`
+- `export-archive`
 - `get-doc`
 - `list-chunks`
 - `search-chunks`
