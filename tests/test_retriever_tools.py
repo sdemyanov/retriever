@@ -2572,11 +2572,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         row = self.fetch_document_row("memo.rtf")
         self.assertEqual(row["content_type"], "E-Doc")
         self.assertEqual(row["text_status"], "ok")
+        self.assertEqual(row["title"], "Contract Review Memorandum")
 
         search_result = retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)
         self.assertEqual(search_result["results"][0]["file_name"], "memo.rtf")
         self.assertTrue(search_result["results"][0]["preview_rel_path"].endswith(".html"))
         self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "html")
+        preview_html = Path(search_result["results"][0]["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("<title>Contract Review Memorandum</title>", preview_html)
+        self.assertNotIn("<h1>", preview_html)
 
     def test_ingest_prefers_native_preview_for_chat_like_rtf_files(self) -> None:
         rtf_path = self.root / "chat-thread.rtf"
@@ -2605,7 +2609,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(len(result["preview_targets"]), 2)
         self.assertEqual(result["preview_targets"][1]["preview_type"], "html")
         preview_html = Path(result["preview_targets"][1]["abs_path"]).read_text(encoding="utf-8")
-        self.assertIn("Retriever Chat Preview", preview_html)
+        self.assertIn("<title>Kickoff thread for launch planning.</title>", preview_html)
+        self.assertNotIn("<h1>", preview_html)
         self.assertIn("Alice Example", preview_html)
         self.assertIn("Bob Example", preview_html)
 
@@ -2644,7 +2649,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(result["preview_rel_path"].endswith(".html"))
         self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
         preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
-        self.assertIn("Retriever Chat Preview", preview_html)
+        self.assertIn("<title>Kickoff thread for launch planning.</title>", preview_html)
+        self.assertNotIn("<h1>", preview_html)
         self.assertIn("Alice Example", preview_html)
         self.assertIn("Bob Example", preview_html)
         self.assertIn("Kickoff thread for launch planning.", preview_html)
@@ -2968,6 +2974,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(preview_html.startswith("<!DOCTYPE html>"))
         self.assertIn("<head>", preview_html)
         self.assertIn('<meta charset="utf-8"/>', preview_html)
+        self.assertIn("<title>Quarterly Strategy Deck</title>", preview_html)
+        self.assertNotIn("<h1>", preview_html)
         self.assertIn("Slide 1", preview_html)
         self.assertIn("Slide 2", preview_html)
         self.assertIn("Q3 Revenue Review", preview_html)
@@ -3895,7 +3903,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(result["preview_rel_path"].startswith(".retriever/previews/mailbox.pst/messages/"))
         self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
         preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
-        self.assertIn("Retriever Chat Preview", preview_html)
+        self.assertIn("<title>Kickoff thread for launch planning.</title>", preview_html)
+        self.assertNotIn("<h1>", preview_html)
         self.assertIn("Alice Example", preview_html)
         self.assertIn("Bob Example", preview_html)
         self.assertIn("Kickoff thread for launch planning.", preview_html)
@@ -3986,7 +3995,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         search_result = retriever_tools.search(self.root, "hey there", None, None, None, 1, 20)
         result = next(item for item in search_result["results"] if item["id"] == chat_row["id"])
         preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
-        self.assertIn("Retriever Chat Preview", preview_html)
+        self.assertIn("<title>hey there</title>", preview_html)
+        self.assertNotIn("<h1>", preview_html)
         self.assertIn("Sergey Demyanov", preview_html)
         self.assertIn("hey there", preview_html)
 
@@ -4031,7 +4041,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(search_result["total_hits"], 1)
         preview_html = Path(search_result["results"][0]["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
-        self.assertIn("Retriever Calendar Preview", preview_html)
+        self.assertIn("<title>Labor Day</title>", preview_html)
+        self.assertNotIn("<h1>", preview_html)
         self.assertIn("Labor Day", preview_html)
         self.assertIn("Sep 7, 2026 12:00 AM UTC", preview_html)
 
@@ -4288,6 +4299,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         html_result = next(item for item in html_search["results"] if item["control_number"] == "PDX000001")
         self.assertTrue(html_result["preview_rel_path"].endswith(".html"))
         preview_html = Path(html_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("<title>Attachment Handling</title>", preview_html)
+        self.assertNotIn("<h1>", preview_html)
         self.assertIn("PDX000001", preview_html)
         self.assertIn("Discuss attachment handling.", preview_html)
         self.assertIn("data:image/png;base64,", preview_html)
@@ -5107,7 +5120,7 @@ class CidInliningTests(unittest.TestCase):
         self.assertIn("data:image/png;base64,", preview_content)
         self.assertNotIn('src="cid:icon"', preview_content)
 
-    def test_build_email_extracted_payload_uses_subject_for_preview_title_and_heading(self) -> None:
+    def test_build_email_extracted_payload_uses_subject_for_preview_title_without_heading(self) -> None:
         payload = retriever_tools.build_email_extracted_payload(
             subject="Legalweek 2023 Mobile App Now Available",
             author="events@example.com",
@@ -5121,8 +5134,7 @@ class CidInliningTests(unittest.TestCase):
 
         preview_content = payload["preview_artifacts"][0]["content"]
         self.assertIn("<title>Legalweek 2023 Mobile App Now Available</title>", preview_content)
-        self.assertIn("<h1>Legalweek 2023 Mobile App Now Available</h1>", preview_content)
-        self.assertNotIn("<h1>Retriever Preview</h1>", preview_content)
+        self.assertNotIn("<h1>", preview_content)
 
 
 if __name__ == "__main__":

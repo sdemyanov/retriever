@@ -612,7 +612,11 @@ def extract_rtf_file(path: Path) -> dict[str, object]:
                 "preview_type": "html",
                 "label": "text",
                 "ordinal": 0,
-                "content": build_html_preview({}, body_text=text_content),
+                "content": build_html_preview(
+                    {},
+                    body_text=text_content,
+                    document_title=title or path.stem or path.name,
+                ),
             }
         ]
     )
@@ -1018,7 +1022,6 @@ def build_email_extracted_payload(
         body_html=preview_html_body,
         body_text=normalized_text,
         document_title=preview_title,
-        heading=preview_title,
     )
     return {
         "page_count": 1,
@@ -1155,6 +1158,7 @@ def build_calendar_extracted_payload(
         normalized_text = strip_html_tags(normalized_html)
     normalized_text = normalize_whitespace(normalized_text)
     preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
+    preview_title = subject or "Retriever Calendar Preview"
     preview = build_html_preview(
         {
             "Organizer": author or "",
@@ -1164,8 +1168,7 @@ def build_calendar_extracted_payload(
         },
         body_html=preview_html_body,
         body_text=normalized_text,
-        document_title=subject or "Retriever Calendar Preview",
-        heading="Retriever Calendar Preview",
+        document_title=preview_title,
     )
     return {
         "page_count": 1,
