@@ -2319,15 +2319,17 @@ def build_html_preview(
     body_html: str | None = None,
     body_text: str | None = None,
     *,
-    document_title: str = "Retriever Preview",
+    document_title: str,
     head_html: str | None = None,
-    heading: str = "Retriever Preview",
+    heading: str | None = None,
 ) -> str:
     header_html = "".join(
         f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
         for key, value in headers.items()
         if value
     )
+    heading_html = f"<h1>{html.escape(heading)}</h1>" if heading else ""
+    header_section = f"<table>{header_html}</table><hr/>" if header_html else ""
     if body_html:
         body_section = body_html
     else:
@@ -2339,11 +2341,8 @@ def build_html_preview(
         f"<title>{html.escape(document_title)}</title>"
         f"{head_html or ''}"
         "</head><body>"
-        f"<h1>{html.escape(heading)}</h1>"
-        "<table>"
-        f"{header_html}"
-        "</table>"
-        "<hr/>"
+        f"{heading_html}"
+        f"{header_section}"
         f"{body_section}"
         "</body></html>"
     )
@@ -2353,14 +2352,13 @@ def build_chat_preview_html(
     headers: dict[str, str],
     body_text: str,
     *,
-    document_title: str = "Retriever Chat Preview",
+    document_title: str,
     entries: list[dict[str, object]] | None = None,
 ) -> str:
     chat_entries = entries if entries is not None else iter_chat_transcript_entries(body_text, max_lines=4000)
     head_html = (
         "<style>"
         "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; color: #1f2328; }"
-        "h1 { font-size: 1.35rem; margin-bottom: 0.75rem; }"
         "table { border-collapse: collapse; margin-bottom: 1rem; }"
         "th { text-align: left; vertical-align: top; padding: 0.25rem 0.75rem 0.25rem 0; color: #57606a; }"
         "td { padding: 0.25rem 0; }"
@@ -2426,7 +2424,6 @@ def build_chat_preview_html(
         body_html=body_section,
         document_title=document_title,
         head_html=head_html,
-        heading="Retriever Chat Preview",
     )
 
 

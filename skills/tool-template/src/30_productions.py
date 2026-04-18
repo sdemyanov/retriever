@@ -299,6 +299,7 @@ def infer_production_title(control_number: str, text_content: str, native_path: 
 
 def build_production_preview_html(
     *,
+    document_title: str,
     control_number: str,
     production_name: str,
     begin_bates: str,
@@ -342,7 +343,7 @@ img { max-width: 100%; height: auto; border: 1px solid #d8dee4; background: #fff
 pre { white-space: pre-wrap; word-break: break-word; background: #f8fafc; border: 1px solid #d8dee4; padding: 0.75rem; }
 </style>
 """.strip()
-    return build_html_preview(headers, body_html=body_html, document_title=f"{control_number} Preview", head_html=head_html)
+    return build_html_preview(headers, body_html=body_html, document_title=document_title, head_html=head_html)
 
 
 def replace_document_related_rows(
@@ -1892,6 +1893,7 @@ def build_production_extracted_payload(
         if data_url is None:
             continue
         page_images.append({"label": f"Page {index}", "src": data_url})
+    resolved_title = (email_headers.get("title") if email_headers else None) or infer_production_title(control_number, text_content, native_path)
     preview_artifacts: list[dict[str, object]] = []
     if preferred_native is None:
         preview_artifacts.append(
@@ -1901,6 +1903,7 @@ def build_production_extracted_payload(
                 "label": "production",
                 "ordinal": 0,
                 "content": build_production_preview_html(
+                    document_title=resolved_title,
                     control_number=control_number,
                     production_name=production_name,
                     begin_bates=begin_bates,
@@ -1919,7 +1922,7 @@ def build_production_extracted_payload(
         "date_created": email_headers.get("date_created") if email_headers else None,
         "date_modified": None,
         "participants": participants,
-        "title": (email_headers.get("title") if email_headers else None) or infer_production_title(control_number, text_content, native_path),
+        "title": resolved_title,
         "subject": subject,
         "recipients": recipients,
         "text_content": text_content,
