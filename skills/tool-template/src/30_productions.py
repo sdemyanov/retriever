@@ -346,6 +346,102 @@ pre { white-space: pre-wrap; word-break: break-word; background: #f8fafc; border
     return build_html_preview(headers, body_html=body_html, document_title=document_title, head_html=head_html)
 
 
+def regenerate_production_preview_for_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    document_id: int,
+    text_content: str,
+) -> dict[str, object]:
+    """Rebuild the synthesized HTML preview for a production document.
+
+    Returns a status payload. Never raises on expected skips (non-production
+    doc, no HTML preview row, missing production row). Unexpected I/O errors
+    propagate and should be handled by the caller as a best-effort regen.
+    """
+    document_row = connection.execute(
+        """
+        SELECT id, control_number, production_id, begin_bates, end_bates,
+               begin_attachment, end_attachment, title
+        FROM documents
+        WHERE id = ?
+        """,
+        (document_id,),
+    ).fetchone()
+    if document_row is None:
+        return {"status": "skipped", "reason": "unknown_document"}
+    if document_row["production_id"] is None:
+        return {"status": "skipped", "reason": "not_production"}
+
+    preview_row = connection.execute(
+        """
+        SELECT rel_preview_path
+        FROM document_previews
+        WHERE document_id = ? AND preview_type = 'html'
+        ORDER BY ordinal
+        LIMIT 1
+        """,
+        (document_id,),
+    ).fetchone()
+    if preview_row is None:
+        return {"status": "skipped", "reason": "no_html_preview"}
+
+    production_row = connection.execute(
+        "SELECT production_name FROM productions WHERE id = ?",
+        (document_row["production_id"],),
+    ).fetchone()
+    if production_row is None:
+        return {"status": "skipped", "reason": "missing_production_row"}
+
+    image_rows = connection.execute(
+        """
+        SELECT ordinal, label, rel_source_path
+        FROM document_source_parts
+        WHERE document_id = ? AND part_kind = 'image'
+        ORDER BY ordinal
+        """,
+        (document_id,),
+    ).fetchall()
+
+    page_images: list[dict[str, object]] = []
+    for index, row in enumerate(image_rows, start=1):
+        abs_image = paths["root"] / row["rel_source_path"]
+        if not abs_image.exists():
+            continue
+        data_url = image_path_data_url(abs_image)
+        if data_url is None:
+            continue
+        page_images.append(
+            {
+                "label": row["label"] or f"Page {index}",
+                "src": data_url,
+            }
+        )
+
+    resolved_title = document_row["title"] or document_row["control_number"]
+    html_body = build_production_preview_html(
+        document_title=resolved_title,
+        control_number=document_row["control_number"],
+        production_name=production_row["production_name"],
+        begin_bates=document_row["begin_bates"] or "",
+        end_bates=document_row["end_bates"] or "",
+        begin_attachment=document_row["begin_attachment"],
+        end_attachment=document_row["end_attachment"],
+        text_content=text_content,
+        page_images=page_images,
+    )
+
+    preview_path = paths["state_dir"] / preview_row["rel_preview_path"]
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_text(html_body, encoding="utf-8")
+    return {
+        "status": "ok",
+        "rel_preview_path": preview_row["rel_preview_path"],
+        "page_images": len(page_images),
+        "text_chars": len(text_content),
+    }
+
+
 def replace_document_related_rows(
     connection: sqlite3.Connection,
     document_id: int,
