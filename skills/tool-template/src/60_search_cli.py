@@ -220,7 +220,7 @@ def document_path_payload(
     preview_rel_path, preview_abs_path = default_preview_target(paths, row, connection)
     return {
         "rel_path": row["rel_path"],
-        "abs_path": str(paths["root"] / row["rel_path"]),
+        "abs_path": str(document_absolute_path(paths, row["rel_path"])),
         "preview_rel_path": preview_rel_path,
         "preview_abs_path": preview_abs_path,
         "preview_targets": collect_preview_targets(paths, int(row["id"]), row["rel_path"], connection),

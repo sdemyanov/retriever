@@ -282,7 +282,7 @@ def resolve_production_source_path(workspace_root: Path, production_root: Path, 
 def production_logical_rel_path(production_rel_root: str, control_number: str) -> str:
     production_slug = sanitize_storage_filename(Path(production_rel_root).name)
     control_slug = sanitize_storage_filename(control_number)
-    return Path(".retriever") / "productions" / production_slug / "documents" / f"{control_slug}.logical"
+    return Path(INTERNAL_REL_PATH_PREFIX) / "productions" / production_slug / "documents" / f"{control_slug}.logical"
 
 
 def infer_production_title(control_number: str, text_content: str, native_path: Path | None) -> str:
@@ -647,7 +647,7 @@ def write_attachment_blob(
     absolute_path = paths["state_dir"] / preview_rel_path
     absolute_path.parent.mkdir(parents=True, exist_ok=True)
     absolute_path.write_bytes(payload)
-    rel_path = Path(".retriever") / preview_rel_path
+    rel_path = Path(INTERNAL_REL_PATH_PREFIX) / preview_rel_path
     return rel_path.as_posix(), absolute_path
 
 
@@ -677,7 +677,7 @@ def cleanup_document_artifacts(
     for preview_row in preview_rows:
         remove_file_if_exists(paths["state_dir"] / preview_row["rel_preview_path"])
     if is_internal_rel_path(row["rel_path"]):
-        remove_file_if_exists(paths["root"] / row["rel_path"])
+        remove_file_if_exists(document_absolute_path(paths, row["rel_path"]))
 
 
 def parse_file_types(raw_value: str | None) -> set[str] | None:

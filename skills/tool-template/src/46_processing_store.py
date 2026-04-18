@@ -1241,13 +1241,18 @@ def workspace_relative_artifact_path(paths: dict[str, Path], absolute_path: Path
         relative_to_state = absolute_path.relative_to(paths["state_dir"])
     except ValueError:
         return relative_document_path(paths["root"], absolute_path)
-    return str(Path(".retriever") / relative_to_state)
+    return str(Path(INTERNAL_REL_PATH_PREFIX) / relative_to_state)
 
 
 def resolve_workspace_artifact_path(root: Path, rel_path: str | None) -> Path | None:
     normalized = normalize_whitespace(str(rel_path or ""))
     if not normalized:
         return None
+    path = Path(normalized)
+    if path.parts and path.parts[0] == INTERNAL_REL_PATH_PREFIX:
+        # Synthetic rel_paths mirror the state-directory layout.
+        state_relative = Path(*path.parts[1:]) if len(path.parts) > 1 else Path()
+        return (root / ".retriever" / state_relative).resolve()
     return (root / normalized).resolve()
 
 

@@ -3,7 +3,7 @@ def preview_base_path_for_rel_path(rel_path: str) -> Path:
     if source_rel_path is not None:
         return Path("previews") / Path(source_rel_path) / "messages"
     base = Path(rel_path)
-    if base.parts and base.parts[0] == ".retriever":
+    if base.parts and base.parts[0] == INTERNAL_REL_PATH_PREFIX:
         base = Path(*base.parts[1:])
     if base.parts and base.parts[0] == "previews":
         return base.parent
@@ -55,7 +55,7 @@ def document_native_target(paths: dict[str, Path], row: sqlite3.Row | None) -> d
     if row is None:
         return None
     rel_path = str(row["rel_path"])
-    abs_path = paths["root"] / rel_path
+    abs_path = document_absolute_path(paths, rel_path)
     if not abs_path.exists():
         return None
     return {
@@ -93,14 +93,14 @@ def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection:
         return str(native_target["rel_path"]), str(native_target["abs_path"])
     if preview_rows:
         rel_preview = preview_rows[0]["rel_preview_path"]
-        rel_path = str(Path(".retriever") / rel_preview)
+        rel_path = str(Path(INTERNAL_REL_PATH_PREFIX) / rel_preview)
         abs_path = str(paths["state_dir"] / rel_preview)
         return rel_path, abs_path
     source_targets = production_source_part_targets(paths, connection, row)
     if source_targets:
         return str(source_targets[0]["rel_path"]), str(source_targets[0]["abs_path"])
     rel_path = row["rel_path"]
-    return rel_path, str(paths["root"] / rel_path)
+    return rel_path, str(document_absolute_path(paths, rel_path))
 
 
 def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: str, connection: sqlite3.Connection) -> list[dict[str, object]]:
@@ -127,7 +127,7 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
             return source_targets
         if native_target is not None:
             return [native_target]
-        abs_path = paths["root"] / rel_path
+        abs_path = document_absolute_path(paths, rel_path)
         return [
             {
                 "rel_path": rel_path,
@@ -144,7 +144,7 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
         if native_target is not None:
             targets.append(native_target)
     for preview_row in preview_rows:
-        rel_preview = str(Path(".retriever") / preview_row["rel_preview_path"])
+        rel_preview = str(Path(INTERNAL_REL_PATH_PREFIX) / preview_row["rel_preview_path"])
         targets.append(
             {
                 "rel_path": rel_preview,

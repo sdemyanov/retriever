@@ -898,10 +898,30 @@ def normalize_internal_rel_path(path: Path) -> str:
     return normalized.lstrip("/")
 
 
+INTERNAL_REL_PATH_PREFIX = "_retriever"
+
+
 def is_internal_rel_path(rel_path: str | None) -> bool:
     if not rel_path:
         return False
-    return normalize_internal_rel_path(Path(rel_path)).startswith(".retriever/")
+    return normalize_internal_rel_path(Path(rel_path)).startswith(f"{INTERNAL_REL_PATH_PREFIX}/")
+
+
+def document_absolute_path(paths: dict[str, Path], rel_path: str | None) -> Path:
+    """Resolve a documents.rel_path (possibly internal) to its absolute location.
+
+    Internal rel_paths (those beginning with ``_retriever/``) address files that
+    live under the workspace's ``.retriever`` state directory. Regular rel_paths
+    are relative to the workspace root.
+    """
+    text = str(rel_path or "").strip()
+    if not text:
+        return paths["root"]
+    path = Path(text)
+    if path.parts and path.parts[0] == INTERNAL_REL_PATH_PREFIX:
+        state_relative = Path(*path.parts[1:]) if len(path.parts) > 1 else Path()
+        return paths["state_dir"] / state_relative
+    return paths["root"] / text
 
 
 def normalize_source_item_id(value: object) -> str:
@@ -921,7 +941,7 @@ def container_source_rel_path_from_message_rel_path(rel_path: str | None) -> str
         return None
     normalized = normalize_internal_rel_path(Path(rel_path))
     parts = Path(normalized).parts
-    if len(parts) < 5 or parts[0] != ".retriever" or parts[1] != "sources":
+    if len(parts) < 5 or parts[0] != INTERNAL_REL_PATH_PREFIX or parts[1] != "sources":
         return None
     try:
         messages_index = parts.index("messages")
@@ -1584,7 +1604,7 @@ def prune_unused_filesystem_dataset(connection: sqlite3.Connection) -> bool:
 def container_message_rel_path(source_rel_path: str, source_item_id: str, file_suffix: str) -> str:
     encoded = encode_source_item_id_for_path(source_item_id)
     return (
-        Path(".retriever")
+        Path(INTERNAL_REL_PATH_PREFIX)
         / "sources"
         / Path(source_rel_path)
         / "messages"
