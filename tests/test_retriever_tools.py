@@ -1567,6 +1567,88 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_translation_run_item_context_includes_execution_template(self) -> None:
+        note_path = self.root / "translation.txt"
+        note_path.write_text("Translate this sentence.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("translation.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Translate FR",
+            "translation",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "translate_fr",
+            "--instruction",
+            "Translate to French and preserve meaning.",
+            "--parameters-json",
+            "{\"target_language\":\"fr\"}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["capability"], "text_translation")
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "translator-a",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        self.assertEqual(len(claim_payload["run_items"]), 1)
+        run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(context_payload["context"]["job_version"]["capability"], "text_translation")
+        self.assertEqual(context_payload["context"]["execution"]["capability"], "text_translation")
+        self.assertEqual(context_payload["context"]["execution"]["target_language"], "fr")
+        self.assertIn(
+            "Translate the entire input text into fr.",
+            context_payload["context"]["execution"]["task_prompt"],
+        )
+        self.assertEqual(
+            context_payload["context"]["execution"]["completion_template"]["created_text_revision_json"]["language"],
+            "fr",
+        )
+        self.assertEqual(
+            context_payload["context"]["execution"]["completion_template"]["created_text_revision_json"]["revision_kind"],
+            "translation",
+        )
+
     def test_claim_complete_run_item_flow_is_idempotent(self) -> None:
         note_path = self.root / "contract.txt"
         note_path.write_text("Governing law is Delaware.", encoding="utf-8")
@@ -1649,6 +1731,19 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "Governing law is Delaware.",
         )
         self.assertIn("governing_law", context_payload["context"]["response_schema"]["properties"])
+        self.assertEqual(context_payload["context"]["execution"]["capability"], "text_structured")
+        self.assertIn(
+            "Return only a JSON object that matches response_schema exactly.",
+            context_payload["context"]["execution"]["task_prompt"],
+        )
+        self.assertEqual(
+            context_payload["context"]["execution"]["output_defaults"]["governing_law"],
+            "",
+        )
+        self.assertEqual(
+            context_payload["context"]["execution"]["completion_template"]["output_values_json"]["governing_law"],
+            "<final governing_law value>",
+        )
 
         complete_exit, complete_payload, _, _ = self.run_cli(
             "complete-run-item",

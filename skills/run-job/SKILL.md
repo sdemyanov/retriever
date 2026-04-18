@@ -34,7 +34,8 @@ Whether running inline or in a subagent, use the same tool commands:
 1. `claim-run-items --run-id ... --claimed-by ... --limit ...`
 2. For each returned item:
    - `get-run-item-context --run-item-id ...`
-   - perform the capability work in-turn
+   - use `context.execution.task_prompt` plus the provided input payload to perform the capability work in-turn
+   - use `context.execution.completion_template` as the shape for `complete-run-item`
    - `complete-run-item ...` or `fail-run-item ...`
 3. `heartbeat-run-items --run-id ... --claimed-by ...` between batches
 4. `run-status --run-id ...` to check for completion or cancellation
