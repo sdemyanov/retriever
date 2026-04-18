@@ -24,6 +24,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "retriever_tools.py"
 BUNDLER_PATH = REPO_ROOT / "skills" / "tool-template" / "bundle_retriever_tools.py"
 TOOL_TEMPLATE_PATH = REPO_ROOT / "skills" / "tool-template" / "tool-template.md"
+SOURCE_HEADER_PATH = REPO_ROOT / "skills" / "tool-template" / "src" / "00_header.py"
+PLUGIN_MANIFEST_PATH = REPO_ROOT / ".claude-plugin" / "plugin.json"
+PING_SKILL_PATH = REPO_ROOT / "skills" / "ping" / "SKILL.md"
 REGRESSION_CORPUS_ROOT = REPO_ROOT / "phase0" / "regression_corpus"
 
 retriever_tools = None
@@ -68,9 +71,39 @@ def assert_bundled_tooling_current() -> None:
         )
 
 
+def assert_version_metadata_current() -> None:
+    header_match = re.search(
+        r'^TOOL_VERSION = "([^"]+)"$',
+        SOURCE_HEADER_PATH.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if header_match is None:
+        raise AssertionError(f"Could not determine TOOL_VERSION from {SOURCE_HEADER_PATH}.")
+    expected_version = header_match.group(1)
+
+    plugin_version = json.loads(PLUGIN_MANIFEST_PATH.read_text(encoding="utf-8")).get("version")
+    if plugin_version != expected_version:
+        raise AssertionError(
+            ".claude-plugin/plugin.json has a stale version relative to TOOL_VERSION. "
+            "Run ./build.sh to synchronize version metadata before running tests."
+        )
+
+    ping_text = PING_SKILL_PATH.read_text(encoding="utf-8")
+    metadata_match = re.search(r'^\s*version:\s*"([^"]+)"\s*$', ping_text, re.MULTILINE)
+    body_match = re.search(r"^Version:\s*(\S+)\s*$", ping_text, re.MULTILINE)
+    if metadata_match is None or body_match is None:
+        raise AssertionError(f"Could not find both ping skill version markers in {PING_SKILL_PATH}.")
+    if metadata_match.group(1) != expected_version or body_match.group(1) != expected_version:
+        raise AssertionError(
+            "skills/ping/SKILL.md has stale version text relative to TOOL_VERSION. "
+            "Run ./build.sh to synchronize version metadata before running tests."
+        )
+
+
 def setUpModule() -> None:
     global retriever_tools, TOOL_BYTES
     assert_bundled_tooling_current()
+    assert_version_metadata_current()
     retriever_tools = load_python_module(TOOL_PATH, "retriever_tools_under_test")
     TOOL_BYTES = TOOL_PATH.read_bytes()
 
