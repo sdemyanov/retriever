@@ -4963,6 +4963,213 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertIn("not visible because they have no dataset memberships", payload["error"])
 
+    def test_export_archive_cli_includes_previews_and_attachment_family(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Archive export",
+            body_text="Parent email body text.",
+            attachment_name="notes.txt",
+            attachment_text="confidential attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        parent_row = self.fetch_document_row("thread.eml")
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            parent_preview_rows = connection.execute(
+                """
+                SELECT rel_preview_path
+                FROM document_previews
+                WHERE document_id = ?
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (parent_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertGreaterEqual(len(parent_preview_rows), 1)
+        parent_preview_archive_path = str(Path(".retriever") / str(parent_preview_rows[0]["rel_preview_path"]))
+
+        export_path = self.root / ".retriever" / "exports" / "family.zip"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-archive",
+            str(self.root),
+            "family.zip",
+            "--query",
+            "confidential",
+            "--family-mode",
+            "with_family",
+            "--limit",
+            "1",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["document_count"], 2)
+        self.assertEqual(payload["output_rel_path"], ".retriever/exports/family.zip")
+        self.assertEqual(payload["family_mode"], "with_family")
+        self.assertFalse(payload["portable_workspace"])
+        self.assertEqual(payload["selector"]["query"], "confidential")
+
+        with zipfile.ZipFile(export_path, "r") as archive:
+            names = set(archive.namelist())
+            manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+
+        self.assertIn("thread.eml", names)
+        self.assertIn(child_row["rel_path"], names)
+        self.assertIn(parent_preview_archive_path, names)
+        self.assertEqual(manifest["document_count"], 2)
+        self.assertEqual(manifest["family_mode"], "with_family")
+        self.assertEqual(manifest["warnings"], [])
+
+        manifest_by_document_id = {
+            int(item["document_id"]): item
+            for item in manifest["documents"]
+        }
+        self.assertEqual(set(manifest_by_document_id), {int(parent_row["id"]), int(child_row["id"])})
+        self.assertEqual(
+            manifest_by_document_id[int(child_row["id"])]["inclusion_reason"]["direct_reasons"][0]["type"],
+            "search",
+        )
+        self.assertEqual(
+            manifest_by_document_id[int(parent_row["id"])]["inclusion_reason"]["family_seed_document_ids"],
+            [int(child_row["id"])],
+        )
+
+    def test_export_archive_portable_workspace_supports_selected_child_with_parent_context_stub(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Portable archive",
+            body_text="Parent email body text.",
+            attachment_name="notes.txt",
+            attachment_text="confidential attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        parent_row = self.fetch_document_row("thread.eml")
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+
+        export_path = self.root / ".retriever" / "exports" / "portable-child.zip"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-archive",
+            str(self.root),
+            "portable-child.zip",
+            "--doc-id",
+            str(child_row["id"]),
+            "--portable-workspace",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["document_count"], 1)
+        self.assertTrue(payload["portable_workspace"])
+        self.assertEqual(payload["selector"]["document_ids"], [child_row["id"]])
+
+        with zipfile.ZipFile(export_path, "r") as archive:
+            names = set(archive.namelist())
+            manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+            self.assertIn(".retriever/retriever.db", names)
+            self.assertIn(child_row["rel_path"], names)
+
+            with tempfile.TemporaryDirectory(prefix="retriever-portable-archive-") as extract_dir:
+                extracted_root = Path(extract_dir) / "workspace"
+                archive.extractall(extracted_root)
+
+                portable_search = retriever_tools.search(extracted_root, "confidential", None, None, None, 1, 20)
+                self.assertEqual(portable_search["total_hits"], 1)
+                self.assertEqual(portable_search["results"][0]["id"], child_row["id"])
+                self.assertEqual(portable_search["results"][0]["parent"]["id"], parent_row["id"])
+                self.assertEqual(
+                    portable_search["results"][0]["parent"]["control_number"],
+                    parent_row["control_number"],
+                )
+
+                parent_search = retriever_tools.search(extracted_root, "Portable archive", None, None, None, 1, 20)
+                self.assertEqual(parent_search["total_hits"], 0)
+
+                portable_connection = retriever_tools.connect_db(extracted_root / ".retriever" / "retriever.db")
+                try:
+                    parent_stub_row = portable_connection.execute(
+                        """
+                        SELECT source_text_revision_id, active_search_text_revision_id
+                        FROM documents
+                        WHERE id = ?
+                        """,
+                        (parent_row["id"],),
+                    ).fetchone()
+                    self.assertIsNotNone(parent_stub_row)
+                    self.assertIsNone(parent_stub_row["source_text_revision_id"])
+                    self.assertIsNone(parent_stub_row["active_search_text_revision_id"])
+
+                    dataset_document_count = portable_connection.execute(
+                        "SELECT COUNT(*) AS count FROM dataset_documents"
+                    ).fetchone()["count"]
+                    self.assertEqual(dataset_document_count, 1)
+                finally:
+                    portable_connection.close()
+
+        self.assertEqual(manifest["portable_workspace_document_ids"], [child_row["id"]])
+        self.assertEqual(manifest["portable_workspace_stub_document_ids"], [parent_row["id"]])
+
+    def test_export_archive_includes_production_source_parts_and_synthetic_logical_entry(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        native_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000004.logical")
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            source_part_rows = connection.execute(
+                """
+                SELECT part_kind, rel_source_path
+                FROM document_source_parts
+                WHERE document_id = ?
+                ORDER BY part_kind ASC, ordinal ASC, id ASC
+                """,
+                (native_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertTrue(any(row["part_kind"] == "native" for row in source_part_rows))
+
+        export_path = self.root / ".retriever" / "exports" / "production.zip"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-archive",
+            str(self.root),
+            "production.zip",
+            "--doc-id",
+            str(native_row["id"]),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["document_count"], 1)
+        self.assertEqual(payload["warnings"], [])
+
+        with zipfile.ZipFile(export_path, "r") as archive:
+            names = set(archive.namelist())
+            manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+            descriptor_payload = json.loads(archive.read(native_row["rel_path"]).decode("utf-8"))
+
+        self.assertIn(native_row["rel_path"], names)
+        self.assertTrue(all(row["rel_source_path"] in names for row in source_part_rows))
+        self.assertEqual(manifest["warnings"], [])
+        self.assertEqual(manifest["documents"][0]["document_entry_kind"], "synthetic")
+        self.assertTrue(any(part["part_kind"] == "native" for part in manifest["documents"][0]["source_part_entries"]))
+        self.assertEqual(descriptor_payload["document_id"], native_row["id"])
+        self.assertEqual(descriptor_payload["control_number"], native_row["control_number"])
+
     def test_get_doc_and_list_chunks_return_summary_and_exact_chunk_text(self) -> None:
         paragraph = "Termination notice requires careful review and supporting detail. "
         body = "\n".join(f"Section {index}: {paragraph * 70}" for index in range(1, 8)) + "\n"

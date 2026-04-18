@@ -115,6 +115,18 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
         (document_id,),
     ).fetchall()
     if not preview_rows:
+        native_target = document_native_target(paths, document_row)
+        source_targets = production_source_part_targets(paths, connection, document_row)
+        if native_target is not None and document_prefers_native_primary_preview(document_row):
+            targets = [native_target]
+            for target in source_targets:
+                if target["rel_path"] not in {existing["rel_path"] for existing in targets}:
+                    targets.append(target)
+            return targets
+        if source_targets:
+            return source_targets
+        if native_target is not None:
+            return [native_target]
         abs_path = paths["root"] / rel_path
         return [
             {
