@@ -78,7 +78,7 @@ except Exception:  # pragma: no cover - required PST backend probe
     pypff = None
 
 
-TOOL_VERSION = "0.13.6"
+TOOL_VERSION = "0.16.0"
 SCHEMA_VERSION = 16
 REQUIREMENTS_VERSION = "2026-04-16-phase4-pst"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
