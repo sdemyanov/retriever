@@ -1007,6 +1007,7 @@ def build_email_extracted_payload(
         [author, recipients or None],
     )
     preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
+    preview_title = subject or "Retriever Email Preview"
     preview = build_html_preview(
         {
             "From": author or "",
@@ -1016,6 +1017,8 @@ def build_email_extracted_payload(
         },
         body_html=preview_html_body,
         body_text=normalized_text,
+        document_title=preview_title,
+        heading=preview_title,
     )
     return {
         "page_count": 1,

@@ -5074,6 +5074,23 @@ class CidInliningTests(unittest.TestCase):
         self.assertIn("data:image/png;base64,", preview_content)
         self.assertNotIn('src="cid:icon"', preview_content)
 
+    def test_build_email_extracted_payload_uses_subject_for_preview_title_and_heading(self) -> None:
+        payload = retriever_tools.build_email_extracted_payload(
+            subject="Legalweek 2023 Mobile App Now Available",
+            author="events@example.com",
+            recipients="sergey@example.com",
+            date_created="2026-04-17T15:31:00Z",
+            text_body="Email body.",
+            html_body=None,
+            attachments=[],
+            preview_file_name="msg.html",
+        )
+
+        preview_content = payload["preview_artifacts"][0]["content"]
+        self.assertIn("<title>Legalweek 2023 Mobile App Now Available</title>", preview_content)
+        self.assertIn("<h1>Legalweek 2023 Mobile App Now Available</h1>", preview_content)
+        self.assertNotIn("<h1>Retriever Preview</h1>", preview_content)
+
 
 if __name__ == "__main__":
     unittest.main()
