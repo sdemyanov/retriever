@@ -2168,7 +2168,10 @@ def build_parser() -> argparse.ArgumentParser:
     list_results_parser.add_argument("--run-id", type=int, help="Filter results to one run")
     list_results_parser.add_argument("--doc-id", dest="document_id", type=int, help="Filter results to one document")
 
-    execute_run_parser = subparsers.add_parser("execute-run", help="Execute one planned processing run")
+    execute_run_parser = subparsers.add_parser(
+        "execute-run",
+        help="Execute one planned processing run via the legacy direct executor",
+    )
     execute_run_parser.add_argument("workspace", help="Workspace root path")
     execute_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
 

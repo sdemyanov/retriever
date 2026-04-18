@@ -1474,7 +1474,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_execute_translation_run_creates_derived_text_revision(self) -> None:
+    def test_claim_complete_translation_run_creates_derived_text_revision(self) -> None:
         note_path = self.root / "memo.txt"
         note_path.write_text("Original English memo text.", encoding="utf-8")
 
@@ -1521,17 +1521,63 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(create_run_payload)
         run_id = int(create_run_payload["run"]["id"])
 
-        execute_run_exit, execute_run_payload, _, _ = self.run_cli(
-            "execute-run",
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
             str(self.root),
             "--run-id",
             str(run_id),
+            "--claimed-by",
+            "translator-es",
+            "--limit",
+            "1",
         )
-        self.assertEqual(execute_run_exit, 0)
-        self.assertIsNotNone(execute_run_payload)
-        self.assertEqual(execute_run_payload["run"]["status"], "completed")
-        self.assertEqual(len(execute_run_payload["results"]), 1)
-        result_payload = execute_run_payload["results"][0]
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        self.assertEqual(len(claim_payload["run_items"]), 1)
+        run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(context_payload["context"]["job_version"]["capability"], "text_translation")
+        self.assertEqual(
+            context_payload["context"]["input"]["inline_text"],
+            "Original English memo text.",
+        )
+        self.assertEqual(context_payload["context"]["execution"]["target_language"], "es")
+
+        completion_template = context_payload["context"]["execution"]["completion_template"]
+        raw_output = dict(completion_template["raw_output_json"])
+        raw_output["translated_text"] = "ES::Original English memo text."
+        normalized_output = dict(completion_template["normalized_output_json"])
+        normalized_output["translated_text"] = "ES::Original English memo text."
+        created_text_revision = dict(completion_template["created_text_revision_json"])
+        created_text_revision["text_content"] = "ES::Original English memo text."
+
+        complete_exit, complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "translator-es",
+            "--raw-output-json",
+            json.dumps(raw_output),
+            "--normalized-output-json",
+            json.dumps(normalized_output),
+            "--created-text-revision-json",
+            json.dumps(created_text_revision),
+        )
+        self.assertEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+        self.assertFalse(complete_payload["idempotent"])
+        self.assertEqual(complete_payload["run"]["status"], "completed")
+        result_payload = complete_payload["result"]
         self.assertIsNotNone(result_payload["created_text_revision_id"])
 
         updated_row = self.fetch_document_by_id(int(document_row["id"]))
@@ -1566,6 +1612,25 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.assertEqual(translated_text, "ES::Original English memo text.")
         finally:
             connection.close()
+
+        repeat_complete_exit, repeat_complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "translator-es",
+            "--raw-output-json",
+            json.dumps(raw_output),
+            "--normalized-output-json",
+            json.dumps(normalized_output),
+            "--created-text-revision-json",
+            json.dumps(created_text_revision),
+        )
+        self.assertEqual(repeat_complete_exit, 0)
+        self.assertIsNotNone(repeat_complete_payload)
+        self.assertTrue(repeat_complete_payload["idempotent"])
+        self.assertEqual(repeat_complete_payload["result"]["id"], result_payload["id"])
 
     def test_translation_run_item_context_includes_execution_template(self) -> None:
         note_path = self.root / "translation.txt"
@@ -1745,6 +1810,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "<final governing_law value>",
         )
 
+        completion_template = context_payload["context"]["execution"]["completion_template"]
+        raw_output = dict(completion_template["raw_output_json"])
+        raw_output["governing_law"] = "Delaware"
+        normalized_output = dict(completion_template["normalized_output_json"])
+        normalized_output["governing_law"] = "Delaware"
+        output_values = dict(completion_template["output_values_json"])
+        output_values["governing_law"] = "Delaware"
+
         complete_exit, complete_payload, _, _ = self.run_cli(
             "complete-run-item",
             str(self.root),
@@ -1753,11 +1826,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "--claimed-by",
             "worker-a",
             "--raw-output-json",
-            "{\"governing_law\":\"Delaware\"}",
+            json.dumps(raw_output),
             "--normalized-output-json",
-            "{\"governing_law\":\"Delaware\"}",
+            json.dumps(normalized_output),
             "--output-values-json",
-            "{\"governing_law\":\"Delaware\"}",
+            json.dumps(output_values),
         )
         self.assertEqual(complete_exit, 0)
         self.assertIsNotNone(complete_payload)
@@ -1776,11 +1849,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "--claimed-by",
             "worker-a",
             "--raw-output-json",
-            "{\"governing_law\":\"Delaware\"}",
+            json.dumps(raw_output),
             "--normalized-output-json",
-            "{\"governing_law\":\"Delaware\"}",
+            json.dumps(normalized_output),
             "--output-values-json",
-            "{\"governing_law\":\"Delaware\"}",
+            json.dumps(output_values),
         )
         self.assertEqual(repeat_complete_exit, 0)
         self.assertIsNotNone(repeat_complete_payload)
