@@ -1802,6 +1802,119 @@ def run_item_status_counts(connection: sqlite3.Connection, run_id: int) -> dict[
     }
 
 
+def run_execution_metadata(connection: sqlite3.Connection, run_id: int) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row]:
+    run_row = require_run_row_by_id(connection, run_id)
+    job_version_row = require_job_version_row_by_id(connection, int(run_row["job_version_id"]))
+    job_row = connection.execute(
+        """
+        SELECT *
+        FROM jobs
+        WHERE id = ?
+        """,
+        (job_version_row["job_id"],),
+    ).fetchone()
+    if job_row is None:
+        raise RetrieverError(f"Run {run_id} references a missing job id: {job_version_row['job_id']}")
+    return run_row, job_version_row, job_row
+
+
+def ocr_run_pending_finalization_count(connection: sqlite3.Connection, run_id: int) -> int:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM run_snapshot_documents AS snapshot
+        WHERE snapshot.run_id = ?
+          AND EXISTS (
+            SELECT 1
+            FROM run_items AS page_item
+            WHERE page_item.run_id = snapshot.run_id
+              AND page_item.document_id = snapshot.document_id
+              AND page_item.item_kind = 'page'
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM run_items AS finalized_item
+            WHERE finalized_item.run_id = snapshot.run_id
+              AND finalized_item.document_id = snapshot.document_id
+              AND finalized_item.result_id IS NOT NULL
+          )
+        """,
+        (run_id,),
+    ).fetchone()
+    return int(row["count"] or 0)
+
+
+def build_run_worker_payload(
+    connection: sqlite3.Connection,
+    run_id: int,
+    *,
+    run_payload: dict[str, object],
+    claimed_by: str | None = None,
+) -> dict[str, object]:
+    _, job_version_row, job_row = run_execution_metadata(connection, run_id)
+    job_kind = normalize_job_kind(str(job_row["job_kind"]))
+    capability = normalize_job_capability(str(job_version_row["capability"]))
+    run_item_counts = dict(run_payload.get("run_item_counts") or {})
+    pending_count = int(run_item_counts.get("pending", 0) or 0)
+    running_count = int(run_item_counts.get("running", 0) or 0)
+    completed_count = int(run_item_counts.get("completed", 0) or 0)
+    failed_count = int(run_item_counts.get("failed", 0) or 0)
+    skipped_count = int(run_item_counts.get("skipped", 0) or 0)
+    planned_count = int(run_payload.get("planned_count", 0) or 0)
+    total_items = pending_count + running_count + completed_count + failed_count + skipped_count
+    outstanding_items = max(planned_count - completed_count - failed_count - skipped_count, 0)
+    needs_ocr_finalization = job_kind == "ocr" and ocr_run_pending_finalization_count(connection, run_id) > 0
+    normalized_claimed_by = normalize_whitespace(claimed_by) if claimed_by and claimed_by.strip() else None
+    recommended_execution_mode = (
+        "background"
+        if max(total_items, planned_count) > DEFAULT_WORKER_INLINE_MAX_ITEMS
+        else "inline"
+    )
+    recommended_batch_size = min(
+        DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE,
+        DEFAULT_WORKER_BATCH_SIZE,
+        max(outstanding_items, 1),
+    )
+    recommended_max_batches = (
+        DEFAULT_WORKER_BACKGROUND_MAX_BATCHES
+        if recommended_execution_mode == "background"
+        else DEFAULT_WORKER_INLINE_MAX_BATCHES
+    )
+
+    next_action = "claim"
+    stop_reason = None
+    run_status = str(run_payload.get("status") or "")
+    if run_status == "canceled":
+        next_action = "stop"
+        stop_reason = "canceled"
+    elif needs_ocr_finalization and pending_count == 0 and running_count == 0 and failed_count == 0:
+        next_action = "finalize_ocr"
+    elif planned_count == 0:
+        next_action = "stop"
+        stop_reason = "empty"
+    elif outstanding_items == 0 and pending_count == 0 and running_count == 0:
+        next_action = "stop"
+        if failed_count:
+            stop_reason = "failed"
+        elif run_status == "completed":
+            stop_reason = "completed"
+        else:
+            stop_reason = run_status or "idle"
+
+    return {
+        "job_kind": job_kind,
+        "capability": capability,
+        "claimed_by": normalized_claimed_by,
+        "recommended_execution_mode": recommended_execution_mode,
+        "recommended_batch_size": recommended_batch_size,
+        "recommended_max_batches_per_worker": recommended_max_batches,
+        "outstanding_items": outstanding_items,
+        "needs_ocr_finalization": needs_ocr_finalization,
+        "next_action": next_action,
+        "stop_reason": stop_reason,
+    }
+
+
 def recent_run_item_failures(
     connection: sqlite3.Connection,
     *,
@@ -2264,6 +2377,7 @@ def run_status_by_id(connection: sqlite3.Connection, run_id: int) -> dict[str, o
         }
         for row in active_claim_rows
     ]
+    payload["worker"] = build_run_worker_payload(connection, run_id, run_payload=payload)
     return payload
 
 

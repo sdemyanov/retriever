@@ -1871,6 +1871,82 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(status_payload["run"]["status"], "completed")
         self.assertEqual(status_payload["run"]["run_item_counts"]["completed"], 1)
 
+    def test_prepare_run_batch_returns_contexts_and_worker_hints(self) -> None:
+        note_path = self.root / "batch-contract.txt"
+        note_path.write_text("Governing law is New York.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("batch-contract.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Batch Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "batch_contract_metadata",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "batch_contract_metadata",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-loop",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["worker"]["claimed_by"], "worker-loop")
+        self.assertEqual(prepare_payload["worker"]["next_action"], "process_batch")
+        self.assertEqual(prepare_payload["worker"]["recommended_execution_mode"], "inline")
+        self.assertEqual(prepare_payload["worker"]["prepared_batch_size"], 1)
+        self.assertEqual(len(prepare_payload["batch"]), 1)
+        batch_entry = prepare_payload["batch"][0]
+        self.assertEqual(batch_entry["run_item"]["claimed_by"], "worker-loop")
+        self.assertEqual(batch_entry["context"]["job_version"]["capability"], "text_structured")
+        self.assertEqual(
+            batch_entry["context"]["input"]["inline_text"],
+            "Governing law is New York.",
+        )
+        self.assertEqual(
+            batch_entry["context"]["execution"]["completion_template"]["output_values_json"]["governing_law"],
+            "<final governing_law value>",
+        )
+
     def test_claim_run_items_reclaims_stale_running_items(self) -> None:
         note_path = self.root / "stale.txt"
         note_path.write_text("Counterparty is Acme.", encoding="utf-8")
@@ -2048,6 +2124,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(post_cancel_claim_payload["run"]["status"], "canceled")
         self.assertEqual(post_cancel_claim_payload["run_items"], [])
 
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-c",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["batch"], [])
+        self.assertEqual(prepare_payload["worker"]["next_action"], "stop")
+        self.assertEqual(prepare_payload["worker"]["stop_reason"], "canceled")
+
     def test_ocr_page_run_items_finalize_into_document_result(self) -> None:
         production_root = self.write_production_fixture()
 
@@ -2187,6 +2277,84 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual([int(row["page_number"]) for row in page_item_rows], [1, 2])
         self.assertTrue(all(str(row["status"]) == "completed" for row in page_item_rows))
         self.assertTrue(all(int(row["result_id"]) == int(result_payload["id"]) for row in page_item_rows))
+
+    def test_prepare_run_batch_requests_ocr_finalization_after_completed_pages(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Queued OCR", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "queued_ocr",
+            "--instruction",
+            "OCR each page image.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "ocr-loop",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["worker"]["next_action"], "process_batch")
+        self.assertEqual(len(prepare_payload["batch"]), 2)
+
+        for batch_entry in prepare_payload["batch"]:
+            page_number = int(batch_entry["run_item"]["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(batch_entry["run_item"]["id"]),
+                "--claimed-by",
+                "ocr-loop",
+                "--page-text",
+                f"OCR batch page {page_number}",
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+
+        final_prepare_exit, final_prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "ocr-loop",
+        )
+        self.assertEqual(final_prepare_exit, 0)
+        self.assertIsNotNone(final_prepare_payload)
+        self.assertEqual(final_prepare_payload["batch"], [])
+        self.assertTrue(final_prepare_payload["worker"]["needs_ocr_finalization"])
+        self.assertEqual(final_prepare_payload["worker"]["next_action"], "finalize_ocr")
 
     def test_ocr_source_parts_uses_native_pdf_parts_for_production_docs(self) -> None:
         production_root = self.write_production_fixture()
