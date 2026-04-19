@@ -1018,18 +1018,19 @@ def build_email_extracted_payload(
     if not normalized_text and normalized_html:
         normalized_text = strip_html_tags(normalized_html)
     normalized_text = normalize_whitespace(normalized_text)
+    resolved_subject = normalize_generated_document_title(subject)
     participants = extract_email_chain_participants(
         normalized_text,
         [author, recipients or None],
     )
     preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
-    preview_title = subject or "Retriever Email Preview"
+    preview_title = resolved_subject or "Retriever Email Preview"
     preview = build_html_preview(
         {
             "From": author or "",
             "To": recipients or "",
             "Date": format_chat_preview_timestamp(date_created) or date_created or "",
-            "Subject": subject or "",
+            "Subject": resolved_subject or "",
         },
         body_html=preview_html_body,
         body_text=normalized_text,
@@ -1042,8 +1043,8 @@ def build_email_extracted_payload(
         "date_created": date_created,
         "date_modified": None,
         "participants": participants,
-        "title": subject or None,
-        "subject": subject or None,
+        "title": resolved_subject,
+        "subject": resolved_subject,
         "recipients": recipients or None,
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
@@ -1125,7 +1126,8 @@ def build_chat_extracted_payload(
     )
     resolved_date_created = str(metadata["date_created"]) if metadata.get("date_created") else date_created
     resolved_date_modified = str(metadata["date_modified"]) if metadata.get("date_modified") else None
-    resolved_title = title or (str(metadata["title"]) if metadata.get("title") else None)
+    metadata_title = normalize_generated_document_title(str(metadata["title"])) if metadata.get("title") else None
+    resolved_title = normalize_generated_document_title(title) or metadata_title
     return {
         "page_count": 1,
         "author": None,
@@ -1169,13 +1171,14 @@ def build_calendar_extracted_payload(
     if not normalized_text and normalized_html:
         normalized_text = strip_html_tags(normalized_html)
     normalized_text = normalize_whitespace(normalized_text)
+    resolved_subject = normalize_generated_document_title(subject)
     preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
-    preview_title = subject or "Retriever Calendar Preview"
+    preview_title = resolved_subject or "Retriever Calendar Preview"
     preview = build_html_preview(
         {
             "Organizer": author or "",
             "Date": format_chat_preview_timestamp(date_created) or date_created or "",
-            "Title": subject or "",
+            "Title": resolved_subject or "",
             "Attendees": recipients or "",
         },
         body_html=preview_html_body,
@@ -1189,8 +1192,8 @@ def build_calendar_extracted_payload(
         "date_created": date_created,
         "date_modified": None,
         "participants": author or None,
-        "title": subject or None,
-        "subject": subject or None,
+        "title": resolved_subject,
+        "subject": resolved_subject,
         "recipients": recipients or None,
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
@@ -1219,7 +1222,7 @@ def pst_folder_path_contains(folder_path: object, marker: str) -> bool:
 
 
 def infer_pst_chat_title(subject: str | None, text_body: str | None) -> str | None:
-    normalized_subject = normalize_whitespace(str(subject or ""))
+    normalized_subject = normalize_generated_document_title(subject)
     if normalized_subject:
         return normalized_subject
     normalized_text = normalize_whitespace(str(text_body or ""))

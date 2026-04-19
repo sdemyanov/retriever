@@ -217,6 +217,25 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
         connection.execute("BEGIN")
         try:
             parent_link_updates = update_production_family_relationships(connection, production_id)
+            attachment_preview_updates = 0
+            preview_document_rows = connection.execute(
+                """
+                SELECT DISTINCT documents.id
+                FROM documents
+                JOIN document_previews ON document_previews.document_id = documents.id
+                WHERE documents.production_id = ?
+                  AND documents.lifecycle_status != 'deleted'
+                  AND document_previews.preview_type = 'html'
+                ORDER BY documents.id ASC
+                """,
+                (production_id,),
+            ).fetchall()
+            for preview_document_row in preview_document_rows:
+                attachment_preview_updates += sync_document_attachment_preview_links(
+                    connection,
+                    paths,
+                    int(preview_document_row["id"]),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -234,6 +253,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
             ).fetchall()
         )
         stats["parent_link_updates"] = parent_link_updates
+        stats["attachment_preview_updates"] = attachment_preview_updates
 
         return {
             "status": "ok",

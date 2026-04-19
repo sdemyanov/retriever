@@ -6,6 +6,7 @@ import importlib.util
 import json
 import io
 import mailbox
+import os
 import re
 import sqlite3
 import tempfile
@@ -2791,6 +2792,47 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parents_with_attachments["total_hits"], 1)
         self.assertEqual(parents_with_attachments["results"][0]["id"], parent_row["id"])
 
+    def test_ingest_email_preview_moves_attachment_lists_out_of_titles_and_into_links(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Energy Balance Revenue Summary and Back Up Attachments: notes.txt; revenue.txt",
+            body_text="Hello team,\nThis is the email body.",
+            attachment_name="notes.txt",
+            attachment_text="confidential attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(result["new"], 1)
+        self.assertEqual(result["failed"], 0)
+
+        parent_row = self.fetch_document_row("thread.eml")
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        self.assertEqual(parent_row["title"], "Energy Balance Revenue Summary")
+        self.assertEqual(parent_row["subject"], "Energy Balance Revenue Summary")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            _, parent_preview_abs_path = retriever_tools.default_preview_target(self.paths, parent_row, connection)
+            _, child_preview_abs_path = retriever_tools.default_preview_target(self.paths, child_row, connection)
+        finally:
+            connection.close()
+
+        parent_preview_path = Path(parent_preview_abs_path)
+        preview_html = parent_preview_path.read_text(encoding="utf-8")
+        expected_href = retriever_tools.urllib_request.pathname2url(
+            os.path.relpath(child_preview_abs_path, start=str(parent_preview_path.parent))
+        )
+
+        self.assertIn("<title>Energy Balance Revenue Summary</title>", preview_html)
+        self.assertIn("<h1>Energy Balance Revenue Summary</h1>", preview_html)
+        self.assertNotIn("Back Up Attachments:", preview_html)
+        self.assertIn("<h2>Attachments</h2>", preview_html)
+        self.assertIn(">notes.txt<", preview_html)
+        self.assertIn(f'href="{expected_href}"', preview_html)
+
         with mock.patch.object(retriever_tools, "pypff", object()):
             doctor_result = retriever_tools.doctor(self.root, quick=False)
         self.assertEqual(doctor_result["workspace_inventory"]["parent_documents"], 1)
@@ -4637,6 +4679,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         preview_html = Path(html_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
         self.assertIn("<title>Attachment Handling</title>", preview_html)
         self.assertIn("<h1>Attachment Handling</h1>", preview_html)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            _, child_preview_abs_path = retriever_tools.default_preview_target(self.paths, child_row, connection)
+        finally:
+            connection.close()
+        expected_href = retriever_tools.urllib_request.pathname2url(
+            os.path.relpath(child_preview_abs_path, start=str(Path(html_result["preview_targets"][0]["abs_path"]).parent))
+        )
+        self.assertIn("<h2>Attachments</h2>", preview_html)
+        self.assertIn(f'href="{expected_href}"', preview_html)
         self.assertIn("PDX000001", preview_html)
         self.assertIn("Discuss attachment handling.", preview_html)
         self.assertIn("data:image/png;base64,", preview_html)
@@ -5665,7 +5717,7 @@ class CidInliningTests(unittest.TestCase):
 
     def test_build_email_extracted_payload_uses_subject_for_preview_title_and_heading(self) -> None:
         payload = retriever_tools.build_email_extracted_payload(
-            subject="Legalweek 2023 Mobile App Now Available",
+            subject="Legalweek 2023 Mobile App Now Available Attachments: agenda.pdf; deck.pdf",
             author="events@example.com",
             recipients="sergey@example.com",
             date_created="2026-04-17T15:31:00Z",
@@ -5678,6 +5730,7 @@ class CidInliningTests(unittest.TestCase):
         preview_content = payload["preview_artifacts"][0]["content"]
         self.assertIn("<title>Legalweek 2023 Mobile App Now Available</title>", preview_content)
         self.assertIn("<h1>Legalweek 2023 Mobile App Now Available</h1>", preview_content)
+        self.assertNotIn("Attachments: agenda.pdf", preview_content)
 
 
 if __name__ == "__main__":

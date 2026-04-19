@@ -291,9 +291,9 @@ def infer_production_title(control_number: str, text_content: str, native_path: 
         if candidate:
             if re.match(r"^(From|To|Cc|Bcc|Sent|Date|Subject):\s*", candidate, flags=re.IGNORECASE):
                 continue
-            return candidate[:220]
+            return normalize_generated_document_title(candidate[:220]) or candidate[:220]
     if native_path is not None:
-        return native_path.stem or native_path.name
+        return normalize_generated_document_title(native_path.stem or native_path.name) or native_path.stem or native_path.name
     return control_number
 
 
@@ -344,6 +344,92 @@ pre { white-space: pre-wrap; word-break: break-word; background: #f8fafc; border
 </style>
 """.strip()
     return build_html_preview(headers, body_html=body_html, document_title=document_title, head_html=head_html)
+
+
+def attachment_preview_link_label(row: sqlite3.Row) -> str:
+    file_name = normalize_whitespace(str(row["file_name"] or ""))
+    title = normalize_generated_document_title(row["title"])
+    control_number = normalize_whitespace(str(row["control_number"] or ""))
+    if file_name and not file_name.lower().endswith(".logical"):
+        return file_name
+    if title:
+        return title
+    if file_name:
+        return file_name
+    return control_number or "Attachment"
+
+
+def build_document_attachment_preview_links(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    parent_preview_path: Path,
+    child_rows: list[sqlite3.Row],
+) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for child_row in child_rows:
+        _, child_preview_abs_path = default_preview_target(paths, child_row, connection)
+        child_preview_path = Path(child_preview_abs_path)
+        if not child_preview_path.exists():
+            continue
+        relative_href = urllib_request.pathname2url(
+            os.path.relpath(str(child_preview_path), start=str(parent_preview_path.parent))
+        )
+        detail = normalize_whitespace(str(child_row["control_number"] or ""))
+        links.append(
+            {
+                "href": relative_href,
+                "label": attachment_preview_link_label(child_row),
+                "detail": detail,
+            }
+        )
+    return links
+
+
+def sync_document_attachment_preview_links(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_id: int,
+) -> int:
+    preview_rows = connection.execute(
+        """
+        SELECT rel_preview_path
+        FROM document_previews
+        WHERE document_id = ? AND preview_type = 'html'
+        ORDER BY ordinal ASC, id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    if not preview_rows:
+        return 0
+
+    child_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE parent_document_id = ?
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+        ORDER BY
+          CASE WHEN control_number_attachment_sequence IS NULL THEN 1 ELSE 0 END ASC,
+          control_number_attachment_sequence ASC,
+          control_number ASC,
+          id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+
+    updated = 0
+    for preview_row in preview_rows:
+        preview_path = paths["state_dir"] / preview_row["rel_preview_path"]
+        if not preview_path.exists():
+            continue
+        current_html = preview_path.read_text(encoding="utf-8")
+        links = build_document_attachment_preview_links(paths, connection, preview_path, child_rows)
+        updated_html = inject_html_preview_attachment_links(current_html, links)
+        if updated_html == current_html:
+            continue
+        preview_path.write_text(updated_html, encoding="utf-8")
+        updated += 1
+    return updated
 
 
 def regenerate_production_preview_for_document(
@@ -434,6 +520,7 @@ def regenerate_production_preview_for_document(
     preview_path = paths["state_dir"] / preview_row["rel_preview_path"]
     preview_path.parent.mkdir(parents=True, exist_ok=True)
     preview_path.write_text(html_body, encoding="utf-8")
+    sync_document_attachment_preview_links(connection, paths, document_id)
     return {
         "status": "ok",
         "rel_preview_path": preview_row["rel_preview_path"],
@@ -1140,6 +1227,7 @@ def reconcile_attachment_documents(
             """,
             (utc_now(), row["id"]),
         )
+    sync_document_attachment_preview_links(connection, paths, parent_document_id)
 
 
 def get_container_source_row(
