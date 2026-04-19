@@ -130,6 +130,25 @@ def build_vision_ocr_execution_payload(job_version_row: sqlite3.Row) -> dict[str
     }
 
 
+def build_vision_description_execution_payload(job_version_row: sqlite3.Row) -> dict[str, object]:
+    instruction_text = normalize_whitespace(str(job_version_row["instruction_text"] or ""))
+    prompt_lines = [
+        "Describe the page image in clear, search-friendly prose.",
+        "Prioritize visible people, objects, scenes, charts, handwriting, stamps, and other salient visual details.",
+        "Return plain text only. Do not wrap the output in JSON or Markdown.",
+    ]
+    if instruction_text:
+        prompt_lines.append(f"Job instruction: {instruction_text}")
+    return {
+        "capability": "vision_description",
+        "task_prompt": "\n".join(prompt_lines),
+        "completion_command": "complete-run-item",
+        "completion_template": {
+            "page_text": "<image description text>",
+        },
+    }
+
+
 def build_capability_execution_payload(
     job_version_row: sqlite3.Row,
     job_output_rows: list[sqlite3.Row],
@@ -139,6 +158,8 @@ def build_capability_execution_payload(
         return build_text_structured_execution_payload(job_version_row, job_output_rows)
     if capability == "text_translation":
         return build_translation_execution_payload(job_version_row)
+    if capability == "vision_description":
+        return build_vision_description_execution_payload(job_version_row)
     if capability == "vision_ocr":
         return build_vision_ocr_execution_payload(job_version_row)
     return None
@@ -232,8 +253,13 @@ def build_run_item_context_payload(
         artifact_path = resolve_workspace_artifact_path(root, artifact_rel_path)
         if artifact_path is None or not artifact_path.exists():
             raise RetrieverError(f"Run item {run_item_row['id']} points at a missing OCR artifact: {artifact_rel_path!r}")
+        page_input_kind = (
+            "image_description_page_image"
+            if normalize_job_kind(str(job_row["job_kind"])) == "image_description"
+            else "ocr_page_image"
+        )
         input_payload = {
-            "kind": "ocr_page_image",
+            "kind": page_input_kind,
             "page_number": int(run_item_row["page_number"] or 0),
             "artifact_rel_path": artifact_rel_path,
             "artifact_path": str(artifact_path),

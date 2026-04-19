@@ -1948,6 +1948,333 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "<final governing_law value>",
         )
 
+    def test_prepare_run_batch_registers_background_worker_and_tracks_task(self) -> None:
+        note_path = self.root / "background-contract.txt"
+        note_path.write_text("The governing law is Delaware.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("background-contract.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Background Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "background_contract_metadata",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "background_contract_metadata",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "background-worker",
+            "--launch-mode",
+            "background",
+            "--worker-task-id",
+            "task-123",
+            "--max-batches",
+            "1",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["worker"]["next_action"], "process_batch")
+        self.assertEqual(prepare_payload["worker_record"]["launch_mode"], "background")
+        self.assertEqual(prepare_payload["worker_record"]["worker_task_id"], "task-123")
+        self.assertEqual(prepare_payload["worker_record"]["max_batches"], 1)
+        self.assertEqual(prepare_payload["worker_record"]["batches_prepared"], 1)
+        self.assertEqual(prepare_payload["worker_record"]["status"], "active")
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "run-status",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        self.assertEqual(status_payload["run"]["workers"][0]["claimed_by"], "background-worker")
+        self.assertEqual(status_payload["run"]["workers"][0]["worker_task_id"], "task-123")
+        self.assertEqual(status_payload["run"]["supervision"]["background_worker_count"], 1)
+
+    def test_run_status_supervision_recommends_wakeup_and_bounded_worker_count(self) -> None:
+        for index in range(12):
+            (self.root / f"background-{index:02d}.txt").write_text(
+                f"Document {index} governing law is Delaware.",
+                encoding="utf-8",
+            )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 12)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_rows = connection.execute("SELECT id FROM documents ORDER BY id ASC").fetchall()
+        finally:
+            connection.close()
+        document_ids = [int(row["id"]) for row in document_rows]
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Long Background Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "long_background_contract_metadata",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "long_background_contract_metadata",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_args = [
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+        ]
+        for document_id in document_ids:
+            create_run_args.extend(["--doc-id", str(document_id)])
+        create_run_exit, create_run_payload, _, _ = self.run_cli(*create_run_args)
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "run-status",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        supervision = status_payload["run"]["supervision"]
+        self.assertEqual(supervision["recommended_action"], "spawn_background_worker")
+        self.assertTrue(supervision["continuation_needed"])
+        self.assertTrue(supervision["should_schedule_wakeup"])
+        self.assertEqual(supervision["wake_interval_seconds"], 60)
+        self.assertEqual(supervision["wakeup_reason"], "pending_work")
+        self.assertEqual(supervision["max_parallel_workers"], 4)
+        self.assertEqual(supervision["suggested_worker_count"], 3)
+        self.assertEqual(supervision["spawn_additional_worker_count"], 3)
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "background-supervisor-worker",
+            "--launch-mode",
+            "background",
+            "--worker-task-id",
+            "task-supervisor-1",
+            "--max-batches",
+            "1",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+
+        after_status_exit, after_status_payload, _, _ = self.run_cli(
+            "run-status",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(after_status_exit, 0)
+        self.assertIsNotNone(after_status_payload)
+        after_supervision = after_status_payload["run"]["supervision"]
+        self.assertEqual(after_supervision["background_worker_count"], 1)
+        self.assertTrue(after_supervision["should_schedule_wakeup"])
+        self.assertEqual(after_supervision["wake_interval_seconds"], 60)
+        self.assertEqual(after_supervision["wakeup_reason"], "workers_active")
+        self.assertGreaterEqual(after_supervision["spawn_additional_worker_count"], 1)
+        self.assertLessEqual(after_supervision["spawn_additional_worker_count"], 3)
+
+    def test_prepare_run_batch_handoffs_after_worker_batch_budget(self) -> None:
+        (self.root / "handoff-a.txt").write_text("Document A governing law is New York.", encoding="utf-8")
+        (self.root / "handoff-b.txt").write_text("Document B governing law is California.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_doc = self.fetch_document_row("handoff-a.txt")
+        second_doc = self.fetch_document_row("handoff-b.txt")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Handoff Test", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "handoff_test",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "handoff_test",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(first_doc["id"]),
+            "--doc-id",
+            str(second_doc["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "handoff-worker",
+            "--launch-mode",
+            "background",
+            "--worker-task-id",
+            "task-handoff",
+            "--max-batches",
+            "1",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(len(prepare_payload["batch"]), 1)
+
+        batch_entry = prepare_payload["batch"][0]
+        complete_exit, complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(batch_entry["run_item"]["id"]),
+            "--claimed-by",
+            "handoff-worker",
+            "--raw-output-json",
+            json.dumps({"governing_law": "New York"}),
+            "--normalized-output-json",
+            json.dumps({"governing_law": "New York"}),
+            "--output-values-json",
+            json.dumps({"governing_law": "New York"}),
+        )
+        self.assertEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+
+        handoff_exit, handoff_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "handoff-worker",
+            "--launch-mode",
+            "background",
+            "--worker-task-id",
+            "task-handoff",
+            "--max-batches",
+            "1",
+        )
+        self.assertEqual(handoff_exit, 0)
+        self.assertIsNotNone(handoff_payload)
+        self.assertEqual(handoff_payload["batch"], [])
+        self.assertEqual(handoff_payload["worker"]["next_action"], "handoff")
+        self.assertEqual(handoff_payload["worker"]["stop_reason"], "max_batches_reached")
+        self.assertTrue(handoff_payload["worker"]["should_exit_after_batch"])
+
+        finish_exit, finish_payload, _, _ = self.run_cli(
+            "finish-run-worker",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "handoff-worker",
+            "--worker-status",
+            "stopped",
+            "--summary-json",
+            json.dumps({"reason": "handoff", "processed": 1}),
+        )
+        self.assertEqual(finish_exit, 0)
+        self.assertIsNotNone(finish_payload)
+        self.assertEqual(finish_payload["worker"]["status"], "stopped")
+        self.assertEqual(finish_payload["worker"]["summary"]["reason"], "handoff")
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "run-status",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        self.assertEqual(status_payload["run"]["supervision"]["active_worker_count"], 0)
+        self.assertTrue(status_payload["run"]["supervision"]["continuation_needed"])
+
     def test_claim_run_items_reclaims_stale_running_items(self) -> None:
         note_path = self.root / "stale.txt"
         note_path.write_text("Counterparty is Acme.", encoding="utf-8")
@@ -2001,6 +2328,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(run_id),
             "--claimed-by",
             "worker-a",
+            "--launch-mode",
+            "background",
+            "--worker-task-id",
+            "task-stale-a",
             "--limit",
             "1",
         )
@@ -2025,6 +2356,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(run_id),
             "--claimed-by",
             "worker-b",
+            "--launch-mode",
+            "background",
+            "--worker-task-id",
+            "task-stale-b",
             "--limit",
             "1",
             "--stale-seconds",
@@ -2035,6 +2370,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(len(second_claim_payload["run_items"]), 1)
         self.assertEqual(int(second_claim_payload["run_items"][0]["id"]), run_item_id)
         self.assertEqual(second_claim_payload["run_items"][0]["claimed_by"], "worker-b")
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "run-status",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        workers_by_claimed_by = {
+            worker_payload["claimed_by"]: worker_payload for worker_payload in status_payload["run"]["workers"]
+        }
+        self.assertEqual(workers_by_claimed_by["worker-a"]["status"], "orphaned")
+        self.assertEqual(workers_by_claimed_by["worker-b"]["status"], "active")
 
     def test_cancel_run_skips_pending_items_and_blocks_new_claims(self) -> None:
         (self.root / "a.txt").write_text("Alpha text.", encoding="utf-8")
@@ -2138,6 +2487,81 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(prepare_payload["batch"], [])
         self.assertEqual(prepare_payload["worker"]["next_action"], "stop")
         self.assertEqual(prepare_payload["worker"]["stop_reason"], "canceled")
+
+    def test_cancel_run_force_returns_background_worker_task_ids(self) -> None:
+        note_path = self.root / "force-cancel.txt"
+        note_path.write_text("Summary this text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("force-cancel.txt")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Force Cancel", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "force_cancel",
+            "summary_text",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "force_cancel",
+            "--instruction",
+            "Summarize the document.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "force-worker",
+            "--launch-mode",
+            "background",
+            "--worker-task-id",
+            "task-force-123",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+
+        cancel_exit, cancel_payload, _, _ = self.run_cli(
+            "cancel-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--force",
+        )
+        self.assertEqual(cancel_exit, 0)
+        self.assertIsNotNone(cancel_payload)
+        self.assertTrue(cancel_payload["force_stop_requested"])
+        self.assertEqual(cancel_payload["force_stop_task_ids"], ["task-force-123"])
+        self.assertEqual(cancel_payload["run"]["status"], "canceled")
+        self.assertEqual(cancel_payload["run"]["workers"][0]["status"], "canceled")
+        self.assertIsNotNone(cancel_payload["run"]["workers"][0]["cancel_requested_at"])
+        self.assertEqual(cancel_payload["run"]["supervision"]["force_stop_task_ids"], ["task-force-123"])
 
     def test_ocr_page_run_items_finalize_into_document_result(self) -> None:
         production_root = self.write_production_fixture()
@@ -2360,6 +2784,228 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(final_prepare_payload["batch"], [])
         self.assertTrue(final_prepare_payload["worker"]["needs_ocr_finalization"])
         self.assertEqual(final_prepare_payload["worker"]["next_action"], "finalize_ocr")
+
+    def test_image_description_page_run_items_finalize_into_document_result(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+        self.assertEqual(image_only_row["text_status"], "empty")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Production Image Description",
+            "image_description",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "production_image_description",
+            "--instruction",
+            "Describe each page so image-only productions become searchable.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertEqual(create_version_payload["job_version"]["capability"], "vision_description")
+        self.assertEqual(create_version_payload["job_version"]["input_basis"], "source_parts")
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "image-description-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        claimed_items = claim_payload["run_items"]
+        self.assertEqual(len(claimed_items), 2)
+        self.assertTrue(all(item["item_kind"] == "page" for item in claimed_items))
+
+        first_item_id = int(claimed_items[0]["id"])
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(first_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        self.assertEqual(context_payload["context"]["input"]["kind"], "image_description_page_image")
+        self.assertEqual(context_payload["context"]["execution"]["capability"], "vision_description")
+
+        for item in claimed_items:
+            page_number = int(item["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(item["id"]),
+                "--claimed-by",
+                "image-description-worker",
+                "--page-text",
+                f"Image description page {page_number}",
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+            self.assertIn("image_description_page_output", complete_payload)
+            self.assertEqual(
+                complete_payload["image_description_page_output"]["text_content"],
+                f"Image description page {page_number}",
+            )
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "finalize-image-description-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+        self.assertEqual(len(finalize_payload["results"]), 1)
+        result_payload = finalize_payload["results"][0]
+        self.assertIsNotNone(result_payload["created_text_revision_id"])
+
+        revisions_exit, revisions_payload, _, _ = self.run_cli(
+            "list-text-revisions",
+            str(self.root),
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(revisions_exit, 0)
+        self.assertIsNotNone(revisions_payload)
+        revisions_by_id = {int(item["id"]): item for item in revisions_payload["text_revisions"]}
+        description_revision = revisions_by_id[int(result_payload["created_text_revision_id"])]
+        self.assertEqual(description_revision["revision_kind"], "image_description")
+        self.assertFalse(description_revision["is_active_search_revision"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            text_revision_row = connection.execute(
+                "SELECT * FROM text_revisions WHERE id = ?",
+                (result_payload["created_text_revision_id"],),
+            ).fetchone()
+            self.assertIsNotNone(text_revision_row)
+            merged_text = retriever_tools.read_text_revision_body(
+                self.paths,
+                text_revision_row["storage_rel_path"],
+            )
+            self.assertEqual(
+                merged_text,
+                "[IMAGE DESCRIPTION - PAGE 1]\nImage description page 1\n\n"
+                "[IMAGE DESCRIPTION - PAGE 2]\nImage description page 2",
+            )
+        finally:
+            connection.close()
+
+    def test_prepare_run_batch_requests_image_description_finalization_after_completed_pages(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Queued Image Description",
+            "image_description",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "queued_image_description",
+            "--instruction",
+            "Describe each page image in search-friendly prose.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "image-description-loop",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["worker"]["next_action"], "process_batch")
+        self.assertEqual(len(prepare_payload["batch"]), 2)
+
+        for batch_entry in prepare_payload["batch"]:
+            page_number = int(batch_entry["run_item"]["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(batch_entry["run_item"]["id"]),
+                "--claimed-by",
+                "image-description-loop",
+                "--page-text",
+                f"Batch image description page {page_number}",
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+
+        final_prepare_exit, final_prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "image-description-loop",
+        )
+        self.assertEqual(final_prepare_exit, 0)
+        self.assertIsNotNone(final_prepare_payload)
+        self.assertEqual(final_prepare_payload["batch"], [])
+        self.assertTrue(final_prepare_payload["worker"]["needs_image_description_finalization"])
+        self.assertEqual(final_prepare_payload["worker"]["next_action"], "finalize_image_description")
 
     def test_ocr_source_parts_uses_native_pdf_parts_for_production_docs(self) -> None:
         production_root = self.write_production_fixture()

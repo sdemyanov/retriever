@@ -882,6 +882,9 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_page_number ON run_items(run_id, document_id, page_number)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_run_claim ON run_items(run_id, status, claimed_by)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_run_items_heartbeat ON run_items(last_heartbeat_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_workers_run_id ON run_workers(run_id, status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_workers_claimed_by ON run_workers(run_id, claimed_by)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_run_workers_task_id ON run_workers(worker_task_id)")
     connection.execute("DROP INDEX IF EXISTS idx_run_items_snapshot_kind_unique")
     connection.execute(
         """
@@ -897,6 +900,10 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_attempts_run_item_id ON attempts(run_item_id, attempt_number)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_ocr_page_outputs_run_id_doc_page ON ocr_page_outputs(run_id, document_id, page_number)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_image_description_page_outputs_run_id_doc_page "
+        "ON image_description_page_outputs(run_id, document_id, page_number)"
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_results_job_version_id ON results(job_version_id, created_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_results_document_id ON results(document_id, created_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_results_input_revision_id ON results(input_revision_id)")

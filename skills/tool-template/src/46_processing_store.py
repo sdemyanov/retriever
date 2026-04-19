@@ -1208,6 +1208,209 @@ def list_run_item_payloads_for_run(connection: sqlite3.Connection, run_id: int) 
     return [run_item_row_to_payload(row) for row in rows]
 
 
+def run_worker_row_to_payload(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": int(row["id"]),
+        "run_id": int(row["run_id"]),
+        "claimed_by": row["claimed_by"],
+        "launch_mode": row["launch_mode"],
+        "worker_task_id": row["worker_task_id"],
+        "status": row["status"],
+        "max_batches": row["max_batches"],
+        "batches_prepared": int(row["batches_prepared"] or 0),
+        "items_completed": int(row["items_completed"] or 0),
+        "items_failed": int(row["items_failed"] or 0),
+        "last_heartbeat_at": row["last_heartbeat_at"],
+        "last_error": row["last_error"],
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "cancel_requested_at": row["cancel_requested_at"],
+        "summary": decode_json_text(row["summary_json"], default={}) or {},
+    }
+
+
+def find_run_worker_row(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    claimed_by: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM run_workers
+        WHERE run_id = ?
+          AND claimed_by = ?
+        """,
+        (run_id, claimed_by),
+    ).fetchone()
+
+
+def ensure_run_worker_row(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    claimed_by: str,
+    launch_mode: str,
+    worker_task_id: str | None,
+    max_batches: int | None,
+) -> sqlite3.Row:
+    normalized_claimed_by = normalize_whitespace(claimed_by)
+    if not normalized_claimed_by:
+        raise RetrieverError("claimed_by cannot be empty.")
+    normalized_launch_mode = normalize_run_worker_mode(launch_mode)
+    normalized_worker_task_id = (
+        normalize_whitespace(worker_task_id)
+        if worker_task_id is not None
+        else ""
+    ) or None
+    existing_row = find_run_worker_row(connection, run_id=run_id, claimed_by=normalized_claimed_by)
+    now = utc_now()
+    if existing_row is not None:
+        updates: list[str] = []
+        params: list[object] = []
+        if str(existing_row["launch_mode"]) != normalized_launch_mode:
+            updates.append("launch_mode = ?")
+            params.append(normalized_launch_mode)
+        if normalized_worker_task_id and normalize_whitespace(str(existing_row["worker_task_id"] or "")) != normalized_worker_task_id:
+            updates.append("worker_task_id = ?")
+            params.append(normalized_worker_task_id)
+        if max_batches is not None and existing_row["max_batches"] != max_batches:
+            updates.append("max_batches = ?")
+            params.append(max_batches)
+        if str(existing_row["status"] or "") in {"completed", "failed", "stopped", "orphaned", "canceled"}:
+            updates.append("status = 'active'")
+            updates.append("completed_at = NULL")
+            updates.append("last_error = NULL")
+            updates.append("cancel_requested_at = NULL")
+            updates.append("summary_json = '{}'")
+        if updates:
+            connection.execute(
+                f"""
+                UPDATE run_workers
+                SET {", ".join(updates)}
+                WHERE id = ?
+                """,
+                (*params, existing_row["id"]),
+            )
+        return connection.execute("SELECT * FROM run_workers WHERE id = ?", (existing_row["id"],)).fetchone()
+
+    connection.execute(
+        """
+        INSERT INTO run_workers (
+          run_id,
+          claimed_by,
+          launch_mode,
+          worker_task_id,
+          status,
+          max_batches,
+          batches_prepared,
+          items_completed,
+          items_failed,
+          last_heartbeat_at,
+          last_error,
+          created_at,
+          started_at,
+          completed_at,
+          cancel_requested_at,
+          summary_json
+        ) VALUES (?, ?, ?, ?, 'active', ?, 0, 0, 0, NULL, NULL, ?, ?, NULL, NULL, '{}')
+        """,
+        (
+            run_id,
+            normalized_claimed_by,
+            normalized_launch_mode,
+            normalized_worker_task_id,
+            max_batches,
+            now,
+            now,
+        ),
+    )
+    return find_run_worker_row(connection, run_id=run_id, claimed_by=normalized_claimed_by)
+
+
+def update_run_worker_row(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    claimed_by: str,
+    status: str | None = None,
+    worker_task_id: str | None = None,
+    max_batches: int | None = None,
+    increment_batches_prepared: bool = False,
+    increment_items_completed: int = 0,
+    increment_items_failed: int = 0,
+    heartbeat: bool = False,
+    last_error: str | None = None,
+    cancel_requested: bool = False,
+    summary: dict[str, object] | None = None,
+    completed_at: str | None = None,
+) -> sqlite3.Row | None:
+    row = find_run_worker_row(connection, run_id=run_id, claimed_by=claimed_by)
+    if row is None:
+        return None
+    next_status = normalize_run_worker_status(status) if status is not None else str(row["status"])
+    next_batches_prepared = int(row["batches_prepared"] or 0) + (1 if increment_batches_prepared else 0)
+    next_items_completed = int(row["items_completed"] or 0) + max(0, int(increment_items_completed))
+    next_items_failed = int(row["items_failed"] or 0) + max(0, int(increment_items_failed))
+    next_worker_task_id = (
+        normalize_whitespace(worker_task_id)
+        if worker_task_id is not None
+        else normalize_whitespace(str(row["worker_task_id"] or ""))
+    ) or row["worker_task_id"]
+    next_max_batches = max_batches if max_batches is not None else row["max_batches"]
+    next_last_heartbeat_at = utc_now() if heartbeat else row["last_heartbeat_at"]
+    next_cancel_requested_at = utc_now() if cancel_requested else row["cancel_requested_at"]
+    next_summary = summary if summary is not None else (decode_json_text(row["summary_json"], default={}) or {})
+    next_completed_at = completed_at if completed_at is not None else row["completed_at"]
+    connection.execute(
+        """
+        UPDATE run_workers
+        SET status = ?,
+            worker_task_id = ?,
+            max_batches = ?,
+            batches_prepared = ?,
+            items_completed = ?,
+            items_failed = ?,
+            last_heartbeat_at = ?,
+            last_error = ?,
+            completed_at = ?,
+            cancel_requested_at = ?,
+            summary_json = ?
+        WHERE id = ?
+        """,
+        (
+            next_status,
+            next_worker_task_id,
+            next_max_batches,
+            next_batches_prepared,
+            next_items_completed,
+            next_items_failed,
+            next_last_heartbeat_at,
+            last_error if last_error is not None else row["last_error"],
+            next_completed_at,
+            next_cancel_requested_at,
+            compact_json_text(next_summary),
+            row["id"],
+        ),
+    )
+    return connection.execute("SELECT * FROM run_workers WHERE id = ?", (row["id"],)).fetchone()
+
+
+def list_run_worker_payloads_for_run(connection: sqlite3.Connection, run_id: int) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM run_workers
+        WHERE run_id = ?
+        ORDER BY created_at ASC, id ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    return [run_worker_row_to_payload(row) for row in rows]
+
+
 def require_run_row_by_id(connection: sqlite3.Connection, run_id: int) -> sqlite3.Row:
     row = connection.execute(
         """
@@ -1425,7 +1628,7 @@ def ocr_page_item_specs_for_document(
     )
 
 
-def prior_run_ocr_page_item_specs(
+def prior_run_page_item_specs(
     connection: sqlite3.Connection,
     *,
     from_run_id: int,
@@ -1503,10 +1706,10 @@ def materialize_run_items_for_run(
         ).fetchone()
         if document_row is None:
             continue
-        if job_kind == "ocr":
+        if job_kind in {"ocr", "image_description"}:
             from_run_id = int(run_row["from_run_id"]) if run_row["from_run_id"] is not None else None
             page_specs = (
-                prior_run_ocr_page_item_specs(
+                prior_run_page_item_specs(
                     connection,
                     from_run_id=from_run_id,
                     document_id=int(snapshot_row["document_id"]),
@@ -1674,6 +1877,99 @@ def list_ocr_page_output_payloads_for_document(
     return [ocr_page_output_row_to_payload(row) for row in rows]
 
 
+def image_description_page_output_row_to_payload(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": int(row["id"]),
+        "run_item_id": int(row["run_item_id"]),
+        "run_id": int(row["run_id"]),
+        "document_id": int(row["document_id"]),
+        "page_number": int(row["page_number"]),
+        "text_content": row["text_content"],
+        "raw_output": decode_json_text(row["raw_output_json"]),
+        "normalized_output": decode_json_text(row["normalized_output_json"]),
+        "provider_metadata": decode_json_text(row["provider_metadata_json"], default={}) or {},
+        "created_at": row["created_at"],
+    }
+
+
+def find_image_description_page_output_row(
+    connection: sqlite3.Connection,
+    *,
+    run_item_id: int,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM image_description_page_outputs
+        WHERE run_item_id = ?
+        """,
+        (run_item_id,),
+    ).fetchone()
+
+
+def upsert_image_description_page_output_row(
+    connection: sqlite3.Connection,
+    *,
+    run_item_id: int,
+    run_id: int,
+    document_id: int,
+    page_number: int,
+    text_content: str,
+    raw_output: object,
+    normalized_output: object,
+    provider_metadata: dict[str, object] | None,
+) -> tuple[int, bool]:
+    existing_row = find_image_description_page_output_row(connection, run_item_id=run_item_id)
+    if existing_row is not None:
+        return int(existing_row["id"]), False
+    cursor = connection.execute(
+        """
+        INSERT INTO image_description_page_outputs (
+          run_item_id,
+          run_id,
+          document_id,
+          page_number,
+          text_content,
+          raw_output_json,
+          normalized_output_json,
+          provider_metadata_json,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_item_id,
+            run_id,
+            document_id,
+            page_number,
+            text_content,
+            compact_json_text(raw_output),
+            compact_json_text(normalized_output),
+            compact_json_text(provider_metadata or {}),
+            utc_now(),
+        ),
+    )
+    return int(cursor.lastrowid), True
+
+
+def list_image_description_page_output_payloads_for_document(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    document_id: int,
+) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM image_description_page_outputs
+        WHERE run_id = ?
+          AND document_id = ?
+        ORDER BY page_number ASC, id ASC
+        """,
+        (run_id, document_id),
+    ).fetchall()
+    return [image_description_page_output_row_to_payload(row) for row in rows]
+
+
 def claim_run_item_rows(
     connection: sqlite3.Connection,
     *,
@@ -1692,6 +1988,32 @@ def claim_run_item_rows(
         return []
 
     stale_cutoff = format_utc_timestamp(datetime.now(timezone.utc) - timedelta(seconds=max(1, stale_after_seconds)))
+    stale_claimed_rows = connection.execute(
+        """
+        SELECT DISTINCT claimed_by
+        FROM run_items
+        WHERE run_id = ?
+          AND status = 'running'
+          AND result_id IS NULL
+          AND claimed_by IS NOT NULL
+          AND last_heartbeat_at IS NOT NULL
+          AND last_heartbeat_at < ?
+        """,
+        (run_id, stale_cutoff),
+    ).fetchall()
+    for stale_row in stale_claimed_rows:
+        stale_claimed_by = normalize_whitespace(str(stale_row["claimed_by"] or ""))
+        if not stale_claimed_by or stale_claimed_by == normalized_claimed_by:
+            continue
+        update_run_worker_row(
+            connection,
+            run_id=run_id,
+            claimed_by=stale_claimed_by,
+            status="orphaned",
+            last_error="Worker claim heartbeat expired and items were reclaimed.",
+            completed_at=utc_now(),
+        )
+
     candidate_rows = connection.execute(
         """
         SELECT *
@@ -1773,6 +2095,12 @@ def heartbeat_claimed_run_items(
         """,
         (now, run_id, normalized_claimed_by),
     )
+    update_run_worker_row(
+        connection,
+        run_id=run_id,
+        claimed_by=normalized_claimed_by,
+        heartbeat=True,
+    )
     return int(cursor.rowcount or 0)
 
 
@@ -1790,6 +2118,40 @@ def cancel_pending_run_items(connection: sqlite3.Connection, *, run_id: int) -> 
         (now, run_id),
     )
     return int(cursor.rowcount or 0)
+
+
+def request_run_worker_cancellation(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    force: bool,
+) -> list[str]:
+    worker_rows = connection.execute(
+        """
+        SELECT claimed_by, worker_task_id
+        FROM run_workers
+        WHERE run_id = ?
+          AND status = 'active'
+        ORDER BY claimed_by ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    task_ids: list[str] = []
+    for row in worker_rows:
+        claimed_by = normalize_whitespace(str(row["claimed_by"] or ""))
+        worker_task_id = normalize_whitespace(str(row["worker_task_id"] or "")) or None
+        if worker_task_id:
+            task_ids.append(worker_task_id)
+        update_run_worker_row(
+            connection,
+            run_id=run_id,
+            claimed_by=claimed_by,
+            status="canceled",
+            cancel_requested=True,
+            last_error=("Force-stop requested." if force else "Cancellation requested."),
+            completed_at=utc_now() if force else None,
+        )
+    return task_ids
 
 
 def run_item_status_counts(connection: sqlite3.Connection, run_id: int) -> dict[str, int]:
@@ -1849,6 +2211,32 @@ def ocr_run_pending_finalization_count(connection: sqlite3.Connection, run_id: i
     return int(row["count"] or 0)
 
 
+def image_description_run_pending_finalization_count(connection: sqlite3.Connection, run_id: int) -> int:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM run_snapshot_documents AS snapshot
+        WHERE snapshot.run_id = ?
+          AND EXISTS (
+            SELECT 1
+            FROM run_items AS page_item
+            WHERE page_item.run_id = snapshot.run_id
+              AND page_item.document_id = snapshot.document_id
+              AND page_item.item_kind = 'page'
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM run_items AS finalized_item
+            WHERE finalized_item.run_id = snapshot.run_id
+              AND finalized_item.document_id = snapshot.document_id
+              AND finalized_item.result_id IS NOT NULL
+          )
+        """,
+        (run_id,),
+    ).fetchone()
+    return int(row["count"] or 0)
+
+
 def build_run_worker_payload(
     connection: sqlite3.Connection,
     run_id: int,
@@ -1869,7 +2257,15 @@ def build_run_worker_payload(
     total_items = pending_count + running_count + completed_count + failed_count + skipped_count
     outstanding_items = max(planned_count - completed_count - failed_count - skipped_count, 0)
     needs_ocr_finalization = job_kind == "ocr" and ocr_run_pending_finalization_count(connection, run_id) > 0
+    needs_image_description_finalization = (
+        job_kind == "image_description" and image_description_run_pending_finalization_count(connection, run_id) > 0
+    )
     normalized_claimed_by = normalize_whitespace(claimed_by) if claimed_by and claimed_by.strip() else None
+    worker_row = (
+        find_run_worker_row(connection, run_id=run_id, claimed_by=normalized_claimed_by)
+        if normalized_claimed_by
+        else None
+    )
     recommended_execution_mode = (
         "background"
         if max(total_items, planned_count) > DEFAULT_WORKER_INLINE_MAX_ITEMS
@@ -1885,6 +2281,19 @@ def build_run_worker_payload(
         if recommended_execution_mode == "background"
         else DEFAULT_WORKER_INLINE_MAX_BATCHES
     )
+    effective_max_batches = (
+        int(worker_row["max_batches"])
+        if worker_row is not None and worker_row["max_batches"] is not None
+        else recommended_max_batches
+    )
+    worker_batches_prepared = int(worker_row["batches_prepared"] or 0) if worker_row is not None else 0
+    worker_cancel_requested = worker_row is not None and worker_row["cancel_requested_at"] is not None
+    worker_should_handoff = (
+        worker_row is not None
+        and effective_max_batches > 0
+        and worker_batches_prepared >= effective_max_batches
+        and pending_count > 0
+    )
 
     next_action = "claim"
     stop_reason = None
@@ -1892,8 +2301,16 @@ def build_run_worker_payload(
     if run_status == "canceled":
         next_action = "stop"
         stop_reason = "canceled"
+    elif worker_cancel_requested:
+        next_action = "stop"
+        stop_reason = "canceled"
+    elif worker_should_handoff:
+        next_action = "handoff"
+        stop_reason = "max_batches_reached"
     elif needs_ocr_finalization and pending_count == 0 and running_count == 0 and failed_count == 0:
         next_action = "finalize_ocr"
+    elif needs_image_description_finalization and pending_count == 0 and running_count == 0 and failed_count == 0:
+        next_action = "finalize_image_description"
     elif planned_count == 0:
         next_action = "stop"
         stop_reason = "empty"
@@ -1910,11 +2327,19 @@ def build_run_worker_payload(
         "job_kind": job_kind,
         "capability": capability,
         "claimed_by": normalized_claimed_by,
+        "launch_mode": worker_row["launch_mode"] if worker_row is not None else None,
+        "worker_task_id": worker_row["worker_task_id"] if worker_row is not None else None,
+        "worker_status": worker_row["status"] if worker_row is not None else None,
         "recommended_execution_mode": recommended_execution_mode,
         "recommended_batch_size": recommended_batch_size,
         "recommended_max_batches_per_worker": recommended_max_batches,
+        "max_batches_per_worker": effective_max_batches,
+        "batches_prepared": worker_batches_prepared,
         "outstanding_items": outstanding_items,
         "needs_ocr_finalization": needs_ocr_finalization,
+        "needs_image_description_finalization": needs_image_description_finalization,
+        "should_exit_after_batch": worker_should_handoff,
+        "after_batch_action": "handoff" if worker_should_handoff else None,
         "next_action": next_action,
         "stop_reason": stop_reason,
     }
@@ -1947,6 +2372,81 @@ def recent_run_item_failures(
         }
         for row in rows
     ]
+
+
+def build_run_supervision_payload(
+    connection: sqlite3.Connection,
+    run_id: int,
+    *,
+    run_payload: dict[str, object],
+    worker_payloads: list[dict[str, object]],
+) -> dict[str, object]:
+    run_status = str(run_payload.get("status") or "")
+    run_worker_hint = build_run_worker_payload(connection, run_id, run_payload=run_payload)
+    active_workers = [payload for payload in worker_payloads if str(payload["status"]) == "active"]
+    background_workers = [payload for payload in active_workers if str(payload["launch_mode"]) == "background"]
+    orphaned_workers = [payload for payload in worker_payloads if str(payload["status"]) == "orphaned"]
+    max_parallel_workers = DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL
+    outstanding_items = int(run_worker_hint["outstanding_items"] or 0)
+    finalization_pending = bool(
+        run_worker_hint["needs_ocr_finalization"] or run_worker_hint["needs_image_description_finalization"]
+    )
+    if run_worker_hint["recommended_execution_mode"] == "background" and outstanding_items > 0:
+        suggested_worker_count = min(
+            max_parallel_workers,
+            max(1, (outstanding_items + DEFAULT_WORKER_BATCH_SIZE - 1) // DEFAULT_WORKER_BATCH_SIZE),
+        )
+    elif outstanding_items > 0:
+        suggested_worker_count = 1
+    else:
+        suggested_worker_count = 0
+    spawn_additional_worker_count = max(0, suggested_worker_count - len(active_workers))
+    force_stop_task_ids = [
+        str(payload["worker_task_id"])
+        for payload in worker_payloads
+        if payload["cancel_requested_at"] is not None and payload["worker_task_id"]
+    ]
+    should_schedule_wakeup = bool(
+        run_status not in {"canceled", "completed", "failed"}
+        and (outstanding_items > 0 or len(active_workers) > 0 or finalization_pending)
+    )
+    if run_status in {"canceled", "completed", "failed"}:
+        wakeup_reason = None
+    elif finalization_pending and not active_workers:
+        wakeup_reason = "finalization_pending"
+    elif len(active_workers) > 0:
+        wakeup_reason = "workers_active"
+    elif outstanding_items > 0:
+        wakeup_reason = "pending_work"
+    else:
+        wakeup_reason = None
+
+    recommended_action = "wait"
+    if run_status == "canceled":
+        recommended_action = "stop"
+    elif run_worker_hint["next_action"] in {"finalize_ocr", "finalize_image_description"}:
+        recommended_action = str(run_worker_hint["next_action"])
+    elif run_worker_hint["next_action"] == "stop":
+        recommended_action = "stop"
+    elif spawn_additional_worker_count > 0:
+        recommended_action = "spawn_background_worker" if run_worker_hint["recommended_execution_mode"] == "background" else "claim_inline"
+
+    return {
+        "active_worker_count": len(active_workers),
+        "background_worker_count": len(background_workers),
+        "orphaned_worker_count": len(orphaned_workers),
+        "continuation_needed": bool(outstanding_items and not active_workers and run_status not in {"canceled", "completed", "failed"}),
+        "outstanding_items": outstanding_items,
+        "finalization_pending": finalization_pending,
+        "max_parallel_workers": max_parallel_workers,
+        "suggested_worker_count": suggested_worker_count,
+        "spawn_additional_worker_count": spawn_additional_worker_count,
+        "should_schedule_wakeup": should_schedule_wakeup,
+        "wake_interval_seconds": (DEFAULT_WORKER_BACKGROUND_WAKE_INTERVAL_SECONDS if should_schedule_wakeup else None),
+        "wakeup_reason": wakeup_reason,
+        "force_stop_task_ids": force_stop_task_ids,
+        "recommended_action": recommended_action,
+    }
 
 
 def attempt_row_to_payload(row: sqlite3.Row) -> dict[str, object]:
@@ -2382,7 +2882,14 @@ def run_status_by_id(connection: sqlite3.Connection, run_id: int) -> dict[str, o
         }
         for row in active_claim_rows
     ]
+    payload["workers"] = list_run_worker_payloads_for_run(connection, run_id)
     payload["worker"] = build_run_worker_payload(connection, run_id, run_payload=payload)
+    payload["supervision"] = build_run_supervision_payload(
+        connection,
+        run_id,
+        run_payload=payload,
+        worker_payloads=payload["workers"],
+    )
     return payload
 
 
@@ -2505,6 +3012,168 @@ def finalize_ocr_results_for_run(
             raw_output={
                 "page_count": len(page_output_payloads),
                 "finalized_from": "ocr_page_outputs",
+            },
+            normalized_output={
+                "page_count": len(page_output_payloads),
+                "created_text_revision_id": created_text_revision_id,
+            },
+            created_text_revision_id=created_text_revision_id,
+            provider_metadata={
+                "run_id": run_id,
+                "page_count": len(page_output_payloads),
+            },
+        )
+        connection.execute(
+            """
+            UPDATE run_items
+            SET result_id = ?
+            WHERE run_id = ?
+              AND document_id = ?
+            """,
+            (result_id, run_id, document_id),
+        )
+        finalized_results.append(result_summary_by_id(connection, result_id))
+
+    refresh_run_progress(connection, run_id)
+    return {
+        "status": "ok",
+        "run": run_status_by_id(connection, run_id),
+        "results": finalized_results,
+    }
+
+
+def build_image_description_revision_text(page_output_payloads: list[dict[str, object]]) -> str:
+    sections: list[str] = []
+    for payload in page_output_payloads:
+        page_number = int(payload["page_number"])
+        text_content = normalize_whitespace(str(payload["text_content"] or ""))
+        if not text_content:
+            continue
+        sections.append(f"[IMAGE DESCRIPTION - PAGE {page_number}]\n{text_content}")
+    return "\n\n".join(sections)
+
+
+def finalize_image_description_results_for_run(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: int,
+) -> dict[str, object]:
+    run_row = require_run_row_by_id(connection, run_id)
+    job_version_row = require_job_version_row_by_id(connection, int(run_row["job_version_id"]))
+    job_row = connection.execute(
+        """
+        SELECT *
+        FROM jobs
+        WHERE id = ?
+        """,
+        (job_version_row["job_id"],),
+    ).fetchone()
+    assert job_row is not None
+    if normalize_job_kind(str(job_row["job_kind"])) != "image_description":
+        raise RetrieverError("finalize-image-description-run only supports image_description jobs.")
+
+    pending_counts = run_item_status_counts(connection, run_id)
+    if pending_counts.get("pending", 0) or pending_counts.get("running", 0) or pending_counts.get("failed", 0):
+        raise RetrieverError(
+            "Image-description run cannot be finalized until all page items are completed. "
+            f"pending={pending_counts.get('pending', 0)}, "
+            f"running={pending_counts.get('running', 0)}, "
+            f"failed={pending_counts.get('failed', 0)}."
+        )
+
+    snapshot_rows = connection.execute(
+        """
+        SELECT *
+        FROM run_snapshot_documents
+        WHERE run_id = ?
+        ORDER BY ordinal ASC, id ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    finalized_results: list[dict[str, object]] = []
+    for snapshot_row in snapshot_rows:
+        document_id = int(snapshot_row["document_id"])
+        existing_result_row = find_active_result_row(
+            connection,
+            document_id=document_id,
+            job_version_id=int(job_version_row["id"]),
+            input_identity=str(snapshot_row["pinned_input_identity"]),
+        )
+        if existing_result_row is not None and existing_result_row["created_text_revision_id"] is not None:
+            result_id = int(existing_result_row["id"])
+            connection.execute(
+                """
+                UPDATE run_items
+                SET result_id = ?
+                WHERE run_id = ?
+                  AND document_id = ?
+                """,
+                (result_id, run_id, document_id),
+            )
+            finalized_results.append(result_summary_by_id(connection, result_id))
+            continue
+
+        page_rows = connection.execute(
+            """
+            SELECT *
+            FROM run_items
+            WHERE run_id = ?
+              AND document_id = ?
+              AND item_kind = 'page'
+            ORDER BY page_number ASC, id ASC
+            """,
+            (run_id, document_id),
+        ).fetchall()
+        if not page_rows:
+            raise RetrieverError(
+                f"Image-description run {run_id} has no page items for document {document_id}."
+            )
+        page_output_payloads = list_image_description_page_output_payloads_for_document(
+            connection,
+            run_id=run_id,
+            document_id=document_id,
+        )
+        if len(page_output_payloads) != len(page_rows):
+            raise RetrieverError(
+                f"Image-description run {run_id} is missing page outputs for document {document_id}: "
+                f"expected {len(page_rows)}, found {len(page_output_payloads)}."
+            )
+        merged_text = build_image_description_revision_text(page_output_payloads)
+        created_text_revision_id = create_text_revision_row(
+            connection,
+            paths,
+            document_id=document_id,
+            revision_kind="image_description",
+            text_content=merged_text,
+            language=None,
+            parent_revision_id=(
+                int(snapshot_row["pinned_input_revision_id"])
+                if snapshot_row["pinned_input_revision_id"] is not None
+                else None
+            ),
+            created_by_job_version_id=int(job_version_row["id"]),
+            quality_score=None,
+            provider_metadata={
+                "run_id": run_id,
+                "page_count": len(page_output_payloads),
+                "finalized_from": "image_description_page_outputs",
+            },
+        )
+        result_id, _ = create_result_row(
+            connection,
+            run_id=run_id,
+            document_id=document_id,
+            job_version_id=int(job_version_row["id"]),
+            input_revision_id=(
+                int(snapshot_row["pinned_input_revision_id"])
+                if snapshot_row["pinned_input_revision_id"] is not None
+                else None
+            ),
+            input_identity=str(snapshot_row["pinned_input_identity"]),
+            raw_output={
+                "page_count": len(page_output_payloads),
+                "finalized_from": "image_description_page_outputs",
             },
             normalized_output={
                 "page_count": len(page_output_payloads),
