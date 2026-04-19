@@ -2146,7 +2146,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         ingest_result = retriever_tools.ingest_production(self.root, production_root)
         self.assertEqual(ingest_result["created"], 4)
 
-        image_only_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
         self.assertEqual(image_only_row["text_status"], "empty")
 
         create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Production OCR", "ocr")
@@ -2286,7 +2288,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         ingest_result = retriever_tools.ingest_production(self.root, production_root)
         self.assertEqual(ingest_result["created"], 4)
 
-        image_only_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
 
         create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Queued OCR", "ocr")
         self.assertEqual(create_job_exit, 0)
@@ -2364,7 +2368,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         ingest_result = retriever_tools.ingest_production(self.root, production_root)
         self.assertEqual(ingest_result["created"], 4)
 
-        native_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000004.logical")
+        native_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000004.logical"
+        )
 
         create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Native PDF OCR", "ocr")
         self.assertEqual(create_job_exit, 0)
@@ -2411,7 +2417,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(run_item["page_number"], 1)
         self.assertTrue(
             str(run_item["input_artifact_rel_path"]).startswith(
-                f".retriever/jobs/ocr/run-{run_id}/doc-{native_row['id']}/page-0001"
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/jobs/ocr/run-{run_id}/doc-{native_row['id']}/page-0001"
             )
         )
         self.assertTrue(str(run_item["input_artifact_rel_path"]).endswith(".png"))
@@ -2436,7 +2442,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         ingest_result = retriever_tools.ingest_production(self.root, production_root)
         self.assertEqual(ingest_result["created"], 4)
 
-        image_only_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -2499,7 +2507,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertEqual([int(row["page_number"]) for row in first_run_item_rows], [1, 2])
         first_run_artifact_paths = [str(row["input_artifact_rel_path"]) for row in first_run_item_rows]
-        self.assertTrue(all(path.startswith(f".retriever/jobs/ocr/run-{first_run_id}/doc-{image_only_row['id']}/") for path in first_run_artifact_paths))
+        self.assertTrue(
+            all(
+                path.startswith(
+                    f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/jobs/ocr/run-{first_run_id}/doc-{image_only_row['id']}/"
+                )
+                for path in first_run_artifact_paths
+            )
+        )
         self.assertTrue(all(path not in source_part_paths for path in first_run_artifact_paths))
 
         self.write_tiff_fixture(self.root / source_part_paths[0], (17, 34, 51))
@@ -2752,7 +2767,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(child_row["file_name"], "notes.txt")
         self.assertEqual(child_row["control_number"], "DOC001.00000001.001")
         self.assertEqual(child_row["parent_document_id"], parent_row["id"])
-        self.assertTrue(str(child_row["rel_path"]).startswith(".retriever/previews/thread.eml/attachments/"))
+        self.assertTrue(
+            str(child_row["rel_path"]).startswith(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/thread.eml/attachments/"
+            )
+        )
         self.assertEqual(child_row["content_type"], "E-Doc")
 
         parent_search = retriever_tools.search(self.root, "Upgrade test", None, None, None, 1, 20)
@@ -3624,8 +3643,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(attachments_only["total_hits"], 1)
         self.assertTrue(
-            all(not str(item["rel_path"]).startswith(".retriever/previews/thread.eml/attachments/") or item["parent_document_id"] is not None
-                for item in browse_results["results"])
+            all(
+                not str(item["rel_path"]).startswith(
+                    f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/thread.eml/attachments/"
+                )
+                or item["parent_document_id"] is not None
+                for item in browse_results["results"]
+            )
         )
 
     def test_ingest_reuses_workspace_dataset_on_reingest(self) -> None:
@@ -3788,7 +3812,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(child_row["custodian"], "mailbox")
         self.assertEqual(parent_row["dataset_id"], sibling_row["dataset_id"])
         self.assertEqual(parent_row["dataset_id"], child_row["dataset_id"])
-        self.assertTrue(str(child_row["rel_path"]).startswith(".retriever/previews/mailbox.mbox/attachments/"))
+        self.assertTrue(
+            str(child_row["rel_path"]).startswith(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/mailbox.mbox/attachments/"
+            )
+        )
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -3822,7 +3850,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_result["attachment_count"], 1)
         self.assertEqual(parent_result["source_rel_path"], "mailbox.mbox")
         self.assertEqual(parent_result["dataset_name"], "mailbox.mbox")
-        self.assertTrue(parent_result["preview_rel_path"].startswith(".retriever/previews/mailbox.mbox/messages/"))
+        self.assertTrue(
+            parent_result["preview_rel_path"].startswith(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/mailbox.mbox/messages/"
+            )
+        )
         parent_preview_html = Path(parent_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
         self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
 
@@ -4096,7 +4128,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(parent_row["dataset_id"])
         self.assertEqual(parent_row["dataset_id"], sibling_row["dataset_id"])
         self.assertEqual(parent_row["dataset_id"], child_row["dataset_id"])
-        self.assertTrue(str(child_row["rel_path"]).startswith(".retriever/previews/mailbox.pst/attachments/"))
+        self.assertTrue(
+            str(child_row["rel_path"]).startswith(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/mailbox.pst/attachments/"
+            )
+        )
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -4136,7 +4172,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_result["source_rel_path"], "mailbox.pst")
         self.assertEqual(parent_result["source_folder_path"], "Inbox")
         self.assertEqual(parent_result["dataset_name"], "mailbox.pst")
-        self.assertTrue(parent_result["preview_rel_path"].startswith(".retriever/previews/mailbox.pst/messages/"))
+        self.assertTrue(
+            parent_result["preview_rel_path"].startswith(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/mailbox.pst/messages/"
+            )
+        )
         parent_preview_html = Path(parent_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
         self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
 
@@ -4278,7 +4318,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         search_result = retriever_tools.search(self.root, "draft the update", None, None, None, 1, 20)
         result = search_result["results"][0]
-        self.assertTrue(result["preview_rel_path"].startswith(".retriever/previews/mailbox.pst/messages/"))
+        self.assertTrue(
+            result["preview_rel_path"].startswith(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/mailbox.pst/messages/"
+            )
+        )
         self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
         preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
         self.assertIn("<title>Kickoff thread for launch planning.</title>", preview_html)
@@ -4595,10 +4639,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(dataset_row["dataset_name"], "Synthetic_Production")
         self.assertTrue(any(row["part_kind"] == "native" for row in source_parts))
 
-        parent_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000001.logical")
-        child_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000003.logical")
-        native_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000004.logical")
-        image_only_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+        parent_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000001.logical"
+        )
+        child_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000003.logical"
+        )
+        native_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000004.logical"
+        )
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
 
         self.assertEqual(parent_row["control_number"], "PDX000001")
         self.assertEqual(parent_row["begin_bates"], "PDX000001")
@@ -4706,8 +4758,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(ingest_result["page_images_linked"], 5)
         self.assertEqual(ingest_result["failures"], [])
 
-        parent_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000001.logical")
-        native_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000004.logical")
+        parent_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000001.logical"
+        )
+        native_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000004.logical"
+        )
         self.assertEqual(parent_row["content_type"], "Email")
         self.assertEqual(parent_row["author"], "Elena Steven <elena@example.com>")
         self.assertEqual(parent_row["date_created"], "2026-04-14T10:32:00Z")
@@ -4757,7 +4813,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         second_result = retriever_tools.ingest_production(self.root, production_root)
         self.assertEqual(second_result["retired"], 1)
 
-        retired_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000005.logical")
+        retired_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
         self.assertEqual(retired_row["lifecycle_status"], "deleted")
 
     def test_search_docs_cli_alias_matches_search(self) -> None:
@@ -5179,7 +5237,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         ingest_result = retriever_tools.ingest_production(self.root, production_root)
         self.assertEqual(ingest_result["created"], 4)
 
-        native_row = self.fetch_document_row(".retriever/productions/Synthetic_Production/documents/PDX000004.logical")
+        native_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000004.logical"
+        )
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
             source_part_rows = connection.execute(
