@@ -10,6 +10,15 @@ def build_content_type_by_extension() -> dict[str, str]:
 
 CONTENT_TYPE_BY_EXTENSION = build_content_type_by_extension()
 
+ATTACHMENT_SUFFIX_PATTERN = re.compile(
+    r"^(?P<title>.+?)\s+(?P<label>(?:and\s+(?:back\s*up|backup)\s+)?attachments?)\s*:\s*(?P<attachments>.+)$",
+    re.IGNORECASE,
+)
+HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN = re.compile(
+    r"<!-- RETRIEVER_ATTACHMENT_LINKS_START -->.*?<!-- RETRIEVER_ATTACHMENT_LINKS_END -->",
+    re.DOTALL,
+)
+
 SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS workspace_meta (
@@ -1884,7 +1893,7 @@ def append_unique_participants(
 
 def email_headers_to_metadata(headers: dict[str, str]) -> dict[str, str | None]:
     recipients = ", ".join(headers[key] for key in ("to", "cc", "bcc") if headers.get(key)) or None
-    subject = headers.get("subject") or None
+    subject = normalize_generated_document_title(headers.get("subject"))
     participants: list[str] = []
     seen: set[str] = set()
     append_unique_participants(
@@ -1900,6 +1909,36 @@ def email_headers_to_metadata(headers: dict[str, str]) -> dict[str, str | None]:
         "subject": subject,
         "title": subject,
     }
+
+
+def attachment_list_looks_like_filenames(raw_value: str) -> bool:
+    candidates = [
+        normalize_whitespace(part).strip(" \t\r\n'\"()[]{}")
+        for part in re.split(r"\s*[;,]\s*", raw_value)
+        if normalize_whitespace(part)
+    ]
+    if not candidates:
+        candidate = normalize_whitespace(raw_value).strip(" \t\r\n'\"()[]{}")
+        if not candidate:
+            return False
+        candidates = [candidate]
+    filename_like = 0
+    for candidate in candidates:
+        leaf = candidate.replace("\\", "/").rsplit("/", 1)[-1]
+        if re.search(r"\.[A-Za-z0-9]{1,8}$", leaf):
+            filename_like += 1
+    return filename_like > 0
+
+
+def normalize_generated_document_title(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or "")) or None
+    if not normalized:
+        return None
+    match = ATTACHMENT_SUFFIX_PATTERN.match(normalized)
+    if match is None or not attachment_list_looks_like_filenames(match.group("attachments")):
+        return normalized
+    trimmed_title = normalize_whitespace(match.group("title").rstrip(" -:;,"))
+    return trimmed_title or normalized
 
 
 def extract_email_header_blocks(text: str, max_lines: int | None = None) -> list[dict[str, str]]:
@@ -2332,6 +2371,37 @@ def inline_cid_references_in_html(
         return f"{prefix}{quote}{replacement}{quote}"
 
     return CID_REFERENCE_PATTERN.sub(_replace, html_body)
+
+
+def render_html_preview_attachment_links(links: list[dict[str, str]]) -> str:
+    if not links:
+        return ""
+    items: list[str] = []
+    for link in links:
+        href = html.escape(str(link.get("href") or ""))
+        label = html.escape(str(link.get("label") or "Attachment"))
+        detail = normalize_whitespace(str(link.get("detail") or ""))
+        detail_html = f' <span class="retriever-attachment-meta">({html.escape(detail)})</span>' if detail else ""
+        items.append(f'<li><a href="{href}">{label}</a>{detail_html}</li>')
+    return (
+        "<!-- RETRIEVER_ATTACHMENT_LINKS_START -->"
+        '<section class="retriever-attachments"><h2>Attachments</h2><ul>'
+        + "".join(items)
+        + "</ul></section>"
+        "<!-- RETRIEVER_ATTACHMENT_LINKS_END -->"
+    )
+
+
+def inject_html_preview_attachment_links(html_text: str, links: list[dict[str, str]]) -> str:
+    cleaned = HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN.sub("", html_text)
+    section = render_html_preview_attachment_links(links)
+    if not section:
+        return cleaned
+    if "</h1>" in cleaned:
+        return cleaned.replace("</h1>", f"</h1>{section}", 1)
+    if "<body>" in cleaned:
+        return cleaned.replace("<body>", f"<body>{section}", 1)
+    return cleaned + section
 
 
 def build_html_preview(
