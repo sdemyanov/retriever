@@ -3017,6 +3017,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
         help="Reclaim running items whose heartbeat is older than this many seconds",
     )
+    claim_run_items_parser.add_argument(
+        "--launch-mode",
+        default="inline",
+        choices=sorted(RUN_WORKER_MODES),
+        help="Worker launch mode for supervision metadata",
+    )
+    claim_run_items_parser.add_argument("--worker-task-id", help="Optional background task identifier")
+    claim_run_items_parser.add_argument(
+        "--max-batches",
+        type=int,
+        help="Optional maximum number of batches this worker should prepare before handing off",
+    )
 
     prepare_run_batch_parser = subparsers.add_parser(
         "prepare-run-batch",
@@ -3036,6 +3048,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
         help="Reclaim running items whose heartbeat is older than this many seconds",
     )
+    prepare_run_batch_parser.add_argument(
+        "--launch-mode",
+        default="inline",
+        choices=sorted(RUN_WORKER_MODES),
+        help="Worker launch mode for supervision metadata",
+    )
+    prepare_run_batch_parser.add_argument("--worker-task-id", help="Optional background task identifier")
+    prepare_run_batch_parser.add_argument(
+        "--max-batches",
+        type=int,
+        help="Optional maximum number of batches this worker should prepare before handing off",
+    )
 
     get_run_item_context_parser = subparsers.add_parser("get-run-item-context", help="Load the execution context for one run item")
     get_run_item_context_parser.add_argument("workspace", help="Workspace root path")
@@ -3046,11 +3070,30 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat_run_items_parser.add_argument("--run-id", type=int, required=True, help="Run id")
     heartbeat_run_items_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
 
+    finish_run_worker_parser = subparsers.add_parser(
+        "finish-run-worker",
+        help="Mark one worker as finished and persist its summary",
+    )
+    finish_run_worker_parser.add_argument("workspace", help="Workspace root path")
+    finish_run_worker_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    finish_run_worker_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
+    finish_run_worker_parser.add_argument(
+        "--worker-status",
+        required=True,
+        choices=sorted(status for status in RUN_WORKER_STATUSES if status != "active"),
+        help="Terminal worker status",
+    )
+    finish_run_worker_parser.add_argument("--summary-json", help="Optional worker summary JSON object")
+    finish_run_worker_parser.add_argument("--error", dest="error_summary", help="Optional terminal error summary")
+
     complete_run_item_parser = subparsers.add_parser("complete-run-item", help="Mark one claimed run item completed and persist its result")
     complete_run_item_parser.add_argument("workspace", help="Workspace root path")
     complete_run_item_parser.add_argument("--run-item-id", type=int, required=True, help="Run item id")
     complete_run_item_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
-    complete_run_item_parser.add_argument("--page-text", help="OCR page text for page-scoped run items")
+    complete_run_item_parser.add_argument(
+        "--page-text",
+        help="Plain-text completion for page-scoped visual run items (OCR or image description)",
+    )
     complete_run_item_parser.add_argument("--raw-output-json", help="Optional raw output JSON")
     complete_run_item_parser.add_argument("--normalized-output-json", help="Optional normalized output JSON")
     complete_run_item_parser.add_argument("--output-values-json", help="Optional per-output values JSON object")
@@ -3081,10 +3124,22 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_run_parser = subparsers.add_parser("cancel-run", help="Stop claiming new work for a run and skip its pending items")
     cancel_run_parser.add_argument("workspace", help="Workspace root path")
     cancel_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    cancel_run_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Request force-stop for background workers that expose task ids",
+    )
 
     finalize_ocr_run_parser = subparsers.add_parser("finalize-ocr-run", help="Merge completed OCR page items into document-level OCR results")
     finalize_ocr_run_parser.add_argument("workspace", help="Workspace root path")
     finalize_ocr_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+
+    finalize_image_description_run_parser = subparsers.add_parser(
+        "finalize-image-description-run",
+        help="Merge completed image-description page items into document-level text revisions",
+    )
+    finalize_image_description_run_parser.add_argument("workspace", help="Workspace root path")
+    finalize_image_description_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
 
     publish_run_results_parser = subparsers.add_parser(
         "publish-run-results",
@@ -3420,6 +3475,9 @@ def main() -> int:
                         claimed_by=args.claimed_by,
                         limit=args.limit,
                         stale_after_seconds=args.stale_seconds,
+                        launch_mode=args.launch_mode,
+                        worker_task_id=args.worker_task_id,
+                        max_batches=args.max_batches,
                     ),
                     indent=2,
                     sort_keys=True,
@@ -3436,6 +3494,9 @@ def main() -> int:
                         claimed_by=args.claimed_by,
                         limit=args.limit,
                         stale_after_seconds=args.stale_seconds,
+                        launch_mode=args.launch_mode,
+                        worker_task_id=args.worker_task_id,
+                        max_batches=args.max_batches,
                     ),
                     indent=2,
                     sort_keys=True,
@@ -3451,6 +3512,23 @@ def main() -> int:
             print(
                 json.dumps(
                     heartbeat_run_items(root, run_id=args.run_id, claimed_by=args.claimed_by),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "finish-run-worker":
+            print(
+                json.dumps(
+                    finish_run_worker(
+                        root,
+                        run_id=args.run_id,
+                        claimed_by=args.claimed_by,
+                        worker_status=args.worker_status,
+                        summary_json=args.summary_json,
+                        error_summary=args.error_summary,
+                    ),
                     indent=2,
                     sort_keys=True,
                 )
@@ -3508,11 +3586,15 @@ def main() -> int:
             return 0
 
         if args.command == "cancel-run":
-            print(json.dumps(cancel_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            print(json.dumps(cancel_run(root, run_id=args.run_id, force=args.force), indent=2, sort_keys=True))
             return 0
 
         if args.command == "finalize-ocr-run":
             print(json.dumps(finalize_ocr_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "finalize-image-description-run":
+            print(json.dumps(finalize_image_description_run(root, run_id=args.run_id), indent=2, sort_keys=True))
             return 0
 
         if args.command == "publish-run-results":

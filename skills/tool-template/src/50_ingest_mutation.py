@@ -976,6 +976,9 @@ def claim_run_items(
     claimed_by: str,
     limit: int = DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE,
     stale_after_seconds: int = DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+    launch_mode: str = "inline",
+    worker_task_id: str | None = None,
+    max_batches: int | None = None,
 ) -> dict[str, object]:
     if limit < 1:
         raise RetrieverError("Claim limit must be >= 1.")
@@ -987,6 +990,14 @@ def claim_run_items(
         connection.execute("BEGIN IMMEDIATE")
         try:
             materialize_run_items_for_run(connection, paths, root, run_id)
+            ensure_run_worker_row(
+                connection,
+                run_id=run_id,
+                claimed_by=claimed_by,
+                launch_mode=launch_mode,
+                worker_task_id=worker_task_id,
+                max_batches=max_batches,
+            )
             reused_count = reuse_active_results_for_run(connection, run_id)
             claimed_rows = claim_run_item_rows(
                 connection,
@@ -995,6 +1006,14 @@ def claim_run_items(
                 limit=limit,
                 stale_after_seconds=stale_after_seconds,
             )
+            if claimed_rows:
+                update_run_worker_row(
+                    connection,
+                    run_id=run_id,
+                    claimed_by=normalize_whitespace(claimed_by),
+                    heartbeat=True,
+                    increment_batches_prepared=True,
+                )
             refresh_run_progress(connection, run_id)
             payload = {
                 "status": "ok",
@@ -1019,6 +1038,9 @@ def prepare_run_batch(
     claimed_by: str,
     limit: int | None = None,
     stale_after_seconds: int = DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+    launch_mode: str = "inline",
+    worker_task_id: str | None = None,
+    max_batches: int | None = None,
 ) -> dict[str, object]:
     if limit is not None and limit < 1:
         raise RetrieverError("Claim limit must be >= 1.")
@@ -1030,6 +1052,14 @@ def prepare_run_batch(
         connection.execute("BEGIN IMMEDIATE")
         try:
             materialize_run_items_for_run(connection, paths, root, run_id)
+            ensure_run_worker_row(
+                connection,
+                run_id=run_id,
+                claimed_by=claimed_by,
+                launch_mode=launch_mode,
+                worker_task_id=worker_task_id,
+                max_batches=max_batches,
+            )
             reused_count = reuse_active_results_for_run(connection, run_id)
             initial_run_payload = run_status_by_id(connection, run_id)
             initial_worker_payload = build_run_worker_payload(
@@ -1057,6 +1087,14 @@ def prepare_run_batch(
                     }
                     for row in claimed_rows
                 ]
+                if batch_payloads:
+                    update_run_worker_row(
+                        connection,
+                        run_id=run_id,
+                        claimed_by=normalize_whitespace(claimed_by),
+                        heartbeat=True,
+                        increment_batches_prepared=True,
+                    )
 
             current_run_payload = run_status_by_id(connection, run_id)
             worker_payload = build_run_worker_payload(
@@ -1081,6 +1119,9 @@ def prepare_run_batch(
                 "requested_limit": effective_limit,
                 "reused_count": reused_count,
                 "batch": batch_payloads,
+                "worker_record": run_worker_row_to_payload(
+                    find_run_worker_row(connection, run_id=run_id, claimed_by=normalize_whitespace(claimed_by))
+                ),
             }
             connection.commit()
         except Exception:
@@ -1169,16 +1210,36 @@ def complete_run_item(
                     else None
                 )
                 ocr_page_output_payload = None
+                image_description_page_output_payload = None
                 if str(run_item_row["item_kind"] or "") == "page":
-                    existing_page_output_row = find_ocr_page_output_row(connection, run_item_id=run_item_id)
-                    if existing_page_output_row is not None:
-                        ocr_page_output_payload = ocr_page_output_row_to_payload(existing_page_output_row)
+                    run_row = require_run_row_by_id(connection, int(run_item_row["run_id"]))
+                    job_version_row = require_job_version_row_by_id(connection, int(run_row["job_version_id"]))
+                    job_row = connection.execute(
+                        "SELECT * FROM jobs WHERE id = ?",
+                        (job_version_row["job_id"],),
+                    ).fetchone()
+                    assert job_row is not None
+                    page_job_kind = normalize_job_kind(str(job_row["job_kind"]))
+                    if page_job_kind == "ocr":
+                        existing_page_output_row = find_ocr_page_output_row(connection, run_item_id=run_item_id)
+                        if existing_page_output_row is not None:
+                            ocr_page_output_payload = ocr_page_output_row_to_payload(existing_page_output_row)
+                    elif page_job_kind == "image_description":
+                        existing_page_output_row = find_image_description_page_output_row(
+                            connection,
+                            run_item_id=run_item_id,
+                        )
+                        if existing_page_output_row is not None:
+                            image_description_page_output_payload = image_description_page_output_row_to_payload(
+                                existing_page_output_row
+                            )
                 payload = {
                     "status": "ok",
                     "idempotent": True,
                     "run_item": run_item_row_to_payload(run_item_row),
                     "result": result_payload,
                     "ocr_page_output": ocr_page_output_payload,
+                    "image_description_page_output": image_description_page_output_payload,
                     "run": run_status_by_id(connection, int(run_item_row["run_id"])),
                 }
                 connection.commit()
@@ -1245,29 +1306,52 @@ def complete_run_item(
             )
 
             created_text_revision_id = None
-            if job_kind == "ocr" and str(run_item_row["item_kind"] or "") == "page":
+            if job_kind in {"ocr", "image_description"} and str(run_item_row["item_kind"] or "") == "page":
                 resolved_page_text = page_text if page_text is not None else None
                 if resolved_page_text is None:
                     normalized_candidate = normalized_output if isinstance(normalized_output, str) else None
                     raw_candidate = raw_output if isinstance(raw_output, str) else None
                     resolved_page_text = normalized_candidate or raw_candidate
                 if resolved_page_text is None:
-                    raise RetrieverError("OCR page completion requires --page-text or a raw/normalized string payload.")
+                    raise RetrieverError(
+                        "Page completion requires --page-text or a raw/normalized string payload."
+                    )
                 page_raw_output = raw_output if raw_output is not None else {"page_text": resolved_page_text}
                 page_normalized_output = (
                     normalized_output if normalized_output is not None else {"page_text": resolved_page_text}
                 )
-                ocr_page_output_id, _ = upsert_ocr_page_output_row(
-                    connection,
-                    run_item_id=run_item_id,
-                    run_id=int(run_item_row["run_id"]),
-                    document_id=int(run_item_row["document_id"]),
-                    page_number=int(run_item_row["page_number"] or 0),
-                    text_content=str(resolved_page_text),
-                    raw_output=page_raw_output,
-                    normalized_output=page_normalized_output,
-                    provider_metadata=provider_metadata,
-                )
+                page_output_payload_key = "ocr_page_output"
+                if job_kind == "ocr":
+                    upsert_ocr_page_output_row(
+                        connection,
+                        run_item_id=run_item_id,
+                        run_id=int(run_item_row["run_id"]),
+                        document_id=int(run_item_row["document_id"]),
+                        page_number=int(run_item_row["page_number"] or 0),
+                        text_content=str(resolved_page_text),
+                        raw_output=page_raw_output,
+                        normalized_output=page_normalized_output,
+                        provider_metadata=provider_metadata,
+                    )
+                    page_output_payload = ocr_page_output_row_to_payload(
+                        find_ocr_page_output_row(connection, run_item_id=run_item_id)  # type: ignore[arg-type]
+                    )
+                else:
+                    page_output_payload_key = "image_description_page_output"
+                    upsert_image_description_page_output_row(
+                        connection,
+                        run_item_id=run_item_id,
+                        run_id=int(run_item_row["run_id"]),
+                        document_id=int(run_item_row["document_id"]),
+                        page_number=int(run_item_row["page_number"] or 0),
+                        text_content=str(resolved_page_text),
+                        raw_output=page_raw_output,
+                        normalized_output=page_normalized_output,
+                        provider_metadata=provider_metadata,
+                    )
+                    page_output_payload = image_description_page_output_row_to_payload(
+                        find_image_description_page_output_row(connection, run_item_id=run_item_id)  # type: ignore[arg-type]
+                    )
                 create_attempt_row(
                     connection,
                     run_item_id=run_item_id,
@@ -1292,15 +1376,20 @@ def complete_run_item(
                     completed_at=completion_time,
                     increment_attempt_count=True,
                 )
+                update_run_worker_row(
+                    connection,
+                    run_id=int(run_item_row["run_id"]),
+                    claimed_by=normalized_claimed_by,
+                    heartbeat=True,
+                    increment_items_completed=1,
+                )
                 payload = {
                     "status": "ok",
                     "idempotent": False,
                     "run_item": run_item_row_to_payload(require_run_item_row_by_id(connection, run_item_id)),
-                    "ocr_page_output": ocr_page_output_row_to_payload(
-                        find_ocr_page_output_row(connection, run_item_id=run_item_id)  # type: ignore[arg-type]
-                    ),
                     "run": run_status_by_id(connection, int(run_item_row["run_id"])),
                 }
+                payload[page_output_payload_key] = page_output_payload
                 connection.commit()
                 return payload
             if created_text_revision_payload:
@@ -1391,6 +1480,13 @@ def complete_run_item(
                 last_heartbeat_at=completion_time,
                 completed_at=completion_time,
                 increment_attempt_count=True,
+            )
+            update_run_worker_row(
+                connection,
+                run_id=int(run_item_row["run_id"]),
+                claimed_by=normalized_claimed_by,
+                heartbeat=True,
+                increment_items_completed=1,
             )
             payload = {
                 "status": "ok",
@@ -1483,6 +1579,14 @@ def fail_run_item(
                 completed_at=completion_time,
                 increment_attempt_count=True,
             )
+            update_run_worker_row(
+                connection,
+                run_id=int(run_item_row["run_id"]),
+                claimed_by=normalized_claimed_by,
+                heartbeat=True,
+                increment_items_failed=1,
+                last_error=normalized_error,
+            )
             payload = {
                 "status": "ok",
                 "idempotent": False,
@@ -1512,7 +1616,7 @@ def run_status(root: Path, *, run_id: int) -> dict[str, object]:
         connection.close()
 
 
-def cancel_run(root: Path, *, run_id: int) -> dict[str, object]:
+def cancel_run(root: Path, *, run_id: int, force: bool = False) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -1534,10 +1638,86 @@ def cancel_run(root: Path, *, run_id: int) -> dict[str, object]:
                 (canceled_at, run_id),
             )
             skipped_count = cancel_pending_run_items(connection, run_id=run_id)
+            force_stop_task_ids = request_run_worker_cancellation(connection, run_id=run_id, force=force)
             payload = {
                 "status": "ok",
                 "idempotent": already_canceled,
                 "canceled_pending_items": skipped_count,
+                "force_stop_requested": force,
+                "force_stop_task_ids": force_stop_task_ids,
+                "run": run_status_by_id(connection, run_id),
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def finish_run_worker(
+    root: Path,
+    *,
+    run_id: int,
+    claimed_by: str,
+    worker_status: str,
+    summary_json: str | None = None,
+    error_summary: str | None = None,
+) -> dict[str, object]:
+    normalized_claimed_by = normalize_whitespace(claimed_by)
+    if not normalized_claimed_by:
+        raise RetrieverError("claimed_by cannot be empty.")
+    normalized_status = normalize_run_worker_status(worker_status)
+    if normalized_status == "active":
+        raise RetrieverError("finish-run-worker requires a terminal worker status, not 'active'.")
+    summary_payload = decode_json_text(summary_json, default={}) if summary_json is not None else {}
+    if summary_json is not None and not isinstance(summary_payload, dict):
+        raise RetrieverError("summary_json must decode to a JSON object.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            run_row = require_run_row_by_id(connection, run_id)
+            worker_row = find_run_worker_row(connection, run_id=run_id, claimed_by=normalized_claimed_by)
+            if worker_row is None:
+                raise RetrieverError(
+                    f"Run {run_id} does not have a registered worker for claimed_by={normalized_claimed_by!r}."
+                )
+            if str(run_row["status"] or "") != "canceled" and normalized_status == "canceled":
+                raise RetrieverError("Worker cannot be finished as canceled unless the run itself is canceled.")
+
+            already_terminal = (
+                str(worker_row["status"] or "") == normalized_status and worker_row["completed_at"] is not None
+            )
+            if already_terminal:
+                payload = {
+                    "status": "ok",
+                    "idempotent": True,
+                    "worker": run_worker_row_to_payload(worker_row),
+                    "run": run_status_by_id(connection, run_id),
+                }
+                connection.commit()
+                return payload
+
+            updated_row = update_run_worker_row(
+                connection,
+                run_id=run_id,
+                claimed_by=normalized_claimed_by,
+                status=normalized_status,
+                last_error=(normalize_whitespace(error_summary) if error_summary is not None else "") or None,
+                summary=summary_payload if isinstance(summary_payload, dict) else {},
+                completed_at=utc_now(),
+            )
+            assert updated_row is not None
+            payload = {
+                "status": "ok",
+                "idempotent": False,
+                "worker": run_worker_row_to_payload(updated_row),
                 "run": run_status_by_id(connection, run_id),
             }
             connection.commit()
@@ -1559,6 +1739,25 @@ def finalize_ocr_run(root: Path, *, run_id: int) -> dict[str, object]:
         try:
             materialize_run_items_for_run(connection, paths, root, run_id)
             payload = finalize_ocr_results_for_run(connection, paths, run_id=run_id)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def finalize_image_description_run(root: Path, *, run_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN")
+        try:
+            materialize_run_items_for_run(connection, paths, root, run_id)
+            payload = finalize_image_description_results_for_run(connection, paths, run_id=run_id)
             connection.commit()
         except Exception:
             connection.rollback()

@@ -333,7 +333,44 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS run_workers (
+      id INTEGER PRIMARY KEY,
+      run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      claimed_by TEXT NOT NULL,
+      launch_mode TEXT NOT NULL DEFAULT 'inline',
+      worker_task_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      max_batches INTEGER,
+      batches_prepared INTEGER NOT NULL DEFAULT 0,
+      items_completed INTEGER NOT NULL DEFAULT 0,
+      items_failed INTEGER NOT NULL DEFAULT 0,
+      last_heartbeat_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      cancel_requested_at TEXT,
+      summary_json TEXT NOT NULL DEFAULT '{}',
+      UNIQUE(run_id, claimed_by)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS ocr_page_outputs (
+      id INTEGER PRIMARY KEY,
+      run_item_id INTEGER NOT NULL REFERENCES run_items(id) ON DELETE CASCADE,
+      run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      page_number INTEGER NOT NULL,
+      text_content TEXT NOT NULL,
+      raw_output_json TEXT,
+      normalized_output_json TEXT,
+      provider_metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      UNIQUE(run_item_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS image_description_page_outputs (
       id INTEGER PRIMARY KEY,
       run_item_id INTEGER NOT NULL REFERENCES run_items(id) ON DELETE CASCADE,
       run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,

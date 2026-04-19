@@ -8,6 +8,7 @@ JOB_KINDS = {
 JOB_CAPABILITIES = {
     "text_structured",
     "text_translation",
+    "vision_description",
     "vision_ocr",
 }
 JOB_INPUT_BASES = {
@@ -29,6 +30,8 @@ RUN_FAMILY_MODES = {"exact", "with_family"}
 RUN_ITEM_KINDS = {"document", "page", "segment"}
 RUN_ITEM_STATUSES = {"completed", "failed", "pending", "running", "skipped"}
 RUN_STATUSES = {"canceled", "completed", "failed", "planned", "running"}
+RUN_WORKER_MODES = {"background", "inline"}
+RUN_WORKER_STATUSES = {"active", "canceled", "completed", "failed", "orphaned", "stopped"}
 TEXT_REVISION_ACTIVATION_POLICIES = {"always", "if_empty", "if_poor", "manual"}
 DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS = 900
 DEFAULT_RUN_ITEM_CONTEXT_INLINE_BYTES = 50 * 1024
@@ -37,6 +40,8 @@ DEFAULT_WORKER_BATCH_SIZE = 5
 DEFAULT_WORKER_INLINE_MAX_ITEMS = 5
 DEFAULT_WORKER_INLINE_MAX_BATCHES = 12
 DEFAULT_WORKER_BACKGROUND_MAX_BATCHES = 3
+DEFAULT_WORKER_BACKGROUND_WAKE_INTERVAL_SECONDS = 60
+DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL = 4
 DEFAULT_OCR_RENDER_RESOLUTION = 150
 
 
@@ -73,6 +78,8 @@ def default_job_capability_for_kind(job_kind: str) -> str:
         return "text_structured"
     if normalized_kind == "translation":
         return "text_translation"
+    if normalized_kind == "image_description":
+        return "vision_description"
     if normalized_kind == "ocr":
         return "vision_ocr"
     raise RetrieverError(
@@ -137,6 +144,24 @@ def normalize_run_item_status(status: str) -> str:
     if normalized not in RUN_ITEM_STATUSES:
         raise RetrieverError(
             f"Unsupported run item status: {status!r}. Expected one of {', '.join(sorted(RUN_ITEM_STATUSES))}."
+        )
+    return normalized
+
+
+def normalize_run_worker_mode(mode: str) -> str:
+    normalized = normalize_whitespace(mode).lower()
+    if normalized not in RUN_WORKER_MODES:
+        raise RetrieverError(
+            f"Unsupported run worker mode: {mode!r}. Expected one of {', '.join(sorted(RUN_WORKER_MODES))}."
+        )
+    return normalized
+
+
+def normalize_run_worker_status(status: str) -> str:
+    normalized = normalize_whitespace(status).lower()
+    if normalized not in RUN_WORKER_STATUSES:
+        raise RetrieverError(
+            f"Unsupported run worker status: {status!r}. Expected one of {', '.join(sorted(RUN_WORKER_STATUSES))}."
         )
     return normalized
 
