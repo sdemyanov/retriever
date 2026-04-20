@@ -278,10 +278,13 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
 
         production_signatures = find_production_root_signatures(root, recursive, connection)
         production_root_paths = [Path(signature["root"]).resolve() for signature in production_signatures]
+        slack_export_descriptors = find_slack_export_roots(root, recursive, allowed_types)
+        slack_export_root_paths = [Path(descriptor["root"]).resolve() for descriptor in slack_export_descriptors]
         scanned_files = [
             path
             for path in collect_files(root, recursive, allowed_types)
             if not any(production_root == path.resolve() or production_root in path.resolve().parents for production_root in production_root_paths)
+            and not any(slack_root == path.resolve() or slack_root in path.resolve().parents for slack_root in slack_export_root_paths)
         ]
         scanned_rel_paths: set[str] = set()
         scanned_pst_source_rel_paths: set[str] = set()
@@ -304,19 +307,8 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 }
             )
 
-        existing_rows = connection.execute(
-            """
-            SELECT *
-            FROM documents
-            WHERE parent_document_id IS NULL
-              AND COALESCE(source_kind, ?) = ?
-            """
-        , (FILESYSTEM_SOURCE_KIND, FILESYSTEM_SOURCE_KIND)).fetchall()
-        existing_by_rel = {row["rel_path"]: row for row in existing_rows}
-        unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
-        for row in existing_rows:
-            if row["rel_path"] not in scanned_rel_paths and row["file_hash"]:
-                unseen_existing_by_hash[row["file_hash"]].append(row)
+        current_ingestion_batch: int | None = None
+        slack_day_documents_missing = 0
 
         stats = {
             "new": 0,
@@ -337,9 +329,66 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             "mbox_messages_deleted": 0,
             "mbox_sources_missing": 0,
             "mbox_documents_missing": 0,
+            "slack_exports_detected": len(slack_export_descriptors),
+            "slack_day_documents_scanned": 0,
+            "slack_documents_created": 0,
+            "slack_documents_updated": 0,
+            "slack_documents_missing": 0,
+            "slack_conversations": 0,
+            "email_conversations": 0,
+            "email_documents_reassigned": 0,
+            "email_child_documents_updated": 0,
+            "pst_chat_conversations": 0,
+            "pst_chat_documents_reassigned": 0,
+            "pst_chat_child_documents_updated": 0,
         }
         failures: list[dict[str, str]] = []
-        current_ingestion_batch: int | None = None
+
+        for descriptor in slack_export_descriptors:
+            export_root = Path(descriptor["root"])
+            try:
+                slack_result = ingest_slack_export_root(
+                    connection,
+                    paths,
+                    export_root,
+                    ingestion_batch_number=current_ingestion_batch,
+                )
+                current_ingestion_batch = (
+                    int(slack_result["ingestion_batch_number"])
+                    if slack_result.get("ingestion_batch_number") is not None
+                    else current_ingestion_batch
+                )
+                stats["new"] += int(slack_result["new"])
+                stats["updated"] += int(slack_result["updated"])
+                stats["failed"] += int(slack_result["failed"])
+                stats["slack_day_documents_scanned"] += int(slack_result["scanned_day_files"])
+                stats["slack_documents_created"] += int(slack_result["new"])
+                stats["slack_documents_updated"] += int(slack_result["updated"])
+                stats["slack_conversations"] += int(slack_result["conversations"])
+                slack_day_documents_missing += int(slack_result["missing"])
+                failures.extend(list(slack_result.get("failures", [])))
+            except Exception as exc:
+                stats["failed"] += 1
+                failures.append(
+                    {
+                        "rel_path": relative_document_path(root, export_root),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+        existing_rows = connection.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE parent_document_id IS NULL
+              AND COALESCE(source_kind, ?) = ?
+            """
+        , (FILESYSTEM_SOURCE_KIND, FILESYSTEM_SOURCE_KIND)).fetchall()
+        existing_by_rel = {row["rel_path"]: row for row in existing_rows}
+        unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in existing_rows:
+            if row["rel_path"] not in scanned_rel_paths and row["file_hash"]:
+                unseen_existing_by_hash[row["file_hash"]].append(row)
 
         for item in scanned_items:
             rel_path = str(item["rel_path"])
@@ -379,6 +428,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     existing_row["file_hash"] == file_hash
                     and existing_row["lifecycle_status"] == "active"
                     and document_row_has_seeded_text_revisions(existing_row)
+                    and document_row_has_email_threading(connection, existing_row)
                 ):
                     filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
                     connection.execute("BEGIN")
@@ -436,6 +486,11 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     control_number_family_sequence=control_number_family_sequence,
                     control_number_attachment_sequence=control_number_attachment_sequence,
                 )
+                replace_document_email_threading_row(
+                    connection,
+                    document_id=document_id,
+                    email_threading=extracted.get("email_threading"),
+                )
                 seed_source_text_revision_for_document(
                     connection,
                     paths,
@@ -482,7 +537,22 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         stats["pst_documents_missing"] = pst_documents_missing
         stats["mbox_sources_missing"] = mbox_sources_missing
         stats["mbox_documents_missing"] = mbox_documents_missing
-        stats["missing"] = filesystem_missing + pst_sources_missing + mbox_sources_missing
+        stats["slack_documents_missing"] = slack_day_documents_missing
+        stats["missing"] = filesystem_missing + pst_sources_missing + mbox_sources_missing + slack_day_documents_missing
+        connection.execute("BEGIN")
+        try:
+            conversation_assignment = assign_supported_conversations(connection)
+            refresh_conversation_previews(connection, paths)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        stats["email_conversations"] = int(conversation_assignment["email_conversations"])
+        stats["email_documents_reassigned"] = int(conversation_assignment["email_documents_reassigned"])
+        stats["email_child_documents_updated"] = int(conversation_assignment["email_child_documents_updated"])
+        stats["pst_chat_conversations"] = int(conversation_assignment["pst_chat_conversations"])
+        stats["pst_chat_documents_reassigned"] = int(conversation_assignment["pst_chat_documents_reassigned"])
+        stats["pst_chat_child_documents_updated"] = int(conversation_assignment["pst_chat_child_documents_updated"])
         connection.execute("BEGIN")
         try:
             pruned_unused_filesystem_dataset = prune_unused_filesystem_dataset(connection)
@@ -493,8 +563,8 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         workspace_inventory = document_inventory_counts(connection)
         result = dict(stats)
         result["failures"] = failures
-        result["scanned"] = len(scanned_items)
-        result["scanned_files"] = len(scanned_items)
+        result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"]
+        result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"]
         result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
         result["skipped_production_roots"] = [str(signature["rel_root"]) for signature in production_signatures]
         if production_signatures:
@@ -1879,6 +1949,289 @@ def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) 
             "documents_with_values": len(value_rows),
             "normalized_values_updated": len(normalized_updates),
             "promotion_applied": True,
+        }
+    finally:
+        connection.close()
+
+
+def get_document_row_for_conversation_assignment(connection: sqlite3.Connection, document_id: int) -> sqlite3.Row:
+    row = connection.execute(
+        """
+        SELECT
+          id,
+          parent_document_id,
+          rel_path,
+          control_number,
+          content_type,
+          source_kind,
+          source_rel_path,
+          source_folder_path,
+          title,
+          subject,
+          conversation_id,
+          conversation_assignment_mode,
+          lifecycle_status
+        FROM documents
+        WHERE id = ?
+        """,
+        (document_id,),
+    ).fetchone()
+    if row is None:
+        raise RetrieverError(f"Unknown document id: {document_id}")
+    if row["lifecycle_status"] in {"missing", "deleted"}:
+        raise RetrieverError(f"Document {document_id} is not active.")
+    return row
+
+
+def get_document_family_root_row_for_assignment(connection: sqlite3.Connection, document_id: int) -> sqlite3.Row:
+    row = get_document_row_for_conversation_assignment(connection, document_id)
+    while row["parent_document_id"] is not None:
+        row = get_document_row_for_conversation_assignment(connection, int(row["parent_document_id"]))
+    return row
+
+
+def document_conversation_assignment_category(row: sqlite3.Row) -> str | None:
+    content_type = normalize_whitespace(str(row["content_type"] or ""))
+    source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
+    if content_type == "Email":
+        return "email"
+    if content_type == "Chat" and source_kind == PST_SOURCE_KIND:
+        return "pst_chat"
+    return None
+
+
+def ensure_document_supports_manual_conversation_assignment(row: sqlite3.Row) -> str:
+    category = document_conversation_assignment_category(row)
+    if category is None:
+        raise RetrieverError(
+            "Manual conversation changes currently support top-level email documents and PST chat documents only."
+        )
+    return category
+
+
+def manual_conversation_display_name(
+    root_row: sqlite3.Row,
+    *,
+    category: str,
+    existing_conversation_row: sqlite3.Row | None,
+) -> str:
+    if category == "email":
+        for candidate in (root_row["subject"], root_row["title"]):
+            display_name = normalize_email_thread_subject(candidate, preserve_case=True)
+            if display_name:
+                return display_name
+        if existing_conversation_row is not None:
+            existing_display = normalize_whitespace(str(existing_conversation_row["display_name"] or ""))
+            if existing_display:
+                return existing_display
+        return "Email conversation"
+
+    title = normalize_whitespace(str(root_row["title"] or ""))
+    if title:
+        return title
+    folder_path = normalize_whitespace(str(root_row["source_folder_path"] or ""))
+    if folder_path:
+        leaf_name = normalize_whitespace(folder_path.split("/")[-1])
+        if leaf_name:
+            return leaf_name
+    if existing_conversation_row is not None:
+        existing_display = normalize_whitespace(str(existing_conversation_row["display_name"] or ""))
+        if existing_display:
+            return existing_display
+    return "Chat conversation"
+
+
+def create_manual_singleton_conversation(
+    connection: sqlite3.Connection,
+    root_row: sqlite3.Row,
+) -> int:
+    category = ensure_document_supports_manual_conversation_assignment(root_row)
+    existing_conversation_row = None
+    if root_row["conversation_id"] is not None:
+        existing_conversation_row = connection.execute(
+            "SELECT * FROM conversations WHERE id = ?",
+            (int(root_row["conversation_id"]),),
+        ).fetchone()
+
+    if existing_conversation_row is not None:
+        source_kind = str(existing_conversation_row["source_kind"])
+        source_locator = str(existing_conversation_row["source_locator"])
+        conversation_type = str(existing_conversation_row["conversation_type"])
+    elif category == "email":
+        source_kind = EMAIL_CONVERSATION_SOURCE_KIND
+        source_locator = filesystem_dataset_locator()
+        conversation_type = "email"
+    else:
+        source_kind = PST_SOURCE_KIND
+        source_locator = normalize_whitespace(str(root_row["source_rel_path"] or "")) or filesystem_dataset_locator()
+        conversation_type = "chat"
+
+    return upsert_conversation_row(
+        connection,
+        source_kind=source_kind,
+        source_locator=source_locator,
+        conversation_key=f"manual:{category}:{int(root_row['id'])}",
+        conversation_type=conversation_type,
+        display_name=manual_conversation_display_name(
+            root_row,
+            category=category,
+            existing_conversation_row=existing_conversation_row,
+        ),
+    )
+
+
+def reassign_conversations_and_refresh_previews(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+) -> dict[str, int]:
+    assignment = assign_supported_conversations(connection)
+    refresh_conversation_previews(connection, paths)
+    return assignment
+
+
+def merge_into_conversation(root: Path, document_id: int, target_document_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        source_root_row = get_document_family_root_row_for_assignment(connection, document_id)
+        target_root_row = get_document_family_root_row_for_assignment(connection, target_document_id)
+        source_category = ensure_document_supports_manual_conversation_assignment(source_root_row)
+        target_category = ensure_document_supports_manual_conversation_assignment(target_root_row)
+        if source_category != target_category:
+            raise RetrieverError("Source and target documents must belong to the same conversation-compatible category.")
+        target_conversation_id = (
+            int(target_root_row["conversation_id"])
+            if target_root_row["conversation_id"] is not None
+            else None
+        )
+        if target_conversation_id is None:
+            raise RetrieverError(f"Target document {int(target_root_row['id'])} does not belong to a conversation.")
+
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                UPDATE documents
+                SET conversation_id = ?, conversation_assignment_mode = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    target_conversation_id,
+                    CONVERSATION_ASSIGNMENT_MODE_MANUAL,
+                    utc_now(),
+                    int(source_root_row["id"]),
+                ),
+            )
+            assignment = reassign_conversations_and_refresh_previews(connection, paths)
+            updated_row = get_document_row_for_conversation_assignment(connection, int(source_root_row["id"]))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        return {
+            "status": "ok",
+            "document_id": document_id,
+            "root_document_id": int(source_root_row["id"]),
+            "target_document_id": target_document_id,
+            "target_root_document_id": int(target_root_row["id"]),
+            "conversation_id": int(updated_row["conversation_id"]) if updated_row["conversation_id"] is not None else None,
+            "conversation_assignment_mode": effective_conversation_assignment_mode(
+                updated_row["conversation_assignment_mode"]
+            ),
+            "assignment_summary": assignment,
+        }
+    finally:
+        connection.close()
+
+
+def split_from_conversation(root: Path, document_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        root_row = get_document_family_root_row_for_assignment(connection, document_id)
+        ensure_document_supports_manual_conversation_assignment(root_row)
+
+        connection.execute("BEGIN")
+        try:
+            singleton_conversation_id = create_manual_singleton_conversation(connection, root_row)
+            connection.execute(
+                """
+                UPDATE documents
+                SET conversation_id = ?, conversation_assignment_mode = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    singleton_conversation_id,
+                    CONVERSATION_ASSIGNMENT_MODE_MANUAL,
+                    utc_now(),
+                    int(root_row["id"]),
+                ),
+            )
+            assignment = reassign_conversations_and_refresh_previews(connection, paths)
+            updated_row = get_document_row_for_conversation_assignment(connection, int(root_row["id"]))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        return {
+            "status": "ok",
+            "document_id": document_id,
+            "root_document_id": int(root_row["id"]),
+            "conversation_id": int(updated_row["conversation_id"]) if updated_row["conversation_id"] is not None else None,
+            "conversation_assignment_mode": effective_conversation_assignment_mode(
+                updated_row["conversation_assignment_mode"]
+            ),
+            "assignment_summary": assignment,
+        }
+    finally:
+        connection.close()
+
+
+def clear_conversation_assignment(root: Path, document_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        root_row = get_document_family_root_row_for_assignment(connection, document_id)
+        ensure_document_supports_manual_conversation_assignment(root_row)
+
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                UPDATE documents
+                SET conversation_assignment_mode = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    CONVERSATION_ASSIGNMENT_MODE_AUTO,
+                    utc_now(),
+                    int(root_row["id"]),
+                ),
+            )
+            assignment = reassign_conversations_and_refresh_previews(connection, paths)
+            updated_row = get_document_row_for_conversation_assignment(connection, int(root_row["id"]))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        return {
+            "status": "ok",
+            "document_id": document_id,
+            "root_document_id": int(root_row["id"]),
+            "conversation_id": int(updated_row["conversation_id"]) if updated_row["conversation_id"] is not None else None,
+            "conversation_assignment_mode": effective_conversation_assignment_mode(
+                updated_row["conversation_assignment_mode"]
+            ),
+            "assignment_summary": assignment,
         }
     finally:
         connection.close()

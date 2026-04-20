@@ -78,14 +78,15 @@ except Exception:  # pragma: no cover - required PST backend probe
     pypff = None
 
 
-TOOL_VERSION = "0.13.2"
-SCHEMA_VERSION = 15
-REQUIREMENTS_VERSION = "2026-04-16-phase4-pst"
+TOOL_VERSION = "0.13.5"
+SCHEMA_VERSION = 18
+REQUIREMENTS_VERSION = "2026-04-19-phase9-export-preview-materialization"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
 MANUAL_FIELD_LOCKS_COLUMN = "manual_field_locks_json"
 LEGACY_METADATA_LOCKS_COLUMN = "locked_metadata_fields_json"
 CHUNK_TARGET_CHARS = 3200
 CHUNK_OVERLAP_CHARS = 250
+CONVERSATION_PREVIEW_MAX_CHARS = 180000
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
 DEFAULT_CHUNK_PAGE_SIZE = 50
@@ -275,6 +276,8 @@ EDITABLE_BUILTIN_FIELDS = {
     "subject",
     "title",
 }
+CONVERSATION_ASSIGNMENT_MODE_AUTO = "auto"
+CONVERSATION_ASSIGNMENT_MODE_MANUAL = "manual"
 SYSTEM_MANAGED_FIELDS = {
     "active_search_text_revision_id",
     "active_text_language",
@@ -285,6 +288,8 @@ SYSTEM_MANAGED_FIELDS = {
     "control_number_batch",
     "control_number_family_sequence",
     "control_number",
+    "conversation_id",
+    "conversation_assignment_mode",
     "dataset_id",
     "file_hash",
     "file_name",
@@ -300,9 +305,11 @@ SYSTEM_MANAGED_FIELDS = {
     "begin_bates",
     "end_attachment",
     "end_bates",
+    "child_document_kind",
     "parent_document_id",
     "production_id",
     "rel_path",
+    "root_message_key",
     "source_folder_path",
     "source_item_id",
     "source_rel_path",
@@ -314,11 +321,15 @@ SYSTEM_MANAGED_FIELDS = {
 BUILTIN_FIELD_TYPES = {
     "id": "integer",
     "control_number": "text",
+    "conversation_id": "integer",
+    "conversation_assignment_mode": "text",
     "dataset_id": "integer",
     "parent_document_id": "integer",
+    "child_document_kind": "text",
     "source_kind": "text",
     "source_rel_path": "text",
     "source_item_id": "text",
+    "root_message_key": "text",
     "source_folder_path": "text",
     "production_id": "integer",
     "begin_bates": "text",
@@ -382,12 +393,14 @@ CATALOG_EXCLUDED_BUILTIN_FIELDS = {
     "active_text_quality_score",
     "active_text_source_kind",
     "content_hash",
+    "conversation_assignment_mode",
     "dataset_id",
     "file_hash",
     "id",
     MANUAL_FIELD_LOCKS_COLUMN,
     LEGACY_METADATA_LOCKS_COLUMN,
     "production_id",
+    "root_message_key",
     "source_text_revision_id",
 }
 CATALOG_EXCLUDED_CUSTOM_FIELDS = {
@@ -400,6 +413,8 @@ BUILTIN_FIELD_DESCRIPTIONS = {
     "begin_bates": "Beginning Bates label for a production document",
     "content_type": "Normalized content category such as Email, E-Doc, or Chat",
     "control_number": "Stable document label used for review and export",
+    "conversation_id": "Internal conversation grouping id shared by related documents",
+    "conversation_assignment_mode": "Whether conversation grouping is automatic or manually pinned",
     "custodian": "Custodian or mailbox owner associated with the document",
     "date_created": "ISO date the document was created",
     "date_modified": "ISO date the document was last modified",
@@ -408,6 +423,7 @@ BUILTIN_FIELD_DESCRIPTIONS = {
     "file_size": "File size in bytes",
     "file_type": "Normalized file extension such as pdf, docx, or eml",
     "page_count": "Page or sheet count when available",
+    "child_document_kind": "Contained-child semantics such as attachment or reply_thread",
     "participants": "Participants extracted from chat or email-style content",
     "recipients": "Recipients extracted from message metadata",
     "rel_path": "Workspace-relative document path",
@@ -459,10 +475,18 @@ PPTX_NAMESPACES = {
 PPTX_NOTES_RELATIONSHIP_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
 PRODUCTION_SOURCE_KIND = "production"
 EMAIL_ATTACHMENT_SOURCE_KIND = "email_attachment"
+EMAIL_CONVERSATION_SOURCE_KIND = "email_conversation"
 FILESYSTEM_SOURCE_KIND = "filesystem"
 MBOX_SOURCE_KIND = "mbox"
 PST_SOURCE_KIND = "pst"
+SLACK_EXPORT_SOURCE_KIND = "slack_export"
 MANUAL_DATASET_SOURCE_KIND = "manual"
+CHILD_DOCUMENT_KIND_ATTACHMENT = "attachment"
+CHILD_DOCUMENT_KIND_REPLY_THREAD = "reply_thread"
+ALLOWED_CHILD_DOCUMENT_KINDS = {
+    CHILD_DOCUMENT_KIND_ATTACHMENT,
+    CHILD_DOCUMENT_KIND_REPLY_THREAD,
+}
 PRODUCTION_DAT_HEADER_ALIASES = {
     "begbates": "begin_bates",
     "beginbates": "begin_bates",

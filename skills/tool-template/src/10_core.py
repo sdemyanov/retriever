@@ -54,14 +54,30 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS conversations (
+      id INTEGER PRIMARY KEY,
+      source_kind TEXT NOT NULL,
+      source_locator TEXT NOT NULL,
+      conversation_key TEXT NOT NULL,
+      conversation_type TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS documents (
       id INTEGER PRIMARY KEY,
       control_number TEXT UNIQUE,
+      conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+      conversation_assignment_mode TEXT NOT NULL DEFAULT 'auto',
       dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
       parent_document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+      child_document_kind TEXT,
       source_kind TEXT,
       source_rel_path TEXT,
       source_item_id TEXT,
+      root_message_key TEXT,
       source_folder_path TEXT,
       production_id INTEGER REFERENCES productions(id) ON DELETE SET NULL,
       begin_bates TEXT,
@@ -93,6 +109,18 @@ SCHEMA_STATEMENTS = [
       control_number_batch INTEGER,
       control_number_family_sequence INTEGER,
       control_number_attachment_sequence INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_email_threading (
+      document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+      message_id TEXT,
+      in_reply_to TEXT,
+      references_json TEXT NOT NULL DEFAULT '[]',
+      conversation_index TEXT,
+      conversation_topic TEXT,
+      normalized_subject TEXT,
+      updated_at TEXT NOT NULL
     )
     """,
     """
@@ -140,6 +168,7 @@ SCHEMA_STATEMENTS = [
       document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
       rel_preview_path TEXT NOT NULL,
       preview_type TEXT NOT NULL,
+      target_fragment TEXT,
       label TEXT,
       ordinal INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
@@ -702,12 +731,20 @@ def backfill_legacy_column(
 
 
 def document_inventory_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    columns = table_columns(connection, "documents")
+    attachment_children_expr = (
+        "CASE WHEN parent_document_id IS NOT NULL "
+        "AND COALESCE(child_document_kind, 'attachment') = 'attachment' "
+        "AND lifecycle_status != 'deleted' THEN 1 ELSE 0 END"
+        if "child_document_kind" in columns
+        else "CASE WHEN parent_document_id IS NOT NULL AND lifecycle_status != 'deleted' THEN 1 ELSE 0 END"
+    )
     row = connection.execute(
-        """
+        f"""
         SELECT
           COALESCE(SUM(CASE WHEN parent_document_id IS NULL AND lifecycle_status != 'deleted' THEN 1 ELSE 0 END), 0) AS parent_documents,
           COALESCE(SUM(CASE WHEN parent_document_id IS NULL AND lifecycle_status = 'missing' THEN 1 ELSE 0 END), 0) AS missing_parent_documents,
-          COALESCE(SUM(CASE WHEN parent_document_id IS NOT NULL AND lifecycle_status != 'deleted' THEN 1 ELSE 0 END), 0) AS attachment_children,
+          COALESCE(SUM({attachment_children_expr}), 0) AS attachment_children,
           COALESCE(SUM(CASE WHEN lifecycle_status != 'deleted' THEN 1 ELSE 0 END), 0) AS documents_total
         FROM documents
         """
@@ -721,14 +758,20 @@ def document_inventory_counts(connection: sqlite3.Connection) -> dict[str, int]:
 
 
 def backfill_source_kinds(connection: sqlite3.Connection) -> int:
-    if "source_kind" not in table_columns(connection, "documents"):
+    columns = table_columns(connection, "documents")
+    if not {"source_kind", "production_id", "parent_document_id"}.issubset(columns):
         return 0
+    attachment_clause = (
+        "parent_document_id IS NOT NULL AND COALESCE(child_document_kind, 'attachment') = 'attachment'"
+        if "child_document_kind" in columns
+        else "parent_document_id IS NOT NULL"
+    )
     cursor = connection.execute(
-        """
+        f"""
         UPDATE documents
         SET source_kind = CASE
           WHEN production_id IS NOT NULL THEN ?
-          WHEN parent_document_id IS NOT NULL THEN ?
+          WHEN {attachment_clause} THEN ?
           ELSE ?
         END
         WHERE source_kind IS NULL OR TRIM(source_kind) = ''
@@ -766,6 +809,75 @@ def normalize_string_list(raw_value: object) -> list[str]:
         if value and value not in normalized:
             normalized.append(value)
     return normalized
+
+
+def normalize_child_document_kind(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or "")).lower().replace("-", "_")
+    if not normalized:
+        return None
+    if normalized not in ALLOWED_CHILD_DOCUMENT_KINDS:
+        allowed = ", ".join(sorted(ALLOWED_CHILD_DOCUMENT_KINDS))
+        raise RetrieverError(f"Unsupported child_document_kind: {value!r}. Expected one of: {allowed}.")
+    return normalized
+
+
+def normalize_conversation_assignment_mode(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or "")).lower().replace("-", "_")
+    if not normalized:
+        return None
+    if normalized in {CONVERSATION_ASSIGNMENT_MODE_AUTO, CONVERSATION_ASSIGNMENT_MODE_MANUAL}:
+        return normalized
+    raise RetrieverError(
+        "Unsupported conversation_assignment_mode: "
+        f"{value!r}. Expected one of: {CONVERSATION_ASSIGNMENT_MODE_AUTO}, {CONVERSATION_ASSIGNMENT_MODE_MANUAL}."
+    )
+
+
+def effective_child_document_kind(
+    *,
+    parent_document_id: int | None,
+    child_document_kind: object,
+) -> str | None:
+    normalized = normalize_child_document_kind(child_document_kind)
+    if parent_document_id is None:
+        return None
+    return normalized or CHILD_DOCUMENT_KIND_ATTACHMENT
+
+
+def effective_conversation_assignment_mode(conversation_assignment_mode: object) -> str:
+    normalized = normalize_conversation_assignment_mode(conversation_assignment_mode)
+    return normalized or CONVERSATION_ASSIGNMENT_MODE_AUTO
+
+
+def attachment_child_filter_sql(alias: str | None = None) -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"{prefix}parent_document_id IS NOT NULL "
+        f"AND COALESCE({prefix}child_document_kind, '{CHILD_DOCUMENT_KIND_ATTACHMENT}') = '{CHILD_DOCUMENT_KIND_ATTACHMENT}'"
+    )
+
+
+def row_child_document_kind(row: sqlite3.Row | dict[str, object]) -> str | None:
+    if isinstance(row, sqlite3.Row):
+        parent_document_id = row["parent_document_id"]
+        raw_kind = row["child_document_kind"] if "child_document_kind" in row.keys() else None
+    else:
+        parent_document_id = row.get("parent_document_id")
+        raw_kind = row.get("child_document_kind")
+    normalized = normalize_whitespace(str(raw_kind or "")).lower().replace("-", "_")
+    if normalized:
+        return normalized
+    if parent_document_id is not None:
+        return CHILD_DOCUMENT_KIND_ATTACHMENT
+    return None
+
+
+def is_attachment_row(row: sqlite3.Row | dict[str, object]) -> bool:
+    if isinstance(row, sqlite3.Row):
+        parent_document_id = row["parent_document_id"]
+    else:
+        parent_document_id = row.get("parent_document_id")
+    return parent_document_id is not None and row_child_document_kind(row) == CHILD_DOCUMENT_KIND_ATTACHMENT
 
 
 def quote_identifier(name: str) -> str:
@@ -973,6 +1085,13 @@ def mbox_dataset_name(source_rel_path: str) -> str:
     return container_dataset_name(source_rel_path, "MBOX Dataset")
 
 
+def slack_export_dataset_name(source_rel_path: str) -> str:
+    candidate = normalize_whitespace(source_rel_path)
+    if candidate:
+        return f"Slack Export: {candidate}"
+    return "Slack Export"
+
+
 def production_dataset_name(rel_root: str, production_name: str | None = None) -> str:
     preferred = normalize_whitespace(str(production_name or ""))
     if preferred:
@@ -1144,6 +1263,89 @@ def ensure_source_backed_dataset(
         source_locator=normalized_source_locator,
     )
     return dataset_id, dataset_source_id
+
+
+def get_conversation_row(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_locator: str,
+    conversation_key: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM conversations
+        WHERE source_kind = ? AND source_locator = ? AND conversation_key = ?
+        """,
+        (
+            normalize_whitespace(source_kind).lower(),
+            normalize_whitespace(source_locator),
+            normalize_whitespace(conversation_key),
+        ),
+    ).fetchone()
+
+
+def upsert_conversation_row(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_locator: str,
+    conversation_key: str,
+    conversation_type: str,
+    display_name: str,
+) -> int:
+    normalized_source_kind = normalize_whitespace(source_kind).lower()
+    normalized_source_locator = normalize_whitespace(source_locator)
+    normalized_conversation_key = normalize_whitespace(conversation_key)
+    normalized_conversation_type = normalize_whitespace(conversation_type).lower()
+    normalized_display_name = normalize_whitespace(display_name)
+    if not all(
+        (
+            normalized_source_kind,
+            normalized_source_locator,
+            normalized_conversation_key,
+            normalized_conversation_type,
+            normalized_display_name,
+        )
+    ):
+        raise RetrieverError("Conversations require non-empty source kind, source locator, key, type, and display name.")
+
+    existing_row = get_conversation_row(
+        connection,
+        source_kind=normalized_source_kind,
+        source_locator=normalized_source_locator,
+        conversation_key=normalized_conversation_key,
+    )
+    now = utc_now()
+    if existing_row is None:
+        connection.execute(
+            """
+            INSERT INTO conversations (
+              source_kind, source_locator, conversation_key, conversation_type, display_name, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_source_kind,
+                normalized_source_locator,
+                normalized_conversation_key,
+                normalized_conversation_type,
+                normalized_display_name,
+                now,
+                now,
+            ),
+        )
+        return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    connection.execute(
+        """
+        UPDATE conversations
+        SET conversation_type = ?, display_name = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (normalized_conversation_type, normalized_display_name, now, int(existing_row["id"])),
+    )
+    return int(existing_row["id"])
 
 
 def ensure_dataset_document_membership(
@@ -1882,6 +2084,84 @@ def email_headers_to_metadata(headers: dict[str, str]) -> dict[str, str | None]:
     }
 
 
+EMAIL_MESSAGE_ID_PATTERN = re.compile(r"<\s*([^<>]+?)\s*>|([^\s<>;,]+@[^\s<>;,]+)")
+EMAIL_THREAD_PREFIX_PATTERN = re.compile(r"^(?:(?:re|fw|fwd)\s*(?:\[\d+\])?\s*:\s*)+", flags=re.IGNORECASE)
+
+
+def extract_email_message_ids(value: object) -> list[str]:
+    normalized = normalize_whitespace(str(value or ""))
+    if not normalized:
+        return []
+    message_ids: list[str] = []
+    seen: set[str] = set()
+    for match in EMAIL_MESSAGE_ID_PATTERN.finditer(normalized):
+        raw = normalize_whitespace(match.group(1) or match.group(2) or "")
+        if not raw:
+            continue
+        normalized_id = raw.strip("<>").strip().lower()
+        if not normalized_id or normalized_id in seen:
+            continue
+        seen.add(normalized_id)
+        message_ids.append(normalized_id)
+    return message_ids
+
+
+def normalize_email_message_id(value: object) -> str | None:
+    message_ids = extract_email_message_ids(value)
+    return message_ids[0] if message_ids else None
+
+
+def normalize_email_thread_subject(value: object, *, preserve_case: bool = False) -> str | None:
+    normalized = normalize_whitespace(str(value or ""))
+    if not normalized:
+        return None
+    previous = None
+    current = normalized
+    while previous != current:
+        previous = current
+        current = EMAIL_THREAD_PREFIX_PATTERN.sub("", current).strip()
+    current = normalize_whitespace(current)
+    if not current:
+        return None
+    return current if preserve_case else current.lower()
+
+
+def normalize_email_conversation_index_root(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or ""))
+    if not normalized:
+        return None
+    compact = re.sub(r"\s+", "", normalized)
+    if not compact:
+        return None
+    return compact[:44] if len(compact) > 44 else compact
+
+
+def email_participant_keys(author: object, recipients: object) -> set[str]:
+    participants: list[str] = []
+    seen: set[str] = set()
+    append_unique_participants(
+        participants,
+        seen,
+        [
+            normalize_whitespace(str(author or "")) or None,
+            normalize_whitespace(str(recipients or "")) or None,
+        ],
+    )
+    return {participant.lower() for participant in participants}
+
+
+def email_heuristic_scope_key(source_kind: object, source_rel_path: object) -> str:
+    normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
+    normalized_source_rel_path = normalize_whitespace(str(source_rel_path or ""))
+    if normalized_source_kind == MBOX_SOURCE_KIND and normalized_source_rel_path:
+        return f"{MBOX_SOURCE_KIND}:{normalized_source_rel_path}"
+    if normalized_source_kind == PST_SOURCE_KIND and normalized_source_rel_path:
+        return f"{PST_SOURCE_KIND}:{normalized_source_rel_path}"
+    if normalized_source_kind == FILESYSTEM_SOURCE_KIND:
+        return f"{FILESYSTEM_SOURCE_KIND}:{filesystem_dataset_locator()}"
+    return f"{normalized_source_kind or FILESYSTEM_SOURCE_KIND}:{normalized_source_rel_path or filesystem_dataset_locator()}"
+
+
 def extract_email_header_blocks(text: str, max_lines: int | None = None) -> list[dict[str, str]]:
     if not text:
         return []
@@ -2428,6 +2708,37 @@ def build_chat_preview_html(
         head_html=head_html,
         heading="Retriever Chat Preview",
     )
+
+
+def conversation_preview_anchor(document_id: int) -> str:
+    return f"doc-{int(document_id)}"
+
+
+def conversation_preview_base_path(conversation_id: int) -> Path:
+    return Path("previews") / "conversations" / f"conversation-{int(conversation_id):08d}"
+
+
+def conversation_preview_toc_rel_path(conversation_id: int) -> str:
+    return (conversation_preview_base_path(conversation_id) / "index.html").as_posix()
+
+
+def conversation_preview_segment_rel_path(conversation_id: int, segment_token: str) -> str:
+    normalized_token = re.sub(r"[^A-Za-z0-9._-]+", "-", normalize_whitespace(segment_token) or "segment").strip("-")
+    return (conversation_preview_base_path(conversation_id) / f"segment-{normalized_token or 'segment'}.html").as_posix()
+
+
+def is_conversation_preview_rel_path(rel_preview_path: object) -> bool:
+    normalized = normalize_internal_rel_path(Path(str(rel_preview_path or "")))
+    return normalized.startswith("previews/conversations/")
+
+
+def append_preview_fragment(path: str, target_fragment: object) -> str:
+    fragment = normalize_whitespace(str(target_fragment or ""))
+    if not fragment:
+        return path
+    if "#" in path:
+        return path
+    return f"{path}#{fragment}"
 
 
 def parse_xml_document(data: bytes) -> ET.Element:

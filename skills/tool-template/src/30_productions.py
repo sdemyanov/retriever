@@ -361,25 +361,7 @@ def replace_document_related_rows(
         ).fetchone()
         custodian = row["custodian"] if row is not None else None
 
-    if preview_rows:
-        connection.executemany(
-            """
-            INSERT INTO document_previews (
-              document_id, rel_preview_path, preview_type, label, ordinal, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    document_id,
-                    row["rel_preview_path"],
-                    row["preview_type"],
-                    row["label"],
-                    row["ordinal"],
-                    row["created_at"],
-                )
-                for row in preview_rows
-            ],
-        )
+    insert_document_preview_rows(connection, document_id, preview_rows)
 
     replace_document_chunks(connection, document_id, chunks)
 
@@ -399,6 +381,43 @@ def replace_document_related_rows(
             metadata_values["recipients"],
         ),
     )
+
+
+def insert_document_preview_rows(
+    connection: sqlite3.Connection,
+    document_id: int,
+    preview_rows: list[dict[str, object]],
+) -> None:
+    if not preview_rows:
+        return
+    connection.executemany(
+        """
+        INSERT INTO document_previews (
+          document_id, rel_preview_path, preview_type, target_fragment, label, ordinal, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                document_id,
+                row["rel_preview_path"],
+                row["preview_type"],
+                row.get("target_fragment"),
+                row.get("label"),
+                row["ordinal"],
+                row["created_at"],
+            )
+            for row in preview_rows
+        ],
+    )
+
+
+def replace_document_preview_rows(
+    connection: sqlite3.Connection,
+    document_id: int,
+    preview_rows: list[dict[str, object]],
+) -> None:
+    connection.execute("DELETE FROM document_previews WHERE document_id = ?", (document_id,))
+    insert_document_preview_rows(connection, document_id, preview_rows)
 
 
 def replace_document_source_parts(
@@ -482,6 +501,30 @@ def delete_document_related_rows(connection: sqlite3.Connection, document_id: in
     connection.execute("DELETE FROM documents_fts WHERE document_id = ?", (document_id,))
 
 
+def cleanup_unreferenced_preview_files(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    rel_preview_paths: list[str] | set[str] | tuple[str, ...],
+) -> None:
+    seen: set[str] = set()
+    for rel_preview_path in rel_preview_paths:
+        normalized_rel_path = normalize_whitespace(str(rel_preview_path or ""))
+        if not normalized_rel_path or normalized_rel_path in seen:
+            continue
+        seen.add(normalized_rel_path)
+        referenced_elsewhere = connection.execute(
+            """
+            SELECT 1
+            FROM document_previews
+            WHERE rel_preview_path = ?
+            LIMIT 1
+            """,
+            (normalized_rel_path,),
+        ).fetchone()
+        if referenced_elsewhere is None:
+            remove_file_if_exists(paths["state_dir"] / normalized_rel_path)
+
+
 def refresh_documents_fts_row(connection: sqlite3.Connection, document_id: int) -> None:
     connection.execute("DELETE FROM documents_fts WHERE document_id = ?", (document_id,))
     row = connection.execute(
@@ -526,6 +569,7 @@ def write_preview_artifacts(
             {
                 "rel_preview_path": preview_rel_path.as_posix(),
                 "preview_type": artifact["preview_type"],
+                "target_fragment": artifact.get("target_fragment"),
                 "label": artifact.get("label"),
                 "ordinal": int(artifact.get("ordinal", 0)),
                 "created_at": utc_now(),
@@ -578,7 +622,18 @@ def cleanup_document_artifacts(
         (row["id"],),
     ).fetchall()
     for preview_row in preview_rows:
-        remove_file_if_exists(paths["state_dir"] / preview_row["rel_preview_path"])
+        referenced_elsewhere = connection.execute(
+            """
+            SELECT 1
+            FROM document_previews
+            WHERE rel_preview_path = ?
+              AND document_id != ?
+            LIMIT 1
+            """,
+            (preview_row["rel_preview_path"], row["id"]),
+        ).fetchone()
+        if referenced_elsewhere is None:
+            remove_file_if_exists(paths["state_dir"] / preview_row["rel_preview_path"])
     if is_internal_rel_path(row["rel_path"]):
         remove_file_if_exists(paths["root"] / row["rel_path"])
 
@@ -632,11 +687,15 @@ def upsert_document_row(
     *,
     file_name: str,
     parent_document_id: int | None,
+    child_document_kind: str | None = None,
     control_number: str,
     dataset_id: int | None,
+    conversation_id: int | None = None,
+    conversation_assignment_mode: str | None = None,
     control_number_batch: int | None,
     control_number_family_sequence: int | None,
     control_number_attachment_sequence: int | None,
+    root_message_key: str | None = None,
     source_kind: str | None = None,
     source_rel_path: str | None = None,
     source_item_id: str | None = None,
@@ -659,10 +718,38 @@ def upsert_document_row(
     file_hash = file_hash_override if file_hash_override is not None else (sha256_file(source_path) if source_path is not None else None)
     file_size = file_size_override if file_size_override is not None else (source_path.stat().st_size if source_path is not None and source_path.exists() else None)
     file_type = file_type_override or normalize_extension(Path(file_name)) or (normalize_extension(source_path) if source_path is not None else None)
-    effective_source_kind = source_kind or (EMAIL_ATTACHMENT_SOURCE_KIND if parent_document_id is not None else FILESYSTEM_SOURCE_KIND)
+    effective_child_kind = effective_child_document_kind(
+        parent_document_id=parent_document_id,
+        child_document_kind=(
+            child_document_kind
+            if child_document_kind is not None
+            else existing_row["child_document_kind"]
+            if existing_row is not None and "child_document_kind" in existing_row.keys()
+            else None
+        ),
+    )
+    effective_source_kind = source_kind or (
+        EMAIL_ATTACHMENT_SOURCE_KIND
+        if effective_child_kind == CHILD_DOCUMENT_KIND_ATTACHMENT
+        else FILESYSTEM_SOURCE_KIND
+    )
     effective_dataset_id = dataset_id
     if effective_dataset_id is None and existing_row is not None and existing_row["dataset_id"] is not None:
         effective_dataset_id = int(existing_row["dataset_id"])
+    effective_conversation_id = conversation_id
+    if effective_conversation_id is None and existing_row is not None and "conversation_id" in existing_row.keys():
+        if existing_row["conversation_id"] is not None:
+            effective_conversation_id = int(existing_row["conversation_id"])
+    effective_conversation_assignment = effective_conversation_assignment_mode(
+        conversation_assignment_mode
+        if conversation_assignment_mode is not None
+        else existing_row["conversation_assignment_mode"]
+        if existing_row is not None and "conversation_assignment_mode" in existing_row.keys()
+        else None
+    )
+    effective_root_message_key = root_message_key
+    if effective_root_message_key is None and existing_row is not None and "root_message_key" in existing_row.keys():
+        effective_root_message_key = existing_row["root_message_key"]
     custodian = extracted.get("custodian")
     if custodian is None:
         custodian = infer_source_custodian(
@@ -672,11 +759,15 @@ def upsert_document_row(
         )
     common_values = {
         "control_number": control_number,
+        "conversation_id": effective_conversation_id,
+        "conversation_assignment_mode": effective_conversation_assignment,
         "dataset_id": effective_dataset_id,
         "parent_document_id": parent_document_id,
+        "child_document_kind": effective_child_kind,
         "source_kind": effective_source_kind,
         "source_rel_path": source_rel_path,
         "source_item_id": source_item_id,
+        "root_message_key": effective_root_message_key,
         "source_folder_path": source_folder_path,
         "production_id": production_id,
         "begin_bates": begin_bates,
@@ -712,21 +803,26 @@ def upsert_document_row(
         connection.execute(
             """
             INSERT INTO documents (
-              control_number, dataset_id, parent_document_id, source_kind, source_rel_path, source_item_id, source_folder_path,
+              control_number, conversation_id, conversation_assignment_mode, dataset_id, parent_document_id, child_document_kind,
+              source_kind, source_rel_path, source_item_id, root_message_key, source_folder_path,
               production_id, begin_bates, end_bates, begin_attachment, end_attachment,
               rel_path, file_name, file_type, file_size, page_count, author, custodian, date_created,
               content_type, date_modified, title, subject, participants, recipients, manual_field_locks_json, file_hash,
               content_hash, text_status, lifecycle_status, ingested_at, last_seen_at, updated_at,
               control_number_batch, control_number_family_sequence, control_number_attachment_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 common_values["control_number"],
+                common_values["conversation_id"],
+                common_values["conversation_assignment_mode"],
                 common_values["dataset_id"],
                 common_values["parent_document_id"],
+                common_values["child_document_kind"],
                 common_values["source_kind"],
                 common_values["source_rel_path"],
                 common_values["source_item_id"],
+                common_values["root_message_key"],
                 common_values["source_folder_path"],
                 common_values["production_id"],
                 common_values["begin_bates"],
@@ -766,7 +862,8 @@ def upsert_document_row(
     connection.execute(
         """
         UPDATE documents
-        SET control_number = ?, dataset_id = ?, parent_document_id = ?, source_kind = ?, source_rel_path = ?, source_item_id = ?, source_folder_path = ?,
+        SET control_number = ?, conversation_id = ?, conversation_assignment_mode = ?, dataset_id = ?, parent_document_id = ?, child_document_kind = ?,
+            source_kind = ?, source_rel_path = ?, source_item_id = ?, root_message_key = ?, source_folder_path = ?,
             production_id = ?, begin_bates = ?, end_bates = ?, begin_attachment = ?, end_attachment = ?,
             rel_path = ?, file_name = ?, file_type = ?, file_size = ?, page_count = ?,
             author = ?, custodian = ?, content_type = ?, date_created = ?, date_modified = ?, title = ?, subject = ?,
@@ -777,11 +874,15 @@ def upsert_document_row(
         """,
         (
             common_values["control_number"],
+            common_values["conversation_id"],
+            common_values["conversation_assignment_mode"],
             common_values["dataset_id"],
             common_values["parent_document_id"],
+            common_values["child_document_kind"],
             common_values["source_kind"],
             common_values["source_rel_path"],
             common_values["source_item_id"],
+            common_values["root_message_key"],
             common_values["source_folder_path"],
             common_values["production_id"],
             common_values["begin_bates"],
@@ -866,6 +967,1394 @@ def mark_seen_without_reingest(
                 document_id=int(child_row["id"]),
                 dataset_source_id=dataset_source_id,
             )
+
+
+def replace_document_email_threading_row(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    email_threading: object,
+) -> None:
+    if not isinstance(email_threading, dict):
+        connection.execute("DELETE FROM document_email_threading WHERE document_id = ?", (document_id,))
+        return
+    references = [
+        value
+        for value in normalize_string_list(email_threading.get("references"))
+        if normalize_whitespace(value)
+    ]
+    normalized_payload = {
+        "message_id": normalize_email_message_id(email_threading.get("message_id")),
+        "in_reply_to": normalize_email_message_id(email_threading.get("in_reply_to")),
+        "references_json": json.dumps(references),
+        "conversation_index": normalize_whitespace(str(email_threading.get("conversation_index") or "")) or None,
+        "conversation_topic": normalize_email_thread_subject(email_threading.get("conversation_topic")),
+        "normalized_subject": normalize_email_thread_subject(email_threading.get("normalized_subject")),
+        "updated_at": utc_now(),
+    }
+    if not any(
+        (
+            normalized_payload["message_id"],
+            normalized_payload["in_reply_to"],
+            references,
+            normalized_payload["conversation_index"],
+            normalized_payload["conversation_topic"],
+            normalized_payload["normalized_subject"],
+        )
+    ):
+        connection.execute("DELETE FROM document_email_threading WHERE document_id = ?", (document_id,))
+        return
+    connection.execute(
+        """
+        INSERT INTO document_email_threading (
+          document_id, message_id, in_reply_to, references_json,
+          conversation_index, conversation_topic, normalized_subject, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id) DO UPDATE SET
+          message_id = excluded.message_id,
+          in_reply_to = excluded.in_reply_to,
+          references_json = excluded.references_json,
+          conversation_index = excluded.conversation_index,
+          conversation_topic = excluded.conversation_topic,
+          normalized_subject = excluded.normalized_subject,
+          updated_at = excluded.updated_at
+        """,
+        (
+            document_id,
+            normalized_payload["message_id"],
+            normalized_payload["in_reply_to"],
+            normalized_payload["references_json"],
+            normalized_payload["conversation_index"],
+            normalized_payload["conversation_topic"],
+            normalized_payload["normalized_subject"],
+            normalized_payload["updated_at"],
+        ),
+    )
+
+
+def document_row_has_email_threading(connection: sqlite3.Connection, row: sqlite3.Row | None) -> bool:
+    if row is None:
+        return False
+    file_type = normalize_whitespace(str(row["file_type"] or "")).lower() if "file_type" in row.keys() else ""
+    if file_type not in {"eml", "msg"}:
+        return True
+    signal_row = connection.execute(
+        """
+        SELECT 1
+        FROM document_email_threading
+        WHERE document_id = ?
+        LIMIT 1
+        """,
+        (int(row["id"]),),
+    ).fetchone()
+    return signal_row is not None
+
+
+def container_email_documents_missing_threading(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_rel_path: str,
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM documents d
+        LEFT JOIN document_email_threading det ON det.document_id = d.id
+        WHERE d.source_kind = ?
+          AND d.source_rel_path = ?
+          AND d.parent_document_id IS NULL
+          AND d.content_type = 'Email'
+          AND d.lifecycle_status != 'deleted'
+          AND det.document_id IS NULL
+        LIMIT 1
+        """,
+        (source_kind, source_rel_path),
+    ).fetchone()
+    return row is not None
+
+
+def list_email_conversation_documents(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT
+          d.id,
+          d.control_number,
+          d.conversation_id,
+          d.conversation_assignment_mode,
+          d.source_kind,
+          d.source_rel_path,
+          d.source_folder_path,
+          d.file_type,
+          d.author,
+          d.recipients,
+          d.subject,
+          d.title,
+          d.date_created,
+          d.custodian,
+          det.message_id,
+          det.in_reply_to,
+          det.references_json,
+          det.conversation_index,
+          det.conversation_topic,
+          det.normalized_subject
+        FROM documents d
+        LEFT JOIN document_email_threading det ON det.document_id = d.id
+        WHERE d.parent_document_id IS NULL
+          AND d.content_type = 'Email'
+          AND d.lifecycle_status NOT IN ('missing', 'deleted')
+        ORDER BY
+          CASE WHEN d.date_created IS NULL OR TRIM(d.date_created) = '' THEN 1 ELSE 0 END ASC,
+          d.date_created ASC,
+          d.id ASC
+        """
+    ).fetchall()
+    documents: list[dict[str, object]] = []
+    for row in rows:
+        references = normalize_string_list(row["references_json"])
+        normalized_subject = normalize_email_thread_subject(
+            row["normalized_subject"] or row["subject"] or row["conversation_topic"]
+        )
+        documents.append(
+            {
+                "id": int(row["id"]),
+                "control_number": row["control_number"],
+                "existing_conversation_id": int(row["conversation_id"]) if row["conversation_id"] is not None else None,
+                "assignment_mode": effective_conversation_assignment_mode(row["conversation_assignment_mode"]),
+                "source_kind": normalize_whitespace(str(row["source_kind"] or "")).lower(),
+                "source_rel_path": normalize_whitespace(str(row["source_rel_path"] or "")) or None,
+                "source_folder_path": normalize_whitespace(str(row["source_folder_path"] or "")) or None,
+                "file_type": normalize_whitespace(str(row["file_type"] or "")).lower() or None,
+                "author": normalize_whitespace(str(row["author"] or "")) or None,
+                "recipients": normalize_whitespace(str(row["recipients"] or "")) or None,
+                "subject": normalize_whitespace(str(row["subject"] or "")) or None,
+                "title": normalize_whitespace(str(row["title"] or "")) or None,
+                "date_created": normalize_datetime(row["date_created"]),
+                "custodian": normalize_whitespace(str(row["custodian"] or "")) or None,
+                "message_id": normalize_email_message_id(row["message_id"]),
+                "in_reply_to": normalize_email_message_id(row["in_reply_to"]),
+                "references": references,
+                "conversation_index_root": normalize_email_conversation_index_root(row["conversation_index"]),
+                "conversation_topic": normalize_email_thread_subject(row["conversation_topic"]),
+                "normalized_subject": normalized_subject,
+                "participant_keys": email_participant_keys(row["author"], row["recipients"]),
+                "heuristic_scope": email_heuristic_scope_key(row["source_kind"], row["source_rel_path"]),
+            }
+        )
+    return documents
+
+
+def create_email_conversation_cluster(*, manual_conversation_id: int | None = None) -> dict[str, object]:
+    return {
+        "documents": [],
+        "manual_conversation_id": manual_conversation_id,
+        "message_ids": set(),
+        "conversation_index_roots": set(),
+        "conversation_topics": set(),
+        "normalized_subjects": set(),
+        "participant_keys": set(),
+        "custodians": set(),
+        "heuristic_scopes": set(),
+        "latest_date": None,
+    }
+
+
+def add_document_to_email_cluster(
+    cluster: dict[str, object],
+    document: dict[str, object],
+    *,
+    cluster_id: int,
+    message_id_index: dict[str, set[int]],
+    conversation_index_root_index: dict[str, set[int]],
+    conversation_topic_index: dict[str, set[int]],
+    heuristic_subject_index: dict[tuple[str, str], set[int]],
+) -> None:
+    cluster["documents"].append(document)
+    message_id = document.get("message_id")
+    if message_id:
+        cluster["message_ids"].add(message_id)
+        message_id_index.setdefault(str(message_id), set()).add(cluster_id)
+    conversation_index_root = document.get("conversation_index_root")
+    if conversation_index_root:
+        cluster["conversation_index_roots"].add(conversation_index_root)
+        conversation_index_root_index.setdefault(str(conversation_index_root), set()).add(cluster_id)
+    conversation_topic = document.get("conversation_topic")
+    if conversation_topic:
+        cluster["conversation_topics"].add(conversation_topic)
+        conversation_topic_index.setdefault(str(conversation_topic), set()).add(cluster_id)
+    normalized_subject = document.get("normalized_subject")
+    heuristic_scope = document.get("heuristic_scope")
+    if normalized_subject:
+        cluster["normalized_subjects"].add(normalized_subject)
+    if heuristic_scope:
+        cluster["heuristic_scopes"].add(heuristic_scope)
+    if normalized_subject and heuristic_scope:
+        heuristic_subject_index.setdefault((str(heuristic_scope), str(normalized_subject)), set()).add(cluster_id)
+    participant_keys = set(document.get("participant_keys") or [])
+    cluster["participant_keys"].update(participant_keys)
+    custodian = document.get("custodian")
+    if custodian:
+        cluster["custodians"].add(custodian)
+    document_date = normalize_datetime(document.get("date_created"))
+    if document_date and (cluster["latest_date"] is None or str(cluster["latest_date"]) < document_date):
+        cluster["latest_date"] = document_date
+
+
+def choose_unique_cluster(cluster_ids: set[int]) -> int | None:
+    if len(cluster_ids) == 1:
+        return next(iter(cluster_ids))
+    return None
+
+
+def choose_reference_cluster(document: dict[str, object], message_id_index: dict[str, set[int]]) -> int | None:
+    references = list(document.get("references") or [])
+    if not references:
+        return None
+    candidate_cluster_ids: set[int] = set()
+    for reference_id in references:
+        candidate_cluster_ids.update(message_id_index.get(str(reference_id), set()))
+    if not candidate_cluster_ids:
+        return None
+    scores: dict[int, int] = {}
+    for cluster_id in candidate_cluster_ids:
+        suffix_length = 0
+        for reference_id in reversed(references):
+            if cluster_id in message_id_index.get(str(reference_id), set()):
+                suffix_length += 1
+            elif suffix_length > 0:
+                break
+        if suffix_length > 0:
+            scores[cluster_id] = suffix_length
+    if not scores:
+        return None
+    best_score = max(scores.values())
+    best_cluster_ids = [cluster_id for cluster_id, score in scores.items() if score == best_score]
+    if len(best_cluster_ids) != 1:
+        return None
+    return best_cluster_ids[0]
+
+
+def choose_outlook_cluster(
+    document: dict[str, object],
+    conversation_index_root_index: dict[str, set[int]],
+    conversation_topic_index: dict[str, set[int]],
+) -> int | None:
+    conversation_index_root = document.get("conversation_index_root")
+    conversation_topic = document.get("conversation_topic")
+    root_candidates = (
+        set(conversation_index_root_index.get(str(conversation_index_root), set()))
+        if conversation_index_root
+        else set()
+    )
+    topic_candidates = (
+        set(conversation_topic_index.get(str(conversation_topic), set()))
+        if conversation_topic
+        else set()
+    )
+    if root_candidates and topic_candidates:
+        intersection = root_candidates & topic_candidates
+        chosen = choose_unique_cluster(intersection)
+        if chosen is not None:
+            return chosen
+    chosen = choose_unique_cluster(root_candidates)
+    if chosen is not None:
+        return chosen
+    return choose_unique_cluster(topic_candidates)
+
+
+def choose_heuristic_cluster(
+    document: dict[str, object],
+    clusters: list[dict[str, object]],
+    heuristic_subject_index: dict[tuple[str, str], set[int]],
+) -> int | None:
+    normalized_subject = document.get("normalized_subject")
+    heuristic_scope = document.get("heuristic_scope")
+    if not normalized_subject or not heuristic_scope:
+        return None
+    candidate_cluster_ids = heuristic_subject_index.get((str(heuristic_scope), str(normalized_subject)), set())
+    if not candidate_cluster_ids:
+        return None
+    participant_keys = set(document.get("participant_keys") or [])
+    document_date = normalize_datetime(document.get("date_created"))
+    document_custodian = document.get("custodian")
+    scored_candidates: list[tuple[int, str, int]] = []
+    for cluster_id in candidate_cluster_ids:
+        cluster = clusters[cluster_id]
+        cluster_participants = set(cluster["participant_keys"])
+        overlap = len(cluster_participants & participant_keys)
+        if overlap <= 0:
+            continue
+        cluster_custodians = set(cluster["custodians"])
+        if document_custodian and cluster_custodians and any(
+            custodian != document_custodian for custodian in cluster_custodians
+        ):
+            continue
+        latest_date = normalize_datetime(cluster["latest_date"])
+        if document_date and latest_date and latest_date > document_date:
+            continue
+        scored_candidates.append((overlap, latest_date or "", cluster_id))
+    if not scored_candidates:
+        return None
+    scored_candidates.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
+    best_candidate = scored_candidates[0]
+    if len(scored_candidates) > 1 and scored_candidates[1][:2] == best_candidate[:2]:
+        return None
+    return best_candidate[2]
+
+
+def derive_email_conversation_key(cluster: dict[str, object]) -> str:
+    message_ids = sorted(str(value) for value in cluster["message_ids"] if normalize_whitespace(str(value)))
+    if message_ids:
+        return f"rfc:{message_ids[0]}"
+    conversation_index_roots = sorted(
+        str(value)
+        for value in cluster["conversation_index_roots"]
+        if normalize_whitespace(str(value))
+    )
+    conversation_topics = sorted(
+        str(value)
+        for value in cluster["conversation_topics"]
+        if normalize_whitespace(str(value))
+    )
+    if conversation_index_roots and conversation_topics:
+        return f"outlook:{conversation_topics[0]}:{conversation_index_roots[0]}"
+    if conversation_index_roots:
+        return f"outlook_index:{conversation_index_roots[0]}"
+    if conversation_topics:
+        return f"outlook_topic:{conversation_topics[0]}"
+    normalized_subjects = sorted(
+        str(value)
+        for value in cluster["normalized_subjects"]
+        if normalize_whitespace(str(value))
+    )
+    heuristic_scopes = sorted(
+        str(value)
+        for value in cluster["heuristic_scopes"]
+        if normalize_whitespace(str(value))
+    )
+    heuristic_signature = sha256_json_value(
+        {
+            "scope": heuristic_scopes[0] if heuristic_scopes else filesystem_dataset_locator(),
+            "subject": normalized_subjects[0] if normalized_subjects else "",
+            "participants": sorted(str(value) for value in cluster["participant_keys"]),
+        }
+    )
+    return f"heuristic:{heuristic_signature[:24]}"
+
+
+def derive_email_conversation_display_name(cluster: dict[str, object]) -> str:
+    for document in list(cluster["documents"]):
+        subject = normalize_email_thread_subject(document.get("subject"), preserve_case=True)
+        if subject:
+            return subject
+        title = normalize_email_thread_subject(document.get("title"), preserve_case=True)
+        if title:
+            return title
+    for conversation_topic in sorted(
+        str(value)
+        for value in cluster["conversation_topics"]
+        if normalize_whitespace(str(value))
+    ):
+        display_name = normalize_email_thread_subject(conversation_topic, preserve_case=True)
+        if display_name:
+            return display_name
+    return "Email conversation"
+
+
+def sync_child_document_conversations(
+    connection: sqlite3.Connection,
+    *,
+    parent_ids: set[int] | None = None,
+    parent_content_types: set[str] | None = None,
+    parent_source_kinds: set[str] | None = None,
+) -> int:
+    clauses = [
+        "parent.lifecycle_status NOT IN ('missing', 'deleted')",
+        "child.lifecycle_status NOT IN ('missing', 'deleted')",
+    ]
+    parameters: list[object] = []
+
+    normalized_parent_ids = {int(value) for value in (parent_ids or set())}
+    normalized_parent_content_types = sorted(
+        normalize_whitespace(str(value or "")) for value in (parent_content_types or set()) if normalize_whitespace(str(value or ""))
+    )
+    normalized_parent_source_kinds = sorted(
+        normalize_whitespace(str(value or "")).lower()
+        for value in (parent_source_kinds or set())
+        if normalize_whitespace(str(value or ""))
+    )
+
+    if normalized_parent_ids:
+        placeholders = ", ".join("?" for _ in normalized_parent_ids)
+        clauses.append(f"parent.id IN ({placeholders})")
+        parameters.extend(sorted(normalized_parent_ids))
+    if normalized_parent_content_types:
+        placeholders = ", ".join("?" for _ in normalized_parent_content_types)
+        clauses.append(f"parent.content_type IN ({placeholders})")
+        parameters.extend(normalized_parent_content_types)
+    if normalized_parent_source_kinds:
+        placeholders = ", ".join("?" for _ in normalized_parent_source_kinds)
+        clauses.append(f"parent.source_kind IN ({placeholders})")
+        parameters.extend(normalized_parent_source_kinds)
+
+    child_rows = connection.execute(
+        f"""
+        SELECT
+          child.id,
+          child.conversation_id AS child_conversation_id,
+          child.conversation_assignment_mode AS child_conversation_assignment_mode,
+          parent.conversation_id AS parent_conversation_id,
+          parent.conversation_assignment_mode AS parent_conversation_assignment_mode
+        FROM documents child
+        JOIN documents parent ON parent.id = child.parent_document_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY child.id ASC
+        """,
+        tuple(parameters),
+    ).fetchall()
+    updated = 0
+    now = utc_now()
+    for row in child_rows:
+        parent_conversation_id = int(row["parent_conversation_id"]) if row["parent_conversation_id"] is not None else None
+        parent_mode = effective_conversation_assignment_mode(row["parent_conversation_assignment_mode"])
+        child_conversation_id = int(row["child_conversation_id"]) if row["child_conversation_id"] is not None else None
+        child_mode = effective_conversation_assignment_mode(row["child_conversation_assignment_mode"])
+        if child_conversation_id == parent_conversation_id and child_mode == parent_mode:
+            continue
+        connection.execute(
+            """
+            UPDATE documents
+            SET conversation_id = ?, conversation_assignment_mode = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (parent_conversation_id, parent_mode, now, int(row["id"])),
+        )
+        updated += 1
+    return updated
+
+
+def assign_email_conversations(connection: sqlite3.Connection) -> dict[str, int]:
+    documents = list_email_conversation_documents(connection)
+    if not documents:
+        return {
+            "email_conversations": 0,
+            "email_documents_reassigned": 0,
+            "email_child_documents_updated": 0,
+        }
+
+    clusters: list[dict[str, object]] = []
+    message_id_index: dict[str, set[int]] = {}
+    conversation_index_root_index: dict[str, set[int]] = {}
+    conversation_topic_index: dict[str, set[int]] = {}
+    heuristic_subject_index: dict[tuple[str, str], set[int]] = {}
+
+    manual_cluster_ids_by_conversation_id: dict[int, int] = {}
+    for document in documents:
+        if document["assignment_mode"] != CONVERSATION_ASSIGNMENT_MODE_MANUAL:
+            continue
+        existing_conversation_id = document.get("existing_conversation_id")
+        if existing_conversation_id is None:
+            continue
+        cluster_id = manual_cluster_ids_by_conversation_id.get(int(existing_conversation_id))
+        if cluster_id is None:
+            cluster_id = len(clusters)
+            manual_cluster_ids_by_conversation_id[int(existing_conversation_id)] = cluster_id
+            clusters.append(create_email_conversation_cluster(manual_conversation_id=int(existing_conversation_id)))
+        add_document_to_email_cluster(
+            clusters[cluster_id],
+            document,
+            cluster_id=cluster_id,
+            message_id_index=message_id_index,
+            conversation_index_root_index=conversation_index_root_index,
+            conversation_topic_index=conversation_topic_index,
+            heuristic_subject_index=heuristic_subject_index,
+        )
+
+    auto_documents = [document for document in documents if document["assignment_mode"] != CONVERSATION_ASSIGNMENT_MODE_MANUAL]
+    for document in auto_documents:
+        cluster_id = None
+        if document.get("message_id"):
+            cluster_id = choose_unique_cluster(message_id_index.get(str(document["message_id"]), set()))
+        if cluster_id is None and document.get("in_reply_to"):
+            cluster_id = choose_unique_cluster(message_id_index.get(str(document["in_reply_to"]), set()))
+        if cluster_id is None:
+            cluster_id = choose_reference_cluster(document, message_id_index)
+        if cluster_id is None:
+            cluster_id = choose_outlook_cluster(document, conversation_index_root_index, conversation_topic_index)
+        if cluster_id is None:
+            cluster_id = choose_heuristic_cluster(document, clusters, heuristic_subject_index)
+        if cluster_id is None:
+            cluster_id = len(clusters)
+            clusters.append(create_email_conversation_cluster())
+        add_document_to_email_cluster(
+            clusters[cluster_id],
+            document,
+            cluster_id=cluster_id,
+            message_id_index=message_id_index,
+            conversation_index_root_index=conversation_index_root_index,
+            conversation_topic_index=conversation_topic_index,
+            heuristic_subject_index=heuristic_subject_index,
+        )
+
+    conversation_id_by_document_id: dict[int, int] = {}
+    unique_conversation_ids: set[int] = set()
+    for cluster in clusters:
+        manual_conversation_id = cluster["manual_conversation_id"]
+        if manual_conversation_id is not None:
+            conversation_id = int(manual_conversation_id)
+        else:
+            conversation_id = upsert_conversation_row(
+                connection,
+                source_kind=EMAIL_CONVERSATION_SOURCE_KIND,
+                source_locator=filesystem_dataset_locator(),
+                conversation_key=derive_email_conversation_key(cluster),
+                conversation_type="email",
+                display_name=derive_email_conversation_display_name(cluster),
+            )
+        unique_conversation_ids.add(conversation_id)
+        for document in list(cluster["documents"]):
+            conversation_id_by_document_id[int(document["id"])] = conversation_id
+
+    documents_reassigned = 0
+    now = utc_now()
+    for document in auto_documents:
+        target_conversation_id = conversation_id_by_document_id.get(int(document["id"]))
+        if target_conversation_id is None:
+            continue
+        if (
+            document.get("existing_conversation_id") == target_conversation_id
+            and document.get("assignment_mode") == CONVERSATION_ASSIGNMENT_MODE_AUTO
+        ):
+            continue
+        connection.execute(
+            """
+            UPDATE documents
+            SET conversation_id = ?, conversation_assignment_mode = ?, updated_at = ?
+            WHERE id = ?
+              AND COALESCE(conversation_assignment_mode, ?) != ?
+            """,
+            (
+                target_conversation_id,
+                CONVERSATION_ASSIGNMENT_MODE_AUTO,
+                now,
+                int(document["id"]),
+                CONVERSATION_ASSIGNMENT_MODE_AUTO,
+                CONVERSATION_ASSIGNMENT_MODE_MANUAL,
+            ),
+        )
+        documents_reassigned += 1
+
+    child_documents_updated = sync_child_document_conversations(connection, parent_content_types={"Email"})
+
+    return {
+        "email_conversations": len(unique_conversation_ids),
+        "email_documents_reassigned": documents_reassigned,
+        "email_child_documents_updated": child_documents_updated,
+    }
+
+
+def list_pst_chat_conversation_documents(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT
+          d.id,
+          d.control_number,
+          d.conversation_id,
+          d.conversation_assignment_mode,
+          d.source_kind,
+          d.source_rel_path,
+          d.source_item_id,
+          d.source_folder_path,
+          d.file_type,
+          d.title,
+          d.participants,
+          d.date_created,
+          d.custodian
+        FROM documents d
+        WHERE d.parent_document_id IS NULL
+          AND d.source_kind = ?
+          AND d.content_type = 'Chat'
+          AND d.lifecycle_status NOT IN ('missing', 'deleted')
+        ORDER BY
+          CASE WHEN d.date_created IS NULL OR TRIM(d.date_created) = '' THEN 1 ELSE 0 END ASC,
+          d.date_created ASC,
+          d.id ASC
+        """,
+        (PST_SOURCE_KIND,),
+    ).fetchall()
+    documents: list[dict[str, object]] = []
+    for row in rows:
+        documents.append(
+            {
+                "id": int(row["id"]),
+                "control_number": row["control_number"],
+                "existing_conversation_id": int(row["conversation_id"]) if row["conversation_id"] is not None else None,
+                "assignment_mode": effective_conversation_assignment_mode(row["conversation_assignment_mode"]),
+                "source_kind": normalize_whitespace(str(row["source_kind"] or "")).lower(),
+                "source_rel_path": normalize_whitespace(str(row["source_rel_path"] or "")) or None,
+                "source_item_id": normalize_whitespace(str(row["source_item_id"] or "")) or None,
+                "source_folder_path": normalize_whitespace(str(row["source_folder_path"] or "")) or None,
+                "file_type": normalize_whitespace(str(row["file_type"] or "")).lower() or None,
+                "title": normalize_whitespace(str(row["title"] or "")) or None,
+                "participants": normalize_whitespace(str(row["participants"] or "")) or None,
+                "date_created": normalize_datetime(row["date_created"]),
+                "custodian": normalize_whitespace(str(row["custodian"] or "")) or None,
+            }
+        )
+    return documents
+
+
+def create_pst_chat_conversation_cluster(*, manual_conversation_id: int | None = None) -> dict[str, object]:
+    return {
+        "documents": [],
+        "manual_conversation_id": manual_conversation_id,
+        "source_rel_paths": set(),
+        "source_folder_paths": set(),
+        "titles": set(),
+        "participants": set(),
+    }
+
+
+def add_document_to_pst_chat_cluster(cluster: dict[str, object], document: dict[str, object]) -> None:
+    cluster["documents"].append(document)
+    source_rel_path = document.get("source_rel_path")
+    if source_rel_path:
+        cluster["source_rel_paths"].add(source_rel_path)
+    source_folder_path = document.get("source_folder_path")
+    if source_folder_path:
+        cluster["source_folder_paths"].add(source_folder_path)
+    title = document.get("title")
+    if title:
+        cluster["titles"].add(title)
+    participants = document.get("participants")
+    if participants:
+        cluster["participants"].add(participants)
+
+
+def pst_chat_cluster_scope_key(document: dict[str, object]) -> tuple[str, str]:
+    source_rel_path = normalize_whitespace(str(document.get("source_rel_path") or ""))
+    source_folder_path = normalize_whitespace(str(document.get("source_folder_path") or ""))
+    if source_folder_path:
+        return (source_rel_path, f"folder:{source_folder_path.lower()}")
+    source_item_id = normalize_whitespace(str(document.get("source_item_id") or ""))
+    if source_item_id:
+        return (source_rel_path, f"item:{source_item_id.lower()}")
+    return (source_rel_path, f"doc:{int(document['id'])}")
+
+
+def derive_pst_chat_conversation_key(cluster: dict[str, object]) -> str:
+    source_folder_paths = sorted(
+        str(value).lower()
+        for value in cluster["source_folder_paths"]
+        if normalize_whitespace(str(value))
+    )
+    if source_folder_paths:
+        return f"folder:{source_folder_paths[0]}"
+    source_item_ids = sorted(
+        normalize_whitespace(str(document.get("source_item_id") or "")).lower()
+        for document in list(cluster["documents"])
+        if normalize_whitespace(str(document.get("source_item_id") or ""))
+    )
+    if source_item_ids:
+        return f"item:{source_item_ids[0]}"
+    return f"doc:{int(cluster['documents'][0]['id'])}"
+
+
+def derive_pst_chat_conversation_display_name(cluster: dict[str, object]) -> str:
+    generic_folder_names = {"conversation history", "teamsmessagesdata", "teamsmeetings"}
+    source_folder_paths = sorted(
+        str(value)
+        for value in cluster["source_folder_paths"]
+        if normalize_whitespace(str(value))
+    )
+    for folder_path in source_folder_paths:
+        leaf_name = normalize_whitespace(str(folder_path).split("/")[-1])
+        if leaf_name and leaf_name.lower() not in generic_folder_names:
+            return leaf_name
+    for document in list(cluster["documents"]):
+        title = normalize_whitespace(str(document.get("title") or ""))
+        if title:
+            return title
+    for folder_path in source_folder_paths:
+        leaf_name = normalize_whitespace(str(folder_path).split("/")[-1])
+        if leaf_name:
+            return leaf_name
+    for participants in sorted(str(value) for value in cluster["participants"] if normalize_whitespace(str(value))):
+        if participants:
+            return participants
+    return "Chat conversation"
+
+
+def assign_pst_chat_conversations(connection: sqlite3.Connection) -> dict[str, int]:
+    documents = list_pst_chat_conversation_documents(connection)
+    if not documents:
+        return {
+            "pst_chat_conversations": 0,
+            "pst_chat_documents_reassigned": 0,
+            "pst_chat_child_documents_updated": 0,
+        }
+
+    clusters: list[dict[str, object]] = []
+    manual_cluster_ids_by_conversation_id: dict[int, int] = {}
+    auto_cluster_ids_by_scope: dict[tuple[str, str], int] = {}
+
+    for document in documents:
+        if document["assignment_mode"] != CONVERSATION_ASSIGNMENT_MODE_MANUAL:
+            continue
+        existing_conversation_id = document.get("existing_conversation_id")
+        if existing_conversation_id is None:
+            continue
+        cluster_id = manual_cluster_ids_by_conversation_id.get(int(existing_conversation_id))
+        if cluster_id is None:
+            cluster_id = len(clusters)
+            manual_cluster_ids_by_conversation_id[int(existing_conversation_id)] = cluster_id
+            clusters.append(create_pst_chat_conversation_cluster(manual_conversation_id=int(existing_conversation_id)))
+        add_document_to_pst_chat_cluster(clusters[cluster_id], document)
+
+    auto_documents = [document for document in documents if document["assignment_mode"] != CONVERSATION_ASSIGNMENT_MODE_MANUAL]
+    for document in auto_documents:
+        scope_key = pst_chat_cluster_scope_key(document)
+        cluster_id = auto_cluster_ids_by_scope.get(scope_key)
+        if cluster_id is None:
+            cluster_id = len(clusters)
+            auto_cluster_ids_by_scope[scope_key] = cluster_id
+            clusters.append(create_pst_chat_conversation_cluster())
+        add_document_to_pst_chat_cluster(clusters[cluster_id], document)
+
+    conversation_id_by_document_id: dict[int, int] = {}
+    unique_conversation_ids: set[int] = set()
+    for cluster in clusters:
+        manual_conversation_id = cluster["manual_conversation_id"]
+        if manual_conversation_id is not None:
+            conversation_id = int(manual_conversation_id)
+        else:
+            source_locator = next(
+                (
+                    str(value)
+                    for value in sorted(cluster["source_rel_paths"])
+                    if normalize_whitespace(str(value))
+                ),
+                None,
+            ) or filesystem_dataset_locator()
+            conversation_id = upsert_conversation_row(
+                connection,
+                source_kind=PST_SOURCE_KIND,
+                source_locator=source_locator,
+                conversation_key=derive_pst_chat_conversation_key(cluster),
+                conversation_type="chat",
+                display_name=derive_pst_chat_conversation_display_name(cluster),
+            )
+        unique_conversation_ids.add(conversation_id)
+        for document in list(cluster["documents"]):
+            conversation_id_by_document_id[int(document["id"])] = conversation_id
+
+    documents_reassigned = 0
+    now = utc_now()
+    for document in auto_documents:
+        target_conversation_id = conversation_id_by_document_id.get(int(document["id"]))
+        if target_conversation_id is None:
+            continue
+        if (
+            document.get("existing_conversation_id") == target_conversation_id
+            and document.get("assignment_mode") == CONVERSATION_ASSIGNMENT_MODE_AUTO
+        ):
+            continue
+        connection.execute(
+            """
+            UPDATE documents
+            SET conversation_id = ?, conversation_assignment_mode = ?, updated_at = ?
+            WHERE id = ?
+              AND COALESCE(conversation_assignment_mode, ?) != ?
+            """,
+            (
+                target_conversation_id,
+                CONVERSATION_ASSIGNMENT_MODE_AUTO,
+                now,
+                int(document["id"]),
+                CONVERSATION_ASSIGNMENT_MODE_AUTO,
+                CONVERSATION_ASSIGNMENT_MODE_MANUAL,
+            ),
+        )
+        documents_reassigned += 1
+
+    child_documents_updated = sync_child_document_conversations(
+        connection,
+        parent_content_types={"Chat"},
+        parent_source_kinds={PST_SOURCE_KIND},
+    )
+    return {
+        "pst_chat_conversations": len(unique_conversation_ids),
+        "pst_chat_documents_reassigned": documents_reassigned,
+        "pst_chat_child_documents_updated": child_documents_updated,
+    }
+
+
+def assign_supported_conversations(connection: sqlite3.Connection) -> dict[str, int]:
+    email_assignment = assign_email_conversations(connection)
+    pst_chat_assignment = assign_pst_chat_conversations(connection)
+    return {
+        **email_assignment,
+        **pst_chat_assignment,
+    }
+
+
+def list_active_conversation_ids(connection: sqlite3.Connection) -> list[int]:
+    rows = connection.execute(
+        """
+        SELECT DISTINCT conversation_id
+        FROM documents
+        WHERE conversation_id IS NOT NULL
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+          AND COALESCE(child_document_kind, '') != ?
+        ORDER BY conversation_id ASC
+        """,
+        (CHILD_DOCUMENT_KIND_ATTACHMENT,),
+    ).fetchall()
+    return [int(row["conversation_id"]) for row in rows if row["conversation_id"] is not None]
+
+
+def conversation_preview_date_hint(value: object) -> str | None:
+    candidate = Path(str(value or "")).stem
+    if not candidate:
+        return None
+    try:
+        return f"{date.fromisoformat(candidate).isoformat()}T00:00:00Z"
+    except ValueError:
+        return None
+
+
+def conversation_preview_primary_timestamp(document: dict[str, object]) -> str | None:
+    return (
+        normalize_datetime(document.get("date_created"))
+        or normalize_datetime(document.get("date_modified"))
+        or conversation_preview_date_hint(document.get("source_rel_path"))
+        or conversation_preview_date_hint(document.get("rel_path"))
+    )
+
+
+def conversation_preview_sort_key(document: dict[str, object]) -> tuple[str, int, str, int]:
+    return (
+        conversation_preview_primary_timestamp(document) or "9999-12-31T23:59:59Z",
+        0 if document.get("parent_document_id") is None else 1,
+        normalize_whitespace(str(document.get("control_number") or "")),
+        int(document["id"]),
+    )
+
+
+def conversation_preview_segment_mode(conversation_type: object, documents: list[dict[str, object]]) -> str:
+    if normalize_whitespace(str(conversation_type or "")).lower() != "email":
+        return "monthly"
+    total_chars = sum(len(str(document.get("text_content") or "")) for document in documents)
+    if total_chars > CONVERSATION_PREVIEW_MAX_CHARS:
+        return "yearly"
+    return "single"
+
+
+def conversation_preview_segment_key(document: dict[str, object], *, segment_mode: str) -> str:
+    if segment_mode == "single":
+        return "all"
+    timestamp = conversation_preview_primary_timestamp(document)
+    if not timestamp:
+        return "undated"
+    if segment_mode == "yearly":
+        return timestamp[:4]
+    return timestamp[:7]
+
+
+def conversation_preview_segment_label(segment_key: str, *, segment_mode: str) -> str:
+    if segment_key == "all":
+        return "All messages"
+    if segment_key == "undated":
+        return "Undated"
+    if segment_mode == "yearly":
+        return segment_key
+    try:
+        return date.fromisoformat(f"{segment_key}-01").strftime("%B %Y")
+    except ValueError:
+        return segment_key
+
+
+def conversation_preview_document_heading(document: dict[str, object]) -> str:
+    for value in (
+        document.get("title"),
+        document.get("subject"),
+        document.get("file_name"),
+        document.get("control_number"),
+    ):
+        normalized = normalize_whitespace(str(value or ""))
+        if normalized:
+            return normalized
+    return f"Document {int(document['id'])}"
+
+
+def conversation_preview_document_kind(document: dict[str, object]) -> str:
+    child_kind = normalize_whitespace(str(document.get("child_document_kind") or "")).lower()
+    content_type = normalize_whitespace(str(document.get("content_type") or "Document"))
+    if child_kind == CHILD_DOCUMENT_KIND_REPLY_THREAD:
+        return "Reply thread"
+    if content_type == "Email":
+        return "Email message"
+    if content_type == "Chat":
+        return "Conversation document"
+    return content_type or "Document"
+
+
+def render_conversation_chat_body_html(text_content: str) -> str:
+    chat_entries = iter_chat_transcript_entries(text_content, max_lines=4000)
+    if not chat_entries:
+        return f"<pre>{html.escape(text_content)}</pre>"
+    rendered_entries: list[str] = []
+    for entry in chat_entries:
+        speaker = normalize_whitespace(str(entry.get("speaker") or "")) or "Unknown"
+        body = normalize_whitespace(str(entry.get("body") or ""))
+        if not body:
+            continue
+        timestamp_label = format_chat_preview_timestamp(entry.get("timestamp")) or ""
+        timestamp_html = f'<span class="conversation-chat-time">[{html.escape(timestamp_label)}]</span>' if timestamp_label else ""
+        avatar_label = chat_avatar_initials(speaker)
+        avatar_background, avatar_foreground = chat_avatar_colors(speaker)
+        avatar_html = build_chat_avatar_svg(avatar_label, avatar_background, avatar_foreground, speaker)
+        rendered_entries.append(
+            "<article class=\"conversation-chat-message\">"
+            f"{avatar_html}"
+            "<div class=\"conversation-chat-main\">"
+            "<div class=\"conversation-chat-meta\">"
+            f"<span class=\"conversation-chat-speaker\">{html.escape(speaker)}</span>"
+            f"{timestamp_html}"
+            "</div>"
+            f"<div class=\"conversation-chat-body\">{html.escape(body)}</div>"
+            "</div>"
+            "</article>"
+        )
+    if not rendered_entries:
+        return f"<pre>{html.escape(text_content)}</pre>"
+    return (
+        "<div class=\"conversation-chat-transcript\">"
+        f"{''.join(rendered_entries)}"
+        "</div>"
+        "<details class=\"conversation-raw-text\">"
+        "<summary>Full transcript</summary>"
+        f"<pre>{html.escape(text_content)}</pre>"
+        "</details>"
+    )
+
+
+def render_conversation_document_section(
+    document: dict[str, object],
+    *,
+    current_segment_href: str,
+    doc_target_hrefs: dict[int, str],
+) -> str:
+    document_id = int(document["id"])
+    anchor = conversation_preview_anchor(document_id)
+    heading = conversation_preview_document_heading(document)
+    kind_label = conversation_preview_document_kind(document)
+    timestamp_label = format_chat_preview_timestamp(conversation_preview_primary_timestamp(document)) or ""
+    text_content = str(document.get("text_content") or "")
+    metadata_items: list[str] = []
+    for label, value in (
+        ("Control number", document.get("control_number")),
+        ("Created", timestamp_label),
+        ("Participants", document.get("participants")),
+        ("From", document.get("author")),
+        ("To", document.get("recipients")),
+        ("Source", document.get("source_rel_path")),
+    ):
+        normalized = normalize_whitespace(str(value or ""))
+        if not normalized:
+            continue
+        metadata_items.append(
+            f"<div><dt>{html.escape(label)}</dt><dd>{html.escape(normalized)}</dd></div>"
+        )
+    parent_document_id = document.get("parent_document_id")
+    if parent_document_id is not None:
+        parent_id = int(parent_document_id)
+        parent_href = doc_target_hrefs.get(parent_id)
+        parent_label = normalize_whitespace(
+            str(document.get("parent_control_number") or document.get("parent_title") or f"Document {parent_id}")
+        )
+        if parent_href and parent_label:
+            metadata_items.append(
+                "<div><dt>Contained in</dt>"
+                f"<dd><a href=\"{html.escape(parent_href)}\">{html.escape(parent_label)}</a></dd></div>"
+            )
+    body_html = (
+        render_conversation_chat_body_html(text_content)
+        if normalize_whitespace(str(document.get("content_type") or "")) == "Chat"
+        else f"<pre>{html.escape(text_content or 'No extracted text available.')}</pre>"
+    )
+    metadata_html = (
+        f'<dl class="conversation-document-meta">{"".join(metadata_items)}</dl>'
+        if metadata_items
+        else ""
+    )
+    header_actions = (
+        f"<a class=\"conversation-permalink\" href=\"#{html.escape(anchor)}\">Permalink</a>"
+        if current_segment_href
+        else ""
+    )
+    return "".join(
+        [
+            f'<article class="conversation-document" id="{html.escape(anchor)}">',
+            '<header class="conversation-document-header">',
+            "<div>",
+            f'<div class="conversation-document-kind">{html.escape(kind_label)}</div>',
+            f"<h2>{html.escape(heading)}</h2>",
+            "</div>",
+            header_actions,
+            "</header>",
+            metadata_html,
+            f'<div class="conversation-document-body">{body_html}</div>',
+            "</article>",
+        ]
+    )
+
+
+def build_conversation_preview_head_html() -> str:
+    return (
+        "<style>"
+        "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background: linear-gradient(180deg, #eef3f8 0%, #f7fafc 100%); color: #122033; }"
+        "main { max-width: 1040px; margin: 0 auto; padding: 28px 20px 44px; }"
+        "table { border-collapse: collapse; width: 100%; margin-bottom: 1.25rem; background: rgba(255,255,255,0.88); border: 1px solid #d7e0ea; border-radius: 16px; overflow: hidden; }"
+        "th, td { text-align: left; padding: 0.55rem 0.75rem; border-bottom: 1px solid #e3e8ef; vertical-align: top; }"
+        "th { width: 12rem; color: #516072; font-weight: 600; }"
+        ".conversation-nav, .conversation-segments { display: grid; gap: 0.9rem; }"
+        ".conversation-segment-card, .conversation-document { background: rgba(255,255,255,0.94); border: 1px solid #d7e0ea; border-radius: 18px; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06); }"
+        ".conversation-segment-card { padding: 1rem 1.1rem; }"
+        ".conversation-segment-card h2 { margin: 0 0 0.35rem; font-size: 1.05rem; }"
+        ".conversation-segment-card p { margin: 0 0 0.65rem; color: #516072; }"
+        ".conversation-segment-card ul { margin: 0; padding-left: 1.15rem; }"
+        ".conversation-segment-card li { margin: 0.28rem 0; }"
+        ".conversation-segment-card a, .conversation-nav a, .conversation-document a { color: #0b63ce; text-decoration: none; }"
+        ".conversation-nav { margin-bottom: 1rem; }"
+        ".conversation-nav-links { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; color: #516072; }"
+        ".conversation-document { padding: 1.1rem 1.15rem 1.15rem; margin-bottom: 1rem; scroll-margin-top: 1rem; }"
+        ".conversation-document-header { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 0.9rem; }"
+        ".conversation-document-header h2 { margin: 0.2rem 0 0; font-size: 1.15rem; }"
+        ".conversation-document-kind { font-size: 0.82rem; letter-spacing: 0.06em; text-transform: uppercase; color: #516072; }"
+        ".conversation-permalink { white-space: nowrap; font-size: 0.92rem; }"
+        ".conversation-document-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.7rem 1rem; margin: 0 0 1rem; }"
+        ".conversation-document-meta div { background: #f8fafc; border: 1px solid #e3e8ef; border-radius: 14px; padding: 0.65rem 0.75rem; }"
+        ".conversation-document-meta dt { font-size: 0.8rem; font-weight: 600; color: #607080; margin-bottom: 0.18rem; }"
+        ".conversation-document-meta dd { margin: 0; }"
+        ".conversation-document-body pre { white-space: pre-wrap; word-break: break-word; margin: 0; background: #f8fafc; border: 1px solid #d7e0ea; border-radius: 14px; padding: 0.9rem 1rem; }"
+        ".conversation-chat-transcript { display: grid; gap: 0.75rem; }"
+        ".conversation-chat-message { display: flex; gap: 0.75rem; align-items: flex-start; border: 1px solid #d0d7de; border-radius: 14px; padding: 0.85rem 0.95rem; background: #f6f8fa; }"
+        ".conversation-chat-main { min-width: 0; flex: 1 1 auto; }"
+        ".conversation-chat-meta { display: flex; gap: 0.55rem; align-items: baseline; margin-bottom: 0.25rem; flex-wrap: wrap; }"
+        ".conversation-chat-speaker { font-weight: 600; color: #0969da; }"
+        ".conversation-chat-time { color: #57606a; font-size: 0.9rem; }"
+        ".conversation-chat-body { white-space: pre-wrap; line-height: 1.45; }"
+        ".conversation-raw-text { margin-top: 0.85rem; }"
+        ".conversation-raw-text summary { cursor: pointer; color: #516072; }"
+        "</style>"
+    )
+
+
+def build_conversation_toc_html(
+    conversation_row: sqlite3.Row,
+    *,
+    documents: list[dict[str, object]],
+    segment_items: list[dict[str, object]],
+    doc_target_hrefs: dict[int, str],
+) -> str:
+    headers = {
+        "Conversation": normalize_whitespace(str(conversation_row["display_name"] or "")) or f"Conversation {int(conversation_row['id'])}",
+        "Type": normalize_whitespace(str(conversation_row["conversation_type"] or "")),
+        "Documents": str(len(documents)),
+        "Segments": str(len(segment_items)),
+    }
+    cards: list[str] = []
+    for segment in segment_items:
+        doc_links = "".join(
+            f"<li><a href=\"{html.escape(doc_target_hrefs[int(document['id'])])}\">{html.escape(conversation_preview_document_heading(document))}</a></li>"
+            for document in segment["documents"]
+        )
+        cards.append(
+            "<section class=\"conversation-segment-card\">"
+            f"<h2><a href=\"{html.escape(Path(str(segment['segment_rel_path'])).name)}\">{html.escape(str(segment['label']))}</a></h2>"
+            f"<p>{len(segment['documents'])} document{'s' if len(segment['documents']) != 1 else ''}</p>"
+            f"{'<ul>' + doc_links + '</ul>' if doc_links else ''}"
+            "</section>"
+        )
+    return build_html_preview(
+        headers,
+        body_html=f"<main><div class=\"conversation-segments\">{''.join(cards)}</div></main>",
+        document_title=headers["Conversation"] or "Conversation",
+        head_html=build_conversation_preview_head_html(),
+        heading="Conversation Contents",
+    )
+
+
+def build_conversation_segment_html(
+    conversation_row: sqlite3.Row,
+    *,
+    segment_label: str,
+    segment_index: int,
+    segment_count: int,
+    segment_items: list[dict[str, object]],
+    current_segment_rel_path: str,
+    doc_target_hrefs: dict[int, str],
+) -> str:
+    current_file_name = Path(current_segment_rel_path).name
+    previous_link = Path(str(segment_items[segment_index - 1]["segment_rel_path"])).name if segment_index > 0 else None
+    next_link = Path(str(segment_items[segment_index + 1]["segment_rel_path"])).name if segment_index + 1 < segment_count else None
+    headers = {
+        "Conversation": normalize_whitespace(str(conversation_row["display_name"] or "")) or f"Conversation {int(conversation_row['id'])}",
+        "Type": normalize_whitespace(str(conversation_row["conversation_type"] or "")),
+        "Segment": segment_label,
+        "Documents": str(len(segment_items[segment_index]["documents"])),
+    }
+    nav_links = ["<a href=\"index.html\">Contents</a>"]
+    if previous_link:
+        nav_links.append(f"<a href=\"{html.escape(previous_link)}\">Previous segment</a>")
+    if next_link:
+        nav_links.append(f"<a href=\"{html.escape(next_link)}\">Next segment</a>")
+    sections = "".join(
+        render_conversation_document_section(
+            document,
+            current_segment_href=current_file_name,
+            doc_target_hrefs=doc_target_hrefs,
+        )
+        for document in segment_items[segment_index]["documents"]
+    )
+    return build_html_preview(
+        headers,
+        body_html=(
+            "<main>"
+            "<div class=\"conversation-nav\">"
+            f"<div class=\"conversation-nav-links\">{' | '.join(nav_links)}</div>"
+            "</div>"
+            f"{sections}"
+            "</main>"
+        ),
+        document_title=f"{headers['Conversation']} - {segment_label}",
+        head_html=build_conversation_preview_head_html(),
+        heading=segment_label,
+    )
+
+
+def load_document_preview_text(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    document_id: int,
+    storage_rel_path: object,
+) -> str:
+    text_content = read_text_revision_body(paths, str(storage_rel_path or "") or None)
+    if text_content is not None:
+        return text_content
+    chunk_rows = connection.execute(
+        """
+        SELECT text_content
+        FROM document_chunks
+        WHERE document_id = ?
+        ORDER BY chunk_index ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    return "\n".join(str(row["text_content"] or "") for row in chunk_rows)
+
+
+def load_preview_documents(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    document_ids: list[int] | None = None,
+    conversation_id: int | None = None,
+    include_attachment_children: bool = False,
+    require_dataset_membership: bool = False,
+) -> list[dict[str, object]]:
+    if document_ids is not None and conversation_id is not None:
+        raise RetrieverError("load_preview_documents accepts either document_ids or conversation_id, not both.")
+    if document_ids is None and conversation_id is None:
+        raise RetrieverError("load_preview_documents requires document_ids or conversation_id.")
+
+    where_clauses = ["d.lifecycle_status NOT IN ('missing', 'deleted')"]
+    parameters: list[object] = []
+    if document_ids is not None:
+        normalized_document_ids = [int(document_id) for document_id in document_ids]
+        if not normalized_document_ids:
+            return []
+        where_clauses.append(f"d.id IN ({', '.join('?' for _ in normalized_document_ids)})")
+        parameters.extend(normalized_document_ids)
+    else:
+        where_clauses.append("d.conversation_id = ?")
+        parameters.append(int(conversation_id))
+    if not include_attachment_children:
+        where_clauses.append("COALESCE(d.child_document_kind, '') != ?")
+        parameters.append(CHILD_DOCUMENT_KIND_ATTACHMENT)
+    if require_dataset_membership:
+        where_clauses.append(
+            "EXISTS (SELECT 1 FROM dataset_documents dd WHERE dd.document_id = d.id)"
+        )
+
+    rows = connection.execute(
+        f"""
+        SELECT
+          d.id,
+          d.rel_path,
+          d.control_number,
+          d.parent_document_id,
+          d.child_document_kind,
+          d.file_name,
+          d.file_type,
+          d.content_type,
+          d.date_created,
+          d.date_modified,
+          d.title,
+          d.subject,
+          d.author,
+          d.participants,
+          d.recipients,
+          d.source_kind,
+          d.source_rel_path,
+          d.source_item_id,
+          d.source_folder_path,
+          d.root_message_key,
+          d.conversation_id,
+          parent.control_number AS parent_control_number,
+          parent.title AS parent_title,
+          tr.storage_rel_path AS source_text_storage_rel_path
+        FROM documents d
+        LEFT JOIN documents parent ON parent.id = d.parent_document_id
+        LEFT JOIN text_revisions tr ON tr.id = d.source_text_revision_id
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY d.id ASC
+        """,
+        tuple(parameters),
+    ).fetchall()
+
+    documents: list[dict[str, object]] = []
+    for row in rows:
+        documents.append(
+            {
+                key: row[key]
+                for key in row.keys()
+            }
+            | {
+                "text_content": load_document_preview_text(
+                    connection,
+                    paths,
+                    document_id=int(row["id"]),
+                    storage_rel_path=row["source_text_storage_rel_path"],
+                )
+            }
+        )
+    documents.sort(key=conversation_preview_sort_key)
+    return documents
+
+
+def refresh_conversation_previews(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    conversation_ids: list[int] | None = None,
+) -> int:
+    target_conversation_ids = (
+        sorted(dict.fromkeys(int(conversation_id) for conversation_id in conversation_ids))
+        if conversation_ids is not None
+        else list_active_conversation_ids(connection)
+    )
+    refreshed = 0
+    for conversation_id in target_conversation_ids:
+        conversation_row = connection.execute(
+            "SELECT * FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if conversation_row is None:
+            continue
+        documents = load_preview_documents(connection, paths, conversation_id=conversation_id)
+        if not documents:
+            continue
+        segment_mode = conversation_preview_segment_mode(conversation_row["conversation_type"], documents)
+        segment_documents: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for document in documents:
+            segment_documents[conversation_preview_segment_key(document, segment_mode=segment_mode)].append(document)
+        segment_items = [
+            {
+                "segment_key": segment_key,
+                "label": conversation_preview_segment_label(segment_key, segment_mode=segment_mode),
+                "segment_rel_path": conversation_preview_segment_rel_path(conversation_id, segment_key),
+                "documents": sorted(items, key=conversation_preview_sort_key),
+            }
+            for segment_key, items in sorted(segment_documents.items(), key=lambda item: item[0])
+        ]
+        doc_target_hrefs = {
+            int(document["id"]): f"{Path(str(segment['segment_rel_path'])).name}#{conversation_preview_anchor(int(document['id']))}"
+            for segment in segment_items
+            for document in segment["documents"]
+        }
+        toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
+        toc_abs_path = paths["state_dir"] / toc_rel_path
+        toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        toc_abs_path.write_text(
+            build_conversation_toc_html(
+                conversation_row,
+                documents=documents,
+                segment_items=segment_items,
+                doc_target_hrefs=doc_target_hrefs,
+            ),
+            encoding="utf-8",
+        )
+        for index, segment in enumerate(segment_items):
+            segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
+            segment_abs_path.parent.mkdir(parents=True, exist_ok=True)
+            segment_abs_path.write_text(
+                build_conversation_segment_html(
+                    conversation_row,
+                    segment_label=str(segment["label"]),
+                    segment_index=index,
+                    segment_count=len(segment_items),
+                    segment_items=segment_items,
+                    current_segment_rel_path=str(segment["segment_rel_path"]),
+                    doc_target_hrefs=doc_target_hrefs,
+                ),
+                encoding="utf-8",
+            )
+        created_at = utc_now()
+        for segment in segment_items:
+            segment["preview_row_template"] = {
+                "rel_preview_path": str(segment["segment_rel_path"]),
+                "preview_type": "html",
+                "label": None,
+                "ordinal": 0,
+                "created_at": created_at,
+            }
+        toc_row = {
+            "rel_preview_path": toc_rel_path,
+            "preview_type": "html",
+            "target_fragment": None,
+            "label": "contents",
+            "ordinal": 1,
+            "created_at": created_at,
+        }
+        document_ids = [int(document["id"]) for document in documents]
+        previous_preview_paths = [
+            str(row["rel_preview_path"])
+            for row in connection.execute(
+                f"""
+                SELECT DISTINCT rel_preview_path
+                FROM document_previews
+                WHERE document_id IN ({", ".join("?" for _ in document_ids)})
+                """,
+                document_ids,
+            ).fetchall()
+        ]
+        for segment in segment_items:
+            for document in segment["documents"]:
+                replace_document_preview_rows(
+                    connection,
+                    int(document["id"]),
+                    [
+                        segment["preview_row_template"] | {
+                            "target_fragment": conversation_preview_anchor(int(document["id"])),
+                        },
+                        toc_row,
+                    ],
+                )
+        cleanup_unreferenced_preview_files(paths, connection, previous_preview_paths)
+        refreshed += 1
+    return refreshed
 
 
 def mark_missing_documents(connection: sqlite3.Connection, scanned_rel_paths: set[str]) -> int:
@@ -956,13 +2445,19 @@ def reconcile_attachment_documents(
     dataset_memberships: list[tuple[int, int | None]] | None = None,
 ) -> None:
     parent_row = connection.execute(
-        "SELECT custodian, dataset_id FROM documents WHERE id = ?",
+        "SELECT custodian, dataset_id, conversation_id, conversation_assignment_mode FROM documents WHERE id = ?",
         (parent_document_id,),
     ).fetchone()
     parent_custodian = (
         normalize_whitespace(str(parent_row["custodian"] or "")) if parent_row is not None else ""
     ) or None
     parent_dataset_id = int(parent_row["dataset_id"]) if parent_row is not None and parent_row["dataset_id"] is not None else None
+    parent_conversation_id = int(parent_row["conversation_id"]) if parent_row is not None and parent_row["conversation_id"] is not None else None
+    parent_conversation_assignment_mode = (
+        str(parent_row["conversation_assignment_mode"])
+        if parent_row is not None and parent_row["conversation_assignment_mode"] is not None
+        else CONVERSATION_ASSIGNMENT_MODE_AUTO
+    )
     existing_rows = connection.execute(
         """
         SELECT *
@@ -1003,6 +2498,8 @@ def reconcile_attachment_documents(
             parent_document_id=parent_document_id,
             control_number=control_number,
             dataset_id=parent_dataset_id,
+            conversation_id=parent_conversation_id,
+            conversation_assignment_mode=parent_conversation_assignment_mode,
             control_number_batch=control_number_batch,
             control_number_family_sequence=control_number_family_sequence,
             control_number_attachment_sequence=attachment_sequence,
@@ -1411,14 +2908,23 @@ def ingest_container_source(
         and container_source_scan_completed(existing_source)
         and not container_documents_missing_text_revisions(
             connection,
-            source_kind=PST_SOURCE_KIND,
+            source_kind=source_kind,
             source_rel_path=source_rel_path,
         )
     ):
         same_size = existing_source["file_size"] == file_size
         same_mtime = existing_source["file_mtime"] == file_mtime
         file_hash = source_scan_hash
-        if same_size and same_mtime and existing_source["file_hash"] == source_scan_hash:
+        if (
+            same_size
+            and same_mtime
+            and existing_source["file_hash"] == source_scan_hash
+            and not container_email_documents_missing_threading(
+                connection,
+                source_kind=source_kind,
+                source_rel_path=source_rel_path,
+            )
+        ):
             message_count = int(existing_source["message_count"] or 0)
             if message_count == 0:
                 row = connection.execute(
@@ -1471,7 +2977,16 @@ def ingest_container_source(
                 "container_messages_updated": 0,
                 "container_messages_deleted": 0,
             }
-        if same_size and existing_source["file_hash"] and existing_source["file_hash"] == source_scan_hash:
+        if (
+            same_size
+            and existing_source["file_hash"]
+            and existing_source["file_hash"] == source_scan_hash
+            and not container_email_documents_missing_threading(
+                connection,
+                source_kind=source_kind,
+                source_rel_path=source_rel_path,
+            )
+        ):
             message_count = int(existing_source["message_count"] or 0)
             connection.execute("BEGIN")
             try:
@@ -1591,6 +3106,11 @@ def ingest_container_source(
                 ingested_at_override=scan_started_at,
                 last_seen_at_override=scan_started_at,
                 updated_at_override=scan_started_at,
+            )
+            replace_document_email_threading_row(
+                connection,
+                document_id=document_id,
+                email_threading=extracted.get("email_threading"),
             )
             seed_source_text_revision_for_document(
                 connection,

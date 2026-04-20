@@ -78,10 +78,49 @@ def document_prefers_native_primary_preview(row: sqlite3.Row | None) -> bool:
     return file_type in {"pdf", "docx", "rtf"}
 
 
-def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection: sqlite3.Connection) -> tuple[str, str]:
+def build_preview_target_payload(
+    *,
+    rel_path: str,
+    abs_path: str,
+    preview_type: str,
+    label: str | None,
+    ordinal: int,
+    target_fragment: object = None,
+) -> dict[str, object]:
+    normalized_fragment = normalize_whitespace(str(target_fragment or "")) or None
+    return {
+        "rel_path": append_preview_fragment(rel_path, normalized_fragment),
+        "abs_path": append_preview_fragment(abs_path, normalized_fragment),
+        "file_rel_path": rel_path,
+        "file_abs_path": abs_path,
+        "preview_type": preview_type,
+        "label": label,
+        "ordinal": ordinal,
+        "target_fragment": normalized_fragment,
+    }
+
+
+def preview_target_payload_from_preview_row(paths: dict[str, Path], preview_row: sqlite3.Row) -> dict[str, object]:
+    rel_preview = str(Path(".retriever") / preview_row["rel_preview_path"])
+    abs_preview = str(paths["state_dir"] / preview_row["rel_preview_path"])
+    return build_preview_target_payload(
+        rel_path=rel_preview,
+        abs_path=abs_preview,
+        preview_type=str(preview_row["preview_type"]),
+        label=(str(preview_row["label"]) if preview_row["label"] is not None else None),
+        ordinal=int(preview_row["ordinal"]),
+        target_fragment=preview_row["target_fragment"] if "target_fragment" in preview_row.keys() else None,
+    )
+
+
+def preview_rows_use_conversation_navigation(preview_rows: list[sqlite3.Row]) -> bool:
+    return bool(preview_rows) and is_conversation_preview_rel_path(preview_rows[0]["rel_preview_path"])
+
+
+def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection: sqlite3.Connection) -> dict[str, object]:
     preview_rows = connection.execute(
         """
-        SELECT rel_preview_path, preview_type, label
+        SELECT rel_preview_path, preview_type, target_fragment, label, ordinal
         FROM document_previews
         WHERE document_id = ?
         ORDER BY ordinal ASC, id ASC
@@ -89,25 +128,45 @@ def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection:
         (row["id"],),
     ).fetchall()
     native_target = document_native_target(paths, row)
-    if preview_rows and document_prefers_native_primary_preview(row) and native_target is not None:
-        return str(native_target["rel_path"]), str(native_target["abs_path"])
+    if (
+        preview_rows
+        and not preview_rows_use_conversation_navigation(preview_rows)
+        and document_prefers_native_primary_preview(row)
+        and native_target is not None
+    ):
+        return build_preview_target_payload(
+            rel_path=str(native_target["rel_path"]),
+            abs_path=str(native_target["abs_path"]),
+            preview_type=str(native_target["preview_type"]),
+            label=(str(native_target["label"]) if native_target["label"] is not None else None),
+            ordinal=int(native_target["ordinal"]),
+        )
     if preview_rows:
-        rel_preview = preview_rows[0]["rel_preview_path"]
-        rel_path = str(Path(".retriever") / rel_preview)
-        abs_path = str(paths["state_dir"] / rel_preview)
-        return rel_path, abs_path
+        return preview_target_payload_from_preview_row(paths, preview_rows[0])
     source_targets = production_source_part_targets(paths, connection, row)
     if source_targets:
-        return str(source_targets[0]["rel_path"]), str(source_targets[0]["abs_path"])
+        return build_preview_target_payload(
+            rel_path=str(source_targets[0]["rel_path"]),
+            abs_path=str(source_targets[0]["abs_path"]),
+            preview_type=str(source_targets[0]["preview_type"]),
+            label=(str(source_targets[0]["label"]) if source_targets[0]["label"] is not None else None),
+            ordinal=int(source_targets[0]["ordinal"]),
+        )
     rel_path = row["rel_path"]
-    return rel_path, str(paths["root"] / rel_path)
+    return build_preview_target_payload(
+        rel_path=str(rel_path),
+        abs_path=str(paths["root"] / rel_path),
+        preview_type="native",
+        label=None,
+        ordinal=0,
+    )
 
 
 def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: str, connection: sqlite3.Connection) -> list[dict[str, object]]:
     document_row = connection.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
     preview_rows = connection.execute(
         """
-        SELECT rel_preview_path, preview_type, label, ordinal
+        SELECT rel_preview_path, preview_type, target_fragment, label, ordinal
         FROM document_previews
         WHERE document_id = ?
         ORDER BY ordinal ASC, id ASC
@@ -117,35 +176,42 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
     if not preview_rows:
         abs_path = paths["root"] / rel_path
         return [
-            {
-                "rel_path": rel_path,
-                "abs_path": str(abs_path),
-                "preview_type": "native",
-                "label": None,
-                "ordinal": 0,
-            }
+            build_preview_target_payload(
+                rel_path=rel_path,
+                abs_path=str(abs_path),
+                preview_type="native",
+                label=None,
+                ordinal=0,
+            )
         ]
 
     targets: list[dict[str, object]] = []
-    if document_prefers_native_primary_preview(document_row):
+    if preview_rows and not preview_rows_use_conversation_navigation(preview_rows) and document_prefers_native_primary_preview(document_row):
         native_target = document_native_target(paths, document_row)
         if native_target is not None:
-            targets.append(native_target)
+            targets.append(
+                build_preview_target_payload(
+                    rel_path=str(native_target["rel_path"]),
+                    abs_path=str(native_target["abs_path"]),
+                    preview_type=str(native_target["preview_type"]),
+                    label=(str(native_target["label"]) if native_target["label"] is not None else None),
+                    ordinal=int(native_target["ordinal"]),
+                )
+            )
     for preview_row in preview_rows:
-        rel_preview = str(Path(".retriever") / preview_row["rel_preview_path"])
-        targets.append(
-            {
-                "rel_path": rel_preview,
-                "abs_path": str(paths["state_dir"] / preview_row["rel_preview_path"]),
-                "preview_type": preview_row["preview_type"],
-                "label": preview_row["label"],
-                "ordinal": preview_row["ordinal"],
-            }
-        )
+        targets.append(preview_target_payload_from_preview_row(paths, preview_row))
     source_targets = production_source_part_targets(paths, connection, document_row)
     for target in source_targets:
         if target["rel_path"] not in {existing["rel_path"] for existing in targets}:
-            targets.append(target)
+            targets.append(
+                build_preview_target_payload(
+                    rel_path=str(target["rel_path"]),
+                    abs_path=str(target["abs_path"]),
+                    preview_type=str(target["preview_type"]),
+                    label=(str(target["label"]) if target["label"] is not None else None),
+                    ordinal=int(target["ordinal"]),
+                )
+            )
     return targets
 
 
@@ -996,6 +1062,7 @@ def build_email_extracted_payload(
     html_body: str | None,
     attachments: list[dict[str, object]] | None,
     preview_file_name: str,
+    email_threading: dict[str, object] | None = None,
 ) -> dict[str, object]:
     normalized_html = None if html_body is None else str(html_body)
     normalized_text = normalize_whitespace(str(text_body or ""))
@@ -1033,6 +1100,7 @@ def build_email_extracted_payload(
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
         "attachments": list(attachments or []),
+        "email_threading": dict(email_threading or {}),
         "preview_artifacts": [
             {
                 "file_name": preview_file_name,
@@ -1043,6 +1111,105 @@ def build_email_extracted_payload(
             }
         ],
     }
+
+
+def parse_email_headers_only(header_text: object) -> object | None:
+    normalized = str(header_text or "")
+    if not normalize_whitespace(normalized):
+        return None
+    payload = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n\n" not in payload:
+        payload = payload.rstrip("\n") + "\n\n"
+    try:
+        return BytesParser(policy=policy.default).parsebytes(payload.encode("utf-8", errors="replace"), headersonly=True)
+    except Exception:
+        return None
+
+
+def email_header_value(header_mapping: object, key: str) -> str | None:
+    target = normalize_whitespace(key).lower()
+    if isinstance(header_mapping, dict):
+        for raw_key, raw_value in header_mapping.items():
+            if normalize_whitespace(str(raw_key or "")).lower() != target:
+                continue
+            normalized = normalize_whitespace(str(raw_value or ""))
+            return normalized or None
+    return None
+
+
+def build_email_threading_payload(
+    *,
+    subject: object,
+    message_id: object = None,
+    in_reply_to: object = None,
+    references: object = None,
+    conversation_index: object = None,
+    conversation_topic: object = None,
+) -> dict[str, object]:
+    normalized_conversation_topic = normalize_email_thread_subject(conversation_topic)
+    normalized_subject = normalize_email_thread_subject(subject or conversation_topic)
+    return {
+        "message_id": normalize_email_message_id(message_id),
+        "in_reply_to": normalize_email_message_id(in_reply_to),
+        "references": extract_email_message_ids(references),
+        "conversation_index": normalize_whitespace(str(conversation_index or "")) or None,
+        "conversation_topic": normalized_conversation_topic,
+        "normalized_subject": normalized_subject,
+    }
+
+
+def extract_parsed_email_threading(message: object) -> dict[str, object]:
+    return build_email_threading_payload(
+        subject=message.get("Subject"),
+        message_id=message.get("Message-ID") or message.get("Message-Id"),
+        in_reply_to=message.get("In-Reply-To"),
+        references=message.get("References"),
+        conversation_index=message.get("Conversation-Index"),
+        conversation_topic=message.get("Conversation-Topic"),
+    )
+
+
+def extract_msg_threading(message: object, subject: object) -> dict[str, object]:
+    header_mapping = getattr(message, "headerDict", None)
+    parsed_headers = parse_email_headers_only(
+        getattr(message, "headerText", None) or getattr(message, "header", None)
+    )
+
+    def _value(header_name: str) -> str | None:
+        mapped = email_header_value(header_mapping, header_name)
+        if mapped:
+            return mapped
+        if parsed_headers is not None:
+            normalized = normalize_whitespace(str(parsed_headers.get(header_name) or ""))
+            if normalized:
+                return normalized
+        return None
+
+    return build_email_threading_payload(
+        subject=subject,
+        message_id=_value("Message-ID"),
+        in_reply_to=_value("In-Reply-To"),
+        references=_value("References"),
+        conversation_index=_value("Conversation-Index"),
+        conversation_topic=_value("Conversation-Topic"),
+    )
+
+
+def extract_transport_header_threading(
+    transport_headers: object,
+    *,
+    subject: object,
+    conversation_topic: object = None,
+) -> dict[str, object]:
+    parsed_headers = parse_email_headers_only(transport_headers)
+    return build_email_threading_payload(
+        subject=subject,
+        message_id=parsed_headers.get("Message-ID") if parsed_headers is not None else None,
+        in_reply_to=parsed_headers.get("In-Reply-To") if parsed_headers is not None else None,
+        references=parsed_headers.get("References") if parsed_headers is not None else None,
+        conversation_index=parsed_headers.get("Conversation-Index") if parsed_headers is not None else None,
+        conversation_topic=conversation_topic or (parsed_headers.get("Conversation-Topic") if parsed_headers is not None else None),
+    )
 
 
 def build_chat_preview_artifacts(
@@ -1323,6 +1490,7 @@ def extract_parsed_email_message(
             text_body, _, _ = decode_bytes(content)
         else:
             text_body = normalize_whitespace(str(content))
+    email_threading = extract_parsed_email_threading(message)
     return build_email_extracted_payload(
         subject=subject or None,
         author=author or None,
@@ -1332,6 +1500,7 @@ def extract_parsed_email_message(
         html_body=html_content,
         attachments=extract_eml_attachments(message) if include_attachments else [],
         preview_file_name=preview_file_name,
+        email_threading=email_threading,
     )
 
 
@@ -1369,6 +1538,7 @@ def extract_msg_file(path: Path, include_attachments: bool = True) -> dict[str, 
             body_value = message.htmlBody
             html_body = body_value.decode("utf-8", errors="replace") if isinstance(body_value, bytes) else str(body_value)
         text_body = normalize_whitespace(str(message.body or "")) or (strip_html_tags(html_body) if html_body else "")
+        email_threading = extract_msg_threading(message, subject)
         return build_email_extracted_payload(
             subject=subject,
             author=author,
@@ -1378,6 +1548,7 @@ def extract_msg_file(path: Path, include_attachments: bool = True) -> dict[str, 
             html_body=html_body,
             attachments=extract_msg_attachments(message) if include_attachments else [],
             preview_file_name=f"{path.name}.html",
+            email_threading=email_threading,
         )
     finally:
         try:
@@ -1701,6 +1872,52 @@ def iter_pst_messages(path: Path):
             return strip_html_tags(html_body)
         return None
 
+    def _message_transport_headers(message: object) -> str | None:
+        for attr_name in ("transport_headers",):
+            value = getattr(message, attr_name, None)
+            if value is None:
+                continue
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            normalized = str(value)
+            if normalize_whitespace(normalized):
+                return normalized
+        for method_name in ("get_transport_headers",):
+            method = getattr(message, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            normalized = str(value)
+            if normalize_whitespace(normalized):
+                return normalized
+        return None
+
+    def _message_conversation_topic(message: object) -> str | None:
+        for attr_name in ("conversation_topic",):
+            value = getattr(message, attr_name, None)
+            normalized = normalize_whitespace(str(value or ""))
+            if normalized:
+                return normalized
+        for method_name in ("get_conversation_topic",):
+            method = getattr(message, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                continue
+            normalized = normalize_whitespace(str(value or ""))
+            if normalized:
+                return normalized
+        return None
+
     def _iter_folder(folder: object, ancestors: list[str]):
         folder_name = normalize_whitespace(str(getattr(folder, "name", "") or ""))
         current_ancestors = [*ancestors]
@@ -1749,6 +1966,8 @@ def iter_pst_messages(path: Path):
                 "folder_path": folder_path,
                 "message_class": normalize_whitespace(str(getattr(message, "message_class", "") or "")) or None,
                 "subject": normalize_whitespace(str(getattr(message, "subject", "") or "")) or None,
+                "conversation_topic": _message_conversation_topic(message),
+                "transport_headers": _message_transport_headers(message),
                 "author": _message_author(message),
                 "recipients": _message_recipients(message),
                 "date_created": normalize_datetime(
@@ -1869,6 +2088,11 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
             preview_file_name=pst_preview_file_name(source_item_id),
         )
     else:
+        email_threading = extract_transport_header_threading(
+            message_dict.get("transport_headers"),
+            subject=normalized_subject,
+            conversation_topic=message_dict.get("conversation_topic"),
+        )
         extracted = build_email_extracted_payload(
             subject=normalized_subject,
             author=normalized_author,
@@ -1878,6 +2102,7 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
             html_body=normalized_html_body,
             attachments=normalized_attachments,
             preview_file_name=pst_preview_file_name(source_item_id),
+            email_threading=email_threading,
         )
     return {
         "rel_path": pst_message_rel_path(source_rel_path, source_item_id),
