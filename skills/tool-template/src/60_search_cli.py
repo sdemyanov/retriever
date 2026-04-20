@@ -66,12 +66,13 @@ def build_virtual_filter_clause(
             raise RetrieverError(f"Virtual filter '{field_name}' only supports eq and neq.")
         typed_value = value_from_type("boolean", value)
         if field_name == "is_attachment":
-            positive_clause = f"{alias}.parent_document_id IS NOT NULL"
+            positive_clause = attachment_child_filter_sql(alias)
         else:
             positive_clause = (
                 "EXISTS ("
                 "SELECT 1 FROM documents child "
                 f"WHERE child.parent_document_id = {alias}.id "
+                f"AND COALESCE(child.child_document_kind, '{CHILD_DOCUMENT_KIND_ATTACHMENT}') = '{CHILD_DOCUMENT_KIND_ATTACHMENT}' "
                 "AND child.lifecycle_status NOT IN ('missing', 'deleted')"
                 ")"
             )
@@ -217,12 +218,15 @@ def document_path_payload(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
 ) -> dict[str, object]:
-    preview_rel_path, preview_abs_path = default_preview_target(paths, row, connection)
+    preview_target = default_preview_target(paths, row, connection)
     return {
         "rel_path": row["rel_path"],
         "abs_path": str(paths["root"] / row["rel_path"]),
-        "preview_rel_path": preview_rel_path,
-        "preview_abs_path": preview_abs_path,
+        "preview_rel_path": preview_target["rel_path"],
+        "preview_abs_path": preview_target["abs_path"],
+        "preview_file_rel_path": preview_target["file_rel_path"],
+        "preview_file_abs_path": preview_target["file_abs_path"],
+        "preview_target_fragment": preview_target["target_fragment"],
         "preview_targets": collect_preview_targets(paths, int(row["id"]), row["rel_path"], connection),
     }
 
@@ -240,10 +244,11 @@ def fetch_attachment_summaries(
         SELECT *
         FROM documents
         WHERE parent_document_id IN ({placeholders})
+          AND COALESCE(child_document_kind, ?) = ?
           AND lifecycle_status NOT IN ('missing', 'deleted')
         ORDER BY parent_document_id ASC, id ASC
         """,
-        parent_ids,
+        [*parent_ids, CHILD_DOCUMENT_KIND_ATTACHMENT, CHILD_DOCUMENT_KIND_ATTACHMENT],
     ).fetchall()
     grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
     for row in rows:
@@ -274,6 +279,47 @@ def fetch_attachment_summaries(
             item.pop("source_kind", None)
             item.pop("begin_bates", None)
             item.pop("control_number_attachment_sequence", None)
+    return grouped
+
+
+def fetch_child_document_summaries(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    parent_ids: list[int],
+) -> dict[int, list[dict[str, object]]]:
+    if not parent_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in parent_ids)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM documents
+        WHERE parent_document_id IN ({placeholders})
+          AND COALESCE(child_document_kind, ?) != ?
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+        ORDER BY parent_document_id ASC, COALESCE(date_created, '') ASC, id ASC
+        """,
+        [*parent_ids, CHILD_DOCUMENT_KIND_ATTACHMENT, CHILD_DOCUMENT_KIND_ATTACHMENT],
+    ).fetchall()
+    grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[int(row["parent_document_id"])].append(
+            {
+                "id": int(row["id"]),
+                "control_number": row["control_number"],
+                "file_name": row["file_name"],
+                "file_type": row["file_type"],
+                **document_path_payload(paths, connection, row),
+                "child_document_kind": row["child_document_kind"],
+                "title": row["title"],
+                "date_created": row["date_created"],
+                "date_modified": row["date_modified"],
+                "root_message_key": row["root_message_key"],
+                "source_kind": row["source_kind"],
+                "source_rel_path": row["source_rel_path"],
+                "source_item_id": row["source_item_id"],
+            }
+        )
     return grouped
 
 
@@ -407,6 +453,8 @@ def compact_search_result_payload(item: dict[str, object]) -> dict[str, object]:
         compact["production_name"] = item["production_name"]
     if int(item.get("attachment_count") or 0) > 0:
         compact["attachment_count"] = int(item["attachment_count"])
+    if int(item.get("child_document_count") or 0) > 0:
+        compact["child_document_count"] = int(item["child_document_count"])
     if payload_has_meaningful_value(item.get("parent")):
         compact["parent"] = item["parent"]
     return compact
@@ -431,6 +479,8 @@ def compact_document_overview_payload(item: object) -> object:
         compact["production_name"] = item["production_name"]
     if int(item.get("attachment_count") or 0) > 0:
         compact["attachment_count"] = int(item["attachment_count"])
+    if int(item.get("child_document_count") or 0) > 0:
+        compact["child_document_count"] = int(item["child_document_count"])
     if payload_has_meaningful_value(item.get("parent")):
         compact["parent"] = item["parent"]
     return compact
@@ -571,8 +621,11 @@ def document_overview_payload(
     payload: dict[str, object] = {
         "document_id": int(row["id"]),
         "control_number": row["control_number"],
+        "conversation_id": row["conversation_id"],
         "dataset_id": row["dataset_id"],
         "parent_document_id": row["parent_document_id"],
+        "child_document_kind": row["child_document_kind"],
+        "root_message_key": row["root_message_key"],
         "source_kind": row["source_kind"],
         "source_rel_path": row["source_rel_path"],
         "source_item_id": row["source_item_id"],
@@ -585,7 +638,9 @@ def document_overview_payload(
             "author": row["author"],
             "begin_attachment": row["begin_attachment"],
             "begin_bates": row["begin_bates"],
+            "child_document_kind": row["child_document_kind"],
             "content_type": row["content_type"],
+            "conversation_id": row["conversation_id"],
             "custodian": row["custodian"],
             "dataset_id": row["dataset_id"],
             "date_created": row["date_created"],
@@ -595,6 +650,7 @@ def document_overview_payload(
             "page_count": row["page_count"],
             "participants": row["participants"],
             "recipients": row["recipients"],
+            "root_message_key": row["root_message_key"],
             "source_kind": row["source_kind"],
             "source_rel_path": row["source_rel_path"],
             "source_item_id": row["source_item_id"],
@@ -627,6 +683,9 @@ def document_overview_payload(
         attachments = fetch_attachment_summaries(connection, paths, [int(row["id"])]).get(int(row["id"]), [])
         payload["attachment_count"] = len(attachments)
         payload["attachments"] = attachments
+        child_documents = fetch_child_document_summaries(connection, paths, [int(row["id"])]).get(int(row["id"]), [])
+        payload["child_document_count"] = len(child_documents)
+        payload["child_documents"] = child_documents
     if include_parent_context and row["parent_document_id"] is not None:
         payload["parent"] = fetch_parent_summaries(connection, [row]).get(int(row["parent_document_id"]))
     return payload
@@ -917,8 +976,11 @@ def search(
                 {
                     "id": int(match["id"]),
                     "control_number": row["control_number"],
+                    "conversation_id": row["conversation_id"],
                     "dataset_id": row["dataset_id"],
                     "parent_document_id": row["parent_document_id"],
+                    "child_document_kind": row["child_document_kind"],
+                    "root_message_key": row["root_message_key"],
                     "source_kind": row["source_kind"],
                     "source_rel_path": row["source_rel_path"],
                     "source_item_id": row["source_item_id"],
@@ -934,7 +996,9 @@ def search(
                         "author": row["author"],
                         "begin_attachment": row["begin_attachment"],
                         "begin_bates": row["begin_bates"],
+                        "child_document_kind": row["child_document_kind"],
                         "content_type": row["content_type"],
+                        "conversation_id": row["conversation_id"],
                         "custodian": row["custodian"],
                         "dataset_id": row["dataset_id"],
                         "date_created": row["date_created"],
@@ -944,6 +1008,7 @@ def search(
                         "page_count": row["page_count"],
                         "participants": row["participants"],
                         "recipients": row["recipients"],
+                        "root_message_key": row["root_message_key"],
                         "source_kind": row["source_kind"],
                         "source_rel_path": row["source_rel_path"],
                         "source_item_id": row["source_item_id"],
@@ -967,6 +1032,11 @@ def search(
         production_names = fetch_production_names(connection, paged_rows)
         dataset_memberships = fetch_document_dataset_memberships(connection, paged_rows)
         attachment_summaries = fetch_attachment_summaries(
+            connection,
+            paths,
+            [int(row["id"]) for row in paged_rows if row["parent_document_id"] is None],
+        )
+        child_document_summaries = fetch_child_document_summaries(
             connection,
             paths,
             [int(row["id"]) for row in paged_rows if row["parent_document_id"] is None],
@@ -1000,6 +1070,9 @@ def search(
                 attachments = attachment_summaries.get(int(row["id"]), [])
                 item["attachment_count"] = len(attachments)
                 item["attachments"] = attachments
+                child_documents = child_document_summaries.get(int(row["id"]), [])
+                item["child_document_count"] = len(child_documents)
+                item["child_documents"] = child_documents
             else:
                 item["parent"] = parent_summaries.get(int(row["parent_document_id"]))
             item.pop("bates_sort_key", None)
@@ -1147,9 +1220,10 @@ def fetch_attachment_parent_ids(
         SELECT DISTINCT parent_document_id
         FROM documents
         WHERE parent_document_id IN ({placeholders})
+          AND COALESCE(child_document_kind, ?) = ?
           AND lifecycle_status NOT IN ('missing', 'deleted')
         """,
-        parent_ids,
+        [*parent_ids, CHILD_DOCUMENT_KIND_ATTACHMENT, CHILD_DOCUMENT_KIND_ATTACHMENT],
     ).fetchall()
     return {
         int(row["parent_document_id"])
@@ -1213,6 +1287,339 @@ def resolve_export_output_path(paths: dict[str, Path], raw_output_path: str) -> 
     return resolved_path
 
 
+def resolve_export_output_dir(paths: dict[str, Path], raw_output_path: str) -> Path:
+    normalized_output_path = raw_output_path.strip()
+    if not normalized_output_path:
+        raise RetrieverError("Output path cannot be empty.")
+    exports_dir = (paths["state_dir"] / "exports").resolve()
+    requested_path = Path(normalized_output_path).expanduser()
+    if requested_path.is_absolute():
+        resolved_path = requested_path.resolve()
+    else:
+        resolved_path = (exports_dir / requested_path).resolve()
+        if not path_within(resolved_path, exports_dir):
+            raise RetrieverError(f"Relative output paths must stay within {exports_dir}.")
+    if resolved_path.exists() and not resolved_path.is_dir():
+        raise RetrieverError(f"Output path is not a directory: {resolved_path}")
+    workspace_root = paths["root"].resolve()
+    if path_within(resolved_path, workspace_root) and not path_within(resolved_path, exports_dir):
+        raise RetrieverError(
+            f"Workspace-internal output paths must live under {exports_dir} to avoid re-ingesting exported exports."
+        )
+    return resolved_path
+
+
+def relative_output_path_or_none(root: Path, output_path: Path) -> str | None:
+    try:
+        return output_path.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
+def export_preview_unit_file_name(unit: dict[str, object]) -> str:
+    unit_kind = str(unit["unit_kind"])
+    if unit_kind == "email_conversation":
+        return f"conversation-{int(unit['conversation_id']):08d}.html"
+    if unit_kind == "conversation_run":
+        return (
+            f"conversation-{int(unit['conversation_id']):08d}"
+            f"-run-{int(unit['run_start_index']) + 1:04d}-{int(unit['run_end_index']) + 1:04d}.html"
+        )
+    return f"document-{int(unit['documents'][0]['id']):08d}.html"
+
+
+def build_export_preview_unit_html(
+    unit: dict[str, object],
+    *,
+    file_name: str,
+) -> str:
+    documents = list(unit["documents"])
+    selected_document_ids = {int(document_id) for document_id in unit["selected_document_ids"]}
+    if unit["unit_kind"] == "standalone":
+        heading = conversation_preview_document_heading(documents[0])
+        preview_type = "document"
+    elif unit["unit_kind"] == "email_conversation":
+        heading = str(unit["title"])
+        preview_type = "email conversation"
+    else:
+        heading = str(unit["title"])
+        preview_type = "conversation run"
+
+    headers = {
+        "Preview": heading,
+        "Type": preview_type,
+        "Documents": str(len(documents)),
+        "Selected": str(len(selected_document_ids)),
+    }
+    if unit.get("conversation_type"):
+        headers["Conversation type"] = str(unit["conversation_type"])
+
+    doc_target_hrefs = {
+        int(document["id"]): f"#{conversation_preview_anchor(int(document['id']))}"
+        for document in documents
+    }
+    sections: list[str] = []
+    for document in documents:
+        section_html = render_conversation_document_section(
+            document,
+            current_segment_href=file_name,
+            doc_target_hrefs=doc_target_hrefs,
+        )
+        if int(document["id"]) in selected_document_ids:
+            section_html = section_html.replace(
+                '<article class="conversation-document"',
+                '<article class="conversation-document" data-selected="true"',
+                1,
+            )
+        sections.append(section_html)
+    nav_links = '<div class="conversation-nav-links"><a href="../index.html">Contents</a></div>'
+    return build_html_preview(
+        headers,
+        body_html=(
+            "<main>"
+            "<div class=\"conversation-nav\">"
+            f"{nav_links}"
+            "</div>"
+            f"{''.join(sections)}"
+            "</main>"
+        ),
+        document_title=heading,
+        head_html=build_conversation_preview_head_html(),
+        heading=heading,
+    )
+
+
+def build_export_preview_index_html(
+    *,
+    units: list[dict[str, object]],
+    selected_rows: list[sqlite3.Row],
+    document_targets_by_id: dict[int, dict[str, object]],
+) -> str:
+    headers = {
+        "Selected documents": str(len(selected_rows)),
+        "Preview files": str(len(units)),
+    }
+    cards: list[str] = []
+    for unit in units:
+        output_rel_path = str(unit["output_rel_path"])
+        selected_links = "".join(
+            f"<li><a href=\"{html.escape(str(document_targets_by_id[int(document_id)]['href']))}\">{html.escape(str(document_targets_by_id[int(document_id)]['title']))}</a></li>"
+            for document_id in unit["selected_document_ids"]
+            if int(document_id) in document_targets_by_id
+        )
+        cards.append(
+            "<section class=\"conversation-segment-card\">"
+            f"<h2><a href=\"{html.escape(output_rel_path)}\">{html.escape(str(unit['title']))}</a></h2>"
+            f"<p>{html.escape(str(unit['summary']))}</p>"
+            f"{'<ul>' + selected_links + '</ul>' if selected_links else ''}"
+            "</section>"
+        )
+    return build_html_preview(
+        headers,
+        body_html=f"<main><div class=\"conversation-segments\">{''.join(cards)}</div></main>",
+        document_title="Export Preview Index",
+        head_html=build_conversation_preview_head_html(),
+        heading="Export Preview Index",
+    )
+
+
+def cleanup_previous_export_preview_outputs(output_dir: Path) -> None:
+    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.exists():
+        return
+    try:
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    relative_paths: set[str] = set()
+    for key in ("index_rel_path",):
+        value = manifest_payload.get(key)
+        if isinstance(value, str) and value:
+            relative_paths.add(value)
+    for unit in manifest_payload.get("units", []):
+        if isinstance(unit, dict):
+            value = unit.get("output_rel_path")
+            if isinstance(value, str) and value:
+                relative_paths.add(value)
+    relative_paths.add("manifest.json")
+    for relative_path in relative_paths:
+        candidate = (output_dir / relative_path).resolve()
+        if path_within(candidate, output_dir.resolve()) and candidate.exists() and candidate.is_file():
+            candidate.unlink()
+
+
+def build_export_preview_units(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    selected_rows: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    selected_rows_by_conversation: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    standalone_rows: list[sqlite3.Row] = []
+    selection_order_by_document_id: dict[int, int] = {}
+    for index, row in enumerate(selected_rows):
+        document_id = int(row["id"])
+        selection_order_by_document_id[document_id] = index
+        child_kind = normalize_whitespace(str(row["child_document_kind"] or "")).lower()
+        if row["conversation_id"] is None or child_kind == CHILD_DOCUMENT_KIND_ATTACHMENT:
+            standalone_rows.append(row)
+        else:
+            selected_rows_by_conversation[int(row["conversation_id"])].append(row)
+
+    units: list[dict[str, object]] = []
+    for row in standalone_rows:
+        document_id = int(row["id"])
+        documents = load_preview_documents(
+            connection,
+            paths,
+            document_ids=[document_id],
+            include_attachment_children=True,
+            require_dataset_membership=True,
+        )
+        if not documents:
+            continue
+        title = conversation_preview_document_heading(documents[0])
+        units.append(
+            {
+                "unit_key": f"document:{document_id}",
+                "unit_kind": "standalone",
+                "title": title,
+                "summary": "Standalone exported document preview",
+                "documents": documents,
+                "selected_document_ids": [document_id],
+                "order_key": selection_order_by_document_id[document_id],
+                "conversation_id": None,
+                "conversation_type": None,
+            }
+        )
+
+    for conversation_id, conversation_rows in selected_rows_by_conversation.items():
+        conversation_row = connection.execute(
+            "SELECT * FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if conversation_row is None:
+            for row in conversation_rows:
+                document_id = int(row["id"])
+                documents = load_preview_documents(
+                    connection,
+                    paths,
+                    document_ids=[document_id],
+                    include_attachment_children=True,
+                    require_dataset_membership=True,
+                )
+                if not documents:
+                    continue
+                title = conversation_preview_document_heading(documents[0])
+                units.append(
+                    {
+                        "unit_key": f"document:{document_id}",
+                        "unit_kind": "standalone",
+                        "title": title,
+                        "summary": "Standalone exported document preview",
+                        "documents": documents,
+                        "selected_document_ids": [document_id],
+                        "order_key": selection_order_by_document_id[document_id],
+                        "conversation_id": None,
+                        "conversation_type": None,
+                    }
+                )
+            continue
+        documents = load_preview_documents(
+            connection,
+            paths,
+            conversation_id=conversation_id,
+            require_dataset_membership=True,
+        )
+        if not documents:
+            continue
+        conversation_type = normalize_whitespace(str(conversation_row["conversation_type"] or "")).lower()
+        conversation_title = normalize_whitespace(str(conversation_row["display_name"] or "")) or f"Conversation {conversation_id}"
+        if conversation_type == "email":
+            selected_document_ids = [
+                int(row["id"])
+                for row in sorted(conversation_rows, key=lambda item: selection_order_by_document_id[int(item["id"])])
+            ]
+            units.append(
+                {
+                    "unit_key": f"conversation:{conversation_id}",
+                    "unit_kind": "email_conversation",
+                    "title": conversation_title,
+                    "summary": f"Full email conversation export ({len(documents)} messages)",
+                    "documents": documents,
+                    "selected_document_ids": selected_document_ids,
+                    "order_key": min(selection_order_by_document_id[int(document_id)] for document_id in selected_document_ids),
+                    "conversation_id": conversation_id,
+                    "conversation_type": conversation_type,
+                }
+            )
+            continue
+
+        position_by_document_id = {
+            int(document["id"]): index
+            for index, document in enumerate(documents)
+        }
+        selected_positions = sorted(
+            position_by_document_id[int(row["id"])]
+            for row in conversation_rows
+            if int(row["id"]) in position_by_document_id
+        )
+        if not selected_positions:
+            continue
+        run_start = selected_positions[0]
+        run_end = run_start
+        for position in selected_positions[1:]:
+            if position == run_end + 1:
+                run_end = position
+                continue
+            run_documents = documents[run_start : run_end + 1]
+            run_selected_document_ids = [
+                int(document["id"])
+                for document in run_documents
+                if int(document["id"]) in selection_order_by_document_id
+            ]
+            units.append(
+                {
+                    "unit_key": f"conversation:{conversation_id}:run:{run_start}:{run_end}",
+                    "unit_kind": "conversation_run",
+                    "title": conversation_title,
+                    "summary": f"Conversation run export ({len(run_documents)} documents)",
+                    "documents": run_documents,
+                    "selected_document_ids": run_selected_document_ids,
+                    "order_key": min(selection_order_by_document_id[int(document_id)] for document_id in run_selected_document_ids),
+                    "conversation_id": conversation_id,
+                    "conversation_type": conversation_type,
+                    "run_start_index": run_start,
+                    "run_end_index": run_end,
+                }
+            )
+            run_start = position
+            run_end = position
+        run_documents = documents[run_start : run_end + 1]
+        run_selected_document_ids = [
+            int(document["id"])
+            for document in run_documents
+            if int(document["id"]) in selection_order_by_document_id
+        ]
+        units.append(
+            {
+                "unit_key": f"conversation:{conversation_id}:run:{run_start}:{run_end}",
+                "unit_kind": "conversation_run",
+                "title": conversation_title,
+                "summary": f"Conversation run export ({len(run_documents)} documents)",
+                "documents": run_documents,
+                "selected_document_ids": run_selected_document_ids,
+                "order_key": min(selection_order_by_document_id[int(document_id)] for document_id in run_selected_document_ids),
+                "conversation_id": conversation_id,
+                "conversation_type": conversation_type,
+                "run_start_index": run_start,
+                "run_end_index": run_end,
+            }
+        )
+
+    units.sort(key=lambda unit: (int(unit["order_key"]), str(unit["unit_key"])))
+    return units
+
+
 def build_export_context(
     connection: sqlite3.Connection,
     rows: list[sqlite3.Row],
@@ -1257,7 +1664,7 @@ def export_field_value(
             return None
         return context["production_names"].get(int(row["production_id"]))
     if field_name == "is_attachment":
-        return row["parent_document_id"] is not None
+        return is_attachment_row(row)
     if field_name == "has_attachments":
         return int(row["id"]) in context["attachment_parent_ids"]
     return row[field_name]
@@ -1350,6 +1757,125 @@ def export_csv(
         connection.close()
 
 
+def export_previews(
+    root: Path,
+    raw_output_path: str,
+    document_ids: list[int] | None,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        output_dir = resolve_export_output_dir(paths, raw_output_path)
+
+        normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+        if normalized_document_ids and (query.strip() or raw_filters or sort_field or order):
+            raise RetrieverError("export-previews accepts either --doc-id selectors or query/filter selectors, not both.")
+
+        if normalized_document_ids:
+            rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
+            selector: dict[str, object] = {
+                "mode": "document_ids",
+                "document_ids": normalized_document_ids,
+            }
+        else:
+            selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
+            rows = [item["row"] for item in selection["results"]]
+            selector = {
+                "mode": "search",
+                "query": selection["query"],
+                "filters": selection["filters"],
+                "sort": selection["sort"],
+                "order": selection["order"],
+            }
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cleanup_previous_export_preview_outputs(output_dir)
+        units_dir = output_dir / "units"
+        units_dir.mkdir(parents=True, exist_ok=True)
+
+        units = build_export_preview_units(connection, paths, rows)
+        unit_payloads: list[dict[str, object]] = []
+        document_targets_by_id: dict[int, dict[str, object]] = {}
+        for unit in units:
+            file_name = export_preview_unit_file_name(unit)
+            unit_output_path = units_dir / file_name
+            unit_output_path.write_text(
+                build_export_preview_unit_html(unit, file_name=file_name),
+                encoding="utf-8",
+            )
+            unit_output_rel_path = Path("units") / file_name
+            unit_payload = {
+                "unit_key": str(unit["unit_key"]),
+                "unit_kind": str(unit["unit_kind"]),
+                "title": str(unit["title"]),
+                "summary": str(unit["summary"]),
+                "conversation_id": int(unit["conversation_id"]) if unit.get("conversation_id") is not None else None,
+                "conversation_type": unit.get("conversation_type"),
+                "document_ids": [int(document["id"]) for document in unit["documents"]],
+                "selected_document_ids": [int(document_id) for document_id in unit["selected_document_ids"]],
+                "output_path": str(unit_output_path),
+                "output_rel_path": unit_output_rel_path.as_posix(),
+                "file_size": file_size_bytes(unit_output_path),
+            }
+            unit_payloads.append(unit_payload)
+            for document in unit["documents"]:
+                document_id = int(document["id"])
+                if document_id not in unit_payload["selected_document_ids"]:
+                    continue
+                document_targets_by_id[document_id] = {
+                    "document_id": document_id,
+                    "title": conversation_preview_document_heading(document),
+                    "output_path": str(unit_output_path),
+                    "output_rel_path": unit_output_rel_path.as_posix(),
+                    "file_output_path": str(unit_output_path),
+                    "file_output_rel_path": unit_output_rel_path.as_posix(),
+                    "target_fragment": conversation_preview_anchor(document_id),
+                    "href": f"{unit_output_rel_path.as_posix()}#{conversation_preview_anchor(document_id)}",
+                }
+
+        index_path = output_dir / "index.html"
+        index_path.write_text(
+            build_export_preview_index_html(
+                units=unit_payloads,
+                selected_rows=rows,
+                document_targets_by_id=document_targets_by_id,
+            ),
+            encoding="utf-8",
+        )
+        index_rel_path = "index.html"
+
+        document_targets = [
+            document_targets_by_id[int(row["id"])]
+            for row in rows
+            if int(row["id"]) in document_targets_by_id
+        ]
+        manifest_payload = {
+            "status": "ok",
+            "output_path": str(output_dir),
+            "output_rel_path": relative_output_path_or_none(root, output_dir),
+            "index_path": str(index_path),
+            "index_rel_path": index_rel_path,
+            "selected_document_count": len(rows),
+            "unit_count": len(unit_payloads),
+            "selector": selector,
+            "units": unit_payloads,
+            "document_targets": document_targets,
+        }
+        manifest_path = output_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True), encoding="utf-8")
+        manifest_payload["manifest_path"] = str(manifest_path)
+        manifest_payload["manifest_rel_path"] = "manifest.json"
+        return manifest_payload
+    finally:
+        connection.close()
+
+
 def get_doc(
     root: Path,
     document_id: int,
@@ -1385,7 +1911,9 @@ def get_doc(
 
         exact_chunks: list[dict[str, object]] = []
         total_text_chars = 0
-        preview_rel_path, preview_abs_path = default_preview_target(paths, row, connection)
+        preview_target = default_preview_target(paths, row, connection)
+        preview_rel_path = str(preview_target["rel_path"])
+        preview_abs_path = str(preview_target["abs_path"])
         for chunk_index in requested_chunk_indexes:
             chunk_row = chunk_rows_by_index[chunk_index]
             text_content = str(chunk_row["text_content"] or "")
@@ -1634,7 +2162,9 @@ def search_chunks(
             [row for row in returned_rows if row["parent_document_id"] is not None],
         )
         for row in returned_rows:
-            preview_rel_path, preview_abs_path = default_preview_target(paths, row, connection)
+            preview_target = default_preview_target(paths, row, connection)
+            preview_rel_path = str(preview_target["rel_path"])
+            preview_abs_path = str(preview_target["abs_path"])
             snippet = make_snippet(str(row["text_content"] or ""), query)
             result = {
                 **document_path_payload(paths, connection, row),
@@ -2010,6 +2540,30 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field for search-based export or 'relevance'")
     export_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
 
+    export_previews_parser = subparsers.add_parser(
+        "export-previews",
+        help="Write HTML preview exports for selected documents under .retriever/exports",
+    )
+    export_previews_parser.add_argument("workspace", help="Workspace root path")
+    export_previews_parser.add_argument("output_path", help="Output directory path; relative paths resolve under .retriever/exports")
+    export_previews_parser.add_argument("query", nargs="?", default="", help="Optional keyword query text for search-based export")
+    export_previews_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to export (repeatable, preserves input order)",
+    )
+    export_previews_parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        nargs="+",
+        help="Repeatable filter in the form <field> <op> <value>",
+    )
+    export_previews_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field for search-based export or 'relevance'")
+    export_previews_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
+
     get_doc_parser = subparsers.add_parser("get-doc", help="Fetch one document with optional summary text or exact chunks")
     get_doc_parser.add_argument("workspace", help="Workspace root path")
     get_doc_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
@@ -2320,6 +2874,28 @@ def build_parser() -> argparse.ArgumentParser:
     set_field_parser.add_argument("--field", required=True, help="Field name")
     set_field_parser.add_argument("--value", help="Field value")
 
+    merge_conversation_parser = subparsers.add_parser(
+        "merge-into-conversation",
+        help="Manually assign one document family into another document's conversation",
+    )
+    merge_conversation_parser.add_argument("workspace", help="Workspace root path")
+    merge_conversation_parser.add_argument("--doc-id", type=int, required=True, help="Document id to move")
+    merge_conversation_parser.add_argument("--target-doc-id", type=int, required=True, help="Target document id")
+
+    split_conversation_parser = subparsers.add_parser(
+        "split-from-conversation",
+        help="Split one document family into its own manually pinned conversation",
+    )
+    split_conversation_parser.add_argument("workspace", help="Workspace root path")
+    split_conversation_parser.add_argument("--doc-id", type=int, required=True, help="Document id to split")
+
+    clear_conversation_parser = subparsers.add_parser(
+        "clear-conversation-assignment",
+        help="Clear a manual conversation pin and re-run automatic conversation assignment",
+    )
+    clear_conversation_parser.add_argument("workspace", help="Workspace root path")
+    clear_conversation_parser.add_argument("--doc-id", type=int, required=True, help="Document id to clear")
+
     subparsers.add_parser("schema-version", help="Print the schema version")
     return parser
 
@@ -2371,6 +2947,24 @@ def main() -> int:
                         root,
                         args.output_path,
                         args.fields,
+                        args.document_ids,
+                        args.query,
+                        args.filters,
+                        args.sort,
+                        args.order,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "export-previews":
+            print(
+                json.dumps(
+                    export_previews(
+                        root,
+                        args.output_path,
                         args.document_ids,
                         args.query,
                         args.filters,
@@ -2698,6 +3292,24 @@ def main() -> int:
 
         if args.command == "set-field":
             return emit_cli_payload("set-field", set_field(root, args.doc_id, args.field, args.value))
+
+        if args.command == "merge-into-conversation":
+            return emit_cli_payload(
+                "merge-into-conversation",
+                merge_into_conversation(root, args.doc_id, args.target_doc_id),
+            )
+
+        if args.command == "split-from-conversation":
+            return emit_cli_payload(
+                "split-from-conversation",
+                split_from_conversation(root, args.doc_id),
+            )
+
+        if args.command == "clear-conversation-assignment":
+            return emit_cli_payload(
+                "clear-conversation-assignment",
+                clear_conversation_assignment(root, args.doc_id),
+            )
 
         parser.error(f"Unknown command: {args.command}")
         return 2

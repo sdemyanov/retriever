@@ -9,6 +9,7 @@ import mailbox
 import re
 import sqlite3
 import tempfile
+import types
 import unittest
 import zipfile
 import base64
@@ -33,10 +34,10 @@ retriever_tools = None
 TOOL_BYTES = b""
 
 def load_python_module(path: Path, module_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
     return module
 
 
@@ -133,6 +134,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         stderr_text = stderr.getvalue().strip()
         payload = json.loads(stdout_text or stderr_text) if (stdout_text or stderr_text) else None
         return exit_code, payload, stdout_text, stderr_text
+
+    def preview_target_file_path(self, target: dict[str, object]) -> Path:
+        file_abs_path = str(target.get("file_abs_path") or target.get("abs_path") or "")
+        return Path(file_abs_path.split("#", 1)[0])
 
     def create_legacy_documents_table(self, *, with_row: bool) -> None:
         connection = sqlite3.connect(self.paths["db_path"])
@@ -349,15 +354,35 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         *,
         subject: str,
         body_text: str,
+        author: str = "Alice Example <alice@example.com>",
+        recipients: str = "Bob Example <bob@example.com>",
+        cc: str | None = "Carol Example <carol@example.com>",
+        date_created: str = "Tue, 14 Apr 2026 10:00:00 +0000",
+        message_id: str | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        conversation_index: str | None = None,
+        conversation_topic: str | None = None,
         attachment_name: str | None = None,
         attachment_text: str | None = None,
     ) -> None:
         message = EmailMessage()
-        message["From"] = "Alice Example <alice@example.com>"
-        message["To"] = "Bob Example <bob@example.com>"
-        message["Cc"] = "Carol Example <carol@example.com>"
+        message["From"] = author
+        message["To"] = recipients
+        if cc is not None:
+            message["Cc"] = cc
         message["Subject"] = subject
-        message["Date"] = "Tue, 14 Apr 2026 10:00:00 +0000"
+        message["Date"] = date_created
+        if message_id is not None:
+            message["Message-ID"] = message_id
+        if in_reply_to is not None:
+            message["In-Reply-To"] = in_reply_to
+        if references is not None:
+            message["References"] = references
+        if conversation_index is not None:
+            message["Conversation-Index"] = conversation_index
+        if conversation_topic is not None:
+            message["Conversation-Topic"] = conversation_topic
         message.set_content(body_text)
         if attachment_name is not None and attachment_text is not None:
             message.add_attachment(attachment_text, subtype="plain", filename=attachment_name)
@@ -421,6 +446,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         recipients: str | None = "Bob Example <bob@example.com>, Carol Example <carol@example.com>",
         date_created: str | None = "2026-04-14T10:00:00Z",
         message_class: str | None = None,
+        transport_headers: str | None = None,
+        conversation_topic: str | None = None,
     ) -> dict[str, object]:
         attachments: list[dict[str, object]] = []
         if attachment_name is not None and attachment_text is not None:
@@ -438,6 +465,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "recipients": recipients,
             "date_created": date_created,
             "message_class": message_class,
+            "transport_headers": transport_headers,
+            "conversation_topic": conversation_topic,
             "text_body": body_text,
             "html_body": None,
             "attachments": attachments,
@@ -692,17 +721,39 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
             columns = retriever_tools.table_columns(connection, "documents")
+            preview_columns = retriever_tools.table_columns(connection, "document_previews")
             self.assertIn("content_type", columns)
             self.assertIn("custodian", columns)
             self.assertIn("participants", columns)
             self.assertIn("control_number", columns)
+            self.assertIn("conversation_id", columns)
+            self.assertIn("conversation_assignment_mode", columns)
             self.assertIn("dataset_id", columns)
             self.assertIn("parent_document_id", columns)
+            self.assertIn("child_document_kind", columns)
+            self.assertIn("root_message_key", columns)
+            self.assertIn("target_fragment", preview_columns)
             row = connection.execute(
                 """
-                SELECT content_type, custodian, participants, control_number, dataset_id, parent_document_id
+                SELECT content_type, custodian, participants, control_number, conversation_id,
+                       conversation_assignment_mode, dataset_id, parent_document_id,
+                       child_document_kind, root_message_key
                 FROM documents
                 WHERE id = 1
+                """
+            ).fetchone()
+            conversations_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'conversations'
+                """
+            ).fetchone()
+            email_threading_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'document_email_threading'
                 """
             ).fetchone()
             dataset_row = connection.execute(
@@ -727,8 +778,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNone(row["custodian"])
         self.assertIsNone(row["participants"])
         self.assertEqual(row["control_number"], "DOC001.00000001")
+        self.assertIsNone(row["conversation_id"])
+        self.assertEqual(row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
         self.assertIsNotNone(row["dataset_id"])
         self.assertIsNone(row["parent_document_id"])
+        self.assertIsNone(row["child_document_kind"])
+        self.assertIsNone(row["root_message_key"])
+        self.assertIsNotNone(conversations_table)
+        self.assertIsNotNone(email_threading_table)
         self.assertIsNotNone(dataset_row)
         self.assertEqual(dataset_row["source_kind"], retriever_tools.FILESYSTEM_SOURCE_KIND)
         self.assertEqual(dataset_row["dataset_locator"], ".")
@@ -2466,6 +2523,104 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             retriever_tools.search(self.root, "", None, "is_attachment", None, 1, 20)
         self.assertIn("virtual filter field", str(context.exception))
 
+    def test_non_attachment_child_documents_are_not_treated_as_attachments(self) -> None:
+        parent_path = self.root / "parent.txt"
+        parent_path.write_text("parent body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        parent_row = self.fetch_document_row("parent.txt")
+        self.assertIsNotNone(parent_row["dataset_id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            child_control_number = retriever_tools.format_control_number(
+                int(parent_row["control_number_batch"]),
+                int(parent_row["control_number_family_sequence"]),
+                retriever_tools.next_attachment_sequence(connection, int(parent_row["id"])),
+            )
+            child_id = retriever_tools.upsert_document_row(
+                connection,
+                "_retriever/logical/slack/general/threads/1700000000.000001.slackthread",
+                None,
+                None,
+                {
+                    "text_content": "Root message\nReply one",
+                    "content_type": "Chat",
+                    "title": "general thread",
+                    "participants": "Alice Example; Bob Example",
+                    "text_status": "ok",
+                    "page_count": None,
+                    "author": None,
+                    "custodian": None,
+                    "date_created": "2026-04-14T10:00:00Z",
+                    "date_modified": "2026-04-14T11:00:00Z",
+                    "subject": None,
+                    "recipients": None,
+                },
+                file_name="1700000000.000001.slackthread",
+                parent_document_id=int(parent_row["id"]),
+                child_document_kind=retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD,
+                control_number=child_control_number,
+                dataset_id=int(parent_row["dataset_id"]),
+                control_number_batch=int(parent_row["control_number_batch"]),
+                control_number_family_sequence=int(parent_row["control_number_family_sequence"]),
+                control_number_attachment_sequence=1,
+                source_kind=retriever_tools.SLACK_EXPORT_SOURCE_KIND,
+                source_rel_path="data/slack/general/2026-04-14.json",
+                source_item_id="1700000000.000001",
+                root_message_key="general:1700000000.000001",
+            )
+            retriever_tools.ensure_dataset_document_membership(
+                connection,
+                dataset_id=int(parent_row["dataset_id"]),
+                document_id=child_id,
+                dataset_source_id=None,
+            )
+            connection.commit()
+            inventory = retriever_tools.document_inventory_counts(connection)
+        finally:
+            connection.close()
+
+        child_row = self.fetch_document_by_id(child_id)
+        self.assertEqual(child_row["child_document_kind"], retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD)
+        self.assertEqual(child_row["source_kind"], retriever_tools.SLACK_EXPORT_SOURCE_KIND)
+        self.assertEqual(inventory["parent_documents"], 1)
+        self.assertEqual(inventory["attachment_children"], 0)
+        self.assertEqual(inventory["documents_total"], 2)
+
+        browse_results = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        parent_result = next(item for item in browse_results["results"] if item["id"] == parent_row["id"])
+        child_result = next(item for item in browse_results["results"] if item["id"] == child_id)
+        self.assertEqual(parent_result["attachment_count"], 0)
+        self.assertEqual(child_result["child_document_kind"], retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD)
+        self.assertEqual(child_result["parent"]["control_number"], parent_row["control_number"])
+
+        attachments_only = retriever_tools.search(
+            self.root,
+            "",
+            [["is_attachment", "eq", "true"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(attachments_only["total_hits"], 0)
+
+        parents_with_attachments = retriever_tools.search(
+            self.root,
+            "",
+            [["has_attachments", "eq", "true"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(parents_with_attachments["total_hits"], 0)
+
     def test_doctor_fails_when_required_pst_backend_is_missing(self) -> None:
         retriever_tools.bootstrap(self.root)
 
@@ -2735,6 +2890,681 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("[Dec 17, 2022 12:03 AM UTC]", preview_html)
         self.assertNotIn("<th>Author</th>", preview_html)
         self.assertNotIn("&quot;type&quot;", preview_html)
+
+    def test_ingest_routes_slack_export_root_into_dedicated_dataset(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "canvases.json").write_text("[]\n", encoding="utf-8")
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "<@U04MAX0001> can we sync?",
+                        "user": "U04SERGEY1",
+                        "ts": "1671235434.237949",
+                    },
+                    {
+                        "type": "message",
+                        "text": "Let's sync at 10:05",
+                        "user": "U04MAX0001",
+                        "ts": "1671235734.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.root / "alpha.txt").write_text("ordinary workspace file\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["slack_exports_detected"], 1)
+        self.assertEqual(ingest_result["slack_day_documents_scanned"], 1)
+        self.assertEqual(ingest_result["slack_documents_created"], 1)
+
+        day_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        self.assertEqual(day_row["source_kind"], retriever_tools.SLACK_EXPORT_SOURCE_KIND)
+        self.assertIsNotNone(day_row["conversation_id"])
+        self.assertIsNotNone(day_row["dataset_id"])
+        self.assertEqual(day_row["title"], "#general - Dec 16, 2022")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            metadata_rows = connection.execute(
+                """
+                SELECT rel_path
+                FROM documents
+                WHERE rel_path IN (?, ?, ?)
+                ORDER BY rel_path ASC
+                """,
+                (
+                    "data/slack/users.json",
+                    "data/slack/channels.json",
+                    "data/slack/canvases.json",
+                ),
+            ).fetchall()
+            conversation_row = connection.execute(
+                """
+                SELECT c.conversation_key, c.conversation_type, c.display_name
+                FROM conversations c
+                JOIN documents d ON d.conversation_id = c.id
+                WHERE d.rel_path = ?
+                """,
+                ("data/slack/general/2022-12-16.json",),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(metadata_rows, [])
+        self.assertIsNotNone(conversation_row)
+        self.assertEqual(conversation_row["conversation_key"], "C04GENERAL1")
+        self.assertEqual(conversation_row["conversation_type"], "public_channel")
+        self.assertEqual(conversation_row["display_name"], "#general")
+
+        dataset_payload = retriever_tools.list_datasets(self.root)
+        slack_dataset = next(
+            item for item in dataset_payload["datasets"] if item["source_kind"] == retriever_tools.SLACK_EXPORT_SOURCE_KIND
+        )
+        filesystem_dataset = next(
+            item for item in dataset_payload["datasets"] if item["source_kind"] == retriever_tools.FILESYSTEM_SOURCE_KIND
+        )
+        self.assertEqual(slack_dataset["dataset_locator"], "data/slack")
+        self.assertEqual(slack_dataset["document_count"], 1)
+        self.assertEqual(filesystem_dataset["document_count"], 1)
+
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(browse_result["total_hits"], 2)
+        day_result = next(item for item in browse_result["results"] if item["id"] == day_row["id"])
+        self.assertEqual(day_result["dataset_name"], slack_dataset["dataset_name"])
+        self.assertEqual(day_result["conversation_id"], day_row["conversation_id"])
+        self.assertTrue(day_result["preview_rel_path"].startswith(".retriever/previews/conversations/"))
+        self.assertTrue(day_result["preview_rel_path"].endswith(f"#doc-{day_row['id']}"))
+
+        search_result = retriever_tools.search(self.root, "sync", None, None, None, 1, 20)
+        self.assertEqual(search_result["results"][0]["id"], day_row["id"])
+
+    def test_ingest_creates_slack_reply_thread_child_documents(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        thread_ts = "1671235434.237949"
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Kickoff thread",
+                        "user": "U04SERGEY1",
+                        "ts": thread_ts,
+                        "thread_ts": thread_ts,
+                        "reply_count": 1,
+                    },
+                    {
+                        "type": "message",
+                        "text": "Standalone channel update",
+                        "user": "U04MAX0001",
+                        "ts": "1671235834.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (channel_dir / "2022-12-17.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Following up on kickoff",
+                        "user": "U04MAX0001",
+                        "ts": "1671321834.237949",
+                        "thread_ts": thread_ts,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 3)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["slack_exports_detected"], 1)
+        self.assertEqual(ingest_result["slack_day_documents_scanned"], 2)
+        self.assertEqual(ingest_result["slack_documents_created"], 3)
+
+        day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        child_rel_path = retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
+        child_row = self.fetch_document_row(child_rel_path)
+
+        self.assertEqual(child_row["parent_document_id"], day_one_row["id"])
+        self.assertEqual(child_row["child_document_kind"], retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD)
+        self.assertEqual(child_row["source_kind"], retriever_tools.SLACK_EXPORT_SOURCE_KIND)
+        self.assertEqual(child_row["source_rel_path"], "data/slack/general/2022-12-16.json")
+        self.assertEqual(child_row["source_item_id"], thread_ts)
+        self.assertEqual(child_row["root_message_key"], f"C04GENERAL1:{thread_ts}")
+        self.assertEqual(child_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(day_two_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(day_two_row["text_status"], "empty")
+
+        reply_search = retriever_tools.search(self.root, "Following up on kickoff", None, None, None, 1, 20)
+        self.assertEqual(reply_search["total_hits"], 1)
+        self.assertEqual(reply_search["results"][0]["id"], child_row["id"])
+        self.assertTrue(reply_search["results"][0]["preview_rel_path"].startswith(".retriever/previews/conversations/"))
+        self.assertTrue(reply_search["results"][0]["preview_rel_path"].endswith(f"#doc-{child_row['id']}"))
+
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        day_one_result = next(item for item in browse_result["results"] if item["id"] == day_one_row["id"])
+        day_two_result = next(item for item in browse_result["results"] if item["id"] == day_two_row["id"])
+        self.assertEqual(day_one_result["attachment_count"], 0)
+        self.assertEqual(day_one_result["child_document_count"], 1)
+        self.assertEqual(day_one_result["child_documents"][0]["id"], child_row["id"])
+        self.assertEqual(day_one_result["child_documents"][0]["child_document_kind"], retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD)
+        self.assertEqual(day_two_result["child_document_count"], 0)
+        self.assertTrue(day_one_result["preview_rel_path"].startswith(".retriever/previews/conversations/"))
+        self.assertTrue(day_one_result["preview_rel_path"].endswith(f"#doc-{day_one_row['id']}"))
+        self.assertEqual(
+            self.preview_target_file_path(day_one_result["preview_targets"][0]),
+            self.preview_target_file_path(reply_search["results"][0]["preview_targets"][0]),
+        )
+        slack_preview_html = self.preview_target_file_path(day_one_result["preview_targets"][0]).read_text(encoding="utf-8")
+        self.assertIn("Kickoff thread", slack_preview_html)
+        self.assertIn("Following up on kickoff", slack_preview_html)
+        self.assertFalse(
+            (
+                self.paths["state_dir"]
+                / retriever_tools.preview_base_path_for_rel_path("data/slack/general/2022-12-16.json")
+                / "2022-12-16.html"
+            ).exists()
+        )
+        self.assertFalse(
+            (
+                self.paths["state_dir"]
+                / retriever_tools.preview_base_path_for_rel_path(child_rel_path)
+                / f"{Path(child_rel_path).stem}.html"
+            ).exists()
+        )
+
+        dataset_payload = retriever_tools.list_datasets(self.root)
+        slack_dataset = next(
+            item for item in dataset_payload["datasets"] if item["source_kind"] == retriever_tools.SLACK_EXPORT_SOURCE_KIND
+        )
+        self.assertEqual(slack_dataset["document_count"], 3)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            source_parts = connection.execute(
+                """
+                SELECT part_kind, rel_source_path, ordinal
+                FROM document_source_parts
+                WHERE document_id = ?
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (child_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            [(row["part_kind"], row["rel_source_path"]) for row in source_parts],
+            [
+                ("slack_thread_root_day", "data/slack/general/2022-12-16.json"),
+                ("slack_thread_reply_day", "data/slack/general/2022-12-17.json"),
+            ],
+        )
+
+    def test_ingest_groups_loose_eml_messages_into_one_conversation(self) -> None:
+        root_path = self.root / "root.eml"
+        reply_path = self.root / "reply.eml"
+        self.write_email_message(
+            root_path,
+            subject="Status Update",
+            body_text="Root message body",
+            message_id="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            reply_path,
+            subject="Re: Status Update",
+            body_text="Reply message body",
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["email_conversations"], 1)
+
+        root_row = self.fetch_document_row("root.eml")
+        reply_row = self.fetch_document_row("reply.eml")
+        self.assertIsNotNone(root_row["conversation_id"])
+        self.assertEqual(root_row["conversation_id"], reply_row["conversation_id"])
+        self.assertEqual(root_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+        self.assertEqual(reply_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            signal_rows = connection.execute(
+                """
+                SELECT document_id, message_id, in_reply_to, references_json, normalized_subject
+                FROM document_email_threading
+                ORDER BY document_id ASC
+                """
+            ).fetchall()
+            conversation_row = connection.execute(
+                """
+                SELECT source_kind, source_locator, conversation_type, display_name
+                FROM conversations
+                WHERE id = ?
+                """,
+                (root_row["conversation_id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(signal_rows), 2)
+        signals_by_message_id = {row["message_id"]: row for row in signal_rows}
+        self.assertEqual(set(signals_by_message_id), {"root@example.com", "reply@example.com"})
+        self.assertEqual(signals_by_message_id["root@example.com"]["in_reply_to"], None)
+        self.assertEqual(json.loads(signals_by_message_id["root@example.com"]["references_json"]), [])
+        self.assertEqual(signals_by_message_id["root@example.com"]["normalized_subject"], "status update")
+        self.assertEqual(signals_by_message_id["reply@example.com"]["in_reply_to"], "root@example.com")
+        self.assertEqual(json.loads(signals_by_message_id["reply@example.com"]["references_json"]), ["root@example.com"])
+        self.assertEqual(signals_by_message_id["reply@example.com"]["normalized_subject"], "status update")
+        self.assertEqual(conversation_row["source_kind"], retriever_tools.EMAIL_CONVERSATION_SOURCE_KIND)
+        self.assertEqual(conversation_row["source_locator"], ".")
+        self.assertEqual(conversation_row["conversation_type"], "email")
+        self.assertEqual(conversation_row["display_name"], "Status Update")
+
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        root_result = next(item for item in browse_result["results"] if item["id"] == root_row["id"])
+        search_result = retriever_tools.search(self.root, "Reply message body", None, None, None, 1, 20)
+        reply_result = next(item for item in search_result["results"] if item["id"] == reply_row["id"])
+        self.assertTrue(reply_result["preview_rel_path"].startswith(".retriever/previews/conversations/"))
+        self.assertTrue(reply_result["preview_rel_path"].endswith(f"#doc-{reply_row['id']}"))
+        self.assertEqual(reply_result["preview_target_fragment"], f"doc-{reply_row['id']}")
+        self.assertEqual(len(reply_result["preview_targets"]), 2)
+        self.assertEqual(reply_result["preview_targets"][1]["label"], "contents")
+        self.assertEqual(
+            self.preview_target_file_path(root_result["preview_targets"][0]),
+            self.preview_target_file_path(reply_result["preview_targets"][0]),
+        )
+        segment_html = self.preview_target_file_path(reply_result["preview_targets"][0]).read_text(encoding="utf-8")
+        toc_html = self.preview_target_file_path(reply_result["preview_targets"][1]).read_text(encoding="utf-8")
+        self.assertIn(f'id="doc-{root_row["id"]}"', segment_html)
+        self.assertIn(f'id="doc-{reply_row["id"]}"', segment_html)
+        self.assertIn("Root message body", segment_html)
+        self.assertIn("Reply message body", segment_html)
+        self.assertIn("Status Update", toc_html)
+        self.assertIn(f"#doc-{reply_row['id']}", toc_html)
+        self.assertFalse(
+            (self.paths["state_dir"] / retriever_tools.preview_base_path_for_rel_path("root.eml") / "root.eml.html").exists()
+        )
+        self.assertFalse(
+            (self.paths["state_dir"] / retriever_tools.preview_base_path_for_rel_path("reply.eml") / "reply.eml.html").exists()
+        )
+
+    def test_manual_conversation_assignment_mode_prevents_root_overwrite_and_retargets_auto_reply(self) -> None:
+        root_path = self.root / "root.eml"
+        reply_path = self.root / "reply.eml"
+        self.write_email_message(
+            root_path,
+            subject="Deal Review",
+            body_text="Root message body",
+            message_id="<deal-root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            reply_path,
+            subject="Re: Deal Review",
+            body_text="Reply message body",
+            message_id="<deal-reply@example.com>",
+            in_reply_to="<deal-root@example.com>",
+            references="<deal-root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_ingest["failed"], 0)
+
+        root_row = self.fetch_document_row("root.eml")
+        reply_row = self.fetch_document_row("reply.eml")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("BEGIN")
+            manual_conversation_id = retriever_tools.upsert_conversation_row(
+                connection,
+                source_kind=retriever_tools.EMAIL_CONVERSATION_SOURCE_KIND,
+                source_locator=".",
+                conversation_key="manual:deal-review",
+                conversation_type="email",
+                display_name="Deal Review (Manual)",
+            )
+            connection.execute(
+                """
+                UPDATE documents
+                SET conversation_id = ?, conversation_assignment_mode = ?
+                WHERE id = ?
+                """,
+                (
+                    manual_conversation_id,
+                    retriever_tools.CONVERSATION_ASSIGNMENT_MODE_MANUAL,
+                    root_row["id"],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(second_ingest["failed"], 0)
+
+        updated_root = self.fetch_document_row("root.eml")
+        updated_reply = self.fetch_document_row("reply.eml")
+        self.assertEqual(updated_root["conversation_id"], manual_conversation_id)
+        self.assertEqual(
+            updated_root["conversation_assignment_mode"],
+            retriever_tools.CONVERSATION_ASSIGNMENT_MODE_MANUAL,
+        )
+        self.assertEqual(updated_reply["conversation_id"], manual_conversation_id)
+        self.assertEqual(
+            updated_reply["conversation_assignment_mode"],
+            retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO,
+        )
+
+    def test_split_and_clear_conversation_assignment_cli_for_loose_eml(self) -> None:
+        root_path = self.root / "root.eml"
+        reply_path = self.root / "reply.eml"
+        self.write_email_message(
+            root_path,
+            subject="Status Update",
+            body_text="Root message body",
+            message_id="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            reply_path,
+            subject="Re: Status Update",
+            body_text="Reply message body",
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        root_row = self.fetch_document_row("root.eml")
+        reply_row = self.fetch_document_row("reply.eml")
+        self.assertEqual(root_row["conversation_id"], reply_row["conversation_id"])
+
+        split_exit, split_payload, _, _ = self.run_cli(
+            "split-from-conversation",
+            str(self.root),
+            "--doc-id",
+            str(reply_row["id"]),
+        )
+        self.assertEqual(split_exit, 0)
+        self.assertIsNotNone(split_payload)
+        self.assertEqual(split_payload["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_MANUAL)
+
+        split_root_row = self.fetch_document_row("root.eml")
+        split_reply_row = self.fetch_document_row("reply.eml")
+        self.assertNotEqual(split_root_row["conversation_id"], split_reply_row["conversation_id"])
+        self.assertEqual(split_root_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+        self.assertEqual(split_reply_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_MANUAL)
+
+        clear_exit, clear_payload, _, _ = self.run_cli(
+            "clear-conversation-assignment",
+            str(self.root),
+            "--doc-id",
+            str(reply_row["id"]),
+        )
+        self.assertEqual(clear_exit, 0)
+        self.assertIsNotNone(clear_payload)
+        self.assertEqual(clear_payload["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+
+        cleared_root_row = self.fetch_document_row("root.eml")
+        cleared_reply_row = self.fetch_document_row("reply.eml")
+        self.assertEqual(cleared_root_row["conversation_id"], cleared_reply_row["conversation_id"])
+        self.assertEqual(cleared_reply_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+
+    def test_merge_into_conversation_cli_retargets_auto_email_replies(self) -> None:
+        root_path = self.root / "root.eml"
+        reply_path = self.root / "reply.eml"
+        target_path = self.root / "target.eml"
+        self.write_email_message(
+            root_path,
+            subject="Deal Review",
+            body_text="Root message body",
+            message_id="<deal-root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            reply_path,
+            subject="Re: Deal Review",
+            body_text="Reply message body",
+            message_id="<deal-reply@example.com>",
+            in_reply_to="<deal-root@example.com>",
+            references="<deal-root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+        self.write_email_message(
+            target_path,
+            subject="Separate Matter",
+            body_text="Target message body",
+            message_id="<target@example.com>",
+            date_created="Tue, 14 Apr 2026 12:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        root_row = self.fetch_document_row("root.eml")
+        reply_row = self.fetch_document_row("reply.eml")
+        target_row = self.fetch_document_row("target.eml")
+        self.assertNotEqual(root_row["conversation_id"], target_row["conversation_id"])
+        self.assertEqual(root_row["conversation_id"], reply_row["conversation_id"])
+
+        merge_exit, merge_payload, _, _ = self.run_cli(
+            "merge-into-conversation",
+            str(self.root),
+            "--doc-id",
+            str(root_row["id"]),
+            "--target-doc-id",
+            str(target_row["id"]),
+        )
+        self.assertEqual(merge_exit, 0)
+        self.assertIsNotNone(merge_payload)
+        self.assertEqual(merge_payload["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_MANUAL)
+
+        updated_root = self.fetch_document_row("root.eml")
+        updated_reply = self.fetch_document_row("reply.eml")
+        updated_target = self.fetch_document_row("target.eml")
+        self.assertEqual(updated_root["conversation_id"], updated_target["conversation_id"])
+        self.assertEqual(updated_reply["conversation_id"], updated_target["conversation_id"])
+        self.assertEqual(updated_root["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_MANUAL)
+        self.assertEqual(updated_reply["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+
+    def test_ingest_mbox_groups_threaded_messages_into_one_conversation(self) -> None:
+        root_message = self.build_fake_mbox_message(
+            subject="Budget Review",
+            body_text="Budget root body",
+            message_id="<mbox-budget-root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        reply_message = self.build_fake_mbox_message(
+            subject="Re: Budget Review",
+            body_text="Budget reply body",
+            message_id="<mbox-budget-reply@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+        reply_message["In-Reply-To"] = "<mbox-budget-root@example.com>"
+        reply_message["References"] = "<mbox-budget-root@example.com>"
+        self.write_fake_mbox_file([root_message, reply_message])
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        root_row = self.fetch_document_row(
+            retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-budget-root@example.com>")
+        )
+        reply_row = self.fetch_document_row(
+            retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-budget-reply@example.com>")
+        )
+        self.assertIsNotNone(root_row["conversation_id"])
+        self.assertEqual(root_row["conversation_id"], reply_row["conversation_id"])
+
+    def test_ingest_pst_email_groups_threaded_messages_from_transport_headers(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-email-root",
+                subject="Witness Prep",
+                body_text="PST root body",
+                date_created="2026-04-14T10:00:00Z",
+                transport_headers="\n".join(
+                    [
+                        "Message-ID: <pst-root@example.com>",
+                        "Conversation-Topic: Witness Prep",
+                        "",
+                    ]
+                ),
+                conversation_topic="Witness Prep",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-email-reply",
+                subject="Re: Witness Prep",
+                body_text="PST reply body",
+                date_created="2026-04-14T11:00:00Z",
+                transport_headers="\n".join(
+                    [
+                        "Message-ID: <pst-reply@example.com>",
+                        "In-Reply-To: <pst-root@example.com>",
+                        "References: <pst-root@example.com>",
+                        "Conversation-Topic: Witness Prep",
+                        "",
+                    ]
+                ),
+                conversation_topic="Witness Prep",
+            ),
+        ]
+
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            retriever_tools.bootstrap(self.root)
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        root_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-email-root"))
+        reply_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-email-reply"))
+        self.assertIsNotNone(root_row["conversation_id"])
+        self.assertEqual(root_row["conversation_id"], reply_row["conversation_id"])
 
     def test_search_parser_accepts_alias_flags_for_paging_and_sorting(self) -> None:
         parser = retriever_tools.build_parser()
@@ -3436,9 +4266,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_result["attachment_count"], 1)
         self.assertEqual(parent_result["source_rel_path"], "mailbox.mbox")
         self.assertEqual(parent_result["dataset_name"], "mailbox.mbox")
-        self.assertTrue(parent_result["preview_rel_path"].startswith(".retriever/previews/mailbox.mbox/messages/"))
-        parent_preview_html = Path(parent_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertTrue(parent_result["preview_rel_path"].startswith(".retriever/previews/conversations/"))
+        self.assertTrue(parent_result["preview_rel_path"].endswith(f"#doc-{parent_row['id']}"))
+        parent_preview_html = self.preview_target_file_path(parent_result["preview_targets"][0]).read_text(encoding="utf-8")
         self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
+        self.assertIn("MBOX Parent", parent_preview_html)
 
         mbox_only = retriever_tools.search(
             self.root,
@@ -3750,9 +4582,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_result["source_rel_path"], "mailbox.pst")
         self.assertEqual(parent_result["source_folder_path"], "Inbox")
         self.assertEqual(parent_result["dataset_name"], "mailbox.pst")
-        self.assertTrue(parent_result["preview_rel_path"].startswith(".retriever/previews/mailbox.pst/messages/"))
-        parent_preview_html = Path(parent_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertTrue(parent_result["preview_rel_path"].startswith(".retriever/previews/conversations/"))
+        self.assertTrue(parent_result["preview_rel_path"].endswith(f"#doc-{parent_row['id']}"))
+        parent_preview_html = self.preview_target_file_path(parent_result["preview_targets"][0]).read_text(encoding="utf-8")
         self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
+        self.assertIn("PST Parent", parent_preview_html)
 
         pst_only = retriever_tools.search(
             self.root,
@@ -3877,6 +4711,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(ingest_result["new"], 1)
         self.assertEqual(ingest_result["failed"], 0)
         self.assertEqual(ingest_result["pst_messages_created"], 1)
+        self.assertEqual(ingest_result["pst_chat_conversations"], 1)
 
         row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-001"))
         self.assertEqual(row["content_type"], "Chat")
@@ -3889,16 +4724,65 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNone(row["subject"])
         self.assertIsNone(row["recipients"])
         self.assertEqual(row["source_folder_path"], "Conversation History")
+        self.assertIsNotNone(row["conversation_id"])
 
         search_result = retriever_tools.search(self.root, "draft the update", None, None, None, 1, 20)
         result = search_result["results"][0]
-        self.assertTrue(result["preview_rel_path"].startswith(".retriever/previews/mailbox.pst/messages/"))
+        self.assertTrue(result["preview_rel_path"].startswith(".retriever/previews/conversations/"))
+        self.assertTrue(result["preview_rel_path"].endswith(f"#doc-{row['id']}"))
         self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
-        preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
-        self.assertIn("Retriever Chat Preview", preview_html)
+        preview_html = self.preview_target_file_path(result["preview_targets"][0]).read_text(encoding="utf-8")
         self.assertIn("Alice Example", preview_html)
         self.assertIn("Bob Example", preview_html)
         self.assertIn("Kickoff thread for launch planning.", preview_html)
+        self.assertIn(f'id="doc-{row["id"]}"', preview_html)
+
+    def test_ingest_groups_pst_chat_messages_by_source_folder_path(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-chat-001",
+                subject=None,
+                body_text="Kickoff thread for launch planning.",
+                folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                author="Alice Example",
+                recipients=None,
+                date_created="2026-04-15T09:00:00Z",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-chat-002",
+                subject=None,
+                body_text="Follow-up from the same Teams space.",
+                folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                author="Bob Example",
+                recipients=None,
+                date_created="2026-04-16T09:00:00Z",
+            ),
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 2)
+        self.assertEqual(ingest_result["pst_chat_conversations"], 1)
+
+        first_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-001"))
+        second_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-002"))
+        self.assertIsNotNone(first_row["conversation_id"])
+        self.assertEqual(first_row["conversation_id"], second_row["conversation_id"])
+        self.assertEqual(first_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+        self.assertEqual(second_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+
+        search_result = retriever_tools.search(self.root, "Follow-up from the same Teams space", None, None, None, 1, 20)
+        result = search_result["results"][0]
+        self.assertTrue(result["preview_rel_path"].startswith(".retriever/previews/conversations/"))
+        preview_html = self.preview_target_file_path(result["preview_targets"][0]).read_text(encoding="utf-8")
+        self.assertIn(f'id="doc-{first_row["id"]}"', preview_html)
+        self.assertIn(f'id="doc-{second_row["id"]}"', preview_html)
+        self.assertIn("Kickoff thread for launch planning.", preview_html)
+        self.assertIn("Follow-up from the same Teams space.", preview_html)
 
     def test_ingest_pst_routes_teams_messages_to_chat_and_skips_system_folders(self) -> None:
         self.write_fake_pst_file()
@@ -3961,6 +4845,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(chat_row["participants"], "Sergey Demyanov")
         self.assertEqual(chat_row["title"], "hey there")
         self.assertEqual(chat_row["source_folder_path"], "Top of Personal Folders/user (Primary)/TeamsMessagesData")
+        self.assertIsNotNone(chat_row["conversation_id"])
         self.assertEqual(email_row["content_type"], "Email")
         self.assertEqual(email_row["custodian"], "mailbox")
 
@@ -3985,8 +4870,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         search_result = retriever_tools.search(self.root, "hey there", None, None, None, 1, 20)
         result = next(item for item in search_result["results"] if item["id"] == chat_row["id"])
-        preview_html = Path(result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
-        self.assertIn("Retriever Chat Preview", preview_html)
+        preview_html = self.preview_target_file_path(result["preview_targets"][0]).read_text(encoding="utf-8")
+        self.assertIn("Conversation document", preview_html)
         self.assertIn("Sergey Demyanov", preview_html)
         self.assertIn("hey there", preview_html)
 
@@ -4613,6 +5498,238 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIsNotNone(payload)
         self.assertIn("not visible because they have no dataset memberships", payload["error"])
+
+    def test_export_previews_expands_reply_selection_to_full_email_conversation(self) -> None:
+        root_path = self.root / "root.eml"
+        reply_path = self.root / "reply.eml"
+        self.write_email_message(
+            root_path,
+            subject="Status Update",
+            body_text="Root message body",
+            message_id="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            reply_path,
+            subject="Re: Status Update",
+            body_text="Reply message body",
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        root_row = self.fetch_document_row("root.eml")
+        reply_row = self.fetch_document_row("reply.eml")
+
+        exit_code, payload, _, _ = self.run_cli(
+            "export-previews",
+            str(self.root),
+            "email-preview",
+            "--doc-id",
+            str(reply_row["id"]),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["selected_document_count"], 1)
+        self.assertEqual(payload["unit_count"], 1)
+        self.assertEqual(payload["output_rel_path"], ".retriever/exports/email-preview")
+        self.assertEqual(len(payload["document_targets"]), 1)
+        self.assertEqual(payload["document_targets"][0]["document_id"], reply_row["id"])
+        self.assertEqual(payload["document_targets"][0]["target_fragment"], f"doc-{reply_row['id']}")
+
+        unit = payload["units"][0]
+        self.assertEqual(unit["unit_kind"], "email_conversation")
+        self.assertEqual(unit["selected_document_ids"], [reply_row["id"]])
+        self.assertEqual(unit["document_ids"], [root_row["id"], reply_row["id"]])
+        self.assertEqual(unit["output_rel_path"], payload["document_targets"][0]["output_rel_path"])
+
+        unit_path = Path(unit["output_path"])
+        index_path = Path(payload["index_path"])
+        manifest_path = Path(payload["manifest_path"])
+        self.assertTrue(unit_path.exists())
+        self.assertTrue(index_path.exists())
+        self.assertTrue(manifest_path.exists())
+
+        unit_html = unit_path.read_text(encoding="utf-8")
+        index_html = index_path.read_text(encoding="utf-8")
+        self.assertIn("Root message body", unit_html)
+        self.assertIn("Reply message body", unit_html)
+        self.assertIn(f'id="doc-{root_row["id"]}"', unit_html)
+        self.assertIn(f'id="doc-{reply_row["id"]}"', unit_html)
+        self.assertIn("units/", index_html)
+        self.assertIn(f"#doc-{reply_row['id']}", index_html)
+
+        units_dir = unit_path.parent
+        self.assertEqual(sorted(path.name for path in units_dir.glob("*.html")), [unit_path.name])
+
+    def test_export_previews_merges_contiguous_slack_documents_and_splits_gaps(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        thread_ts = "1671235434.237949"
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Kickoff thread",
+                        "user": "U04SERGEY1",
+                        "ts": thread_ts,
+                        "thread_ts": thread_ts,
+                        "reply_count": 1,
+                    },
+                    {
+                        "type": "message",
+                        "text": "Standalone channel update",
+                        "user": "U04MAX0001",
+                        "ts": "1671235834.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (channel_dir / "2022-12-17.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Following up on kickoff",
+                        "user": "U04MAX0001",
+                        "ts": "1671321834.237949",
+                        "thread_ts": thread_ts,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        child_row = self.fetch_document_row(
+            retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
+        )
+
+        contiguous_exit, contiguous_payload, _, _ = self.run_cli(
+            "export-previews",
+            str(self.root),
+            "slack-contiguous",
+            "--doc-id",
+            str(day_one_row["id"]),
+            "--doc-id",
+            str(child_row["id"]),
+        )
+
+        self.assertEqual(contiguous_exit, 0)
+        self.assertIsNotNone(contiguous_payload)
+        self.assertEqual(contiguous_payload["unit_count"], 1)
+        self.assertEqual(len(contiguous_payload["document_targets"]), 2)
+        contiguous_unit = contiguous_payload["units"][0]
+        self.assertEqual(contiguous_unit["unit_kind"], "conversation_run")
+        self.assertEqual(contiguous_unit["selected_document_ids"], [day_one_row["id"], child_row["id"]])
+        self.assertEqual(contiguous_unit["document_ids"], [day_one_row["id"], child_row["id"]])
+        self.assertEqual(
+            {
+                target["output_rel_path"]
+                for target in contiguous_payload["document_targets"]
+            },
+            {contiguous_unit["output_rel_path"]},
+        )
+        contiguous_html = Path(contiguous_unit["output_path"]).read_text(encoding="utf-8")
+        self.assertIn("Kickoff thread", contiguous_html)
+        self.assertIn("Following up on kickoff", contiguous_html)
+        self.assertIn(f'id="doc-{day_one_row["id"]}"', contiguous_html)
+        self.assertIn(f'id="doc-{child_row["id"]}"', contiguous_html)
+        self.assertNotIn(f'id="doc-{day_two_row["id"]}"', contiguous_html)
+
+        split_exit, split_payload, _, _ = self.run_cli(
+            "export-previews",
+            str(self.root),
+            "slack-split",
+            "--doc-id",
+            str(day_two_row["id"]),
+            "--doc-id",
+            str(child_row["id"]),
+        )
+
+        self.assertEqual(split_exit, 0)
+        self.assertIsNotNone(split_payload)
+        self.assertEqual(split_payload["unit_count"], 2)
+        self.assertEqual(
+            [unit["selected_document_ids"] for unit in split_payload["units"]],
+            [[day_two_row["id"]], [child_row["id"]]],
+        )
+        self.assertEqual(
+            [unit["document_ids"] for unit in split_payload["units"]],
+            [[day_two_row["id"]], [child_row["id"]]],
+        )
+        self.assertEqual(
+            len({target["output_rel_path"] for target in split_payload["document_targets"]}),
+            2,
+        )
+        first_split_html = Path(split_payload["units"][0]["output_path"]).read_text(encoding="utf-8")
+        second_split_html = Path(split_payload["units"][1]["output_path"]).read_text(encoding="utf-8")
+        self.assertIn(f'id="doc-{day_two_row["id"]}"', first_split_html)
+        self.assertNotIn(f'id="doc-{day_one_row["id"]}"', first_split_html)
+        self.assertIn(f'id="doc-{child_row["id"]}"', second_split_html)
+        self.assertNotIn(f'id="doc-{day_one_row["id"]}"', second_split_html)
 
     def test_get_doc_and_list_chunks_return_summary_and_exact_chunk_text(self) -> None:
         paragraph = "Termination notice requires careful review and supporting detail. "

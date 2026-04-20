@@ -113,6 +113,39 @@ def backfill_content_type(connection: sqlite3.Connection) -> int:
     return updated
 
 
+def backfill_child_document_kinds(connection: sqlite3.Connection) -> int:
+    columns = table_columns(connection, "documents")
+    required = {"parent_document_id", "child_document_kind"}
+    if not required.issubset(columns):
+        return 0
+    cursor = connection.execute(
+        """
+        UPDATE documents
+        SET child_document_kind = ?
+        WHERE parent_document_id IS NOT NULL
+          AND (child_document_kind IS NULL OR TRIM(child_document_kind) = '')
+        """,
+        (CHILD_DOCUMENT_KIND_ATTACHMENT,),
+    )
+    return int(cursor.rowcount or 0)
+
+
+def backfill_conversation_assignment_modes(connection: sqlite3.Connection) -> int:
+    columns = table_columns(connection, "documents")
+    if "conversation_assignment_mode" not in columns:
+        return 0
+    cursor = connection.execute(
+        """
+        UPDATE documents
+        SET conversation_assignment_mode = ?
+        WHERE conversation_assignment_mode IS NULL
+          OR TRIM(conversation_assignment_mode) = ''
+        """,
+        (CONVERSATION_ASSIGNMENT_MODE_AUTO,),
+    )
+    return int(cursor.rowcount or 0)
+
+
 def backfill_custodian(connection: sqlite3.Connection) -> int:
     columns = table_columns(connection, "documents")
     required = {"custodian", "source_kind", "source_rel_path", "parent_document_id"}
@@ -726,11 +759,15 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "documents", "custodian TEXT")
     ensure_column(connection, "documents", "participants TEXT")
     ensure_column(connection, "documents", "control_number TEXT")
+    ensure_column(connection, "documents", "conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL")
+    ensure_column(connection, "documents", f"conversation_assignment_mode TEXT NOT NULL DEFAULT '{CONVERSATION_ASSIGNMENT_MODE_AUTO}'")
     ensure_column(connection, "documents", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     ensure_column(connection, "documents", "parent_document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE")
+    ensure_column(connection, "documents", "child_document_kind TEXT")
     ensure_column(connection, "documents", "source_kind TEXT")
     ensure_column(connection, "documents", "source_rel_path TEXT")
     ensure_column(connection, "documents", "source_item_id TEXT")
+    ensure_column(connection, "documents", "root_message_key TEXT")
     ensure_column(connection, "documents", "source_folder_path TEXT")
     ensure_column(connection, "documents", "production_id INTEGER REFERENCES productions(id) ON DELETE SET NULL")
     ensure_column(connection, "documents", "begin_bates TEXT")
@@ -745,6 +782,14 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "documents", "active_text_source_kind TEXT")
     ensure_column(connection, "documents", "active_text_language TEXT")
     ensure_column(connection, "documents", "active_text_quality_score REAL")
+    ensure_column(connection, "document_email_threading", "message_id TEXT")
+    ensure_column(connection, "document_email_threading", "in_reply_to TEXT")
+    ensure_column(connection, "document_email_threading", "references_json TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(connection, "document_email_threading", "conversation_index TEXT")
+    ensure_column(connection, "document_email_threading", "conversation_topic TEXT")
+    ensure_column(connection, "document_email_threading", "normalized_subject TEXT")
+    ensure_column(connection, "document_email_threading", "updated_at TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "document_previews", "target_fragment TEXT")
     ensure_column(connection, "job_versions", "capability TEXT NOT NULL DEFAULT ''")
     ensure_column(connection, "run_items", "result_id INTEGER REFERENCES results(id) ON DELETE SET NULL")
     ensure_column(connection, "run_items", "page_number INTEGER")
@@ -798,10 +843,14 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
                 "UPDATE job_versions SET capability = ? WHERE id = ?",
                 (capability, int(row["id"])),
             )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_conversation_id ON documents(conversation_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_conversation_assignment_mode ON documents(conversation_assignment_mode)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_parent_document_id ON documents(parent_document_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_child_document_kind ON documents(child_document_kind)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_dataset_id ON documents(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_kind ON documents(source_kind)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_rel_path ON documents(source_rel_path)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_root_message_key ON documents(root_message_key)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_production_id ON documents(production_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_begin_bates ON documents(begin_bates)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_end_bates ON documents(end_bates)")
@@ -811,6 +860,14 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_sources_dataset_id ON dataset_sources(dataset_id)")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_sources_locator_unique ON dataset_sources(source_kind, source_locator)")
+    connection.execute("DROP INDEX IF EXISTS idx_conversations_source_kind_key")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_source_locator_key_unique
+        ON conversations(source_kind, source_locator, conversation_key)
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_conversations_source_locator ON conversations(source_locator)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_documents_document_id ON dataset_documents(document_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_documents_dataset_id ON dataset_documents(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_documents_source_id ON dataset_documents(dataset_source_id)")
@@ -824,6 +881,16 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     connection.execute("CREATE INDEX IF NOT EXISTS idx_productions_dataset_id ON productions(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_container_sources_dataset_id ON container_sources(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_container_sources_source_kind ON container_sources(source_kind)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_email_threading_message_id ON document_email_threading(message_id)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_email_threading_conversation_index ON document_email_threading(conversation_index)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_email_threading_conversation_topic ON document_email_threading(conversation_topic)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_email_threading_normalized_subject ON document_email_threading(normalized_subject)"
+    )
     connection.execute("DROP INDEX IF EXISTS idx_documents_display_sort")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_control_number_unique ON documents(control_number)")
     connection.execute(
@@ -918,6 +985,8 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     )
     merged_legacy_locks = merge_legacy_field_locks(connection)
     backfilled_content_type = backfill_content_type(connection)
+    backfilled_child_document_kinds = backfill_child_document_kinds(connection)
+    backfilled_conversation_assignment_modes = backfill_conversation_assignment_modes(connection)
     backfilled_source_kinds = backfill_source_kinds(connection)
     dataset_membership_migration_needed = prior_schema_version is None or prior_schema_version < 12
     backfilled_dataset_ids = backfill_dataset_ids(connection, root) if dataset_membership_migration_needed else 0
@@ -930,6 +999,8 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     return {
         "schema_version": SCHEMA_VERSION,
         "backfilled_content_type": backfilled_content_type,
+        "backfilled_child_document_kinds": backfilled_child_document_kinds,
+        "backfilled_conversation_assignment_modes": backfilled_conversation_assignment_modes,
         "backfilled_custodian": backfilled_custodian,
         "backfilled_dataset_ids": backfilled_dataset_ids,
         "backfilled_dataset_memberships": backfilled_dataset_memberships,

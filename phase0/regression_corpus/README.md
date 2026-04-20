@@ -18,6 +18,20 @@ This directory contains Phase 0 sample files used by [runtime_probe.py](/Users/s
 - `sample_utf8.mbox`: UTF-8 MBOX sample with two messages
 - `sample_invalid.msg`: intentionally invalid Outlook MSG fixture for failure-path testing
 
+## Conversation Coverage
+
+Not every multi-document conversation case is stored as a static fixture in this directory.
+
+The current conversation and preview regressions generate their own tiny synthetic inputs inside
+`tests/test_retriever_tools.py`, including:
+
+- loose email chains with `Message-ID` / `In-Reply-To` linkage
+- extracted Slack export roots with `users.json`, `channels.json`, per-day channel files, and cross-day reply threads
+- PST email and PST chat-like items
+- `export-previews` outputs under `.retriever/exports/`
+
+That keeps the repo corpus small while still exercising cross-document grouping and preview behavior.
+
 ## Current Gap
 
 This corpus does not yet include a valid positive-path `.msg` sample.
@@ -28,3 +42,8 @@ That means:
 - successful `.msg` extraction is still unverified
 
 Add a real `.msg` sample before calling MSG support fully validated.
+
+Additional conversation-fixture gaps still open:
+
+- one malformed or incomplete Slack export fixture stored on disk
+- one ZIP-wrapped Slack export fixture stored on disk

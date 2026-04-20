@@ -8,6 +8,7 @@ FRAGMENT_FILENAMES = [
     "00_header.py",
     "10_core.py",
     "20_extractors.py",
+    "25_slack_export.py",
     "30_productions.py",
     "40_schema_runtime.py",
     "45_processing_core.py",
