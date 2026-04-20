@@ -217,6 +217,25 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
         connection.execute("BEGIN")
         try:
             parent_link_updates = update_production_family_relationships(connection, production_id)
+            attachment_preview_updates = 0
+            preview_document_rows = connection.execute(
+                """
+                SELECT DISTINCT documents.id
+                FROM documents
+                JOIN document_previews ON document_previews.document_id = documents.id
+                WHERE documents.production_id = ?
+                  AND documents.lifecycle_status != 'deleted'
+                  AND document_previews.preview_type = 'html'
+                ORDER BY documents.id ASC
+                """,
+                (production_id,),
+            ).fetchall()
+            for preview_document_row in preview_document_rows:
+                attachment_preview_updates += sync_document_attachment_preview_links(
+                    connection,
+                    paths,
+                    int(preview_document_row["id"]),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -234,6 +253,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
             ).fetchall()
         )
         stats["parent_link_updates"] = parent_link_updates
+        stats["attachment_preview_updates"] = attachment_preview_updates
 
         return {
             "status": "ok",
@@ -614,9 +634,19 @@ def value_from_type(field_type: str, value: str | None) -> object:
 def resolve_field_definition(connection: sqlite3.Connection, field_name: str) -> dict[str, str]:
     field_name = FIELD_NAME_ALIASES.get(field_name, field_name)
     if field_name in BUILTIN_FIELD_TYPES:
-        return {"field_name": field_name, "field_type": BUILTIN_FIELD_TYPES[field_name], "source": "builtin"}
+        return {
+            "field_name": field_name,
+            "field_type": BUILTIN_FIELD_TYPES[field_name],
+            "source": "builtin",
+            "displayable": "true",
+        }
     if field_name in VIRTUAL_FILTER_FIELD_TYPES:
-        return {"field_name": field_name, "field_type": VIRTUAL_FILTER_FIELD_TYPES[field_name], "source": "virtual"}
+        return {
+            "field_name": field_name,
+            "field_type": VIRTUAL_FILTER_FIELD_TYPES[field_name],
+            "source": "virtual",
+            "displayable": "true" if field_name in DISPLAYABLE_VIRTUAL_FIELDS else "false",
+        }
 
     row = connection.execute(
         """
@@ -628,13 +658,23 @@ def resolve_field_definition(connection: sqlite3.Connection, field_name: str) ->
     ).fetchone()
     columns = table_columns(connection, "documents")
     if row is not None and row["field_name"] in columns:
-        return {"field_name": row["field_name"], "field_type": row["field_type"], "source": "custom"}
+        return {
+            "field_name": row["field_name"],
+            "field_type": row["field_type"],
+            "source": "custom",
+            "displayable": "true",
+        }
     if field_name in columns:
         sqlite_type = next(
             (info["type"] for info in table_info(connection, "documents") if info["name"] == field_name),
             "",
         )
-        return {"field_name": field_name, "field_type": infer_registry_field_type(sqlite_type), "source": "column"}
+        return {
+            "field_name": field_name,
+            "field_type": infer_registry_field_type(sqlite_type),
+            "source": "column",
+            "displayable": "true",
+        }
     raise RetrieverError(f"Unknown field: {field_name}")
 
 
@@ -795,6 +835,28 @@ def delete_dataset(
         connection.close()
 
 
+def rename_dataset(root: Path, old_name: str, new_name: str) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        dataset_row = resolve_dataset_row(connection, dataset_name=old_name)
+        connection.execute("BEGIN")
+        try:
+            renamed_summary = rename_dataset_row(connection, int(dataset_row["id"]), new_name)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "dataset": renamed_summary,
+        }
+    finally:
+        connection.close()
+
+
 def list_runs(root: Path) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -829,19 +891,12 @@ def create_run(
     job_version_id: int | None = None,
     raw_job_name: str | None = None,
     job_version_number: int | None = None,
-    dataset_ids: list[int] | None = None,
     dataset_names: list[str] | None = None,
-    document_ids: list[int] | None = None,
-    control_numbers: list[str] | None = None,
-    query: str | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
     raw_filters: list[list[str]] | None = None,
     from_run_id: int | None = None,
-    exclude_dataset_ids: list[int] | None = None,
-    exclude_dataset_names: list[str] | None = None,
-    exclude_document_ids: list[int] | None = None,
-    exclude_control_numbers: list[str] | None = None,
-    exclude_query: str | None = None,
-    exclude_filters: list[list[str]] | None = None,
+    select_from_scope: bool = False,
     family_mode: str = "exact",
     seed_limit: int | None = None,
 ) -> dict[str, object]:
@@ -854,32 +909,24 @@ def create_run(
     if seed_limit is not None and seed_limit < 1:
         raise RetrieverError("Run limit must be >= 1.")
 
-    selector = normalize_run_selector_spec(
-        dataset_ids=dataset_ids,
-        dataset_names=dataset_names,
-        document_ids=document_ids,
-        control_numbers=control_numbers,
-        query=query,
-        raw_filters=raw_filters,
-        from_run_id=from_run_id,
-    )
-    exclude_selector = normalize_run_selector_spec(
-        dataset_ids=exclude_dataset_ids,
-        dataset_names=exclude_dataset_names,
-        document_ids=exclude_document_ids,
-        control_numbers=exclude_control_numbers,
-        query=exclude_query,
-        raw_filters=exclude_filters,
-        from_run_id=None,
-    )
-    if not selector_has_inputs(selector):
-        raise RetrieverError("Run selector must include at least one inclusion input.")
-
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        selector = build_effective_scope_selector(
+            connection,
+            paths,
+            query=query,
+            raw_bates=raw_bates,
+            raw_filters=raw_filters,
+            dataset_names=dataset_names,
+            from_run_id=from_run_id,
+            select_from_scope=select_from_scope,
+        )
+        if not scope_run_selector_has_inputs(selector):
+            raise RetrieverError("Run selector must include at least one inclusion input.")
+        preferred_from_run_id = preferred_scope_selector_from_run_id(selector)
         job_version_row = require_job_version_row(
             connection,
             job_version_id=job_version_id,
@@ -891,13 +938,12 @@ def create_run(
             (job_version_row["job_id"],),
         ).fetchone()
         assert job_row is not None
-        snapshot_rows = plan_run_snapshot_rows(
+        snapshot_rows = plan_scope_run_snapshot_rows(
             connection,
             root=root,
             job_row=job_row,
             job_version_row=job_version_row,
             selector=selector,
-            exclude_selector=exclude_selector,
             family_mode=normalized_family_mode,
             seed_limit=seed_limit,
         )
@@ -907,10 +953,10 @@ def create_run(
                 connection,
                 job_version_id=int(job_version_row["id"]),
                 selector=selector,
-                exclude_selector=exclude_selector,
+                exclude_selector={},
                 family_mode=normalized_family_mode,
                 seed_limit=seed_limit,
-                from_run_id=from_run_id,
+                from_run_id=preferred_from_run_id,
                 status="planned",
             )
             replace_run_snapshot_documents(
@@ -1026,6 +1072,9 @@ def claim_run_items(
     claimed_by: str,
     limit: int = DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE,
     stale_after_seconds: int = DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+    launch_mode: str = "inline",
+    worker_task_id: str | None = None,
+    max_batches: int | None = None,
 ) -> dict[str, object]:
     if limit < 1:
         raise RetrieverError("Claim limit must be >= 1.")
@@ -1037,6 +1086,14 @@ def claim_run_items(
         connection.execute("BEGIN IMMEDIATE")
         try:
             materialize_run_items_for_run(connection, paths, root, run_id)
+            ensure_run_worker_row(
+                connection,
+                run_id=run_id,
+                claimed_by=claimed_by,
+                launch_mode=launch_mode,
+                worker_task_id=worker_task_id,
+                max_batches=max_batches,
+            )
             reused_count = reuse_active_results_for_run(connection, run_id)
             claimed_rows = claim_run_item_rows(
                 connection,
@@ -1045,6 +1102,14 @@ def claim_run_items(
                 limit=limit,
                 stale_after_seconds=stale_after_seconds,
             )
+            if claimed_rows:
+                update_run_worker_row(
+                    connection,
+                    run_id=run_id,
+                    claimed_by=normalize_whitespace(claimed_by),
+                    heartbeat=True,
+                    increment_batches_prepared=True,
+                )
             refresh_run_progress(connection, run_id)
             payload = {
                 "status": "ok",
@@ -1052,6 +1117,107 @@ def claim_run_items(
                 "claimed_by": normalize_whitespace(claimed_by),
                 "reused_count": reused_count,
                 "run_items": [run_item_row_to_payload(row) for row in claimed_rows],
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def prepare_run_batch(
+    root: Path,
+    *,
+    run_id: int,
+    claimed_by: str,
+    limit: int | None = None,
+    stale_after_seconds: int = DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+    launch_mode: str = "inline",
+    worker_task_id: str | None = None,
+    max_batches: int | None = None,
+) -> dict[str, object]:
+    if limit is not None and limit < 1:
+        raise RetrieverError("Claim limit must be >= 1.")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            materialize_run_items_for_run(connection, paths, root, run_id)
+            ensure_run_worker_row(
+                connection,
+                run_id=run_id,
+                claimed_by=claimed_by,
+                launch_mode=launch_mode,
+                worker_task_id=worker_task_id,
+                max_batches=max_batches,
+            )
+            reused_count = reuse_active_results_for_run(connection, run_id)
+            initial_run_payload = run_status_by_id(connection, run_id)
+            initial_worker_payload = build_run_worker_payload(
+                connection,
+                run_id,
+                run_payload=initial_run_payload,
+                claimed_by=claimed_by,
+            )
+            effective_limit = limit if limit is not None else int(initial_worker_payload["recommended_batch_size"])
+            claimed_rows: list[sqlite3.Row] = []
+            batch_payloads: list[dict[str, object]] = []
+
+            if initial_worker_payload["next_action"] == "claim":
+                claimed_rows = claim_run_item_rows(
+                    connection,
+                    run_id=run_id,
+                    claimed_by=claimed_by,
+                    limit=effective_limit,
+                    stale_after_seconds=stale_after_seconds,
+                )
+                batch_payloads = [
+                    {
+                        "run_item": run_item_row_to_payload(row),
+                        "context": build_run_item_context_payload(connection, paths, root, row),
+                    }
+                    for row in claimed_rows
+                ]
+                if batch_payloads:
+                    update_run_worker_row(
+                        connection,
+                        run_id=run_id,
+                        claimed_by=normalize_whitespace(claimed_by),
+                        heartbeat=True,
+                        increment_batches_prepared=True,
+                    )
+
+            current_run_payload = run_status_by_id(connection, run_id)
+            worker_payload = build_run_worker_payload(
+                connection,
+                run_id,
+                run_payload=current_run_payload,
+                claimed_by=claimed_by,
+            )
+            if batch_payloads:
+                worker_payload["next_action"] = "process_batch"
+                worker_payload["stop_reason"] = None
+            elif worker_payload["next_action"] == "claim":
+                worker_payload["next_action"] = "stop"
+                worker_payload["stop_reason"] = "no_claimable_items"
+            worker_payload["prepared_batch_size"] = len(batch_payloads)
+
+            payload = {
+                "status": "ok",
+                "run": current_run_payload,
+                "worker": worker_payload,
+                "claimed_by": normalize_whitespace(claimed_by),
+                "requested_limit": effective_limit,
+                "reused_count": reused_count,
+                "batch": batch_payloads,
+                "worker_record": run_worker_row_to_payload(
+                    find_run_worker_row(connection, run_id=run_id, claimed_by=normalize_whitespace(claimed_by))
+                ),
             }
             connection.commit()
         except Exception:
@@ -1140,16 +1306,36 @@ def complete_run_item(
                     else None
                 )
                 ocr_page_output_payload = None
+                image_description_page_output_payload = None
                 if str(run_item_row["item_kind"] or "") == "page":
-                    existing_page_output_row = find_ocr_page_output_row(connection, run_item_id=run_item_id)
-                    if existing_page_output_row is not None:
-                        ocr_page_output_payload = ocr_page_output_row_to_payload(existing_page_output_row)
+                    run_row = require_run_row_by_id(connection, int(run_item_row["run_id"]))
+                    job_version_row = require_job_version_row_by_id(connection, int(run_row["job_version_id"]))
+                    job_row = connection.execute(
+                        "SELECT * FROM jobs WHERE id = ?",
+                        (job_version_row["job_id"],),
+                    ).fetchone()
+                    assert job_row is not None
+                    page_job_kind = normalize_job_kind(str(job_row["job_kind"]))
+                    if page_job_kind == "ocr":
+                        existing_page_output_row = find_ocr_page_output_row(connection, run_item_id=run_item_id)
+                        if existing_page_output_row is not None:
+                            ocr_page_output_payload = ocr_page_output_row_to_payload(existing_page_output_row)
+                    elif page_job_kind == "image_description":
+                        existing_page_output_row = find_image_description_page_output_row(
+                            connection,
+                            run_item_id=run_item_id,
+                        )
+                        if existing_page_output_row is not None:
+                            image_description_page_output_payload = image_description_page_output_row_to_payload(
+                                existing_page_output_row
+                            )
                 payload = {
                     "status": "ok",
                     "idempotent": True,
                     "run_item": run_item_row_to_payload(run_item_row),
                     "result": result_payload,
                     "ocr_page_output": ocr_page_output_payload,
+                    "image_description_page_output": image_description_page_output_payload,
                     "run": run_status_by_id(connection, int(run_item_row["run_id"])),
                 }
                 connection.commit()
@@ -1216,29 +1402,52 @@ def complete_run_item(
             )
 
             created_text_revision_id = None
-            if job_kind == "ocr" and str(run_item_row["item_kind"] or "") == "page":
+            if job_kind in {"ocr", "image_description"} and str(run_item_row["item_kind"] or "") == "page":
                 resolved_page_text = page_text if page_text is not None else None
                 if resolved_page_text is None:
                     normalized_candidate = normalized_output if isinstance(normalized_output, str) else None
                     raw_candidate = raw_output if isinstance(raw_output, str) else None
                     resolved_page_text = normalized_candidate or raw_candidate
                 if resolved_page_text is None:
-                    raise RetrieverError("OCR page completion requires --page-text or a raw/normalized string payload.")
+                    raise RetrieverError(
+                        "Page completion requires --page-text or a raw/normalized string payload."
+                    )
                 page_raw_output = raw_output if raw_output is not None else {"page_text": resolved_page_text}
                 page_normalized_output = (
                     normalized_output if normalized_output is not None else {"page_text": resolved_page_text}
                 )
-                ocr_page_output_id, _ = upsert_ocr_page_output_row(
-                    connection,
-                    run_item_id=run_item_id,
-                    run_id=int(run_item_row["run_id"]),
-                    document_id=int(run_item_row["document_id"]),
-                    page_number=int(run_item_row["page_number"] or 0),
-                    text_content=str(resolved_page_text),
-                    raw_output=page_raw_output,
-                    normalized_output=page_normalized_output,
-                    provider_metadata=provider_metadata,
-                )
+                page_output_payload_key = "ocr_page_output"
+                if job_kind == "ocr":
+                    upsert_ocr_page_output_row(
+                        connection,
+                        run_item_id=run_item_id,
+                        run_id=int(run_item_row["run_id"]),
+                        document_id=int(run_item_row["document_id"]),
+                        page_number=int(run_item_row["page_number"] or 0),
+                        text_content=str(resolved_page_text),
+                        raw_output=page_raw_output,
+                        normalized_output=page_normalized_output,
+                        provider_metadata=provider_metadata,
+                    )
+                    page_output_payload = ocr_page_output_row_to_payload(
+                        find_ocr_page_output_row(connection, run_item_id=run_item_id)  # type: ignore[arg-type]
+                    )
+                else:
+                    page_output_payload_key = "image_description_page_output"
+                    upsert_image_description_page_output_row(
+                        connection,
+                        run_item_id=run_item_id,
+                        run_id=int(run_item_row["run_id"]),
+                        document_id=int(run_item_row["document_id"]),
+                        page_number=int(run_item_row["page_number"] or 0),
+                        text_content=str(resolved_page_text),
+                        raw_output=page_raw_output,
+                        normalized_output=page_normalized_output,
+                        provider_metadata=provider_metadata,
+                    )
+                    page_output_payload = image_description_page_output_row_to_payload(
+                        find_image_description_page_output_row(connection, run_item_id=run_item_id)  # type: ignore[arg-type]
+                    )
                 create_attempt_row(
                     connection,
                     run_item_id=run_item_id,
@@ -1263,15 +1472,20 @@ def complete_run_item(
                     completed_at=completion_time,
                     increment_attempt_count=True,
                 )
+                update_run_worker_row(
+                    connection,
+                    run_id=int(run_item_row["run_id"]),
+                    claimed_by=normalized_claimed_by,
+                    heartbeat=True,
+                    increment_items_completed=1,
+                )
                 payload = {
                     "status": "ok",
                     "idempotent": False,
                     "run_item": run_item_row_to_payload(require_run_item_row_by_id(connection, run_item_id)),
-                    "ocr_page_output": ocr_page_output_row_to_payload(
-                        find_ocr_page_output_row(connection, run_item_id=run_item_id)  # type: ignore[arg-type]
-                    ),
                     "run": run_status_by_id(connection, int(run_item_row["run_id"])),
                 }
+                payload[page_output_payload_key] = page_output_payload
                 connection.commit()
                 return payload
             if created_text_revision_payload:
@@ -1362,6 +1576,13 @@ def complete_run_item(
                 last_heartbeat_at=completion_time,
                 completed_at=completion_time,
                 increment_attempt_count=True,
+            )
+            update_run_worker_row(
+                connection,
+                run_id=int(run_item_row["run_id"]),
+                claimed_by=normalized_claimed_by,
+                heartbeat=True,
+                increment_items_completed=1,
             )
             payload = {
                 "status": "ok",
@@ -1454,6 +1675,14 @@ def fail_run_item(
                 completed_at=completion_time,
                 increment_attempt_count=True,
             )
+            update_run_worker_row(
+                connection,
+                run_id=int(run_item_row["run_id"]),
+                claimed_by=normalized_claimed_by,
+                heartbeat=True,
+                increment_items_failed=1,
+                last_error=normalized_error,
+            )
             payload = {
                 "status": "ok",
                 "idempotent": False,
@@ -1483,7 +1712,7 @@ def run_status(root: Path, *, run_id: int) -> dict[str, object]:
         connection.close()
 
 
-def cancel_run(root: Path, *, run_id: int) -> dict[str, object]:
+def cancel_run(root: Path, *, run_id: int, force: bool = False) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -1505,10 +1734,86 @@ def cancel_run(root: Path, *, run_id: int) -> dict[str, object]:
                 (canceled_at, run_id),
             )
             skipped_count = cancel_pending_run_items(connection, run_id=run_id)
+            force_stop_task_ids = request_run_worker_cancellation(connection, run_id=run_id, force=force)
             payload = {
                 "status": "ok",
                 "idempotent": already_canceled,
                 "canceled_pending_items": skipped_count,
+                "force_stop_requested": force,
+                "force_stop_task_ids": force_stop_task_ids,
+                "run": run_status_by_id(connection, run_id),
+            }
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def finish_run_worker(
+    root: Path,
+    *,
+    run_id: int,
+    claimed_by: str,
+    worker_status: str,
+    summary_json: str | None = None,
+    error_summary: str | None = None,
+) -> dict[str, object]:
+    normalized_claimed_by = normalize_whitespace(claimed_by)
+    if not normalized_claimed_by:
+        raise RetrieverError("claimed_by cannot be empty.")
+    normalized_status = normalize_run_worker_status(worker_status)
+    if normalized_status == "active":
+        raise RetrieverError("finish-run-worker requires a terminal worker status, not 'active'.")
+    summary_payload = decode_json_text(summary_json, default={}) if summary_json is not None else {}
+    if summary_json is not None and not isinstance(summary_payload, dict):
+        raise RetrieverError("summary_json must decode to a JSON object.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            run_row = require_run_row_by_id(connection, run_id)
+            worker_row = find_run_worker_row(connection, run_id=run_id, claimed_by=normalized_claimed_by)
+            if worker_row is None:
+                raise RetrieverError(
+                    f"Run {run_id} does not have a registered worker for claimed_by={normalized_claimed_by!r}."
+                )
+            if str(run_row["status"] or "") != "canceled" and normalized_status == "canceled":
+                raise RetrieverError("Worker cannot be finished as canceled unless the run itself is canceled.")
+
+            already_terminal = (
+                str(worker_row["status"] or "") == normalized_status and worker_row["completed_at"] is not None
+            )
+            if already_terminal:
+                payload = {
+                    "status": "ok",
+                    "idempotent": True,
+                    "worker": run_worker_row_to_payload(worker_row),
+                    "run": run_status_by_id(connection, run_id),
+                }
+                connection.commit()
+                return payload
+
+            updated_row = update_run_worker_row(
+                connection,
+                run_id=run_id,
+                claimed_by=normalized_claimed_by,
+                status=normalized_status,
+                last_error=(normalize_whitespace(error_summary) if error_summary is not None else "") or None,
+                summary=summary_payload if isinstance(summary_payload, dict) else {},
+                completed_at=utc_now(),
+            )
+            assert updated_row is not None
+            payload = {
+                "status": "ok",
+                "idempotent": False,
+                "worker": run_worker_row_to_payload(updated_row),
                 "run": run_status_by_id(connection, run_id),
             }
             connection.commit()
@@ -1530,6 +1835,25 @@ def finalize_ocr_run(root: Path, *, run_id: int) -> dict[str, object]:
         try:
             materialize_run_items_for_run(connection, paths, root, run_id)
             payload = finalize_ocr_results_for_run(connection, paths, run_id=run_id)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return payload
+    finally:
+        connection.close()
+
+
+def finalize_image_description_run(root: Path, *, run_id: int) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        connection.execute("BEGIN")
+        try:
+            materialize_run_items_for_run(connection, paths, root, run_id)
+            payload = finalize_image_description_results_for_run(connection, paths, run_id=run_id)
             connection.commit()
         except Exception:
             connection.rollback()

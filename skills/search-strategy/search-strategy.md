@@ -4,83 +4,101 @@
 
 - Use full-text search when the user supplies keywords or phrases.
 - Use browse mode when the user primarily filters by metadata or custom fields.
-- Build filters with repeatable `--filter <field> <op> <value>` clauses.
-- Use the canonical `search` CLI flags `--sort`, `--order`, `--page`, and `--per-page` for sorting and paging.
+- Retriever now exposes two complementary search surfaces:
+  - stateless CLI `search ...`
+  - persistent slash commands `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, and `/columns`
+- A scope is a conjunctive selector over document fields. In the current implementation it may include a keyword slot, a Bates slot, a SQL-like filter slot, a dataset slot, and a `from_run_id` slot.
+- Build metadata constraints with repeatable SQL-like `--filter "<expression>"` clauses. Repeated `--filter` flags AND-compose.
+- The filter grammar applies to Retriever's logical document field set, not only raw table columns. Supported names include built-in fields, registered custom fields, and schema-defined virtual fields such as `production_name`, `is_attachment`, and `has_attachments`.
+- Use the canonical stateless `search` CLI flags `--sort`, `--order`, `--page`, `--per-page`, and `--columns` for sorting, paging, and display control.
 - Map "show N" style requests to `--page 1 --per-page N`; do not invent `--limit`.
 - Use canonical built-in field names such as `date_created`, not ad hoc variants like `created_date`.
 
-Supported MVP operators:
+Supported SQL-like filter operators:
 
-- `eq`
-- `neq`
-- `gt`
-- `gte`
-- `lt`
-- `lte`
-- `contains`
-- `is-null`
-- `not-null`
+- `=`
+- `<>`
+- `!=`
+- `<`
+- `<=`
+- `>`
+- `>=`
+- `LIKE`
+- `IS NULL`
+- `IS NOT NULL`
+- `IN (...)`
+- `BETWEEN ... AND ...`
+
+Boolean composition:
+
+- `AND`
+- `OR`
+- `NOT`
+- parentheses
 
 Virtual attachment-family filters:
 
-- `is_attachment eq true` to show only child attachment documents
-- `has_attachments eq true` to show documents that currently have one or more child attachments
-- `production_name contains <text>` to filter production-derived documents by production name
+- `is_attachment = 1` to show only child attachment documents
+- `has_attachments = 1` to show documents that currently have one or more child attachments
+- `production_name LIKE '%Acme%'` to filter production-derived documents by production name
 
 Production-aware query behavior:
 
 - A single Bates/control token such as `SR000123` should prefer Bates-aware lookup over plain keyword FTS.
 - A normalized Bates range such as `SR000123-SR000150` should return all logical documents whose Bates spans overlap that range.
 - Bates range matching must use normalized prefix + numeric parsing, not raw lexicographic string comparison.
+- Slash commands may store Bates state in a dedicated scope slot via `/bates` or `/search <bates>`.
 
 ## OUTPUT FORMAT (mandatory)
 
-Unless the user explicitly asks for a different layout, every search result set MUST use the standard table format below.
+Unless the user explicitly asks for a different layout, every search result set MUST use a table driven by the active display column set.
 This is mandatory for all result types: keyword searches, filtered browses, ranked requests ("show 10 largest"), and any other document listing.
+Always show the active search header immediately before the table:
 
-### Standard columns — exact order
+```
+Scope: keyword='...', filter=..., dataset=...
+Sort: date_created desc
+Page: 1 of 3  (docs 1-20 of 55)
+```
 
-| Type | Title | Author | Datetime (UTC) | Control Number |
-|------|-------|--------|----------------|----------------|
+### Default columns
 
-- `Type` = the document's `content_type`
-- `Title` = **always a clickable link** using the document title; fall back to subject, then file name
-- `Author` = the document's `author` field; show `—` when null
-- `Datetime (UTC)` = best available datetime, preferring `date_created` → `date_modified` → `updated_at`
-- `Control Number` = always the rightmost column when available
+When no display override is present, use this default column set and order:
 
-### Smart column adjustments
+| content_type | title | author | date_created | control_number |
+|--------------|-------|--------|--------------|----------------|
 
-The standard columns are the default, but apply common sense to make the table informative:
+- `title` is **always a clickable link** and should fall back to subject, then file name when the stored title is null
+- `control_number` should remain rightmost in the default set
+- `/columns ...` or `search --columns ...` may replace the default set entirely
 
-- **Empty-column rule**: if a column is null/empty for ALL rows in the result page, replace it with the best available alternative rather than showing a column of `—` dashes. The replacement must occupy the same position in the column order.
-  - `Author` all null → replace with `Participants` if populated; if both are empty, drop the column entirely
-  - `Type` all identical → may be omitted (same as the single-value filter rule)
-  - `Datetime (UTC)` all null → drop the column
-- **Extra columns**: you may add request-relevant columns (e.g. Size for "largest" queries) after Datetime (UTC) and before Control Number
-- **Single-value filter rule**: if the active filters constrain one field to a single value across every shown row, you may omit only that one redundant column
-- Do not add columns that duplicate information already in the standard set
+### Column rules
 
-The goal is: every visible column should carry meaningful, varying information for the result set being displayed.
+- The active display column set is the source of truth. Do not silently swap in a different field just because it looks nicer.
+- `title`, when present, is always the clickable cell. Do not create a separate link column.
+- `control_number`, when present, should be rendered as its own column rather than folded into the title.
+- Boolean display columns such as `is_attachment` should render as `Yes` or `No`.
+- Virtual fields that are marked filter-only, such as `has_attachments`, must not be offered as display columns.
+- If the user asks for a different column set, honor it directly via `/columns ...` or `--columns ...`.
 
 ### Correct examples
 
-Mixed result set with authors:
+Default-column result set:
 ```
-| Type | Title | Author | Datetime (UTC) | Control Number |
-|------|-------|--------|----------------|----------------|
+| content_type | title | author | date_created | control_number |
+|--------------|-------|--------|--------------|----------------|
 | Email | [Re: Q4 Budget Review](computer:///path/to/.retriever/previews/file.html) | John Smith | 2024-03-15 09:22 | DOC001.00000042 |
 | Email | [FW: Contract Draft](computer:///path/to/.retriever/previews/file2.html) | Jane Doe | 2024-03-16 11:05 | DOC001.00000043 |
 
 Documents 1–10 of 85. Ask for the next page to see more.
 ```
 
-Slack chat results where Author is null but Participants is populated:
+User-chosen display columns:
 ```
-| Type | Title | Participants | Datetime (UTC) | Control Number |
-|------|-------|--------------|----------------|----------------|
-| Chat | [#general - Dec 16, 2022](computer:///path/to/.retriever/previews/general/2022-12-16.json.html) | Sergey Demyanov, Udit Sood | 2022-12-17 00:03 | DOC003.00000003 |
-| Chat | [#general - Dec 17, 2022](computer:///path/to/.retriever/previews/general/2022-12-17.json.html) | Max, Artur Chakhvadze | 2022-12-17 16:16 | DOC003.00000004 |
+| title | participants | control_number |
+|-------|--------------|----------------|
+| [#general - Dec 16, 2022](computer:///path/to/.retriever/previews/general/2022-12-16.json.html) | Sergey Demyanov, Udit Sood | DOC003.00000003 |
+| [#general - Dec 17, 2022](computer:///path/to/.retriever/previews/general/2022-12-17.json.html) | Max, Artur Chakhvadze | DOC003.00000004 |
 
 Documents 1–10 of 231. Ask for the next page to see more.
 ```
@@ -88,8 +106,7 @@ Documents 1–10 of 231. Ask for the next page to see more.
 ### NEVER do any of these
 
 - NEVER add a separate "Link", "View", "Preview", or "Open" column — the Title cell IS the link
-- NEVER show a column of all `—` dashes when a better alternative field is available
-- NEVER reorder the standard column positions (Type is always first, Control Number always last)
+- NEVER ignore an explicit `/columns` or `--columns` choice and silently render a different field set
 - NEVER show results without a paging summary line
 - NEVER show a bare unlinked title when a preview or native path is available
 - NEVER put a row number `#` column — it is not part of the standard format
@@ -97,19 +114,17 @@ Documents 1–10 of 231. Ask for the next page to see more.
 
 ### Post-search checklist — verify before responding
 
-1. Columns follow the standard order: Type | Title | Author-or-substitute | Datetime (UTC) | Control Number
-2. No column is all `—` or all empty — if it is, replace or drop it per the smart column rules
-3. Every Title cell is a clickable `[text](computer://...)` link
-4. Paging summary is present: "Documents X–Y of Z"
-5. If a filter constrains one field to a single value across all rows, that one column may be omitted
-6. Any extra columns go after Datetime (UTC) and before Control Number
-7. Attachment children use `↳` prefix and are indented below their parent row
+1. Columns match the active display preference or explicit `--columns` override
+2. Every `title` cell is a clickable `[text](computer://...)` link
+3. Paging summary is present: "Documents X–Y of Z"
+4. `control_number`, when present, remains its own column
+5. Attachment children use `↳` prefix and are indented below their parent row
 
 ### Additional rules
 
 - For production-derived documents, keep the produced Bates/control number in the Control Number column rather than replacing it with a generated `DOC...` value
-- For ranked browse requests, keep the standard columns and describe the sort key/order in the heading or summary
-- You may add request-relevant extra columns only when they materially improve the requested view; extra columns go after Datetime (UTC) and before Control Number
+- For ranked browse requests, keep the active display columns and describe the sort key/order in the heading or summary
+- You may suggest a different column set when it materially improves the requested view, but only change it when the user asks or when a persisted display preference already exists
 - Keep the primary document column clickable for every row
 
 Whenever you show files, documents, or attachment children, render each shown item as a clickable link that opens in the preview pane. Do not show a bare document name when a preview/open target is available.
@@ -150,7 +165,9 @@ When the user asks to inspect fields or columns:
 ## Sorting
 
 - Keyword query + no explicit sort: `relevance asc`
-- Filter-only browse + no explicit sort: `updated_at desc`
+- Bates lookup + no explicit sort: `bates asc`
+- Filter-only browse + no explicit sort: `date_created desc`
+- Browse ordering pushes null `date_created` values to the end of the list
 - `relevance` is only valid when query text is present.
 - Validate explicit sort fields against built-in or registered custom fields.
 - Break equal primary sort values by `id asc` so page boundaries stay stable.

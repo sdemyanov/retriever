@@ -129,13 +129,34 @@ def build_virtual_filter_clause(
 
 
 def build_search_filters(
-    connection: sqlite3.Connection, raw_filters: list[list[str]] | None
+    connection: sqlite3.Connection, raw_filters: object | None
+) -> tuple[list[object], list[str], list[object]]:
+    if uses_legacy_tuple_filters(raw_filters):
+        return build_legacy_search_filters(connection, raw_filters)  # type: ignore[arg-type]
+    return build_sql_like_search_filters(connection, raw_filters)
+
+
+def uses_legacy_tuple_filters(raw_filters: object | None) -> bool:
+    if not isinstance(raw_filters, list) or not raw_filters:
+        return False
+    legacy_operators = {"eq", "neq", "gt", "gte", "lt", "lte", "contains", "is-null", "not-null"}
+    saw_item = False
+    for item in raw_filters:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            return False
+        operator = normalize_inline_whitespace(str(item[1] or "")).lower()
+        if operator not in legacy_operators:
+            return False
+        saw_item = True
+    return saw_item
+
+
+def build_legacy_search_filters(
+    connection: sqlite3.Connection,
+    raw_filters: list[list[str]] | None,
 ) -> tuple[list[dict[str, object]], list[str], list[object]]:
     parsed_filters = parse_filter_args(raw_filters)
-    clauses = [
-        "d.lifecycle_status NOT IN ('missing', 'deleted')",
-        "EXISTS (SELECT 1 FROM dataset_documents dd WHERE dd.document_id = d.id)",
-    ]
+    clauses = base_document_search_clauses()
     params: list[object] = []
     normalized_filters: list[dict[str, object]] = []
     for raw_filter in parsed_filters:
@@ -157,6 +178,536 @@ def build_search_filters(
             }
         )
     return normalized_filters, clauses, params
+
+
+def base_document_search_clauses() -> list[str]:
+    return [
+        "d.lifecycle_status NOT IN ('missing', 'deleted')",
+        "EXISTS (SELECT 1 FROM dataset_documents dd WHERE dd.document_id = d.id)",
+    ]
+
+
+def known_logical_field_names(connection: sqlite3.Connection) -> list[str]:
+    names = set(BUILTIN_FIELD_TYPES) | set(VIRTUAL_FILTER_FIELD_TYPES)
+    if table_exists(connection, "custom_fields_registry"):
+        registry_rows = connection.execute(
+            """
+            SELECT field_name
+            FROM custom_fields_registry
+            ORDER BY field_name ASC
+            """
+        ).fetchall()
+        document_columns = table_columns(connection, "documents")
+        for row in registry_rows:
+            field_name = str(row["field_name"])
+            if field_name in document_columns:
+                names.add(field_name)
+    return sorted(names)
+
+
+def field_name_suggestions(connection: sqlite3.Connection, field_name: str) -> list[str]:
+    candidates = known_logical_field_names(connection)
+    return difflib.get_close_matches(field_name, candidates, n=3, cutoff=0.45)
+
+
+def sql_filter_operator_names_for_field_type(field_type: str) -> list[str]:
+    if field_type == "boolean":
+        return ["=", "!=", "IS NULL", "IS NOT NULL"]
+    operators = ["=", "!=", "<", "<=", ">", ">=", "IS NULL", "IS NOT NULL", "IN", "BETWEEN"]
+    if field_type in {"text", "date"}:
+        operators.insert(6, "LIKE")
+    return operators
+
+
+def filter_error_excerpt(expression: str, position: int) -> tuple[str, str]:
+    start = max(0, position - 60)
+    end = min(len(expression), position + 60)
+    excerpt = expression[start:end]
+    caret = " " * max(0, position - start) + "^"
+    return excerpt, caret
+
+
+def raise_filter_syntax_error(expression: str, position: int, message: str) -> None:
+    excerpt, caret = filter_error_excerpt(expression, position)
+    raise RetrieverError(f"{message} at position {position + 1}.\n{excerpt}\n{caret}")
+
+
+def tokenize_sql_filter_expression(expression: str) -> list[dict[str, object]]:
+    if len(expression.encode("utf-8")) > MAX_FILTER_EXPRESSION_LENGTH:
+        raise RetrieverError(
+            f"Filter expressions are capped at {MAX_FILTER_EXPRESSION_LENGTH} bytes."
+        )
+    tokens: list[dict[str, object]] = []
+    index = 0
+    length = len(expression)
+    keywords = {"AND", "BETWEEN", "FALSE", "IN", "IS", "LIKE", "NOT", "NULL", "OR", "TRUE"}
+
+    while index < length:
+        char = expression[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char in "(),":
+            token_kind = {"(": "lparen", ")": "rparen", ",": "comma"}[char]
+            tokens.append({"kind": token_kind, "value": char, "start": index, "end": index + 1})
+            index += 1
+            continue
+        if expression.startswith("<=", index) or expression.startswith(">=", index) or expression.startswith("!=", index) or expression.startswith("<>", index):
+            tokens.append({"kind": "operator", "value": expression[index:index + 2], "start": index, "end": index + 2})
+            index += 2
+            continue
+        if char in "=<>":
+            tokens.append({"kind": "operator", "value": char, "start": index, "end": index + 1})
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            start = index
+            index += 1
+            value_chars: list[str] = []
+            while index < length:
+                current = expression[index]
+                if current == "\\" and index + 1 < length:
+                    value_chars.append(expression[index + 1])
+                    index += 2
+                    continue
+                if current == quote:
+                    if index + 1 < length and expression[index + 1] == quote:
+                        value_chars.append(quote)
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                value_chars.append(current)
+                index += 1
+            else:
+                raise_filter_syntax_error(expression, start, "Unterminated string literal")
+            tokens.append(
+                {
+                    "kind": "literal",
+                    "literal_kind": "string",
+                    "value": "".join(value_chars),
+                    "start": start,
+                    "end": index,
+                }
+            )
+            continue
+        if char in "+-" and index + 1 < length and expression[index + 1].isdigit():
+            start = index
+            index += 1
+            while index < length and expression[index].isdigit():
+                index += 1
+            if index < length and expression[index] == ".":
+                index += 1
+                while index < length and expression[index].isdigit():
+                    index += 1
+            tokens.append(
+                {
+                    "kind": "literal",
+                    "literal_kind": "number",
+                    "value": expression[start:index],
+                    "start": start,
+                    "end": index,
+                }
+            )
+            continue
+        if char.isdigit():
+            start = index
+            while index < length and expression[index].isdigit():
+                index += 1
+            if index < length and expression[index] == ".":
+                index += 1
+                while index < length and expression[index].isdigit():
+                    index += 1
+            tokens.append(
+                {
+                    "kind": "literal",
+                    "literal_kind": "number",
+                    "value": expression[start:index],
+                    "start": start,
+                    "end": index,
+                }
+            )
+            continue
+        if char.isalpha() or char == "_":
+            start = index
+            index += 1
+            while index < length and (expression[index].isalnum() or expression[index] == "_"):
+                index += 1
+            raw_value = expression[start:index]
+            upper_value = raw_value.upper()
+            if upper_value in keywords:
+                if upper_value in {"TRUE", "FALSE"}:
+                    tokens.append(
+                        {
+                            "kind": "literal",
+                            "literal_kind": "boolean",
+                            "value": upper_value == "TRUE",
+                            "start": start,
+                            "end": index,
+                        }
+                    )
+                elif upper_value == "NULL":
+                    tokens.append(
+                        {
+                            "kind": "literal",
+                            "literal_kind": "null",
+                            "value": None,
+                            "start": start,
+                            "end": index,
+                        }
+                    )
+                else:
+                    tokens.append({"kind": "keyword", "value": upper_value, "start": start, "end": index})
+            else:
+                tokens.append({"kind": "identifier", "value": raw_value, "start": start, "end": index})
+            continue
+        raise_filter_syntax_error(expression, index, f"Unexpected character {char!r}")
+
+    tokens.append({"kind": "eof", "value": "", "start": length, "end": length})
+    return tokens
+
+
+def peek_filter_token(state: dict[str, object]) -> dict[str, object]:
+    tokens = state["tokens"]
+    index = int(state["index"])
+    return tokens[index]  # type: ignore[index]
+
+
+def consume_filter_token(state: dict[str, object]) -> dict[str, object]:
+    token = peek_filter_token(state)
+    state["index"] = int(state["index"]) + 1
+    return token
+
+
+def match_filter_keyword(state: dict[str, object], keyword: str) -> bool:
+    token = peek_filter_token(state)
+    if token["kind"] == "keyword" and token["value"] == keyword:
+        consume_filter_token(state)
+        return True
+    return False
+
+
+def match_filter_token_kind(state: dict[str, object], kind: str, value: str | None = None) -> dict[str, object] | None:
+    token = peek_filter_token(state)
+    if token["kind"] != kind:
+        return None
+    if value is not None and token["value"] != value:
+        return None
+    consume_filter_token(state)
+    return token
+
+
+def expect_filter_token(state: dict[str, object], kind: str, message: str, value: str | None = None) -> dict[str, object]:
+    token = match_filter_token_kind(state, kind, value=value)
+    if token is not None:
+        return token
+    next_token = peek_filter_token(state)
+    raise_filter_syntax_error(str(state["expression"]), int(next_token["start"]), message)
+
+
+def resolve_sql_filter_field(connection: sqlite3.Connection, raw_field_name: str) -> dict[str, object]:
+    try:
+        return resolve_field_definition(connection, raw_field_name)
+    except RetrieverError as exc:
+        suggestions = field_name_suggestions(connection, raw_field_name)
+        suggestion_text = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise RetrieverError(f"Unknown field '{raw_field_name}'.{suggestion_text}") from exc
+
+
+def literal_text_value(literal: dict[str, object]) -> str | None:
+    literal_kind = literal["literal_kind"]
+    if literal_kind == "null":
+        return None
+    if literal_kind == "boolean":
+        return "true" if bool(literal["value"]) else "false"
+    return str(literal["value"])
+
+
+def coerce_sql_literal(field_type: str, literal: dict[str, object]) -> object:
+    raw_value = literal_text_value(literal)
+    if raw_value is None:
+        raise RetrieverError("NULL is only valid with IS NULL / IS NOT NULL.")
+    if literal["literal_kind"] == "boolean" and field_type not in {"boolean", "text"}:
+        raise RetrieverError(f"Expected {field_type} value, got boolean literal.")
+    if literal["literal_kind"] == "number" and field_type == "boolean":
+        return value_from_type("boolean", raw_value)
+    if field_type == "date":
+        normalized = normalize_date_field_value(raw_value)
+        if normalized is None:
+            raise RetrieverError(f"Expected ISO date value, got {raw_value!r}")
+        return normalized
+    if field_type in {"integer", "real", "boolean"}:
+        return value_from_type(field_type, raw_value)
+    return raw_value
+
+
+def ensure_sql_filter_operator_supported(field_def: dict[str, object], operator: str) -> None:
+    supported = sql_filter_operator_names_for_field_type(str(field_def["field_type"]))
+    if operator not in supported:
+        field_name = str(field_def["field_name"])
+        field_type = str(field_def["field_type"])
+        raise RetrieverError(
+            f"Field '{field_name}' is {field_type}; supported operators: {', '.join(supported)}."
+        )
+
+
+def build_scalar_sql_filter_clause(
+    sql_expression: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+) -> tuple[str, list[object]]:
+    ensure_sql_filter_operator_supported(field_def, operator)
+    field_type = str(field_def["field_type"])
+    if operator in {"IS NULL", "IS NOT NULL"}:
+        return f"{sql_expression} {operator}", []
+
+    if operator == "LIKE":
+        if field_type not in {"text", "date"}:
+            ensure_sql_filter_operator_supported(field_def, operator)
+        assert isinstance(operand, dict)
+        return f"COALESCE({sql_expression}, '') LIKE ?", [str(coerce_sql_literal("text", operand))]
+
+    if operator == "IN":
+        if not isinstance(operand, list) or not operand:
+            raise RetrieverError("IN requires at least one value.")
+        if len(operand) > MAX_FILTER_IN_LIST_ITEMS:
+            raise RetrieverError(f"IN (...) is capped at {MAX_FILTER_IN_LIST_ITEMS} values.")
+        typed_values = [coerce_sql_literal(field_type, literal) for literal in operand]
+        placeholders = ", ".join("?" for _ in typed_values)
+        return f"{sql_expression} IN ({placeholders})", typed_values
+
+    if operator == "BETWEEN":
+        if not isinstance(operand, tuple) or len(operand) != 2:
+            raise RetrieverError("BETWEEN requires two values.")
+        left_value = coerce_sql_literal(field_type, operand[0])
+        right_value = coerce_sql_literal(field_type, operand[1])
+        return f"{sql_expression} BETWEEN ? AND ?", [left_value, right_value]
+
+    assert isinstance(operand, dict)
+    comparator = "!=" if operator == "<>" else operator
+    return f"{sql_expression} {comparator} ?", [coerce_sql_literal(field_type, operand)]
+
+
+def build_dataset_name_sql_filter_clause(
+    alias: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+) -> tuple[str, list[object]]:
+    ensure_sql_filter_operator_supported(field_def, operator)
+    exists_sql = (
+        "SELECT 1 "
+        "FROM dataset_documents dd "
+        "JOIN datasets ds ON ds.id = dd.dataset_id "
+        f"WHERE dd.document_id = {alias}.id"
+    )
+    if operator == "IS NULL":
+        return f"NOT EXISTS ({exists_sql})", []
+    if operator == "IS NOT NULL":
+        return f"EXISTS ({exists_sql})", []
+    if operator == "IN":
+        assert isinstance(operand, list)
+        if len(operand) > MAX_FILTER_IN_LIST_ITEMS:
+            raise RetrieverError(f"IN (...) is capped at {MAX_FILTER_IN_LIST_ITEMS} values.")
+        values = [str(coerce_sql_literal("text", literal)) for literal in operand]
+        placeholders = ", ".join("?" for _ in values)
+        return f"EXISTS ({exists_sql} AND ds.dataset_name IN ({placeholders}))", values
+    if operator == "BETWEEN":
+        assert isinstance(operand, tuple)
+        values = [str(coerce_sql_literal("text", operand[0])), str(coerce_sql_literal("text", operand[1]))]
+        return f"EXISTS ({exists_sql} AND ds.dataset_name BETWEEN ? AND ?)", values
+    if operator == "LIKE":
+        assert isinstance(operand, dict)
+        value = str(coerce_sql_literal("text", operand))
+        return f"EXISTS ({exists_sql} AND COALESCE(ds.dataset_name, '') LIKE ?)", [value]
+    assert isinstance(operand, dict)
+    comparator = "!=" if operator == "<>" else operator
+    value = str(coerce_sql_literal("text", operand))
+    if comparator == "!=":
+        return f"NOT EXISTS ({exists_sql} AND COALESCE(ds.dataset_name, '') = ?)", [value]
+    return f"EXISTS ({exists_sql} AND COALESCE(ds.dataset_name, '') {comparator} ?)", [value]
+
+
+def virtual_field_sql_expression(alias: str, field_name: str) -> str:
+    if field_name == "production_name":
+        return (
+            "(SELECT p.production_name FROM productions p "
+            f"WHERE p.id = {alias}.production_id)"
+        )
+    if field_name == "is_attachment":
+        return f"(CASE WHEN {alias}.parent_document_id IS NOT NULL THEN 1 ELSE 0 END)"
+    if field_name == "has_attachments":
+        return (
+            "(CASE WHEN EXISTS ("
+            "SELECT 1 FROM documents child "
+            f"WHERE child.parent_document_id = {alias}.id "
+            "AND child.lifecycle_status NOT IN ('missing', 'deleted')"
+            ") THEN 1 ELSE 0 END)"
+        )
+    raise RetrieverError(f"Unknown virtual filter: {field_name}")
+
+
+def build_sql_filter_clause(
+    alias: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+) -> tuple[str, list[object]]:
+    field_name = str(field_def["field_name"])
+    if field_def.get("source") == "virtual":
+        if field_name == "dataset_name":
+            return build_dataset_name_sql_filter_clause(alias, field_def, operator, operand)
+        return build_scalar_sql_filter_clause(virtual_field_sql_expression(alias, field_name), field_def, operator, operand)
+    return build_scalar_sql_filter_clause(f"{alias}.{quote_identifier(field_name)}", field_def, operator, operand)
+
+
+def parse_sql_filter_literal(state: dict[str, object]) -> dict[str, object]:
+    token = peek_filter_token(state)
+    if token["kind"] != "literal":
+        raise_filter_syntax_error(str(state["expression"]), int(token["start"]), "Expected a literal value")
+    return consume_filter_token(state)
+
+
+def parse_sql_filter_predicate(state: dict[str, object]) -> tuple[str, list[object]]:
+    identifier = expect_filter_token(state, "identifier", "Expected a field name")
+    field_name = str(identifier["value"])
+    field_def = resolve_sql_filter_field(state["connection"], field_name)
+
+    if match_filter_keyword(state, "IS"):
+        operator = "IS NOT NULL" if match_filter_keyword(state, "NOT") else "IS NULL"
+        token = expect_filter_token(state, "literal", "Expected NULL after IS / IS NOT")
+        if token["literal_kind"] != "null":
+            raise_filter_syntax_error(str(state["expression"]), int(token["start"]), "Expected NULL after IS / IS NOT")
+        return build_sql_filter_clause("d", field_def, operator, None)
+
+    negated_operator = match_filter_keyword(state, "NOT")
+    if match_filter_keyword(state, "IN"):
+        expect_filter_token(state, "lparen", "Expected '(' after IN")
+        values: list[dict[str, object]] = []
+        while True:
+            values.append(parse_sql_filter_literal(state))
+            if match_filter_token_kind(state, "comma") is None:
+                break
+        expect_filter_token(state, "rparen", "Expected ')' to close IN list")
+        clause, params = build_sql_filter_clause("d", field_def, "IN", values)
+        return (f"NOT ({clause})", params) if negated_operator else (clause, params)
+
+    if match_filter_keyword(state, "BETWEEN"):
+        left_value = parse_sql_filter_literal(state)
+        if not match_filter_keyword(state, "AND"):
+            token = peek_filter_token(state)
+            raise_filter_syntax_error(str(state["expression"]), int(token["start"]), "Expected AND in BETWEEN expression")
+        right_value = parse_sql_filter_literal(state)
+        clause, params = build_sql_filter_clause("d", field_def, "BETWEEN", (left_value, right_value))
+        return (f"NOT ({clause})", params) if negated_operator else (clause, params)
+
+    if match_filter_keyword(state, "LIKE"):
+        value = parse_sql_filter_literal(state)
+        clause, params = build_sql_filter_clause("d", field_def, "LIKE", value)
+        return (f"NOT ({clause})", params) if negated_operator else (clause, params)
+
+    if negated_operator:
+        token = peek_filter_token(state)
+        raise_filter_syntax_error(str(state["expression"]), int(token["start"]), "Expected IN, BETWEEN, or LIKE after NOT")
+
+    operator_token = expect_filter_token(state, "operator", "Expected an operator after the field name")
+    value = parse_sql_filter_literal(state)
+    return build_sql_filter_clause("d", field_def, str(operator_token["value"]).upper(), value)
+
+
+def parse_sql_filter_primary(state: dict[str, object]) -> tuple[str, list[object]]:
+    if match_filter_token_kind(state, "lparen") is not None:
+        clause, params = parse_sql_filter_or_expression(state)
+        expect_filter_token(state, "rparen", "Expected ')' to close grouped expression")
+        return clause, params
+    return parse_sql_filter_predicate(state)
+
+
+def parse_sql_filter_not_expression(state: dict[str, object]) -> tuple[str, list[object]]:
+    if match_filter_keyword(state, "NOT"):
+        clause, params = parse_sql_filter_not_expression(state)
+        return f"NOT ({clause})", params
+    return parse_sql_filter_primary(state)
+
+
+def parse_sql_filter_and_expression(state: dict[str, object]) -> tuple[str, list[object]]:
+    clause, params = parse_sql_filter_not_expression(state)
+    while match_filter_keyword(state, "AND"):
+        right_clause, right_params = parse_sql_filter_not_expression(state)
+        clause = f"({clause}) AND ({right_clause})"
+        params.extend(right_params)
+    return clause, params
+
+
+def parse_sql_filter_or_expression(state: dict[str, object]) -> tuple[str, list[object]]:
+    clause, params = parse_sql_filter_and_expression(state)
+    while match_filter_keyword(state, "OR"):
+        right_clause, right_params = parse_sql_filter_and_expression(state)
+        clause = f"({clause}) OR ({right_clause})"
+        params.extend(right_params)
+    return clause, params
+
+
+def compile_sql_filter_expression(
+    connection: sqlite3.Connection,
+    expression: str,
+) -> tuple[str, list[object]]:
+    normalized_expression = expression.strip()
+    if not normalized_expression:
+        raise RetrieverError("Filter expression cannot be empty.")
+    state: dict[str, object] = {
+        "connection": connection,
+        "expression": normalized_expression,
+        "tokens": tokenize_sql_filter_expression(normalized_expression),
+        "index": 0,
+    }
+    clause, params = parse_sql_filter_or_expression(state)
+    trailing_token = peek_filter_token(state)
+    if trailing_token["kind"] != "eof":
+        raise_filter_syntax_error(
+            normalized_expression,
+            int(trailing_token["start"]),
+            "Unexpected token after complete expression",
+        )
+    return clause, params
+
+
+def normalize_sql_filter_expressions(raw_filters: object | None) -> list[str]:
+    if raw_filters is None:
+        return []
+    if isinstance(raw_filters, str):
+        return [raw_filters] if raw_filters.strip() else []
+    if not isinstance(raw_filters, list):
+        raise RetrieverError("Filters must be provided as strings or repeatable --filter arguments.")
+    expressions: list[str] = []
+    for item in raw_filters:
+        if isinstance(item, str):
+            if item.strip():
+                expressions.append(item)
+            continue
+        if isinstance(item, (list, tuple)):
+            expression = " ".join(str(part) for part in item if normalize_inline_whitespace(str(part or "")))
+            if expression:
+                expressions.append(expression)
+            continue
+        raise RetrieverError("Unsupported filter payload shape.")
+    return expressions
+
+
+def build_sql_like_search_filters(
+    connection: sqlite3.Connection,
+    raw_filters: object | None,
+) -> tuple[list[str], list[str], list[object]]:
+    expressions = normalize_sql_filter_expressions(raw_filters)
+    clauses = base_document_search_clauses()
+    params: list[object] = []
+    for expression in expressions:
+        clause, clause_params = compile_sql_filter_expression(connection, expression)
+        clauses.append(f"({clause})")
+        params.extend(clause_params)
+    return expressions, clauses, params
 
 
 def metadata_snippet(row: sqlite3.Row) -> str:
@@ -221,7 +772,7 @@ def document_path_payload(
     preview_target = default_preview_target(paths, row, connection)
     return {
         "rel_path": row["rel_path"],
-        "abs_path": str(paths["root"] / row["rel_path"]),
+        "abs_path": str(document_absolute_path(paths, row["rel_path"])),
         "preview_rel_path": preview_target["rel_path"],
         "preview_abs_path": preview_target["abs_path"],
         "preview_file_rel_path": preview_target["file_rel_path"],
@@ -457,6 +1008,8 @@ def compact_search_result_payload(item: dict[str, object]) -> dict[str, object]:
         compact["child_document_count"] = int(item["child_document_count"])
     if payload_has_meaningful_value(item.get("parent")):
         compact["parent"] = item["parent"]
+    if "display_values" in item:
+        compact["display_values"] = item["display_values"]
     return compact
 
 
@@ -487,7 +1040,7 @@ def compact_document_overview_payload(item: object) -> object:
 
 
 def compact_search_payload(payload: dict[str, object]) -> dict[str, object]:
-    return {
+    compact_payload = {
         "query": payload["query"],
         "filters": payload["filters"],
         "sort": payload["sort"],
@@ -498,6 +1051,15 @@ def compact_search_payload(payload: dict[str, object]) -> dict[str, object]:
         "total_pages": payload["total_pages"],
         "results": [compact_search_result_payload(item) for item in payload["results"]],
     }
+    if payload_has_meaningful_value(payload.get("scope")):
+        compact_payload["scope"] = payload["scope"]
+    if payload_has_meaningful_value(payload.get("header")):
+        compact_payload["header"] = payload["header"]
+    if payload_has_meaningful_value(payload.get("display")):
+        compact_payload["display"] = payload["display"]
+    if payload_has_meaningful_value(payload.get("warnings")):
+        compact_payload["warnings"] = payload["warnings"]
+    return compact_payload
 
 
 def compact_get_doc_payload(payload: dict[str, object]) -> dict[str, object]:
@@ -542,7 +1104,7 @@ def compact_search_chunk_result_payload(item: dict[str, object]) -> dict[str, ob
 def compact_search_chunks_payload(payload: dict[str, object]) -> dict[str, object]:
     if "results" not in payload:
         return payload
-    return {
+    compact_payload = {
         "query": payload["query"],
         "filters": payload["filters"],
         "sort": payload["sort"],
@@ -552,6 +1114,11 @@ def compact_search_chunks_payload(payload: dict[str, object]) -> dict[str, objec
         "total_matches": payload["total_matches"],
         "results": [compact_search_chunk_result_payload(item) for item in payload["results"]],
     }
+    if payload_has_meaningful_value(payload.get("scope")):
+        compact_payload["scope"] = payload["scope"]
+    if payload.get("selected_from_scope"):
+        compact_payload["selected_from_scope"] = True
+    return compact_payload
 
 
 def prepare_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> dict[str, object]:
@@ -715,11 +1282,7 @@ def build_chunk_citation_payload(
 
 
 def filter_operators_for_field_type(field_type: str) -> list[str]:
-    if field_type in {"integer", "real", "date"}:
-        return ["eq", "neq", "gt", "gte", "lt", "lte", "is-null", "not-null"]
-    if field_type == "boolean":
-        return ["eq", "neq", "is-null", "not-null"]
-    return ["eq", "neq", "contains", "is-null", "not-null"]
+    return sql_filter_operator_names_for_field_type(field_type)
 
 
 def catalog_description_for_field(field_name: str, *, source: str, instruction: object = None) -> str:
@@ -738,6 +1301,7 @@ def catalog_field_entry(
     *,
     source: str,
     instruction: object = None,
+    displayable: bool | None = None,
 ) -> dict[str, object]:
     return {
         "name": field_name,
@@ -746,6 +1310,7 @@ def catalog_field_entry(
         "filter_operators": filter_operators_for_field_type(field_type),
         "sortable": source != "virtual",
         "aggregatable": source != "virtual" or field_name in AGGREGATABLE_VIRTUAL_FIELDS,
+        "displayable": displayable if displayable is not None else (source != "virtual" or field_name in DISPLAYABLE_VIRTUAL_FIELDS),
         "date_granularities": ["year", "quarter", "month", "week"] if field_type == "date" else [],
     }
 
@@ -876,20 +1441,15 @@ def sort_search_results(
     query: str,
 ) -> list[dict[str, object]]:
     query_present = bool(query.strip())
-    normalized_order = (order or ("asc" if (sort_field or "relevance") == "relevance" and query_present else "desc")).lower()
     stable_results = sorted(results, key=lambda item: item["id"])
 
     if query_present and (sort_field is None or sort_field == "relevance"):
-        reverse = normalized_order == "desc"
-        return sorted(stable_results, key=lambda item: (item["rank"] is None, item["rank"]), reverse=reverse)
+        stable_results = stable_sort_results_by_field(stable_results, "date_created", "desc")
+        return sorted(stable_results, key=lambda item: (item["rank"] is None, item["rank"]))
 
-    field_name = sort_field or "updated_at"
-    reverse = normalized_order == "desc"
-    return sorted(
-        stable_results,
-        key=lambda item: coerce_sort_value(item["row"][field_name]),
-        reverse=reverse,
-    )
+    field_name = sort_field or "date_created"
+    normalized_order = (order or "desc").lower()
+    return stable_sort_results_by_field(stable_results, field_name, normalized_order)
 
 
 def resolve_document_search(
@@ -941,8 +1501,10 @@ def resolve_document_search(
     return {
         "query": query,
         "filters": filter_summary,
-        "sort": normalized_sort_field or ("bates" if is_bates_query and query.strip() else ("relevance" if query.strip() else "updated_at")),
+        "sort": normalized_sort_field or ("bates" if is_bates_query and query.strip() else ("relevance" if query.strip() else "date_created")),
         "order": (order or ("asc" if (is_bates_query or (query.strip() and (sort_field in (None, "relevance")))) else "desc")).lower(),
+        "sort_spec": f"{normalized_sort_field or ('bates' if is_bates_query and query.strip() else ('relevance' if query.strip() else 'date_created'))} "
+        f"{(order or ('asc' if (is_bates_query or (query.strip() and (sort_field in (None, 'relevance')))) else 'desc')).lower()}",
         "results": sorted_results,
     }
 
@@ -955,6 +1517,7 @@ def search(
     order: str | None,
     page: int,
     per_page: int,
+    raw_columns: str | None = None,
 ) -> dict[str, object]:
     if page < 1:
         raise RetrieverError("Page must be >= 1.")
@@ -968,6 +1531,13 @@ def search(
     try:
         apply_schema(connection, root)
         selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
+        derived_scope = derive_search_scope(query, raw_filters)
+        raw_column_list = parse_display_columns_argument(raw_columns) if raw_columns is not None else None
+        display_column_defs, display_warnings, _ = resolve_display_column_definitions(
+            connection,
+            raw_column_list,
+            drop_missing=False,
+        )
 
         results: list[dict[str, object]] = []
         for match in selection["results"]:
@@ -1075,20 +1645,36 @@ def search(
                 item["child_documents"] = child_documents
             else:
                 item["parent"] = parent_summaries.get(int(row["parent_document_id"]))
+            item["display_values"] = build_search_result_display_values(row, item, display_column_defs)
             item.pop("bates_sort_key", None)
             item.pop("row", None)
 
-        return {
+        payload = {
             "query": selection["query"],
             "filters": selection["filters"],
             "sort": selection["sort"],
             "order": selection["order"],
+            "sort_spec": selection["sort_spec"],
             "page": page,
             "per_page": per_page,
             "total_hits": total_hits,
             "total_pages": total_pages,
             "results": paged_results,
+            "scope": derived_scope,
+            "display": build_display_payload(display_column_defs, per_page),
+            "header": build_search_header_payload(derived_scope, {
+                "sort": selection["sort"],
+                "order": selection["order"],
+                "sort_spec": selection["sort_spec"],
+                "page": page,
+                "per_page": per_page,
+                "total_hits": total_hits,
+                "total_pages": total_pages,
+            }),
         }
+        if display_warnings:
+            payload["warnings"] = display_warnings
+        return payload
     finally:
         connection.close()
 
@@ -1101,8 +1687,1409 @@ def search_docs(
     order: str | None,
     page: int,
     per_page: int,
+    raw_columns: str | None = None,
 ) -> dict[str, object]:
-    return search(root, query, raw_filters, sort_field, order, page, per_page)
+    return search(root, query, raw_filters, sort_field, order, page, per_page, raw_columns)
+
+
+def format_scope_bates_value(bates_scope: object) -> str:
+    if not isinstance(bates_scope, dict):
+        return ""
+    begin = normalize_inline_whitespace(str(bates_scope.get("begin") or ""))
+    end = normalize_inline_whitespace(str(bates_scope.get("end") or ""))
+    if not begin or not end:
+        return ""
+    return begin if begin == end else f"{begin}-{end}"
+
+
+def truncate_scope_header_value(value: object, *, max_chars: int = 200) -> str:
+    normalized = normalize_inline_whitespace(str(value or ""))
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 1] + "…"
+
+
+def format_scope_header(scope: dict[str, object]) -> str:
+    parts: list[str] = []
+    if isinstance(scope.get("keyword"), str) and scope["keyword"].strip():
+        parts.append(f"keyword={scope['keyword']!r}")
+    bates_value = format_scope_bates_value(scope.get("bates"))
+    if bates_value:
+        parts.append(f"bates={bates_value}")
+    if isinstance(scope.get("filter"), str) and scope["filter"].strip():
+        parts.append(f"filter={truncate_scope_header_value(scope['filter'])}")
+    dataset_entries = coerce_scope_dataset_entries(scope.get("dataset"))
+    if dataset_entries:
+        dataset_names = ", ".join(entry["name"] for entry in dataset_entries)
+        parts.append(f"dataset={truncate_scope_header_value(dataset_names)}")
+    if scope.get("from_run_id") is not None:
+        parts.append(f"from_run_id={scope['from_run_id']}")
+    return "Scope: (none)" if not parts else "Scope: " + ", ".join(parts)
+
+
+def derive_search_scope(query: str, raw_filters: object | None) -> dict[str, object]:
+    scope: dict[str, object] = {}
+    bates_begin, bates_end = parse_bates_query(query)
+    if bates_begin is not None and bates_end is not None:
+        scope["bates"] = {"begin": bates_begin, "end": bates_end}
+    elif query.strip():
+        scope["keyword"] = query
+    if raw_filters:
+        if uses_legacy_tuple_filters(raw_filters):
+            parsed_filters = parse_filter_args(raw_filters)  # type: ignore[arg-type]
+            comparator_map = {
+                "eq": "=",
+                "neq": "!=",
+                "gt": ">",
+                "gte": ">=",
+                "lt": "<",
+                "lte": "<=",
+                "contains": "LIKE",
+                "is-null": "IS NULL",
+                "not-null": "IS NOT NULL",
+            }
+            rendered_parts: list[str] = []
+            for parsed_filter in parsed_filters:
+                operator = str(parsed_filter["operator"])
+                field_name = str(parsed_filter["field_name"])
+                value = parsed_filter["value"]
+                if operator in {"is-null", "not-null"}:
+                    rendered_parts.append(f"{field_name} {comparator_map[operator]}")
+                elif operator == "contains":
+                    rendered_parts.append(f"{field_name} LIKE '%{value}%'")
+                else:
+                    rendered_parts.append(f"{field_name} {comparator_map[operator]} {value!r}")
+            if rendered_parts:
+                scope["filter"] = " AND ".join(rendered_parts)
+        else:
+            expressions = normalize_sql_filter_expressions(raw_filters)
+            if expressions:
+                scope["filter"] = " AND ".join(f"({expression})" for expression in expressions)
+    return scope
+
+
+def build_search_header_payload(scope: dict[str, object], payload: dict[str, object]) -> dict[str, str]:
+    total_hits = int(payload.get("total_hits") or 0)
+    page = int(payload.get("page") or 1)
+    per_page = int(payload.get("per_page") or DEFAULT_PAGE_SIZE)
+    start_index = 0 if total_hits == 0 else ((page - 1) * per_page) + 1
+    end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
+    sort_summary = str(payload.get("sort_spec") or f"{payload.get('sort')} {payload.get('order')}")
+    return {
+        "scope": format_scope_header(scope),
+        "sort": f"Sort: {sort_summary}",
+        "page": f"Page: {page} of {payload.get('total_pages')}  (docs {start_index}-{end_index} of {total_hits})",
+    }
+
+
+def default_display_columns() -> list[str]:
+    return list(DEFAULT_DISPLAY_COLUMNS)
+
+
+def session_display_state(session_state: dict[str, object]) -> dict[str, object]:
+    display = session_state.get("display")
+    return display if isinstance(display, dict) else {}
+
+
+def displayable_field_names(connection: sqlite3.Connection) -> list[str]:
+    names: set[str] = set()
+    for field_name in known_logical_field_names(connection):
+        field_def = resolve_field_definition(connection, field_name)
+        if str(field_def.get("displayable") or "").lower() == "true":
+            names.add(str(field_def["field_name"]))
+    return sorted(names)
+
+
+def display_field_suggestions(connection: sqlite3.Connection, field_name: str) -> list[str]:
+    return difflib.get_close_matches(field_name, displayable_field_names(connection), n=3, cutoff=0.45)
+
+
+def displayable_field_examples(connection: sqlite3.Connection, *, limit: int = 12) -> str:
+    return ", ".join(displayable_field_names(connection)[:limit])
+
+
+def default_display_column_definitions(connection: sqlite3.Connection) -> list[dict[str, str]]:
+    definitions: list[dict[str, str]] = []
+    for column_name in default_display_columns():
+        field_def = resolve_field_definition(connection, column_name)
+        definitions.append(
+            {
+                "name": str(field_def["field_name"]),
+                "type": str(field_def["field_type"]),
+                "source": str(field_def["source"]),
+            }
+        )
+    return definitions
+
+
+def resolve_display_column_definitions(
+    connection: sqlite3.Connection,
+    raw_columns: object,
+    *,
+    drop_missing: bool,
+) -> tuple[list[dict[str, str]], list[str], bool]:
+    raw_values = raw_columns if isinstance(raw_columns, list) and raw_columns else default_display_columns()
+    warnings: list[str] = []
+    changed = False
+    resolved_columns: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    for raw_value in raw_values:
+        normalized_name = normalize_inline_whitespace(str(raw_value or ""))
+        if not normalized_name:
+            changed = True
+            continue
+        try:
+            field_def = resolve_field_definition(connection, normalized_name)
+        except RetrieverError as exc:
+            if drop_missing:
+                warnings.append(
+                    f"Column '{normalized_name}' no longer exists and has been removed from your display preferences."
+                )
+                changed = True
+                continue
+            suggestions = display_field_suggestions(connection, normalized_name)
+            suggestion_text = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise RetrieverError(f"Unknown column: {normalized_name}.{suggestion_text}") from exc
+        canonical_name = str(field_def["field_name"])
+        if str(field_def.get("displayable") or "").lower() != "true":
+            if drop_missing:
+                warnings.append(
+                    f"Column '{canonical_name}' is no longer displayable and has been removed from your display preferences."
+                )
+                changed = True
+                continue
+            raise RetrieverError(
+                f"Field '{canonical_name}' is filter-only and cannot be displayed. "
+                f"Displayable fields include: {displayable_field_examples(connection)}."
+            )
+        if canonical_name in seen_names:
+            changed = True
+            continue
+        if canonical_name != normalized_name:
+            changed = True
+        seen_names.add(canonical_name)
+        resolved_columns.append(
+            {
+                "name": canonical_name,
+                "type": str(field_def["field_type"]),
+                "source": str(field_def["source"]),
+            }
+        )
+    if not resolved_columns:
+        return default_display_column_definitions(connection), warnings, True
+    return resolved_columns, warnings, changed
+
+
+def display_column_names(column_defs: list[dict[str, str]]) -> list[str]:
+    return [column_def["name"] for column_def in column_defs]
+
+
+def build_display_payload(column_defs: list[dict[str, str]], page_size: int) -> dict[str, object]:
+    return {
+        "columns": display_column_names(column_defs),
+        "page_size": page_size,
+    }
+
+
+def persist_display_columns(
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+    column_defs: list[dict[str, str]],
+) -> dict[str, object]:
+    display_state = session_display_state(session_state)
+    column_names = display_column_names(column_defs)
+    if column_names == default_display_columns():
+        display_state.pop("columns", None)
+    else:
+        display_state["columns"] = column_names
+    session_state["display"] = coerce_display_payload(display_state)
+    return persist_session_state(paths, session_state)
+
+
+def resolve_session_display_columns(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+) -> tuple[list[dict[str, str]], list[str], dict[str, object]]:
+    configured_columns = session_display_state(session_state).get("columns")
+    column_defs, warnings, changed = resolve_display_column_definitions(
+        connection,
+        configured_columns,
+        drop_missing=True,
+    )
+    if changed:
+        session_state = persist_display_columns(paths, session_state, column_defs)
+    return column_defs, warnings, session_state
+
+
+def parse_display_columns_argument(raw_text: str) -> list[str]:
+    column_names = split_quoted_comma_values(raw_text)
+    if not column_names:
+        raise RetrieverError("Column list cannot be empty.")
+    return column_names
+
+
+def parse_page_size_value(raw_value: str) -> int:
+    try:
+        page_size = int(normalize_inline_whitespace(raw_value))
+    except ValueError as exc:
+        raise RetrieverError("Usage: /page-size <N>") from exc
+    if page_size < 1 or page_size > MAX_PAGE_SIZE:
+        raise RetrieverError(f"Page size must be between 1 and {MAX_PAGE_SIZE}.")
+    return page_size
+
+
+def best_result_title(row: sqlite3.Row) -> str | None:
+    for candidate in (row["title"], row["subject"], row["file_name"]):
+        normalized = normalize_inline_whitespace(str(candidate or ""))
+        if normalized:
+            return normalized
+    return None
+
+
+def search_result_display_value(
+    row: sqlite3.Row,
+    item: dict[str, object],
+    field_name: str,
+    field_type: str,
+) -> object:
+    if field_name == "title":
+        return best_result_title(row)
+    if field_name == "dataset_name":
+        dataset_names = item.get("dataset_names")
+        if isinstance(dataset_names, list):
+            normalized_names = [normalize_inline_whitespace(str(value)) for value in dataset_names if normalize_inline_whitespace(str(value))]
+            return ", ".join(normalized_names) or None
+        value = item.get("dataset_name")
+        return normalize_inline_whitespace(str(value)) or None
+    if field_name == "production_name":
+        value = item.get("production_name")
+        return normalize_inline_whitespace(str(value)) or None
+    if field_name == "is_attachment":
+        return "Yes" if row["parent_document_id"] is not None else "No"
+
+    if field_name in item and field_name not in {"metadata", "display_values"}:
+        value = item.get(field_name)
+    elif field_name in row.keys():
+        value = row[field_name]
+    else:
+        metadata = item.get("metadata")
+        value = metadata.get(field_name) if isinstance(metadata, dict) else None
+
+    if field_type == "boolean":
+        if value in (None, ""):
+            return None
+        return "Yes" if bool(value) else "No"
+    if isinstance(value, list):
+        normalized_values = [normalize_inline_whitespace(str(entry)) for entry in value if normalize_inline_whitespace(str(entry))]
+        return ", ".join(normalized_values) or None
+    if isinstance(value, str):
+        return value or None
+    return value
+
+
+def build_search_result_display_values(
+    row: sqlite3.Row,
+    item: dict[str, object],
+    column_defs: list[dict[str, str]],
+) -> dict[str, object]:
+    return {
+        column_def["name"]: search_result_display_value(row, item, column_def["name"], column_def["type"])
+        for column_def in column_defs
+    }
+
+
+def scope_dataset_name_suggestions(connection: sqlite3.Connection, dataset_name: str) -> list[str]:
+    dataset_names = [summary["dataset_name"] for summary in list_dataset_summaries(connection)]
+    return difflib.get_close_matches(normalize_inline_whitespace(dataset_name), dataset_names, n=3, cutoff=0.45)
+
+
+def resolve_scope_dataset_entries(
+    connection: sqlite3.Connection,
+    dataset_entries: object,
+) -> list[dict[str, object]]:
+    normalized_entries = coerce_scope_dataset_entries(dataset_entries)
+    if len(normalized_entries) > MAX_SCOPE_DATASETS:
+        raise RetrieverError(f"Scope datasets are capped at {MAX_SCOPE_DATASETS} entries.")
+    resolved_entries: list[dict[str, object]] = []
+    seen_ids: set[int] = set()
+    for entry in normalized_entries:
+        dataset_id = int(entry["id"])
+        row = get_dataset_row_by_id(connection, dataset_id)
+        if row is None:
+            raise RetrieverError(
+                f"Dataset id {dataset_id} ({entry['name']!r}) no longer exists. Clear with /dataset clear or replace with /dataset <other-name>."
+            )
+        if dataset_id in seen_ids:
+            continue
+        seen_ids.add(dataset_id)
+        resolved_entries.append({"id": dataset_id, "name": str(row["dataset_name"])})
+    return resolved_entries
+
+
+def resolve_scope_from_run_id(connection: sqlite3.Connection, from_run_id: object) -> int | None:
+    if from_run_id in (None, ""):
+        return None
+    try:
+        normalized_run_id = int(from_run_id)
+    except (TypeError, ValueError) as exc:
+        raise RetrieverError(f"Invalid run id: {from_run_id!r}") from exc
+    row = connection.execute("SELECT id FROM runs WHERE id = ?", (normalized_run_id,)).fetchone()
+    if row is None:
+        raise RetrieverError(
+            f"Run {normalized_run_id} referenced by scope.from_run_id no longer exists. Clear with /from-run clear."
+        )
+    return normalized_run_id
+
+
+def build_scope_search_filters(
+    connection: sqlite3.Connection,
+    raw_scope: object,
+) -> tuple[dict[str, object], list[str], list[object], list[object]]:
+    scope = coerce_scope_payload(raw_scope)
+    clauses = base_document_search_clauses()
+    params: list[object] = []
+    filter_summary: list[object] = []
+
+    filter_expression = normalize_inline_whitespace(str(scope.get("filter") or ""))
+    if filter_expression:
+        clause, clause_params = compile_sql_filter_expression(connection, filter_expression)
+        clauses.append(f"({clause})")
+        params.extend(clause_params)
+        filter_summary.append(filter_expression)
+
+    dataset_entries = resolve_scope_dataset_entries(connection, scope.get("dataset"))
+    if dataset_entries:
+        placeholders = ", ".join("?" for _ in dataset_entries)
+        clauses.append(
+            "EXISTS (SELECT 1 FROM dataset_documents dd_scope "
+            f"WHERE dd_scope.document_id = d.id AND dd_scope.dataset_id IN ({placeholders}))"
+        )
+        params.extend(int(entry["id"]) for entry in dataset_entries)
+        scope["dataset"] = dataset_entries
+
+    from_run_id = resolve_scope_from_run_id(connection, scope.get("from_run_id"))
+    if from_run_id is not None:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM run_snapshot_documents rsd "
+            "WHERE rsd.document_id = d.id AND rsd.run_id = ?)"
+        )
+        params.append(from_run_id)
+        scope["from_run_id"] = from_run_id
+
+    return scope, clauses, params, filter_summary
+
+
+def stable_sort_results_by_field(
+    results: list[dict[str, object]],
+    field_name: str,
+    order: str,
+) -> list[dict[str, object]]:
+    reverse = order.lower() == "desc"
+    field_type = BUILTIN_FIELD_TYPES.get(field_name)
+    non_null_items: list[tuple[object, dict[str, object]]] = []
+    null_items: list[dict[str, object]] = []
+    for item in results:
+        row = item["row"]
+        raw_value = row[field_name]
+        if raw_value is None:
+            null_items.append(item)
+            continue
+        normalized_value: object = raw_value
+        if field_type == "date":
+            parsed_value = parse_utc_timestamp(raw_value)
+            if parsed_value is None:
+                null_items.append(item)
+                continue
+            normalized_value = parsed_value
+        elif isinstance(raw_value, str):
+            normalized_value = raw_value.lower()
+        non_null_items.append((normalized_value, item))
+    non_null_items.sort(key=lambda pair: pair[0], reverse=reverse)
+    return [item for _, item in non_null_items] + null_items
+
+
+def coerce_sort_specs(raw_value: object) -> list[tuple[str, str]]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized_specs: list[tuple[str, str]] = []
+    for item in raw_value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        field_name = normalize_inline_whitespace(str(item[0] or ""))
+        direction = normalize_inline_whitespace(str(item[1] or "")).lower()
+        if not field_name or direction not in {"asc", "desc"}:
+            continue
+        normalized_specs.append((field_name, direction))
+    return normalized_specs
+
+
+def serialize_sort_specs(sort_specs: list[tuple[str, str]] | None) -> list[list[str]]:
+    if not sort_specs:
+        return []
+    return [[field_name, direction] for field_name, direction in sort_specs]
+
+
+def sort_specs_text(sort_specs: list[tuple[str, str]] | None) -> str | None:
+    if not sort_specs:
+        return None
+    return ", ".join(f"{field_name} {direction}" for field_name, direction in sort_specs)
+
+
+def resolve_sort_field_name(connection: sqlite3.Connection, raw_field_name: str) -> str:
+    field_def = resolve_field_definition(connection, raw_field_name)
+    if field_def.get("source") == "virtual":
+        raise RetrieverError(f"Cannot sort by virtual filter field: {raw_field_name}")
+    return str(field_def["field_name"])
+
+
+def parse_slash_sort_specs(connection: sqlite3.Connection, raw_text: str) -> list[tuple[str, str]]:
+    if not normalize_inline_whitespace(raw_text):
+        raise RetrieverError("Usage: /sort <column asc|desc[, column asc|desc...]>")
+    parts = split_quoted_comma_values(raw_text)
+    if not parts:
+        raise RetrieverError("Usage: /sort <column asc|desc[, column asc|desc...]>")
+    sort_specs: list[tuple[str, str]] = []
+    for part in parts:
+        tokens = shlex_split_slash_tail(part)
+        if len(tokens) != 2:
+            raise RetrieverError("Each sort entry must be exactly '<column> <asc|desc>'.")
+        field_name = resolve_sort_field_name(connection, tokens[0])
+        direction = normalize_inline_whitespace(tokens[1]).lower()
+        if direction not in {"asc", "desc"}:
+            raise RetrieverError("Sort direction must be 'asc' or 'desc'.")
+        sort_specs.append((field_name, direction))
+    return sort_specs
+
+
+def apply_sort_specs(
+    results: list[dict[str, object]],
+    sort_specs: list[tuple[str, str]] | None,
+) -> list[dict[str, object]]:
+    if not sort_specs:
+        return results
+    effective_specs = list(sort_specs)
+    if not any(field_name == "id" for field_name, _ in effective_specs):
+        effective_specs.append(("id", "asc"))
+    sorted_results = list(results)
+    for field_name, direction in reversed(effective_specs):
+        if field_name == "id":
+            sorted_results = sorted(
+                sorted_results,
+                key=lambda item: int(item["id"]),
+                reverse=direction == "desc",
+            )
+            continue
+        sorted_results = stable_sort_results_by_field(sorted_results, field_name, direction)
+    return sorted_results
+
+
+def resolve_scope_document_search(
+    connection: sqlite3.Connection,
+    raw_scope: object,
+    *,
+    sort_specs: list[tuple[str, str]] | None = None,
+) -> dict[str, object]:
+    scope, clauses, params, filter_summary = build_scope_search_filters(connection, raw_scope)
+    keyword_query = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    bates_scope = scope.get("bates")
+    bates_query = format_scope_bates_value(bates_scope)
+    bates_begin = normalize_inline_whitespace(str(bates_scope.get("begin") or "")) if isinstance(bates_scope, dict) else ""
+    bates_end = normalize_inline_whitespace(str(bates_scope.get("end") or "")) if isinstance(bates_scope, dict) else ""
+
+    bates_matches: dict[int, dict[str, object]] | None = None
+    keyword_matches: dict[int, dict[str, object]] | None = None
+    browse_matches: dict[int, dict[str, object]] | None = None
+
+    if bates_query:
+        bates_matches = search_bates(connection, bates_begin, bates_end, clauses, params)
+    if keyword_query:
+        keyword_matches = search_fts(connection, keyword_query, clauses, params)
+    if bates_matches is None and keyword_matches is None:
+        browse_matches = search_browse(connection, clauses, params)
+
+    if bates_matches is not None and keyword_matches is not None:
+        matches: dict[int, dict[str, object]] = {}
+        for document_id, bates_match in bates_matches.items():
+            keyword_match = keyword_matches.get(document_id)
+            if keyword_match is None:
+                continue
+            matches[document_id] = {
+                "row": bates_match["row"],
+                "rank": keyword_match.get("rank"),
+                "snippet": keyword_match.get("snippet") or bates_match["snippet"],
+                "bates_sort_key": bates_match.get("bates_sort_key"),
+            }
+    else:
+        matches = bates_matches or keyword_matches or browse_matches or {}
+
+    results = [
+        {
+            "id": document_id,
+            "rank": match["rank"],
+            "snippet": match["snippet"],
+            "bates_sort_key": match.get("bates_sort_key"),
+            "row": match["row"],
+        }
+        for document_id, match in matches.items()
+    ]
+    stable_results = sorted(results, key=lambda item: int(item["id"]))
+    if sort_specs:
+        sorted_results = apply_sort_specs(stable_results, sort_specs)
+        sort_name = sort_specs[0][0]
+        order_name = sort_specs[0][1]
+        sort_spec = sort_specs_text(sort_specs) or f"{sort_name} {order_name}"
+    elif bates_query:
+        sorted_results = sorted(
+            stable_results,
+            key=lambda item: item.get("bates_sort_key") or (1, "", 0, ""),
+        )
+        sort_name = "bates"
+        order_name = "asc"
+        sort_spec = "bates asc"
+    elif keyword_query:
+        sorted_results = stable_sort_results_by_field(stable_results, "date_created", "desc")
+        sorted_results = sorted(
+            sorted_results,
+            key=lambda item: (item["rank"] is None, item["rank"]),
+        )
+        sort_name = "relevance"
+        order_name = "asc"
+        sort_spec = "relevance asc"
+    else:
+        sorted_results = stable_sort_results_by_field(stable_results, "date_created", "desc")
+        sort_name = "date_created"
+        order_name = "desc"
+        sort_spec = "date_created desc"
+
+    query_label = keyword_query or bates_query or ""
+    return {
+        "scope": scope,
+        "query": query_label,
+        "filters": filter_summary,
+        "sort": sort_name,
+        "order": order_name,
+        "sort_spec": sort_spec,
+        "results": sorted_results,
+    }
+
+
+def search_with_scope(
+    root: Path,
+    raw_scope: object,
+    *,
+    page: int = 1,
+    per_page: int = DEFAULT_PAGE_SIZE,
+    offset: int | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
+    display_column_defs: list[dict[str, str]] | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, object]:
+    if page < 1:
+        raise RetrieverError("Page must be >= 1.")
+    if per_page < 1:
+        raise RetrieverError("per-page must be >= 1.")
+    per_page = min(per_page, MAX_PAGE_SIZE)
+    if offset is not None and offset < 0:
+        raise RetrieverError("Offset must be >= 0.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        selection = resolve_scope_document_search(connection, raw_scope, sort_specs=sort_specs)
+        effective_display_column_defs = display_column_defs or default_display_column_definitions(connection)
+
+        results: list[dict[str, object]] = []
+        for match in selection["results"]:
+            row = match["row"]
+            results.append(
+                {
+                    "id": int(match["id"]),
+                    "control_number": row["control_number"],
+                    "dataset_id": row["dataset_id"],
+                    "parent_document_id": row["parent_document_id"],
+                    "source_kind": row["source_kind"],
+                    "source_rel_path": row["source_rel_path"],
+                    "source_item_id": row["source_item_id"],
+                    "source_folder_path": row["source_folder_path"],
+                    "production_id": row["production_id"],
+                    **document_path_payload(paths, connection, row),
+                    "file_name": row["file_name"],
+                    "file_type": row["file_type"],
+                    "snippet": str(match["snippet"]),
+                    "rank": match["rank"],
+                    "bates_sort_key": match.get("bates_sort_key"),
+                    "metadata": {
+                        "author": row["author"],
+                        "begin_attachment": row["begin_attachment"],
+                        "begin_bates": row["begin_bates"],
+                        "content_type": row["content_type"],
+                        "custodian": row["custodian"],
+                        "dataset_id": row["dataset_id"],
+                        "date_created": row["date_created"],
+                        "date_modified": row["date_modified"],
+                        "end_attachment": row["end_attachment"],
+                        "end_bates": row["end_bates"],
+                        "page_count": row["page_count"],
+                        "participants": row["participants"],
+                        "recipients": row["recipients"],
+                        "source_kind": row["source_kind"],
+                        "source_rel_path": row["source_rel_path"],
+                        "source_item_id": row["source_item_id"],
+                        "source_folder_path": row["source_folder_path"],
+                        "subject": row["subject"],
+                        "title": row["title"],
+                        "updated_at": row["updated_at"],
+                    },
+                    "manual_field_locks": normalize_string_list(row[MANUAL_FIELD_LOCKS_COLUMN]),
+                    "row": row,
+                }
+            )
+
+        total_hits = len(results)
+        total_pages = max(1, (total_hits + per_page - 1) // per_page)
+        start = (page - 1) * per_page if offset is None else offset
+        if total_hits > 0 and start >= total_hits:
+            start = (total_pages - 1) * per_page
+        start = max(0, start)
+        page = (start // per_page) + 1
+        end = start + per_page
+        paged_results = results[start:end]
+        paged_rows = [item["row"] for item in paged_results]
+        production_names = fetch_production_names(connection, paged_rows)
+        dataset_memberships = fetch_document_dataset_memberships(connection, paged_rows)
+        attachment_summaries = fetch_attachment_summaries(
+            connection,
+            paths,
+            [int(row["id"]) for row in paged_rows if row["parent_document_id"] is None],
+        )
+        parent_summaries = fetch_parent_summaries(
+            connection,
+            [row for row in paged_rows if row["parent_document_id"] is not None],
+        )
+        for item in paged_results:
+            row = item["row"]
+            memberships = dataset_memberships.get(int(row["id"]), {"ids": [], "names": []})
+            dataset_ids = [int(dataset_id) for dataset_id in memberships["ids"]]
+            dataset_names = [str(dataset_name) for dataset_name in memberships["names"]]
+            item["dataset_ids"] = dataset_ids
+            item["dataset_names"] = dataset_names
+            item["metadata"]["dataset_ids"] = dataset_ids
+            item["metadata"]["dataset_names"] = dataset_names
+            if len(dataset_ids) == 1:
+                item["dataset_id"] = dataset_ids[0]
+                item["metadata"]["dataset_id"] = dataset_ids[0]
+            else:
+                item["dataset_id"] = None
+                item["metadata"]["dataset_id"] = None
+            if len(dataset_names) == 1:
+                item["dataset_name"] = dataset_names[0]
+                item["metadata"]["dataset_name"] = dataset_names[0]
+            if row["production_id"] is not None:
+                item["production_name"] = production_names.get(int(row["production_id"]))
+                item["metadata"]["production_name"] = production_names.get(int(row["production_id"]))
+            if row["parent_document_id"] is None:
+                attachments = attachment_summaries.get(int(row["id"]), [])
+                item["attachment_count"] = len(attachments)
+                item["attachments"] = attachments
+            else:
+                item["parent"] = parent_summaries.get(int(row["parent_document_id"]))
+            item["display_values"] = build_search_result_display_values(row, item, effective_display_column_defs)
+            item.pop("bates_sort_key", None)
+            item.pop("row", None)
+
+        payload = {
+            "query": selection["query"],
+            "filters": selection["filters"],
+            "sort": selection["sort"],
+            "order": selection["order"],
+            "sort_spec": selection["sort_spec"],
+            "page": page,
+            "per_page": per_page,
+            "offset": start,
+            "total_hits": total_hits,
+            "total_pages": total_pages,
+            "results": paged_results,
+            "scope": selection["scope"],
+            "display": build_display_payload(effective_display_column_defs, per_page),
+        }
+        payload["header"] = build_search_header_payload(selection["scope"], payload)
+        if warnings:
+            payload["warnings"] = warnings
+        return payload
+    finally:
+        connection.close()
+
+
+def session_page_size(session_state: dict[str, object]) -> int:
+    display = session_display_state(session_state)
+    if not display:
+        return DEFAULT_PAGE_SIZE
+    page_size = display.get("page_size")
+    if not isinstance(page_size, int) or page_size < 1:
+        return DEFAULT_PAGE_SIZE
+    return min(page_size, MAX_PAGE_SIZE)
+
+
+def session_browsing_state(session_state: dict[str, object]) -> dict[str, object]:
+    browsing = session_state.get("browsing")
+    return browsing if isinstance(browsing, dict) else {}
+
+
+def session_sort_specs(session_state: dict[str, object]) -> list[tuple[str, str]]:
+    return coerce_sort_specs(session_browsing_state(session_state).get("sort"))
+
+
+def clear_session_browsing(session_state: dict[str, object]) -> dict[str, object]:
+    session_state["browsing"] = {}
+    return session_state
+
+
+def persist_session_state(paths: dict[str, Path], session_state: dict[str, object]) -> dict[str, object]:
+    write_session_state(paths, session_state)
+    return read_session_state(paths)
+
+
+def persist_scope_to_session(
+    paths: dict[str, Path],
+    scope: dict[str, object],
+    *,
+    reset_browsing: bool = True,
+) -> dict[str, object]:
+    session_state = read_session_state(paths)
+    normalized_scope = coerce_scope_payload(scope)
+    if normalized_scope:
+        normalized_scope["set_at"] = utc_now()
+    session_state["scope"] = normalized_scope
+    if reset_browsing:
+        clear_session_browsing(session_state)
+    return persist_session_state(paths, session_state)
+
+
+def find_saved_scope_name(saved_scopes_state: dict[str, object], requested_name: str) -> str | None:
+    scopes = saved_scopes_state.get("scopes")
+    if not isinstance(scopes, dict):
+        return None
+    normalized_name = normalize_saved_scope_name(requested_name)
+    for existing_name in scopes:
+        if normalize_saved_scope_name(str(existing_name)) == normalized_name:
+            return str(existing_name)
+    return None
+
+
+def save_named_scope(
+    paths: dict[str, Path],
+    scope_name: str,
+    scope: dict[str, object],
+) -> dict[str, object]:
+    normalized_scope_name = normalize_inline_whitespace(scope_name)
+    if not normalized_scope_name:
+        raise RetrieverError("Saved scope name cannot be empty.")
+    saved_scopes_state = read_saved_scopes_state(paths)
+    scopes = saved_scopes_state.setdefault("scopes", {})
+    assert isinstance(scopes, dict)
+    existing_name = find_saved_scope_name(saved_scopes_state, normalized_scope_name)
+    if existing_name is None and len(scopes) >= MAX_SAVED_SCOPES:
+        raise RetrieverError(f"Saved scopes are capped at {MAX_SAVED_SCOPES} per workspace.")
+    if existing_name is not None and existing_name != normalized_scope_name:
+        scopes.pop(existing_name, None)
+    payload = coerce_scope_payload(scope)
+    payload.pop("set_at", None)
+    if payload:
+        payload["saved_at"] = utc_now()
+    scopes[normalized_scope_name] = payload
+    write_saved_scopes_state(paths, saved_scopes_state)
+    return {"status": "ok", "name": normalized_scope_name, "scope": payload}
+
+
+def parse_bates_scope_input(raw_value: str) -> dict[str, str]:
+    begin, end = parse_bates_query(raw_value)
+    if begin is None or end is None:
+        raise RetrieverError("Expected a Bates token or Bates range.")
+    begin_parsed = parse_bates_identifier(begin)
+    end_parsed = parse_bates_identifier(end)
+    if not bates_range_compatible(begin_parsed, end_parsed):
+        raise RetrieverError("Mixed-prefix Bates ranges are not supported; use two separate queries.")
+    return {"begin": begin, "end": end}
+
+
+def intersect_bates_scopes(current_bates: object, incoming_bates: dict[str, str]) -> dict[str, str]:
+    if not isinstance(current_bates, dict):
+        return incoming_bates
+    current_begin = parse_bates_identifier(current_bates.get("begin"))
+    current_end = parse_bates_identifier(current_bates.get("end"))
+    next_begin = parse_bates_identifier(incoming_bates.get("begin"))
+    next_end = parse_bates_identifier(incoming_bates.get("end"))
+    if not all((current_begin, current_end, next_begin, next_end)):
+        return incoming_bates
+    if not bates_range_compatible(current_begin, current_end) or not bates_range_compatible(next_begin, next_end):
+        return incoming_bates
+    if not bates_range_compatible(current_begin, next_begin):
+        raise RetrieverError("Cannot intersect Bates ranges from different series.")
+    overlap_begin = max(int(current_begin["number"]), int(next_begin["number"]))
+    overlap_end = min(int(current_end["number"]), int(next_end["number"]))
+    if overlap_begin > overlap_end:
+        raise RetrieverError("The requested Bates range does not overlap the current Bates scope.")
+    prefix = str(current_begin["prefix"])
+    width = int(current_begin["width"])
+    return {
+        "begin": f"{prefix}{overlap_begin:0{width}d}",
+        "end": f"{prefix}{overlap_end:0{width}d}",
+    }
+
+
+def refresh_dataset_name_refs_in_scope(scope: dict[str, object], dataset_id: int, dataset_name: str) -> dict[str, object]:
+    dataset_entries = coerce_scope_dataset_entries(scope.get("dataset"))
+    if not dataset_entries:
+        return scope
+    updated_entries: list[dict[str, object]] = []
+    for entry in dataset_entries:
+        if int(entry["id"]) == dataset_id:
+            updated_entries.append({"id": dataset_id, "name": dataset_name})
+        else:
+            updated_entries.append(entry)
+    scope["dataset"] = updated_entries
+    return scope
+
+
+def refresh_dataset_name_refs_in_saved_scopes(paths: dict[str, Path], dataset_id: int, dataset_name: str) -> None:
+    saved_scopes_state = read_saved_scopes_state(paths)
+    scopes = saved_scopes_state.get("scopes")
+    if not isinstance(scopes, dict):
+        return
+    changed = False
+    for scope_payload in scopes.values():
+        if not isinstance(scope_payload, dict):
+            continue
+        before = json.dumps(scope_payload, ensure_ascii=True, sort_keys=True)
+        refresh_dataset_name_refs_in_scope(scope_payload, dataset_id, dataset_name)
+        after = json.dumps(scope_payload, ensure_ascii=True, sort_keys=True)
+        if before != after:
+            changed = True
+    if changed:
+        write_saved_scopes_state(paths, saved_scopes_state)
+
+
+def split_quoted_comma_values(raw_text: str) -> list[str]:
+    values: list[str] = []
+    current: list[str] = []
+    quote_char: str | None = None
+    escaped = False
+    for char in raw_text:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote_char is not None:
+            if char == quote_char:
+                quote_char = None
+            else:
+                current.append(char)
+            continue
+        if char in {"'", '"'}:
+            quote_char = char
+            continue
+        if char == ",":
+            value = normalize_inline_whitespace("".join(current))
+            if value:
+                values.append(value)
+            current = []
+            continue
+        current.append(char)
+    if quote_char is not None:
+        raise RetrieverError("Unterminated quote in slash command.")
+    if escaped:
+        current.append("\\")
+    value = normalize_inline_whitespace("".join(current))
+    if value:
+        values.append(value)
+    return values
+
+
+def shlex_split_slash_tail(raw_tail: str) -> list[str]:
+    try:
+        return shlex.split(raw_tail, posix=True)
+    except ValueError as exc:
+        raise RetrieverError(f"Could not parse slash command arguments: {exc}") from exc
+
+
+def resolve_scope_dataset_selection(connection: sqlite3.Connection, raw_values: list[str]) -> list[dict[str, object]]:
+    if len(raw_values) > MAX_SCOPE_DATASETS:
+        raise RetrieverError(f"Scope datasets are capped at {MAX_SCOPE_DATASETS} entries.")
+    resolved_entries: list[dict[str, object]] = []
+    seen_ids: set[int] = set()
+    for raw_value in raw_values:
+        matches = find_dataset_rows_by_name(connection, raw_value)
+        if not matches:
+            suggestions = scope_dataset_name_suggestions(connection, raw_value)
+            suggestion_text = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise RetrieverError(f"Unknown dataset name: {raw_value}.{suggestion_text}")
+        row = matches[0]
+        dataset_id = int(row["id"])
+        if dataset_id in seen_ids:
+            continue
+        seen_ids.add(dataset_id)
+        resolved_entries.append({"id": dataset_id, "name": str(row["dataset_name"])})
+    return resolved_entries
+
+
+def scope_selector_instances(raw_selector: object) -> list[dict[str, object]]:
+    if isinstance(raw_selector, dict) and isinstance(raw_selector.get("all_of"), list):
+        instances: list[dict[str, object]] = []
+        for item in raw_selector["all_of"]:
+            normalized = coerce_scope_payload(item)
+            if normalized:
+                instances.append(normalized)
+        return instances
+    normalized = coerce_scope_payload(raw_selector)
+    return [normalized] if normalized else []
+
+
+def compose_scope_selectors_and(*raw_selectors: object) -> dict[str, object]:
+    instances: list[dict[str, object]] = []
+    for raw_selector in raw_selectors:
+        instances.extend(scope_selector_instances(raw_selector))
+    if not instances:
+        return {}
+    if len(instances) == 1:
+        return instances[0]
+    return {"all_of": instances}
+
+
+def preferred_scope_selector_from_run_id(raw_selector: object) -> int | None:
+    preferred_run_id: int | None = None
+    for scope in scope_selector_instances(raw_selector):
+        if scope.get("from_run_id") is not None:
+            preferred_run_id = int(scope["from_run_id"])
+    return preferred_run_id
+
+
+def and_compose_scope_text(existing_value: object, incoming_value: object) -> str:
+    existing_text = normalize_inline_whitespace(str(existing_value or ""))
+    incoming_text = normalize_inline_whitespace(str(incoming_value or ""))
+    if not existing_text:
+        return incoming_text
+    if not incoming_text:
+        return existing_text
+    return f"({existing_text}) AND ({incoming_text})"
+
+
+def merge_scope_with_search_inputs(
+    raw_scope: object,
+    query: str,
+    raw_filters: list[list[str]] | None,
+) -> dict[str, object]:
+    merged_scope = coerce_scope_payload(raw_scope)
+    incoming_scope = derive_search_scope(query, raw_filters)
+
+    incoming_keyword = normalize_inline_whitespace(str(incoming_scope.get("keyword") or ""))
+    if incoming_keyword:
+        merged_scope["keyword"] = and_compose_scope_text(merged_scope.get("keyword"), incoming_keyword)
+
+    incoming_bates = incoming_scope.get("bates")
+    if isinstance(incoming_bates, dict):
+        merged_scope["bates"] = intersect_bates_scopes(merged_scope.get("bates"), incoming_bates)
+
+    incoming_filter = normalize_inline_whitespace(str(incoming_scope.get("filter") or ""))
+    if incoming_filter:
+        merged_scope["filter"] = and_compose_scope_text(merged_scope.get("filter"), incoming_filter)
+
+    return merged_scope
+
+
+def build_explicit_scope_selector(
+    connection: sqlite3.Connection,
+    *,
+    query: str,
+    raw_bates: str | None,
+    raw_filters: list[list[str]] | None,
+    dataset_names: list[str] | None,
+    from_run_id: int | None,
+) -> dict[str, object]:
+    selector: dict[str, object] = {}
+    normalized_query = query.strip()
+    if normalized_query:
+        selector["keyword"] = query
+
+    normalized_bates = normalize_inline_whitespace(str(raw_bates or ""))
+    if normalized_bates:
+        selector["bates"] = parse_bates_scope_input(normalized_bates)
+
+    expressions = normalize_sql_filter_expressions(raw_filters)
+    if expressions:
+        selector["filter"] = " AND ".join(f"({expression})" for expression in expressions)
+
+    raw_dataset_names = [
+        normalize_inline_whitespace(str(dataset_name or ""))
+        for dataset_name in (dataset_names or [])
+    ]
+    normalized_dataset_names = [dataset_name for dataset_name in raw_dataset_names if dataset_name]
+    if normalized_dataset_names:
+        selector["dataset"] = resolve_scope_dataset_selection(connection, normalized_dataset_names)
+
+    resolved_from_run_id = resolve_scope_from_run_id(connection, from_run_id)
+    if resolved_from_run_id is not None:
+        selector["from_run_id"] = resolved_from_run_id
+
+    return coerce_scope_payload(selector)
+
+
+def build_effective_scope_selector(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    query: str,
+    raw_bates: str | None,
+    raw_filters: list[list[str]] | None,
+    dataset_names: list[str] | None,
+    from_run_id: int | None,
+    select_from_scope: bool,
+) -> dict[str, object]:
+    base_scope = {}
+    if select_from_scope:
+        base_scope = coerce_scope_payload(read_session_state(paths).get("scope"))
+        base_scope.pop("set_at", None)
+    explicit_selector = build_explicit_scope_selector(
+        connection,
+        query=query,
+        raw_bates=raw_bates,
+        raw_filters=raw_filters,
+        dataset_names=dataset_names,
+        from_run_id=from_run_id,
+    )
+    return compose_scope_selectors_and(base_scope, explicit_selector)
+
+
+def resolve_scope_document_search_with_explicit_sort(
+    connection: sqlite3.Connection,
+    raw_scope: object,
+    sort_field: str | None,
+    order: str | None,
+) -> dict[str, object]:
+    normalized_sort_field = sort_field
+    normalized_order = (order or "desc").lower()
+    keyword_query = normalize_inline_whitespace(str(coerce_scope_payload(raw_scope).get("keyword") or ""))
+    if sort_field == "relevance" and not keyword_query:
+        raise RetrieverError("Sort 'relevance' requires a non-empty query.")
+    if sort_field and sort_field != "relevance":
+        normalized_sort_field = resolve_sort_field_name(connection, sort_field)
+        selection = resolve_scope_document_search(
+            connection,
+            raw_scope,
+            sort_specs=[(str(normalized_sort_field), normalized_order)],
+        )
+        selection["sort"] = str(normalized_sort_field)
+        selection["order"] = normalized_order
+        selection["sort_spec"] = f"{normalized_sort_field} {normalized_order}"
+        return selection
+    selection = resolve_scope_document_search(connection, raw_scope)
+    if sort_field == "relevance":
+        selection["sort"] = "relevance"
+        selection["order"] = (order or "asc").lower()
+        selection["sort_spec"] = f"relevance {selection['order']}"
+    return selection
+
+
+def persist_browsing_search_result(
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+    payload: dict[str, object],
+    sort_specs: list[tuple[str, str]] | None,
+) -> dict[str, object]:
+    session_state["scope"] = coerce_scope_payload(payload.get("scope"))
+    browsing_payload: dict[str, object] = {
+        "offset": int(payload.get("offset") or 0),
+        "total_known": int(payload.get("total_hits") or 0),
+        "run_at": utc_now(),
+    }
+    if sort_specs:
+        browsing_payload["sort"] = serialize_sort_specs(sort_specs)
+    session_state["browsing"] = browsing_payload
+    persist_session_state(paths, session_state)
+    return payload
+
+
+def run_browsing_search_from_session(
+    root: Path,
+    paths: dict[str, Path],
+    session_state: dict[str, object] | None = None,
+    *,
+    offset: int | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
+) -> dict[str, object]:
+    normalized_session_state = read_session_state(paths) if session_state is None else session_state
+    effective_sort_specs = sort_specs if sort_specs is not None else session_sort_specs(normalized_session_state)
+    current_offset = int(session_browsing_state(normalized_session_state).get("offset") or 0)
+    connection = connect_db(paths["db_path"])
+    try:
+        display_column_defs, display_warnings, normalized_session_state = resolve_session_display_columns(
+            connection,
+            paths,
+            normalized_session_state,
+        )
+    finally:
+        connection.close()
+    payload = search_with_scope(
+        root,
+        normalized_session_state.get("scope", {}),
+        per_page=session_page_size(normalized_session_state),
+        offset=current_offset if offset is None else offset,
+        sort_specs=effective_sort_specs or None,
+        display_column_defs=display_column_defs,
+        warnings=display_warnings,
+    )
+    return persist_browsing_search_result(paths, normalized_session_state, payload, effective_sort_specs or None)
+
+
+def run_scope_search_from_session(root: Path, paths: dict[str, Path], scope: dict[str, object]) -> dict[str, object]:
+    session_state = persist_scope_to_session(paths, scope)
+    return run_browsing_search_from_session(root, paths, session_state, offset=0)
+
+
+def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
+    command_text = raw_command.strip()
+    if not command_text:
+        raise RetrieverError("Slash command cannot be empty.")
+    if not command_text.startswith("/"):
+        raise RetrieverError("Slash commands must begin with '/'.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        session_state = read_session_state(paths)
+        scope = coerce_scope_payload(session_state.get("scope"))
+        command_body = command_text[1:]
+        command_name, _, tail = command_body.partition(" ")
+        normalized_tail = tail.lstrip()
+
+        if command_name == "scope":
+            scope_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
+            if not scope_args:
+                return {"status": "ok", "scope": scope}
+            subcommand = scope_args[0]
+            if subcommand == "clear":
+                return run_scope_search_from_session(root, paths, {})
+            if subcommand == "save":
+                if len(scope_args) != 2:
+                    raise RetrieverError("Usage: /scope save <name>")
+                return save_named_scope(paths, scope_args[1], scope)
+            if subcommand == "load":
+                if len(scope_args) != 2:
+                    raise RetrieverError("Usage: /scope load <name>")
+                saved_scopes_state = read_saved_scopes_state(paths)
+                existing_name = find_saved_scope_name(saved_scopes_state, scope_args[1])
+                if existing_name is None:
+                    raise RetrieverError(f"Unknown saved scope: {scope_args[1]}")
+                saved_scope = saved_scopes_state["scopes"][existing_name]
+                loaded_scope = coerce_scope_payload(saved_scope)
+                return run_scope_search_from_session(root, paths, loaded_scope)
+            raise RetrieverError(f"Unknown /scope command: {subcommand}")
+
+        if command_name == "page-size":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /page-size <N>")
+            updated_session_state = read_session_state(paths)
+            display_state = session_display_state(updated_session_state)
+            display_state["page_size"] = parse_page_size_value(normalized_tail)
+            updated_session_state["display"] = coerce_display_payload(display_state)
+            updated_session_state = persist_session_state(paths, updated_session_state)
+            return run_browsing_search_from_session(root, paths, updated_session_state)
+
+        if command_name == "columns":
+            updated_session_state = read_session_state(paths)
+            if not normalized_tail:
+                column_defs, warnings, updated_session_state = resolve_session_display_columns(connection, paths, updated_session_state)
+                payload: dict[str, object] = {
+                    "status": "ok",
+                    "display": build_display_payload(column_defs, session_page_size(updated_session_state)),
+                }
+                if warnings:
+                    payload["warnings"] = warnings
+                return payload
+
+            if normalized_tail == "default":
+                display_state = session_display_state(updated_session_state)
+                display_state.pop("columns", None)
+                updated_session_state["display"] = coerce_display_payload(display_state)
+                updated_session_state = persist_session_state(paths, updated_session_state)
+                return run_browsing_search_from_session(root, paths, updated_session_state)
+
+            subcommand, _, remainder = normalized_tail.partition(" ")
+            if subcommand not in {"set", "add", "remove"}:
+                raise RetrieverError("Usage: /columns, /columns set <list>, /columns add <col>, /columns remove <col>, or /columns default")
+            if not remainder.strip():
+                raise RetrieverError("Column selection cannot be empty.")
+
+            current_column_defs, _, updated_session_state = resolve_session_display_columns(connection, paths, updated_session_state)
+            current_columns = display_column_names(current_column_defs)
+
+            if subcommand == "set":
+                requested_columns = parse_display_columns_argument(remainder.strip())
+                next_column_defs, _, _ = resolve_display_column_definitions(connection, requested_columns, drop_missing=False)
+            elif subcommand == "add":
+                field_name = normalize_inline_whitespace(remainder.strip())
+                next_column_defs, _, _ = resolve_display_column_definitions(
+                    connection,
+                    current_columns + [field_name],
+                    drop_missing=False,
+                )
+            else:
+                field_name = normalize_inline_whitespace(remainder.strip())
+                field_def = resolve_field_definition(connection, field_name)
+                canonical_name = str(field_def["field_name"])
+                if canonical_name not in current_columns:
+                    raise RetrieverError(f"Column '{canonical_name}' is not in the current display set.")
+                remaining_columns = [column_name for column_name in current_columns if column_name != canonical_name]
+                if not remaining_columns:
+                    raise RetrieverError("Display must include at least one column. Use /columns default to reset.")
+                next_column_defs, _, _ = resolve_display_column_definitions(connection, remaining_columns, drop_missing=False)
+
+            updated_session_state = persist_display_columns(paths, updated_session_state, next_column_defs)
+            return run_browsing_search_from_session(root, paths, updated_session_state)
+
+        if command_name == "sort":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /sort <column asc|desc[, column asc|desc...]> or /sort default")
+            updated_session_state = read_session_state(paths)
+            if normalized_tail == "default":
+                return run_browsing_search_from_session(root, paths, updated_session_state, offset=0, sort_specs=[])
+            sort_specs = parse_slash_sort_specs(connection, normalized_tail)
+            return run_browsing_search_from_session(root, paths, updated_session_state, offset=0, sort_specs=sort_specs)
+
+        if command_name in {"next", "previous"}:
+            updated_session_state = read_session_state(paths)
+            per_page = session_page_size(updated_session_state)
+            current_offset = int(session_browsing_state(updated_session_state).get("offset") or 0)
+            target_offset = current_offset + per_page if command_name == "next" else max(0, current_offset - per_page)
+            return run_browsing_search_from_session(root, paths, updated_session_state, offset=target_offset)
+
+        if command_name == "page":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /page <N|first|last|next|previous>")
+            updated_session_state = read_session_state(paths)
+            per_page = session_page_size(updated_session_state)
+            current_offset = int(session_browsing_state(updated_session_state).get("offset") or 0)
+            page_token = normalize_inline_whitespace(normalized_tail).lower()
+            if page_token == "first":
+                target_offset = 0
+            elif page_token == "last":
+                target_offset = 10**12
+            elif page_token == "next":
+                target_offset = current_offset + per_page
+            elif page_token == "previous":
+                target_offset = max(0, current_offset - per_page)
+            else:
+                try:
+                    page_number = int(page_token)
+                except ValueError as exc:
+                    raise RetrieverError("Usage: /page <N|first|last|next|previous>") from exc
+                if page_number < 1:
+                    raise RetrieverError("Page number must be >= 1.")
+                target_offset = (page_number - 1) * per_page
+            return run_browsing_search_from_session(root, paths, updated_session_state, offset=target_offset)
+
+        if command_name == "search":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /search <text>, /search --within <text>, /search --fts <text>, or /search clear")
+            if normalized_tail == "clear":
+                scope.pop("keyword", None)
+                scope.pop("bates", None)
+                return run_scope_search_from_session(root, paths, scope)
+            force_fts = False
+            within = False
+            query_text = normalized_tail
+            if normalized_tail.startswith("--within "):
+                within = True
+                query_text = normalized_tail[len("--within "):].lstrip()
+            elif normalized_tail.startswith("--fts "):
+                force_fts = True
+                query_text = normalized_tail[len("--fts "):].lstrip()
+            if not query_text:
+                raise RetrieverError("Search text cannot be empty.")
+            incoming_bates = None if force_fts else parse_bates_query(query_text)
+            if incoming_bates[0] is not None and incoming_bates[1] is not None:
+                parsed_bates = parse_bates_scope_input(query_text)
+                if within:
+                    if "bates" not in scope and "keyword" in scope:
+                        raise RetrieverError("`/search --within` only composes within the current slot. Use `/search <bates>` to add Bates alongside a keyword scope.")
+                    scope["bates"] = intersect_bates_scopes(scope.get("bates"), parsed_bates)
+                else:
+                    scope["bates"] = parsed_bates
+                return run_scope_search_from_session(root, paths, scope)
+            if within:
+                if "keyword" not in scope and "bates" in scope:
+                    raise RetrieverError("`/search --within` only composes within the current slot. Use `/search <text>` or `/filter <expr>` to add a keyword alongside Bates scope.")
+                existing_keyword = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+                scope["keyword"] = query_text if not existing_keyword else f"({existing_keyword}) AND ({query_text})"
+            else:
+                scope["keyword"] = query_text
+            return run_scope_search_from_session(root, paths, scope)
+
+        if command_name == "bates":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /bates <token|range> or /bates clear")
+            if normalized_tail == "clear":
+                scope.pop("bates", None)
+                return run_scope_search_from_session(root, paths, scope)
+            scope["bates"] = parse_bates_scope_input(normalized_tail)
+            return run_scope_search_from_session(root, paths, scope)
+
+        if command_name == "filter":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /filter <expression> or /filter clear")
+            if normalized_tail == "clear":
+                scope.pop("filter", None)
+                return run_scope_search_from_session(root, paths, scope)
+            compile_sql_filter_expression(connection, normalized_tail)
+            existing_filter = normalize_inline_whitespace(str(scope.get("filter") or ""))
+            scope["filter"] = normalized_tail if not existing_filter else f"({existing_filter}) AND ({normalized_tail})"
+            return run_scope_search_from_session(root, paths, scope)
+
+        if command_name == "dataset":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /dataset <name[, name...]>, /dataset clear, or /dataset rename <old> <new>")
+            dataset_args = shlex_split_slash_tail(normalized_tail)
+            if dataset_args and dataset_args[0] == "clear":
+                scope.pop("dataset", None)
+                return run_scope_search_from_session(root, paths, scope)
+            if dataset_args and dataset_args[0] == "rename":
+                if len(dataset_args) != 3:
+                    raise RetrieverError("Usage: /dataset rename <old-name> <new-name>")
+                renamed_payload = rename_dataset(root, dataset_args[1], dataset_args[2])
+                dataset_summary = renamed_payload["dataset"]
+                dataset_id = int(dataset_summary["id"])
+                dataset_name = str(dataset_summary["dataset_name"])
+                refresh_dataset_name_refs_in_scope(scope, dataset_id, dataset_name)
+                updated_session_state = read_session_state(paths)
+                updated_session_state["scope"] = coerce_scope_payload(scope)
+                persist_session_state(paths, updated_session_state)
+                refresh_dataset_name_refs_in_saved_scopes(paths, dataset_id, dataset_name)
+                return renamed_payload
+            dataset_names = split_quoted_comma_values(normalized_tail)
+            if not dataset_names:
+                raise RetrieverError("Dataset selection cannot be empty.")
+            scope["dataset"] = resolve_scope_dataset_selection(connection, dataset_names)
+            return run_scope_search_from_session(root, paths, scope)
+
+        if command_name == "from-run":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /from-run <id> or /from-run clear")
+            if normalized_tail == "clear":
+                scope.pop("from_run_id", None)
+                return run_scope_search_from_session(root, paths, scope)
+            scope["from_run_id"] = resolve_scope_from_run_id(connection, normalized_tail)
+            return run_scope_search_from_session(root, paths, scope)
+
+        raise RetrieverError(f"Unknown slash command: /{command_name}")
+    finally:
+        connection.close()
 
 
 def catalog(root: Path) -> dict[str, object]:
@@ -1282,7 +3269,7 @@ def resolve_export_output_path(paths: dict[str, Path], raw_output_path: str) -> 
     workspace_root = paths["root"].resolve()
     if path_within(resolved_path, workspace_root) and not path_within(resolved_path, exports_dir):
         raise RetrieverError(
-            f"Workspace-internal output paths must live under {exports_dir} to avoid re-ingesting exported CSVs."
+            f"Workspace-internal output paths must live under {exports_dir} to avoid re-ingesting exported artifacts."
         )
     return resolved_path
 
@@ -1689,6 +3676,7 @@ def export_csv(
     raw_filters: list[list[str]] | None,
     sort_field: str | None,
     order: str | None,
+    select_from_scope: bool = False,
 ) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -1699,8 +3687,8 @@ def export_csv(
         output_path = resolve_export_output_path(paths, raw_output_path)
 
         normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
-        if normalized_document_ids and (query.strip() or raw_filters or sort_field or order):
-            raise RetrieverError("export-csv accepts either --doc-id selectors or query/filter selectors, not both.")
+        if normalized_document_ids and (query.strip() or raw_filters or sort_field or order or select_from_scope):
+            raise RetrieverError("export-csv accepts either --doc-id selectors or query/filter/scope selectors, not both.")
 
         if normalized_document_ids:
             rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
@@ -1709,15 +3697,29 @@ def export_csv(
                 "document_ids": normalized_document_ids,
             }
         else:
-            selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
+            if select_from_scope:
+                session_state = read_session_state(paths)
+                merged_scope = merge_scope_with_search_inputs(session_state.get("scope"), query, raw_filters)
+                selection = resolve_scope_document_search_with_explicit_sort(connection, merged_scope, sort_field, order)
+                selector = {
+                    "mode": "scope_search",
+                    "selected_from_scope": True,
+                    "scope": selection["scope"],
+                    "query": selection["query"],
+                    "filters": selection["filters"],
+                    "sort": selection["sort"],
+                    "order": selection["order"],
+                }
+            else:
+                selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
+                selector = {
+                    "mode": "search",
+                    "query": selection["query"],
+                    "filters": selection["filters"],
+                    "sort": selection["sort"],
+                    "order": selection["order"],
+                }
             rows = [item["row"] for item in selection["results"]]
-            selector = {
-                "mode": "search",
-                "query": selection["query"],
-                "filters": selection["filters"],
-                "sort": selection["sort"],
-                "order": selection["order"],
-            }
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overwrote_existing_file = output_path.exists()
@@ -1750,6 +3752,808 @@ def export_csv(
             "field_count": len(field_defs),
             "fields": field_defs,
             "selector": selector,
+            "overwrote_existing_file": overwrote_existing_file,
+            "file_size": file_size_bytes(output_path),
+        }
+    finally:
+        connection.close()
+
+def normalize_archive_member_path(raw_rel_path: str, *, label: str = "Archive member path") -> str:
+    normalized = normalize_whitespace(raw_rel_path)
+    if not normalized:
+        raise RetrieverError(f"{label} cannot be empty.")
+    candidate = Path(normalized)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise RetrieverError(f"{label} must stay within the archive root: {raw_rel_path!r}")
+    return candidate.as_posix()
+
+
+def add_archive_file_once(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    source_path: Path,
+    archive_rel_path: str,
+) -> str:
+    member_path = normalize_archive_member_path(archive_rel_path)
+    if member_path in written_member_paths:
+        return member_path
+    archive.write(source_path, arcname=member_path)
+    written_member_paths.add(member_path)
+    return member_path
+
+
+def add_archive_bytes_once(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    payload_bytes: bytes,
+    archive_rel_path: str,
+) -> str:
+    member_path = normalize_archive_member_path(archive_rel_path)
+    if member_path in written_member_paths:
+        return member_path
+    archive.writestr(member_path, payload_bytes)
+    written_member_paths.add(member_path)
+    return member_path
+
+
+def document_preview_rows(connection: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT rel_preview_path, preview_type, label, ordinal, created_at
+        FROM document_previews
+        WHERE document_id = ?
+        ORDER BY ordinal ASC, id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+
+
+def document_source_part_rows(connection: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT part_kind, rel_source_path, ordinal, label, created_at
+        FROM document_source_parts
+        WHERE document_id = ?
+        ORDER BY
+          CASE part_kind WHEN 'native' THEN 0 WHEN 'image' THEN 1 ELSE 2 END ASC,
+          ordinal ASC,
+          id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+
+
+def document_text_revision_rows(connection: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT *
+        FROM text_revisions
+        WHERE document_id = ?
+        ORDER BY id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+
+
+def document_source_text_body(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+) -> str | None:
+    revision_ids: list[int] = []
+    for field_name in ("source_text_revision_id", "active_search_text_revision_id"):
+        if field_name in row.keys() and row[field_name] is not None:
+            revision_id = int(row[field_name])
+            if revision_id not in revision_ids:
+                revision_ids.append(revision_id)
+    for revision_id in revision_ids:
+        revision_row = connection.execute(
+            """
+            SELECT storage_rel_path
+            FROM text_revisions
+            WHERE id = ?
+            """,
+            (revision_id,),
+        ).fetchone()
+        if revision_row is None:
+            continue
+        revision_body = read_text_revision_body(paths, revision_row["storage_rel_path"])
+        if revision_body is not None:
+            return revision_body
+    chunk_rows = document_chunk_rows(connection, int(row["id"]))
+    if not chunk_rows:
+        return None
+    return "\n\n".join(str(chunk_row["text_content"] or "") for chunk_row in chunk_rows)
+
+
+def build_synthetic_document_export_payload(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+    *,
+    preview_rows: list[sqlite3.Row],
+    source_part_rows: list[sqlite3.Row],
+) -> bytes:
+    payload = {
+        "document_id": int(row["id"]),
+        "control_number": row["control_number"],
+        "rel_path": row["rel_path"],
+        "file_name": row["file_name"],
+        "file_type": row["file_type"],
+        "source_kind": row["source_kind"],
+        "source_rel_path": row["source_rel_path"],
+        "source_item_id": row["source_item_id"],
+        "production_id": row["production_id"],
+        "parent_document_id": row["parent_document_id"],
+        "metadata": {
+            "author": row["author"],
+            "content_type": row["content_type"],
+            "custodian": row["custodian"],
+            "date_created": row["date_created"],
+            "date_modified": row["date_modified"],
+            "participants": row["participants"],
+            "recipients": row["recipients"],
+            "subject": row["subject"],
+            "title": row["title"],
+            "updated_at": row["updated_at"],
+        },
+        "preview_rel_paths": [
+            str(Path(".retriever") / str(preview_row["rel_preview_path"]))
+            for preview_row in preview_rows
+        ],
+        "source_part_rel_paths": [
+            str(source_part_row["rel_source_path"])
+            for source_part_row in source_part_rows
+        ],
+        "text_content": document_source_text_body(connection, paths, row),
+    }
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def archive_document_files(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+) -> tuple[dict[str, object], list[str]]:
+    document_id = int(row["id"])
+    rel_path = normalize_archive_member_path(str(row["rel_path"]), label=f"Document {document_id} rel_path")
+    preview_rows = document_preview_rows(connection, document_id)
+    source_part_rows = document_source_part_rows(connection, document_id)
+    warnings: list[str] = []
+    exported_rel_paths: list[str] = []
+    preview_rel_paths: list[str] = []
+    source_part_entries: list[dict[str, object]] = []
+
+    source_path = resolve_workspace_artifact_path(paths["root"], str(row["rel_path"]))
+    if source_path is not None and source_path.exists():
+        exported_rel_paths.append(add_archive_file_once(archive, written_member_paths, source_path, rel_path))
+        document_entry_kind = "copied"
+    else:
+        descriptor_bytes = build_synthetic_document_export_payload(
+            connection,
+            paths,
+            row,
+            preview_rows=preview_rows,
+            source_part_rows=source_part_rows,
+        )
+        exported_rel_paths.append(add_archive_bytes_once(archive, written_member_paths, descriptor_bytes, rel_path))
+        document_entry_kind = "synthetic"
+        if str(row["source_kind"] or "") not in {PRODUCTION_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND}:
+            warnings.append(
+                f"Document {document_id} has no on-disk primary artifact at {row['rel_path']}; wrote a synthetic descriptor instead."
+            )
+
+    for preview_row in preview_rows:
+        preview_source_path = paths["state_dir"] / str(preview_row["rel_preview_path"])
+        archive_rel_path = normalize_archive_member_path(
+            str(Path(".retriever") / str(preview_row["rel_preview_path"])),
+            label=f"Preview path for document {document_id}",
+        )
+        if not preview_source_path.exists():
+            warnings.append(
+                f"Preview artifact is missing for document {document_id}: {archive_rel_path}"
+            )
+            continue
+        preview_rel_paths.append(add_archive_file_once(archive, written_member_paths, preview_source_path, archive_rel_path))
+        if archive_rel_path not in exported_rel_paths:
+            exported_rel_paths.append(archive_rel_path)
+
+    for source_part_row in source_part_rows:
+        source_rel_path = normalize_archive_member_path(
+            str(source_part_row["rel_source_path"]),
+            label=f"Source part path for document {document_id}",
+        )
+        source_part_entry = {
+            "part_kind": str(source_part_row["part_kind"]),
+            "rel_path": source_rel_path,
+            "ordinal": int(source_part_row["ordinal"] or 0),
+            "label": source_part_row["label"],
+        }
+        source_part_path = resolve_workspace_artifact_path(paths["root"], str(source_part_row["rel_source_path"]))
+        if source_part_path is None or not source_part_path.exists():
+            source_part_entry["missing"] = True
+            warnings.append(
+                f"Source part is missing for document {document_id}: {source_rel_path}"
+            )
+            source_part_entries.append(source_part_entry)
+            continue
+        source_part_entry["archive_rel_path"] = add_archive_file_once(
+            archive,
+            written_member_paths,
+            source_part_path,
+            source_rel_path,
+        )
+        if source_part_entry["archive_rel_path"] not in exported_rel_paths:
+            exported_rel_paths.append(str(source_part_entry["archive_rel_path"]))
+        source_part_entries.append(source_part_entry)
+
+    return (
+        {
+            "document_id": document_id,
+            "control_number": row["control_number"],
+            "file_name": row["file_name"],
+            "file_type": row["file_type"],
+            "rel_path": rel_path,
+            "source_kind": row["source_kind"],
+            "parent_document_id": row["parent_document_id"],
+            "document_entry_kind": document_entry_kind,
+            "preview_rel_paths": preview_rel_paths,
+            "source_part_entries": source_part_entries,
+            "exported_rel_paths": exported_rel_paths,
+        },
+        warnings,
+    )
+
+
+def archive_document_text_revisions(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_id: int,
+) -> tuple[list[dict[str, object]], list[str]]:
+    entries: list[dict[str, object]] = []
+    warnings: list[str] = []
+    for revision_row in document_text_revision_rows(connection, document_id):
+        entry = {
+            "id": int(revision_row["id"]),
+            "revision_kind": revision_row["revision_kind"],
+            "storage_rel_path": revision_row["storage_rel_path"],
+        }
+        storage_rel_path = normalize_whitespace(str(revision_row["storage_rel_path"] or ""))
+        if not storage_rel_path:
+            entries.append(entry)
+            continue
+        source_path = paths["state_dir"] / storage_rel_path
+        archive_rel_path = normalize_archive_member_path(
+            str(Path(".retriever") / storage_rel_path),
+            label=f"Text revision path for document {document_id}",
+        )
+        if not source_path.exists():
+            warnings.append(
+                f"Text revision body is missing for document {document_id}: {archive_rel_path}"
+            )
+            entries.append(entry)
+            continue
+        entry["archive_rel_path"] = add_archive_file_once(
+            archive,
+            written_member_paths,
+            source_path,
+            archive_rel_path,
+        )
+        entries.append(entry)
+    return entries, warnings
+
+
+def sqlite_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {str(key): row[key] for key in row.keys()}
+
+
+def table_column_names_in_order(connection: sqlite3.Connection, table_name: str) -> list[str]:
+    return [str(row["name"]) for row in table_info(connection, table_name)]
+
+
+def insert_row_dicts(
+    connection: sqlite3.Connection,
+    table_name: str,
+    row_dicts: list[dict[str, object]],
+    *,
+    column_names: list[str] | None = None,
+) -> None:
+    if not row_dicts:
+        return
+    ordered_columns = column_names or table_column_names_in_order(connection, table_name)
+    usable_columns = [column_name for column_name in ordered_columns if any(column_name in row_dict for row_dict in row_dicts)]
+    if not usable_columns:
+        return
+    placeholders = ", ".join("?" for _ in usable_columns)
+    connection.executemany(
+        f"""
+        INSERT INTO {quote_identifier(table_name)} ({', '.join(quote_identifier(column_name) for column_name in usable_columns)})
+        VALUES ({placeholders})
+        """,
+        [[row_dict.get(column_name) for column_name in usable_columns] for row_dict in row_dicts],
+    )
+
+
+def portable_context_parent_rows(
+    connection: sqlite3.Connection,
+    selected_document_rows: list[sqlite3.Row],
+) -> list[sqlite3.Row]:
+    selected_document_ids = {int(row["id"]) for row in selected_document_rows}
+    parent_ids = sorted(
+        {
+            int(row["parent_document_id"])
+            for row in selected_document_rows
+            if row["parent_document_id"] is not None and int(row["parent_document_id"]) not in selected_document_ids
+        }
+    )
+    if not parent_ids:
+        return []
+    placeholders = ", ".join("?" for _ in parent_ids)
+    return connection.execute(
+        f"""
+        SELECT *
+        FROM documents
+        WHERE id IN ({placeholders})
+        ORDER BY id ASC
+        """,
+        parent_ids,
+    ).fetchall()
+
+
+def portable_document_row_dict(
+    row: sqlite3.Row,
+    *,
+    preserve_text_revisions: bool,
+) -> dict[str, object]:
+    payload = sqlite_row_to_dict(row)
+    if not preserve_text_revisions:
+        for field_name in (
+            "source_text_revision_id",
+            "active_search_text_revision_id",
+            "active_text_source_kind",
+            "active_text_language",
+            "active_text_quality_score",
+        ):
+            if field_name in payload:
+                payload[field_name] = None
+    return payload
+
+
+def build_portable_workspace_db(
+    source_connection: sqlite3.Connection,
+    portable_root: Path,
+    selected_document_rows: list[sqlite3.Row],
+) -> dict[str, object]:
+    portable_paths = workspace_paths(portable_root)
+    ensure_layout(portable_paths)
+    target_connection = sqlite3.connect(portable_paths["db_path"])
+    target_connection.row_factory = sqlite3.Row
+    target_connection.execute("PRAGMA busy_timeout = 5000")
+    target_connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        apply_schema(target_connection, portable_root)
+
+        custom_field_rows = source_connection.execute(
+            """
+            SELECT *
+            FROM custom_fields_registry
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        for custom_field_row in custom_field_rows:
+            field_name = str(custom_field_row["field_name"])
+            sql_type = REGISTRY_FIELD_TYPES.get(str(custom_field_row["field_type"]))
+            if sql_type is None:
+                raise RetrieverError(f"Unsupported custom field type for portable export: {custom_field_row['field_type']!r}")
+            target_connection.execute(
+                f"ALTER TABLE documents ADD COLUMN {quote_identifier(field_name)} {sql_type}"
+            )
+        insert_row_dicts(
+            target_connection,
+            "custom_fields_registry",
+            [sqlite_row_to_dict(row) for row in custom_field_rows],
+        )
+
+        selected_document_ids = sorted({int(row["id"]) for row in selected_document_rows})
+        context_parent_rows = portable_context_parent_rows(source_connection, selected_document_rows)
+        retained_row_by_id = {
+            int(row["id"]): row
+            for row in [*context_parent_rows, *selected_document_rows]
+        }
+        retained_rows = sorted(
+            retained_row_by_id.values(),
+            key=lambda row: (0 if row["parent_document_id"] is None else 1, int(row["id"])),
+        )
+        stub_document_ids = sorted(
+            document_id for document_id in retained_row_by_id if document_id not in selected_document_ids
+        )
+        conversation_ids = sorted(
+            {
+                int(row["conversation_id"])
+                for row in retained_rows
+                if row["conversation_id"] is not None
+            }
+        )
+
+        dataset_document_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM dataset_documents
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM dataset_documents
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        dataset_ids = sorted(
+            {
+                int(row["dataset_id"])
+                for row in retained_rows
+                if row["dataset_id"] is not None
+            }
+            | {
+                int(row["dataset_id"])
+                for row in dataset_document_rows
+                if row["dataset_id"] is not None
+            }
+        )
+        dataset_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM datasets
+            WHERE id IN ({', '.join('?' for _ in dataset_ids)})
+            ORDER BY id ASC
+            """ if dataset_ids else """
+            SELECT *
+            FROM datasets
+            WHERE 0
+            """,
+            dataset_ids,
+        ).fetchall()
+        dataset_source_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM dataset_sources
+            WHERE dataset_id IN ({', '.join('?' for _ in dataset_ids)})
+            ORDER BY id ASC
+            """ if dataset_ids else """
+            SELECT *
+            FROM dataset_sources
+            WHERE 0
+            """,
+            dataset_ids,
+        ).fetchall()
+        conversation_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM conversations
+            WHERE id IN ({', '.join('?' for _ in conversation_ids)})
+            ORDER BY id ASC
+            """ if conversation_ids else """
+            SELECT *
+            FROM conversations
+            WHERE 0
+            """,
+            conversation_ids,
+        ).fetchall()
+        production_ids = sorted({int(row["production_id"]) for row in retained_rows if row["production_id"] is not None})
+        production_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM productions
+            WHERE id IN ({', '.join('?' for _ in production_ids)})
+            ORDER BY id ASC
+            """ if production_ids else """
+            SELECT *
+            FROM productions
+            WHERE 0
+            """,
+            production_ids,
+        ).fetchall()
+        container_pairs = sorted(
+            {
+                (str(row["source_kind"]), str(row["source_rel_path"]))
+                for row in retained_rows
+                if normalize_whitespace(str(row["source_kind"] or "")).lower() in {PST_SOURCE_KIND, MBOX_SOURCE_KIND}
+                and normalize_whitespace(str(row["source_rel_path"] or ""))
+            }
+        )
+        container_source_rows: list[sqlite3.Row] = []
+        for source_kind, source_rel_path in container_pairs:
+            row = source_connection.execute(
+                """
+                SELECT *
+                FROM container_sources
+                WHERE source_kind = ? AND source_rel_path = ?
+                """,
+                (source_kind, source_rel_path),
+            ).fetchone()
+            if row is not None:
+                container_source_rows.append(row)
+
+        preview_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM document_previews
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM document_previews
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        source_part_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM document_source_parts
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM document_source_parts
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        chunk_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM document_chunks
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM document_chunks
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        text_revision_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM text_revisions
+            WHERE document_id IN ({', '.join('?' for _ in selected_document_ids)})
+            ORDER BY id ASC
+            """ if selected_document_ids else """
+            SELECT *
+            FROM text_revisions
+            WHERE 0
+            """,
+            selected_document_ids,
+        ).fetchall()
+        text_revision_ids = [int(row["id"]) for row in text_revision_rows]
+        text_revision_segment_rows = source_connection.execute(
+            f"""
+            SELECT *
+            FROM text_revision_segments
+            WHERE revision_id IN ({', '.join('?' for _ in text_revision_ids)})
+            ORDER BY id ASC
+            """ if text_revision_ids else """
+            SELECT *
+            FROM text_revision_segments
+            WHERE 0
+            """,
+            text_revision_ids,
+        ).fetchall()
+
+        target_connection.execute("PRAGMA foreign_keys = OFF")
+        target_connection.execute("BEGIN")
+        try:
+            insert_row_dicts(target_connection, "conversations", [sqlite_row_to_dict(row) for row in conversation_rows])
+            insert_row_dicts(target_connection, "datasets", [sqlite_row_to_dict(row) for row in dataset_rows])
+            insert_row_dicts(target_connection, "dataset_sources", [sqlite_row_to_dict(row) for row in dataset_source_rows])
+            insert_row_dicts(target_connection, "productions", [sqlite_row_to_dict(row) for row in production_rows])
+            insert_row_dicts(target_connection, "container_sources", [sqlite_row_to_dict(row) for row in container_source_rows])
+            insert_row_dicts(
+                target_connection,
+                "documents",
+                [
+                    portable_document_row_dict(
+                        row,
+                        preserve_text_revisions=int(row["id"]) not in set(stub_document_ids),
+                    )
+                    for row in retained_rows
+                ],
+                column_names=table_column_names_in_order(target_connection, "documents"),
+            )
+            insert_row_dicts(target_connection, "dataset_documents", [sqlite_row_to_dict(row) for row in dataset_document_rows])
+            insert_row_dicts(target_connection, "document_previews", [sqlite_row_to_dict(row) for row in preview_rows])
+            insert_row_dicts(target_connection, "document_source_parts", [sqlite_row_to_dict(row) for row in source_part_rows])
+            insert_row_dicts(
+                target_connection,
+                "text_revisions",
+                [
+                    {
+                        **sqlite_row_to_dict(row),
+                        "created_by_job_version_id": None,
+                    }
+                    for row in text_revision_rows
+                ],
+            )
+            insert_row_dicts(
+                target_connection,
+                "text_revision_segments",
+                [sqlite_row_to_dict(row) for row in text_revision_segment_rows],
+            )
+            insert_row_dicts(target_connection, "document_chunks", [sqlite_row_to_dict(row) for row in chunk_rows])
+            for document_id in selected_document_ids:
+                refresh_documents_fts_row(target_connection, document_id)
+            if chunk_rows:
+                target_connection.executemany(
+                    """
+                    INSERT INTO chunks_fts (chunk_id, document_id, text_content)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        (row["id"], row["document_id"], row["text_content"])
+                        for row in chunk_rows
+                    ],
+                )
+            target_connection.commit()
+        except Exception:
+            target_connection.rollback()
+            raise
+        target_connection.execute("PRAGMA foreign_keys = ON")
+        foreign_key_issues = target_connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_issues:
+            raise RetrieverError(f"Portable workspace export failed foreign key validation: {foreign_key_issues[0]}")
+        return {
+            "db_path": portable_paths["db_path"],
+            "selected_document_ids": selected_document_ids,
+            "retained_document_ids": [int(row["id"]) for row in retained_rows],
+            "stub_document_ids": stub_document_ids,
+        }
+    finally:
+        target_connection.close()
+
+
+def export_archive(
+    root: Path,
+    raw_output_path: str,
+    *,
+    dataset_names: list[str] | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
+    family_mode: str = "exact",
+    seed_limit: int | None = None,
+    portable_workspace: bool = False,
+) -> dict[str, object]:
+    normalized_family_mode = normalize_run_family_mode(family_mode)
+    if seed_limit is not None and seed_limit < 1:
+        raise RetrieverError("Archive limit must be >= 1.")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        selector = build_effective_scope_selector(
+            connection,
+            paths,
+            query=query,
+            raw_bates=raw_bates,
+            raw_filters=raw_filters,
+            dataset_names=dataset_names,
+            from_run_id=from_run_id,
+            select_from_scope=select_from_scope,
+        )
+        if not scope_run_selector_has_inputs(selector):
+            raise RetrieverError("Archive selector must include at least one inclusion input.")
+        output_path = resolve_export_output_path(paths, raw_output_path)
+        selected_documents, _ = plan_scope_selected_documents(
+            connection,
+            selector=selector,
+            family_mode=normalized_family_mode,
+            seed_limit=seed_limit,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        overwrote_existing_file = output_path.exists()
+        written_member_paths: set[str] = set()
+        manifest_document_entries: list[dict[str, object]] = []
+        warnings: list[str] = []
+        created_at = utc_now()
+
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for selected_document in selected_documents:
+                document_row = selected_document["document_row"]
+                manifest_entry, document_warnings = archive_document_files(
+                    archive,
+                    written_member_paths,
+                    connection,
+                    paths,
+                    document_row,
+                )
+                manifest_entry["ordinal"] = int(selected_document["ordinal"])
+                manifest_entry["inclusion_reason"] = selected_document["inclusion_reason"]
+                if portable_workspace:
+                    revision_entries, revision_warnings = archive_document_text_revisions(
+                        archive,
+                        written_member_paths,
+                        connection,
+                        paths,
+                        int(document_row["id"]),
+                    )
+                    manifest_entry["text_revision_entries"] = revision_entries
+                    warnings.extend(revision_warnings)
+                manifest_document_entries.append(manifest_entry)
+                warnings.extend(document_warnings)
+
+            portable_workspace_payload = None
+            if portable_workspace:
+                with tempfile.TemporaryDirectory(prefix="retriever-portable-workspace-") as tempdir:
+                    portable_root = Path(tempdir) / "workspace"
+                    portable_workspace_payload = build_portable_workspace_db(
+                        connection,
+                        portable_root,
+                        [selected_document["document_row"] for selected_document in selected_documents],
+                    )
+                    add_archive_file_once(
+                        archive,
+                        written_member_paths,
+                        Path(portable_workspace_payload["db_path"]),
+                        ".retriever/retriever.db",
+                    )
+
+            manifest_payload = {
+                "status": "ok",
+                "created_at": created_at,
+                "selector": selector,
+                "family_mode": normalized_family_mode,
+                "seed_limit": seed_limit,
+                "document_count": len(selected_documents),
+                "portable_workspace": portable_workspace,
+                "portable_workspace_document_ids": (
+                    portable_workspace_payload["selected_document_ids"]
+                    if portable_workspace_payload is not None
+                    else []
+                ),
+                "portable_workspace_stub_document_ids": (
+                    portable_workspace_payload["stub_document_ids"]
+                    if portable_workspace_payload is not None
+                    else []
+                ),
+                "documents": manifest_document_entries,
+                "warnings": warnings,
+            }
+            add_archive_bytes_once(
+                archive,
+                written_member_paths,
+                (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                ".retriever/export-manifest.json",
+            )
+
+        output_rel_path = None
+        try:
+            output_rel_path = output_path.relative_to(root).as_posix()
+        except ValueError:
+            output_rel_path = None
+
+        return {
+            "status": "ok",
+            "created_at": created_at,
+            "output_path": str(output_path),
+            "output_rel_path": output_rel_path,
+            "document_count": len(selected_documents),
+            "selector": selector,
+            "family_mode": normalized_family_mode,
+            "seed_limit": seed_limit,
+            "portable_workspace": portable_workspace,
+            "manifest_rel_path": ".retriever/export-manifest.json",
+            "archive_member_count": len(written_member_paths),
+            "documents": manifest_document_entries,
+            "warnings": warnings,
             "overwrote_existing_file": overwrote_existing_file,
             "file_size": file_size_bytes(output_path),
         }
@@ -2096,6 +4900,49 @@ def count_filtered_documents(
     return int(row["count"] or 0)
 
 
+def build_analysis_scope_filters(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    raw_filters: list[list[str]] | None,
+    select_from_scope: bool,
+) -> tuple[dict[str, object] | None, list[str], list[object], list[object]]:
+    if not select_from_scope:
+        filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+        return None, clauses, params, filter_summary
+
+    merged_scope = merge_scope_with_search_inputs(read_session_state(paths).get("scope"), "", raw_filters)
+    scope, clauses, params, filter_summary = build_scope_search_filters(connection, merged_scope)
+    keyword_query = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    bates_query = format_scope_bates_value(scope.get("bates"))
+    if not keyword_query and not bates_query:
+        return scope, clauses, params, filter_summary
+
+    selection = resolve_scope_document_search(connection, scope)
+    selected_document_ids = [int(item["id"]) for item in selection["results"]]
+    if not selected_document_ids:
+        return selection["scope"], ["0"], [], selection["filters"]
+
+    connection.execute("DROP TABLE IF EXISTS temp_scope_selected_documents")
+    connection.execute(
+        """
+        CREATE TEMP TABLE temp_scope_selected_documents (
+          document_id INTEGER PRIMARY KEY
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO temp_scope_selected_documents (document_id) VALUES (?)",
+        [(document_id,) for document_id in selected_document_ids],
+    )
+    return (
+        selection["scope"],
+        ["EXISTS (SELECT 1 FROM temp_scope_selected_documents tsd WHERE tsd.document_id = d.id)"],
+        [],
+        selection["filters"],
+    )
+
+
 def search_chunks(
     root: Path,
     query: str,
@@ -2105,6 +4952,7 @@ def search_chunks(
     top_k: int,
     per_doc_cap: int,
     *,
+    select_from_scope: bool = False,
     count_only: bool = False,
     distinct_docs: bool = False,
 ) -> dict[str, object]:
@@ -2124,15 +4972,24 @@ def search_chunks(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+        effective_scope, clauses, params, filter_summary = build_analysis_scope_filters(
+            connection,
+            paths,
+            raw_filters=raw_filters,
+            select_from_scope=select_from_scope,
+        )
         if count_only:
-            return {
+            payload = {
                 "query": query,
                 "filters": filter_summary,
                 "documents_with_hits": count_distinct_chunk_documents(connection, query, clauses, params),
                 "total_docs_filtered": count_filtered_documents(connection, clauses, params),
                 "count_mode": "distinct-documents",
             }
+            if effective_scope is not None:
+                payload["selected_from_scope"] = True
+                payload["scope"] = effective_scope
+            return payload
 
         raw_rows = search_chunk_rows(connection, query, clauses, params)
         grouped_rows: dict[int, list[sqlite3.Row]] = defaultdict(list)
@@ -2218,7 +5075,7 @@ def search_chunks(
 
         normalized_sort = (sort_field or "relevance").lower()
         normalized_order = (order or ("asc" if normalized_sort == "relevance" else "desc")).lower()
-        return {
+        payload = {
             "query": query,
             "filters": filter_summary,
             "sort": normalized_sort,
@@ -2228,6 +5085,10 @@ def search_chunks(
             "total_matches": len(raw_rows),
             "results": results,
         }
+        if effective_scope is not None:
+            payload["selected_from_scope"] = True
+            payload["scope"] = effective_scope
+        return payload
     finally:
         connection.close()
 
@@ -2350,6 +5211,8 @@ def aggregate(
     order: str | None,
     limit: int,
     explain: bool,
+    *,
+    select_from_scope: bool = False,
 ) -> dict[str, object]:
     if not raw_group_bys:
         raise RetrieverError("aggregate requires at least one --group-by.")
@@ -2364,7 +5227,12 @@ def aggregate(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+        effective_scope, clauses, params, filter_summary = build_analysis_scope_filters(
+            connection,
+            paths,
+            raw_filters=raw_filters,
+            select_from_scope=select_from_scope,
+        )
         used_names: set[str] = set()
         group_defs = [resolve_aggregate_group(connection, raw_group, used_names) for raw_group in raw_group_bys]
         joins: list[str] = []
@@ -2415,6 +5283,9 @@ def aggregate(
             "buckets": buckets,
             "graph": graph_metadata_for_buckets(group_defs, buckets),
         }
+        if effective_scope is not None:
+            payload["selected_from_scope"] = True
+            payload["scope"] = effective_scope
         if explain:
             payload["sql"] = sql.replace(" ?", f" {limit}")
         return payload
@@ -2436,7 +5307,7 @@ def add_search_arguments(parser: argparse.ArgumentParser) -> None:
         dest="filters",
         action="append",
         nargs="+",
-        help="Repeatable filter in the form <field> <op> <value>",
+        help="Repeatable SQL-like filter expression",
     )
     parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field or 'relevance'")
     parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
@@ -2449,6 +5320,7 @@ def add_search_arguments(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_PAGE_SIZE,
         help="Results per page",
     )
+    parser.add_argument("--columns", help="Comma-separated result columns")
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -2456,28 +5328,29 @@ def add_search_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_run_selector_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -> None:
-    option_prefix = f"{prefix}-" if prefix else ""
-    dest_prefix = f"{prefix.replace('-', '_')}_" if prefix else ""
-    parser.add_argument(f"--{option_prefix}dataset-id", dest=f"{dest_prefix}dataset_ids", action="append", type=int, help="Dataset id (repeatable)")
-    parser.add_argument(f"--{option_prefix}dataset-name", dest=f"{dest_prefix}dataset_names", action="append", help="Exact dataset name (repeatable)")
-    parser.add_argument(f"--{option_prefix}doc-id", dest=f"{dest_prefix}document_ids", action="append", type=int, help="Document id (repeatable)")
+def add_scope_run_selector_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--keyword", dest="query", help="Keyword query text")
     parser.add_argument(
-        f"--{option_prefix}control-number",
-        dest=f"{dest_prefix}control_numbers",
-        action="append",
-        help="Control number (repeatable)",
-    )
-    parser.add_argument(f"--{option_prefix}query", dest=f"{dest_prefix}query", help="Keyword query text")
-    parser.add_argument(
-        f"--{option_prefix}filter",
-        dest=f"{dest_prefix}filters",
+        "--filter",
+        dest="filters",
         action="append",
         nargs="+",
-        help="Repeatable filter in the form <field> <op> <value>",
+        help="Repeatable SQL-like filter expression",
     )
-    if not prefix:
-        parser.add_argument("--from-run-id", type=int, help="Reuse the full frozen snapshot from a prior run")
+    parser.add_argument("--bates", help="Bates token or Bates range")
+    parser.add_argument(
+        "--dataset",
+        dest="dataset_names",
+        action="append",
+        help="Exact dataset name (repeatable)",
+    )
+    parser.add_argument("--from-run-id", type=int, help="Restrict to documents already present in a prior run")
+    parser.add_argument(
+        "--select-from-scope",
+        action="store_true",
+        help="AND-narrow the selector with the persisted workspace scope",
+    )
+    parser.add_argument("query", nargs="?", default="", help="Optional keyword query text")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2509,6 +5382,10 @@ def build_parser() -> argparse.ArgumentParser:
     search_docs_parser = subparsers.add_parser("search-docs", help="Search indexed documents at the document level")
     add_search_arguments(search_docs_parser)
 
+    slash_parser = subparsers.add_parser("slash", help="Execute a scope-aware slash command")
+    slash_parser.add_argument("workspace", help="Workspace root path")
+    slash_parser.add_argument("command_text", nargs=argparse.REMAINDER, help="Slash command text")
+
     catalog_parser = subparsers.add_parser("catalog", help="Describe searchable, filterable, and aggregatable fields")
     catalog_parser.add_argument("workspace", help="Workspace root path")
 
@@ -2535,10 +5412,38 @@ def build_parser() -> argparse.ArgumentParser:
         dest="filters",
         action="append",
         nargs="+",
-        help="Repeatable filter in the form <field> <op> <value>",
+        help="Repeatable SQL-like filter expression",
+    )
+    export_parser.add_argument(
+        "--select-from-scope",
+        action="store_true",
+        help="AND-narrow the export selector with the persisted workspace scope",
     )
     export_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field for search-based export or 'relevance'")
     export_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
+
+    export_archive_parser = subparsers.add_parser(
+        "export-archive",
+        help="Write selected documents, previews, and source artifacts to a zip archive",
+    )
+    export_archive_parser.add_argument("workspace", help="Workspace root path")
+    export_archive_parser.add_argument(
+        "output_path",
+        help="Zip file path; relative paths resolve under .retriever/exports",
+    )
+    add_scope_run_selector_arguments(export_archive_parser)
+    export_archive_parser.add_argument(
+        "--family-mode",
+        default="exact",
+        choices=sorted(RUN_FAMILY_MODES),
+        help="Whether to include only seed docs or their family members too",
+    )
+    export_archive_parser.add_argument("--limit", dest="seed_limit", type=int, help="Limit the directly matched seed set")
+    export_archive_parser.add_argument(
+        "--portable-workspace",
+        action="store_true",
+        help="Include a curated subset .retriever/retriever.db for the exported documents",
+    )
 
     export_previews_parser = subparsers.add_parser(
         "export-previews",
@@ -2607,7 +5512,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="filters",
         action="append",
         nargs="+",
-        help="Repeatable filter in the form <field> <op> <value>",
+        help="Repeatable SQL-like filter expression",
     )
     search_chunks_parser.add_argument(
         "--sort",
@@ -2631,6 +5536,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Count distinct documents with matching chunks when used with --count-only",
     )
     search_chunks_parser.add_argument(
+        "--select-from-scope",
+        action="store_true",
+        help="AND-narrow the chunk search to the persisted workspace scope",
+    )
+    search_chunks_parser.add_argument(
         "--verbose",
         action="store_true",
         help="Return raw chunk text and the full document context instead of the default compact JSON",
@@ -2643,7 +5553,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="filters",
         action="append",
         nargs="+",
-        help="Repeatable filter in the form <field> <op> <value>",
+        help="Repeatable SQL-like filter expression",
     )
     aggregate_parser.add_argument(
         "--group-by",
@@ -2657,6 +5567,11 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate_parser.add_argument("--order", choices=("asc", "desc"), help="Sort order")
     aggregate_parser.add_argument("--limit", type=int, default=DEFAULT_AGGREGATE_LIMIT, help="Maximum buckets to return")
     aggregate_parser.add_argument("--explain", action="store_true", help="Include generated SQL in the response")
+    aggregate_parser.add_argument(
+        "--select-from-scope",
+        action="store_true",
+        help="AND-narrow the aggregation to the persisted workspace scope",
+    )
 
     list_datasets_parser = subparsers.add_parser("list-datasets", help="List datasets in the workspace")
     list_datasets_parser.add_argument("workspace", help="Workspace root path")
@@ -2692,8 +5607,7 @@ def build_parser() -> argparse.ArgumentParser:
     job_version_group.add_argument("--job-version-id", type=int, help="Explicit job version id")
     job_version_group.add_argument("--job-name", help="Job name")
     create_run_parser.add_argument("--job-version", dest="job_version_number", type=int, help="Job version number when selecting by job name")
-    add_run_selector_arguments(create_run_parser)
-    add_run_selector_arguments(create_run_parser, prefix="exclude")
+    add_scope_run_selector_arguments(create_run_parser)
     create_run_parser.add_argument(
         "--family-mode",
         default="exact",
@@ -2722,7 +5636,10 @@ def build_parser() -> argparse.ArgumentParser:
     list_results_parser.add_argument("--run-id", type=int, help="Filter results to one run")
     list_results_parser.add_argument("--doc-id", dest="document_id", type=int, help="Filter results to one document")
 
-    execute_run_parser = subparsers.add_parser("execute-run", help="Execute one planned processing run")
+    execute_run_parser = subparsers.add_parser(
+        "execute-run",
+        help="Execute one planned processing run via the legacy direct executor",
+    )
     execute_run_parser.add_argument("workspace", help="Workspace root path")
     execute_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
 
@@ -2742,6 +5659,49 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
         help="Reclaim running items whose heartbeat is older than this many seconds",
     )
+    claim_run_items_parser.add_argument(
+        "--launch-mode",
+        default="inline",
+        choices=sorted(RUN_WORKER_MODES),
+        help="Worker launch mode for supervision metadata",
+    )
+    claim_run_items_parser.add_argument("--worker-task-id", help="Optional background task identifier")
+    claim_run_items_parser.add_argument(
+        "--max-batches",
+        type=int,
+        help="Optional maximum number of batches this worker should prepare before handing off",
+    )
+
+    prepare_run_batch_parser = subparsers.add_parser(
+        "prepare-run-batch",
+        help="Claim one worker batch and return execution contexts plus worker hints",
+    )
+    prepare_run_batch_parser.add_argument("workspace", help="Workspace root path")
+    prepare_run_batch_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    prepare_run_batch_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier claiming the batch")
+    prepare_run_batch_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Optional maximum number of run items to claim; defaults to the worker recommendation",
+    )
+    prepare_run_batch_parser.add_argument(
+        "--stale-seconds",
+        type=int,
+        default=DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+        help="Reclaim running items whose heartbeat is older than this many seconds",
+    )
+    prepare_run_batch_parser.add_argument(
+        "--launch-mode",
+        default="inline",
+        choices=sorted(RUN_WORKER_MODES),
+        help="Worker launch mode for supervision metadata",
+    )
+    prepare_run_batch_parser.add_argument("--worker-task-id", help="Optional background task identifier")
+    prepare_run_batch_parser.add_argument(
+        "--max-batches",
+        type=int,
+        help="Optional maximum number of batches this worker should prepare before handing off",
+    )
 
     get_run_item_context_parser = subparsers.add_parser("get-run-item-context", help="Load the execution context for one run item")
     get_run_item_context_parser.add_argument("workspace", help="Workspace root path")
@@ -2752,11 +5712,30 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat_run_items_parser.add_argument("--run-id", type=int, required=True, help="Run id")
     heartbeat_run_items_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
 
+    finish_run_worker_parser = subparsers.add_parser(
+        "finish-run-worker",
+        help="Mark one worker as finished and persist its summary",
+    )
+    finish_run_worker_parser.add_argument("workspace", help="Workspace root path")
+    finish_run_worker_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    finish_run_worker_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
+    finish_run_worker_parser.add_argument(
+        "--worker-status",
+        required=True,
+        choices=sorted(status for status in RUN_WORKER_STATUSES if status != "active"),
+        help="Terminal worker status",
+    )
+    finish_run_worker_parser.add_argument("--summary-json", help="Optional worker summary JSON object")
+    finish_run_worker_parser.add_argument("--error", dest="error_summary", help="Optional terminal error summary")
+
     complete_run_item_parser = subparsers.add_parser("complete-run-item", help="Mark one claimed run item completed and persist its result")
     complete_run_item_parser.add_argument("workspace", help="Workspace root path")
     complete_run_item_parser.add_argument("--run-item-id", type=int, required=True, help="Run item id")
     complete_run_item_parser.add_argument("--claimed-by", required=True, help="Worker/session identifier")
-    complete_run_item_parser.add_argument("--page-text", help="OCR page text for page-scoped run items")
+    complete_run_item_parser.add_argument(
+        "--page-text",
+        help="Plain-text completion for page-scoped visual run items (OCR or image description)",
+    )
     complete_run_item_parser.add_argument("--raw-output-json", help="Optional raw output JSON")
     complete_run_item_parser.add_argument("--normalized-output-json", help="Optional normalized output JSON")
     complete_run_item_parser.add_argument("--output-values-json", help="Optional per-output values JSON object")
@@ -2787,10 +5766,22 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_run_parser = subparsers.add_parser("cancel-run", help="Stop claiming new work for a run and skip its pending items")
     cancel_run_parser.add_argument("workspace", help="Workspace root path")
     cancel_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    cancel_run_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Request force-stop for background workers that expose task ids",
+    )
 
     finalize_ocr_run_parser = subparsers.add_parser("finalize-ocr-run", help="Merge completed OCR page items into document-level OCR results")
     finalize_ocr_run_parser.add_argument("workspace", help="Workspace root path")
     finalize_ocr_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+
+    finalize_image_description_run_parser = subparsers.add_parser(
+        "finalize-image-description-run",
+        help="Merge completed image-description page items into document-level text revisions",
+    )
+    finalize_image_description_run_parser.add_argument("workspace", help="Workspace root path")
+    finalize_image_description_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
 
     publish_run_results_parser = subparsers.add_parser(
         "publish-run-results",
@@ -2926,16 +5917,26 @@ def main() -> int:
         if args.command == "search":
             return emit_cli_payload(
                 "search",
-                search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
+                search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page, args.columns),
                 verbose=args.verbose,
             )
 
         if args.command == "search-docs":
             return emit_cli_payload(
                 "search-docs",
-                search_docs(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page),
+                search_docs(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page, args.columns),
                 verbose=args.verbose,
             )
+
+        if args.command == "slash":
+            print(
+                json.dumps(
+                    run_slash_command(root, " ".join(args.command_text).strip()),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
 
         if args.command == "catalog":
             return emit_cli_payload("catalog", catalog(root))
@@ -2947,11 +5948,34 @@ def main() -> int:
                         root,
                         args.output_path,
                         args.fields,
-                        args.document_ids,
-                        args.query,
-                        args.filters,
-                        args.sort,
-                        args.order,
+                    args.document_ids,
+                    args.query,
+                    args.filters,
+                    args.sort,
+                    args.order,
+                    args.select_from_scope,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+            )
+            return 0
+
+        if args.command == "export-archive":
+            print(
+                json.dumps(
+                    export_archive(
+                        root,
+                        args.output_path,
+                        dataset_names=args.dataset_names,
+                        query=args.query,
+                        raw_bates=args.bates,
+                        raw_filters=args.filters,
+                        from_run_id=args.from_run_id,
+                        select_from_scope=args.select_from_scope,
+                        family_mode=args.family_mode,
+                        seed_limit=args.seed_limit,
+                        portable_workspace=args.portable_workspace,
                     ),
                     indent=2,
                     sort_keys=True,
@@ -2998,6 +6022,7 @@ def main() -> int:
                     args.order,
                     args.top_k,
                     args.per_doc_cap,
+                    select_from_scope=args.select_from_scope,
                     count_only=args.count_only,
                     distinct_docs=args.distinct_docs,
                 ),
@@ -3016,6 +6041,7 @@ def main() -> int:
                     args.order,
                     args.limit,
                     args.explain,
+                    select_from_scope=args.select_from_scope,
                 ),
             )
 
@@ -3073,19 +6099,12 @@ def main() -> int:
                         job_version_id=args.job_version_id,
                         raw_job_name=args.job_name,
                         job_version_number=args.job_version_number,
-                        dataset_ids=args.dataset_ids,
                         dataset_names=args.dataset_names,
-                        document_ids=args.document_ids,
-                        control_numbers=args.control_numbers,
                         query=args.query,
+                        raw_bates=args.bates,
                         raw_filters=args.filters,
                         from_run_id=args.from_run_id,
-                        exclude_dataset_ids=args.exclude_dataset_ids,
-                        exclude_dataset_names=args.exclude_dataset_names,
-                        exclude_document_ids=args.exclude_document_ids,
-                        exclude_control_numbers=args.exclude_control_numbers,
-                        exclude_query=args.exclude_query,
-                        exclude_filters=args.exclude_filters,
+                        select_from_scope=args.select_from_scope,
                         family_mode=args.family_mode,
                         seed_limit=args.seed_limit,
                     ),
@@ -3137,6 +6156,28 @@ def main() -> int:
                         claimed_by=args.claimed_by,
                         limit=args.limit,
                         stale_after_seconds=args.stale_seconds,
+                        launch_mode=args.launch_mode,
+                        worker_task_id=args.worker_task_id,
+                        max_batches=args.max_batches,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "prepare-run-batch":
+            print(
+                json.dumps(
+                    prepare_run_batch(
+                        root,
+                        run_id=args.run_id,
+                        claimed_by=args.claimed_by,
+                        limit=args.limit,
+                        stale_after_seconds=args.stale_seconds,
+                        launch_mode=args.launch_mode,
+                        worker_task_id=args.worker_task_id,
+                        max_batches=args.max_batches,
                     ),
                     indent=2,
                     sort_keys=True,
@@ -3152,6 +6193,23 @@ def main() -> int:
             print(
                 json.dumps(
                     heartbeat_run_items(root, run_id=args.run_id, claimed_by=args.claimed_by),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "finish-run-worker":
+            print(
+                json.dumps(
+                    finish_run_worker(
+                        root,
+                        run_id=args.run_id,
+                        claimed_by=args.claimed_by,
+                        worker_status=args.worker_status,
+                        summary_json=args.summary_json,
+                        error_summary=args.error_summary,
+                    ),
                     indent=2,
                     sort_keys=True,
                 )
@@ -3209,11 +6267,15 @@ def main() -> int:
             return 0
 
         if args.command == "cancel-run":
-            print(json.dumps(cancel_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            print(json.dumps(cancel_run(root, run_id=args.run_id, force=args.force), indent=2, sort_keys=True))
             return 0
 
         if args.command == "finalize-ocr-run":
             print(json.dumps(finalize_ocr_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "finalize-image-description-run":
+            print(json.dumps(finalize_image_description_run(root, run_id=args.run_id), indent=2, sort_keys=True))
             return 0
 
         if args.command == "publish-run-results":

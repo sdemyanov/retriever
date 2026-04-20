@@ -282,7 +282,7 @@ def resolve_production_source_path(workspace_root: Path, production_root: Path, 
 def production_logical_rel_path(production_rel_root: str, control_number: str) -> str:
     production_slug = sanitize_storage_filename(Path(production_rel_root).name)
     control_slug = sanitize_storage_filename(control_number)
-    return Path(".retriever") / "productions" / production_slug / "documents" / f"{control_slug}.logical"
+    return Path(INTERNAL_REL_PATH_PREFIX) / "productions" / production_slug / "documents" / f"{control_slug}.logical"
 
 
 def infer_production_title(control_number: str, text_content: str, native_path: Path | None) -> str:
@@ -291,14 +291,15 @@ def infer_production_title(control_number: str, text_content: str, native_path: 
         if candidate:
             if re.match(r"^(From|To|Cc|Bcc|Sent|Date|Subject):\s*", candidate, flags=re.IGNORECASE):
                 continue
-            return candidate[:220]
+            return normalize_generated_document_title(candidate[:220]) or candidate[:220]
     if native_path is not None:
-        return native_path.stem or native_path.name
+        return normalize_generated_document_title(native_path.stem or native_path.name) or native_path.stem or native_path.name
     return control_number
 
 
 def build_production_preview_html(
     *,
+    document_title: str,
     control_number: str,
     production_name: str,
     begin_bates: str,
@@ -342,7 +343,240 @@ img { max-width: 100%; height: auto; border: 1px solid #d8dee4; background: #fff
 pre { white-space: pre-wrap; word-break: break-word; background: #f8fafc; border: 1px solid #d8dee4; padding: 0.75rem; }
 </style>
 """.strip()
-    return build_html_preview(headers, body_html=body_html, document_title=f"{control_number} Preview", head_html=head_html)
+    return build_html_preview(headers, body_html=body_html, document_title=document_title, head_html=head_html)
+
+
+def attachment_preview_link_label(row: sqlite3.Row) -> str:
+    file_name = normalize_whitespace(str(row["file_name"] or ""))
+    title = normalize_generated_document_title(row["title"])
+    control_number = normalize_whitespace(str(row["control_number"] or ""))
+    if file_name and not file_name.lower().endswith(".logical"):
+        return file_name
+    if title:
+        return title
+    if file_name:
+        return file_name
+    return control_number or "Attachment"
+
+
+def build_document_attachment_preview_links(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    parent_preview_path: Path,
+    child_rows: list[sqlite3.Row],
+) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for child_row in child_rows:
+        child_preview_target = default_preview_target(paths, child_row, connection)
+        child_preview_abs_path = str(
+            child_preview_target.get("file_abs_path")
+            or child_preview_target.get("abs_path")
+            or ""
+        ).split("#", 1)[0]
+        child_preview_path = Path(child_preview_abs_path)
+        if not child_preview_path.exists():
+            continue
+        relative_href = urllib_request.pathname2url(
+            os.path.relpath(str(child_preview_path), start=str(parent_preview_path.parent))
+        )
+        detail = normalize_whitespace(str(child_row["control_number"] or ""))
+        links.append(
+            {
+                "href": relative_href,
+                "label": attachment_preview_link_label(child_row),
+                "detail": detail,
+            }
+        )
+    return links
+
+
+def conversation_attachment_links_by_document_id(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    segment_preview_path: Path,
+    documents: list[dict[str, object]],
+) -> dict[int, list[dict[str, str]]]:
+    parent_ids = [
+        int(document["id"])
+        for document in documents
+        if document.get("parent_document_id") is None
+    ]
+    if not parent_ids:
+        return {}
+    child_rows = connection.execute(
+        f"""
+        SELECT *
+        FROM documents
+        WHERE parent_document_id IN ({", ".join("?" for _ in parent_ids)})
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+          AND COALESCE(child_document_kind, ?) = ?
+        ORDER BY
+          parent_document_id ASC,
+          CASE WHEN control_number_attachment_sequence IS NULL THEN 1 ELSE 0 END ASC,
+          control_number_attachment_sequence ASC,
+          control_number ASC,
+          id ASC
+        """,
+        (*parent_ids, CHILD_DOCUMENT_KIND_ATTACHMENT, CHILD_DOCUMENT_KIND_ATTACHMENT),
+    ).fetchall()
+    child_rows_by_parent_id: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    for child_row in child_rows:
+        child_rows_by_parent_id[int(child_row["parent_document_id"])].append(child_row)
+    return {
+        parent_id: build_document_attachment_preview_links(
+            paths,
+            connection,
+            segment_preview_path,
+            rows,
+        )
+        for parent_id, rows in child_rows_by_parent_id.items()
+    }
+
+
+def sync_document_attachment_preview_links(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_id: int,
+) -> int:
+    preview_rows = connection.execute(
+        """
+        SELECT rel_preview_path
+        FROM document_previews
+        WHERE document_id = ? AND preview_type = 'html'
+        ORDER BY ordinal ASC, id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    if not preview_rows:
+        return 0
+
+    child_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE parent_document_id = ?
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+          AND COALESCE(child_document_kind, ?) = ?
+        ORDER BY
+          CASE WHEN control_number_attachment_sequence IS NULL THEN 1 ELSE 0 END ASC,
+          control_number_attachment_sequence ASC,
+          control_number ASC,
+          id ASC
+        """,
+        (document_id, CHILD_DOCUMENT_KIND_ATTACHMENT, CHILD_DOCUMENT_KIND_ATTACHMENT),
+    ).fetchall()
+
+    updated = 0
+    for preview_row in preview_rows:
+        preview_path = paths["state_dir"] / preview_row["rel_preview_path"]
+        if not preview_path.exists():
+            continue
+        current_html = preview_path.read_text(encoding="utf-8")
+        links = build_document_attachment_preview_links(paths, connection, preview_path, child_rows)
+        updated_html = inject_html_preview_attachment_links(current_html, links)
+        if updated_html == current_html:
+            continue
+        preview_path.write_text(updated_html, encoding="utf-8")
+        updated += 1
+    return updated
+
+
+def regenerate_production_preview_for_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    document_id: int,
+    text_content: str,
+) -> dict[str, object]:
+    """Rebuild the synthesized HTML preview for a production document.
+
+    Returns a status payload. Never raises on expected skips (non-production
+    doc, no HTML preview row, missing production row). Unexpected I/O errors
+    propagate and should be handled by the caller as a best-effort regen.
+    """
+    document_row = connection.execute(
+        """
+        SELECT id, control_number, production_id, begin_bates, end_bates,
+               begin_attachment, end_attachment, title
+        FROM documents
+        WHERE id = ?
+        """,
+        (document_id,),
+    ).fetchone()
+    if document_row is None:
+        return {"status": "skipped", "reason": "unknown_document"}
+    if document_row["production_id"] is None:
+        return {"status": "skipped", "reason": "not_production"}
+
+    preview_row = connection.execute(
+        """
+        SELECT rel_preview_path
+        FROM document_previews
+        WHERE document_id = ? AND preview_type = 'html'
+        ORDER BY ordinal
+        LIMIT 1
+        """,
+        (document_id,),
+    ).fetchone()
+    if preview_row is None:
+        return {"status": "skipped", "reason": "no_html_preview"}
+
+    production_row = connection.execute(
+        "SELECT production_name FROM productions WHERE id = ?",
+        (document_row["production_id"],),
+    ).fetchone()
+    if production_row is None:
+        return {"status": "skipped", "reason": "missing_production_row"}
+
+    image_rows = connection.execute(
+        """
+        SELECT ordinal, label, rel_source_path
+        FROM document_source_parts
+        WHERE document_id = ? AND part_kind = 'image'
+        ORDER BY ordinal
+        """,
+        (document_id,),
+    ).fetchall()
+
+    page_images: list[dict[str, object]] = []
+    for index, row in enumerate(image_rows, start=1):
+        abs_image = paths["root"] / row["rel_source_path"]
+        if not abs_image.exists():
+            continue
+        data_url = image_path_data_url(abs_image)
+        if data_url is None:
+            continue
+        page_images.append(
+            {
+                "label": row["label"] or f"Page {index}",
+                "src": data_url,
+            }
+        )
+
+    resolved_title = document_row["title"] or document_row["control_number"]
+    html_body = build_production_preview_html(
+        document_title=resolved_title,
+        control_number=document_row["control_number"],
+        production_name=production_row["production_name"],
+        begin_bates=document_row["begin_bates"] or "",
+        end_bates=document_row["end_bates"] or "",
+        begin_attachment=document_row["begin_attachment"],
+        end_attachment=document_row["end_attachment"],
+        text_content=text_content,
+        page_images=page_images,
+    )
+
+    preview_path = paths["state_dir"] / preview_row["rel_preview_path"]
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_text(html_body, encoding="utf-8")
+    sync_document_attachment_preview_links(connection, paths, document_id)
+    return {
+        "status": "ok",
+        "rel_preview_path": preview_row["rel_preview_path"],
+        "page_images": len(page_images),
+        "text_chars": len(text_content),
+    }
 
 
 def replace_document_related_rows(
@@ -594,7 +828,7 @@ def write_attachment_blob(
     absolute_path = paths["state_dir"] / preview_rel_path
     absolute_path.parent.mkdir(parents=True, exist_ok=True)
     absolute_path.write_bytes(payload)
-    rel_path = Path(".retriever") / preview_rel_path
+    rel_path = Path(INTERNAL_REL_PATH_PREFIX) / preview_rel_path
     return rel_path.as_posix(), absolute_path
 
 
@@ -635,7 +869,7 @@ def cleanup_document_artifacts(
         if referenced_elsewhere is None:
             remove_file_if_exists(paths["state_dir"] / preview_row["rel_preview_path"])
     if is_internal_rel_path(row["rel_path"]):
-        remove_file_if_exists(paths["root"] / row["rel_path"])
+        remove_file_if_exists(document_absolute_path(paths, row["rel_path"]))
 
 
 def parse_file_types(raw_value: str | None) -> set[str] | None:
@@ -1944,6 +2178,7 @@ def render_conversation_document_section(
     *,
     current_segment_href: str,
     doc_target_hrefs: dict[int, str],
+    attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
 ) -> str:
     document_id = int(document["id"])
     anchor = conversation_preview_anchor(document_id)
@@ -1983,6 +2218,10 @@ def render_conversation_document_section(
         if normalize_whitespace(str(document.get("content_type") or "")) == "Chat"
         else f"<pre>{html.escape(text_content or 'No extracted text available.')}</pre>"
     )
+    attachment_links_html = ""
+    if attachment_links_by_document_id:
+        attachment_links = attachment_links_by_document_id.get(document_id) or []
+        attachment_links_html = render_html_preview_attachment_links(attachment_links)
     metadata_html = (
         f'<dl class="conversation-document-meta">{"".join(metadata_items)}</dl>'
         if metadata_items
@@ -2005,6 +2244,7 @@ def render_conversation_document_section(
             "</header>",
             metadata_html,
             f'<div class="conversation-document-body">{body_html}</div>',
+            attachment_links_html,
             "</article>",
         ]
     )
@@ -2095,6 +2335,7 @@ def build_conversation_segment_html(
     segment_items: list[dict[str, object]],
     current_segment_rel_path: str,
     doc_target_hrefs: dict[int, str],
+    attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
 ) -> str:
     current_file_name = Path(current_segment_rel_path).name
     previous_link = Path(str(segment_items[segment_index - 1]["segment_rel_path"])).name if segment_index > 0 else None
@@ -2115,6 +2356,7 @@ def build_conversation_segment_html(
             document,
             current_segment_href=current_file_name,
             doc_target_hrefs=doc_target_hrefs,
+            attachment_links_by_document_id=attachment_links_by_document_id,
         )
         for document in segment_items[segment_index]["documents"]
     )
@@ -2299,6 +2541,12 @@ def refresh_conversation_previews(
         for index, segment in enumerate(segment_items):
             segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
             segment_abs_path.parent.mkdir(parents=True, exist_ok=True)
+            attachment_links = conversation_attachment_links_by_document_id(
+                connection,
+                paths,
+                segment_preview_path=segment_abs_path,
+                documents=list(segment["documents"]),
+            )
             segment_abs_path.write_text(
                 build_conversation_segment_html(
                     conversation_row,
@@ -2308,6 +2556,7 @@ def refresh_conversation_previews(
                     segment_items=segment_items,
                     current_segment_rel_path=str(segment["segment_rel_path"]),
                     doc_target_hrefs=doc_target_hrefs,
+                    attachment_links_by_document_id=attachment_links,
                 ),
                 encoding="utf-8",
             )
@@ -2540,6 +2789,7 @@ def reconcile_attachment_documents(
             """,
             (utc_now(), row["id"]),
         )
+    sync_document_attachment_preview_links(connection, paths, parent_document_id)
 
 
 def get_container_source_row(
@@ -3412,6 +3662,7 @@ def build_production_extracted_payload(
         if data_url is None:
             continue
         page_images.append({"label": f"Page {index}", "src": data_url})
+    resolved_title = (email_headers.get("title") if email_headers else None) or infer_production_title(control_number, text_content, native_path)
     preview_artifacts: list[dict[str, object]] = []
     if preferred_native is None:
         preview_artifacts.append(
@@ -3421,6 +3672,7 @@ def build_production_extracted_payload(
                 "label": "production",
                 "ordinal": 0,
                 "content": build_production_preview_html(
+                    document_title=resolved_title,
                     control_number=control_number,
                     production_name=production_name,
                     begin_bates=begin_bates,
@@ -3439,7 +3691,7 @@ def build_production_extracted_payload(
         "date_created": email_headers.get("date_created") if email_headers else None,
         "date_modified": None,
         "participants": participants,
-        "title": (email_headers.get("title") if email_headers else None) or infer_production_title(control_number, text_content, native_path),
+        "title": resolved_title,
         "subject": subject,
         "recipients": recipients,
         "text_content": text_content,
