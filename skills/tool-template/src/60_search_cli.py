@@ -2972,6 +2972,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted(RUN_FAMILY_MODES),
         help="Whether to include only seed docs or their family members too",
     )
+    create_run_parser.add_argument(
+        "--activation-policy",
+        default="manual",
+        choices=sorted(RUN_ACTIVATION_POLICIES),
+        help="Whether revision-producing jobs should auto-promote created text revisions",
+    )
     create_run_parser.add_argument("--limit", dest="seed_limit", type=int, help="Limit the directly matched seed set")
 
     list_text_revisions_parser = subparsers.add_parser("list-text-revisions", help="List stored text revisions for a document")
@@ -3424,6 +3430,7 @@ def main() -> int:
                         exclude_control_numbers=args.exclude_control_numbers,
                         exclude_query=args.exclude_query,
                         exclude_filters=args.exclude_filters,
+                        activation_policy=args.activation_policy,
                         family_mode=args.family_mode,
                         seed_limit=args.seed_limit,
                     ),

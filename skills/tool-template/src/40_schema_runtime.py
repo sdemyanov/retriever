@@ -769,6 +769,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "documents", "active_text_language TEXT")
     ensure_column(connection, "documents", "active_text_quality_score REAL")
     ensure_column(connection, "job_versions", "capability TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "runs", "activation_policy TEXT NOT NULL DEFAULT 'manual'")
     ensure_column(connection, "run_items", "result_id INTEGER REFERENCES results(id) ON DELETE SET NULL")
     ensure_column(connection, "run_items", "page_number INTEGER")
     ensure_column(connection, "run_items", "input_artifact_rel_path TEXT")
