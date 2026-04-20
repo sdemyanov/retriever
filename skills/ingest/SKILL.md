@@ -41,9 +41,12 @@ Use this skill when the user says things like:
 - For `.pst` sources, use regular `ingest`, not `ingest-production`.
 - If `doctor` reports `pst_backend.status != pass`, explain that the workspace is not fully bootstrapped until the required `libpff-python` / `pypff` backend is installed.
 - If the user target is a processed production root, or the user explicitly asks for production ingest, run `ingest-production` instead of plain `ingest`.
+- Keep `ingest-production` as the precise entrypoint for targeted reruns, scripts, or one-off production-only ingest.
 - Treat `DAT` + companion `TEXT/`, `IMAGES/`, and optional `NATIVES/` folders as a production signature, not as loose files.
-- If plain `ingest` reports `skipped_production_roots`, explain that Retriever detected a processed production and use `ingest-production` when the user's intent is to index that production root.
-- Run plain `ingest` with `--recursive` when the user wants the whole non-production tree scanned.
+- Run plain `ingest` with `--recursive` when the user wants the whole tree scanned.
+- Plain `ingest` without `--file-types` now auto-routes detected production roots through the production ingest pipeline while still indexing loose files elsewhere in the tree.
+- If plain `ingest` reports `skipped_production_roots`, explain that Retriever detected a processed production but skipped it because a file-type filter was present; use `ingest-production` when the user's intent is to index that production root explicitly.
 - Summarize `new`, `updated`, `renamed`, `missing`, `skipped`, and `failed` for plain ingest.
+- When plain ingest auto-routes productions, also summarize `ingested_production_roots` plus the production document create/update/unchanged/retired and linked-part counters.
 - Summarize `created`, `updated`, `unchanged`, `retired`, family reconstruction, linked images, and missing linked parts for `ingest-production`.
 - If failures are present, list the failed relative paths and short reasons.
