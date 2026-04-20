@@ -38,6 +38,7 @@ SCHEMA_STATEMENTS = [
       source_kind TEXT NOT NULL,
       dataset_locator TEXT NOT NULL,
       dataset_name TEXT NOT NULL,
+      dataset_name_normalized TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
@@ -560,6 +561,8 @@ def workspace_paths(root: Path) -> dict[str, Path]:
         "root": root,
         "state_dir": state_dir,
         "db_path": state_dir / "retriever.db",
+        "session_path": state_dir / "session.json",
+        "saved_scopes_path": state_dir / "saved_scopes.json",
         "previews_dir": state_dir / "previews",
         "text_revisions_dir": state_dir / "text-revisions",
         "bin_dir": state_dir / "bin",
@@ -825,6 +828,192 @@ def normalize_whitespace(text: str) -> str:
     return text.strip()
 
 
+def normalize_inline_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", str(text or "")).strip())
+
+
+def normalize_dataset_name_for_compare(dataset_name: str) -> str:
+    normalized = normalize_inline_whitespace(dataset_name)
+    return normalized.casefold()
+
+
+def normalize_saved_scope_name(scope_name: str) -> str:
+    return normalize_dataset_name_for_compare(scope_name)
+
+
+def default_session_state() -> dict[str, object]:
+    return {
+        "schema_version": SESSION_SCHEMA_VERSION,
+        "scope": {},
+        "browsing": {},
+        "display": {},
+    }
+
+
+def default_saved_scopes_state() -> dict[str, object]:
+    return {
+        "schema_version": SESSION_SCHEMA_VERSION,
+        "scopes": {},
+    }
+
+
+def coerce_scope_dataset_entries(raw_value: object) -> list[dict[str, object]]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized_entries: list[dict[str, object]] = []
+    seen_ids: set[int] = set()
+    for item in raw_value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            dataset_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        dataset_name = normalize_inline_whitespace(str(item.get("name") or ""))
+        if not dataset_name or dataset_id in seen_ids:
+            continue
+        seen_ids.add(dataset_id)
+        normalized_entries.append({"id": dataset_id, "name": dataset_name})
+    return normalized_entries
+
+
+def coerce_scope_payload(raw_scope: object) -> dict[str, object]:
+    if not isinstance(raw_scope, dict):
+        return {}
+    scope: dict[str, object] = {}
+    keyword = raw_scope.get("keyword")
+    if isinstance(keyword, str) and keyword.strip():
+        scope["keyword"] = keyword
+    bates = raw_scope.get("bates")
+    if isinstance(bates, dict):
+        begin = normalize_inline_whitespace(str(bates.get("begin") or ""))
+        end = normalize_inline_whitespace(str(bates.get("end") or ""))
+        if begin and end:
+            scope["bates"] = {"begin": begin, "end": end}
+    filter_expression = raw_scope.get("filter")
+    if isinstance(filter_expression, str) and filter_expression.strip():
+        scope["filter"] = filter_expression
+    dataset_entries = coerce_scope_dataset_entries(raw_scope.get("dataset"))
+    if dataset_entries:
+        scope["dataset"] = dataset_entries
+    from_run_id = raw_scope.get("from_run_id")
+    if from_run_id is not None:
+        try:
+            scope["from_run_id"] = int(from_run_id)
+        except (TypeError, ValueError):
+            pass
+    set_at = raw_scope.get("set_at")
+    if isinstance(set_at, str) and set_at.strip():
+        scope["set_at"] = set_at
+    return scope
+
+
+def coerce_saved_scope_payload(raw_scope: object) -> dict[str, object]:
+    scope = coerce_scope_payload(raw_scope)
+    saved_at = raw_scope.get("saved_at") if isinstance(raw_scope, dict) else None
+    if isinstance(saved_at, str) and saved_at.strip():
+        scope["saved_at"] = saved_at
+    scope.pop("set_at", None)
+    return scope
+
+
+def coerce_session_state(raw_value: object) -> dict[str, object]:
+    session = default_session_state()
+    if not isinstance(raw_value, dict):
+        return session
+    schema_version = raw_value.get("schema_version")
+    if isinstance(schema_version, int):
+        session["schema_version"] = schema_version
+    session["scope"] = coerce_scope_payload(raw_value.get("scope"))
+    browsing = raw_value.get("browsing")
+    session["browsing"] = browsing if isinstance(browsing, dict) else {}
+    display = raw_value.get("display")
+    session["display"] = display if isinstance(display, dict) else {}
+    return session
+
+
+def coerce_saved_scopes_state(raw_value: object) -> dict[str, object]:
+    saved_scopes = default_saved_scopes_state()
+    if not isinstance(raw_value, dict):
+        return saved_scopes
+    schema_version = raw_value.get("schema_version")
+    if isinstance(schema_version, int):
+        saved_scopes["schema_version"] = schema_version
+    scopes = raw_value.get("scopes")
+    if not isinstance(scopes, dict):
+        return saved_scopes
+    normalized_scopes: dict[str, object] = {}
+    for scope_name, scope_payload in scopes.items():
+        if not isinstance(scope_name, str):
+            continue
+        normalized_name = normalize_saved_scope_name(scope_name)
+        if not normalized_name:
+            continue
+        normalized_scopes[scope_name] = coerce_saved_scope_payload(scope_payload)
+    saved_scopes["scopes"] = normalized_scopes
+    return saved_scopes
+
+
+def read_json_state(path: Path, default_factory) -> dict[str, object]:
+    if not path.exists():
+        return default_factory()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RetrieverError(f"Could not read state file {path}: {exc}") from exc
+    coerced = default_factory()
+    if default_factory is default_session_state:
+        coerced = coerce_session_state(payload)
+    elif default_factory is default_saved_scopes_state:
+        coerced = coerce_saved_scopes_state(payload)
+    return coerced
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temp_path = Path(file_handle.name)
+    try:
+        with file_handle:
+            json.dump(payload, file_handle, indent=2, sort_keys=True)
+            file_handle.write("\n")
+            file_handle.flush()
+        temp_path.replace(path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def read_session_state(paths: dict[str, Path]) -> dict[str, object]:
+    return read_json_state(paths["session_path"], default_session_state)
+
+
+def write_session_state(paths: dict[str, Path], payload: dict[str, object]) -> None:
+    coerced = coerce_session_state(payload)
+    coerced["schema_version"] = SESSION_SCHEMA_VERSION
+    write_json_atomic(paths["session_path"], coerced)
+
+
+def read_saved_scopes_state(paths: dict[str, Path]) -> dict[str, object]:
+    return read_json_state(paths["saved_scopes_path"], default_saved_scopes_state)
+
+
+def write_saved_scopes_state(paths: dict[str, Path], payload: dict[str, object]) -> None:
+    coerced = coerce_saved_scopes_state(payload)
+    coerced["schema_version"] = SESSION_SCHEMA_VERSION
+    write_json_atomic(paths["saved_scopes_path"], coerced)
+
+
 def normalize_extension(path: Path) -> str:
     return path.suffix.lower().lstrip(".")
 
@@ -1052,6 +1241,11 @@ def manual_dataset_locator(dataset_name: str | None = None) -> str:
     return f"manual:{sha256_text(f'{seed}:{utc_now()}')[:16]}"
 
 
+def normalized_dataset_name_or_default(dataset_name: str | None, default: str = "Dataset") -> str:
+    normalized = normalize_inline_whitespace(str(dataset_name or ""))
+    return normalized or default
+
+
 def get_dataset_row(
     connection: sqlite3.Connection,
     *,
@@ -1076,29 +1270,50 @@ def ensure_dataset_row(
     dataset_name: str,
 ) -> int:
     now = utc_now()
+    normalized_dataset_name = normalized_dataset_name_or_default(dataset_name)
+    normalized_compare_name = normalize_dataset_name_for_compare(normalized_dataset_name)
     existing_row = get_dataset_row(
         connection,
         source_kind=source_kind,
         dataset_locator=dataset_locator,
     )
     if existing_row is None:
-        connection.execute(
-            """
-            INSERT INTO datasets (
-              source_kind, dataset_locator, dataset_name, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (source_kind, dataset_locator, dataset_name, now, now),
-        )
+        try:
+            connection.execute(
+                """
+                INSERT INTO datasets (
+                  source_kind, dataset_locator, dataset_name, dataset_name_normalized, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (source_kind, dataset_locator, normalized_dataset_name, normalized_compare_name, now, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            conflicting_row = connection.execute(
+                """
+                SELECT id, dataset_name
+                FROM datasets
+                WHERE dataset_name_normalized = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (normalized_compare_name,),
+            ).fetchone()
+            if conflicting_row is not None:
+                raise RetrieverError(
+                    f"Dataset name {normalized_dataset_name!r} is already used by dataset {conflicting_row['id']} ({conflicting_row['dataset_name']!r})."
+                ) from exc
+            raise
         return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
-    if str(existing_row["dataset_name"]) != dataset_name:
+    existing_name = normalized_dataset_name_or_default(str(existing_row["dataset_name"] or ""))
+    existing_normalized = normalize_inline_whitespace(str(existing_row["dataset_name_normalized"] or ""))
+    if existing_normalized != normalize_dataset_name_for_compare(existing_name):
         connection.execute(
             """
             UPDATE datasets
-            SET dataset_name = ?, updated_at = ?
+            SET dataset_name = ?, dataset_name_normalized = ?, updated_at = ?
             WHERE id = ?
             """,
-            (dataset_name, now, existing_row["id"]),
+            (existing_name, normalize_dataset_name_for_compare(existing_name), now, existing_row["id"]),
         )
     return int(existing_row["id"])
 
@@ -1110,7 +1325,7 @@ def create_dataset_row(
     source_kind: str | None = None,
     dataset_locator: str | None = None,
 ) -> int:
-    normalized_name = normalize_whitespace(dataset_name) or "Dataset"
+    normalized_name = normalized_dataset_name_or_default(dataset_name)
     normalized_source_kind = normalize_whitespace(str(source_kind or MANUAL_DATASET_SOURCE_KIND)).lower()
     normalized_locator = normalize_whitespace(str(dataset_locator or ""))
     if not normalized_locator:
@@ -1263,14 +1478,14 @@ def get_dataset_row_by_id(connection: sqlite3.Connection, dataset_id: int) -> sq
 
 
 def find_dataset_rows_by_name(connection: sqlite3.Connection, dataset_name: str) -> list[sqlite3.Row]:
-    normalized_name = normalize_whitespace(dataset_name)
+    normalized_name = normalize_dataset_name_for_compare(dataset_name)
     if not normalized_name:
         return []
     return connection.execute(
         """
         SELECT *
         FROM datasets
-        WHERE dataset_name = ?
+        WHERE dataset_name_normalized = ?
         ORDER BY id ASC
         """,
         (normalized_name,),
@@ -1289,20 +1504,48 @@ def resolve_dataset_row(
         row = get_dataset_row_by_id(connection, dataset_id)
         if row is None:
             raise RetrieverError(f"Unknown dataset id: {dataset_id}")
-        if dataset_name is not None and normalize_whitespace(str(row["dataset_name"] or "")) != normalize_whitespace(dataset_name):
+        if dataset_name is not None and normalize_dataset_name_for_compare(str(row["dataset_name"] or "")) != normalize_dataset_name_for_compare(dataset_name):
             raise RetrieverError(
-                f"Dataset id {dataset_id} is named {row['dataset_name']!r}, not {normalize_whitespace(dataset_name)!r}."
+                f"Dataset id {dataset_id} is named {row['dataset_name']!r}, not {normalize_inline_whitespace(dataset_name)!r}."
             )
         return row
     matches = find_dataset_rows_by_name(connection, str(dataset_name or ""))
     if not matches:
         raise RetrieverError(f"Unknown dataset name: {dataset_name}")
-    if len(matches) > 1:
-        ids = ", ".join(str(row["id"]) for row in matches)
-        raise RetrieverError(
-            f"Dataset name {normalize_whitespace(str(dataset_name or ''))!r} is ambiguous; use --dataset-id. Matching ids: {ids}."
-        )
     return matches[0]
+
+
+def rename_dataset_row(connection: sqlite3.Connection, dataset_id: int, new_dataset_name: str) -> dict[str, object]:
+    dataset_row = get_dataset_row_by_id(connection, dataset_id)
+    if dataset_row is None:
+        raise RetrieverError(f"Unknown dataset id: {dataset_id}")
+    normalized_name = normalized_dataset_name_or_default(new_dataset_name)
+    normalized_compare_name = normalize_dataset_name_for_compare(normalized_name)
+    conflicting_row = connection.execute(
+        """
+        SELECT id, dataset_name
+        FROM datasets
+        WHERE dataset_name_normalized = ?
+          AND id != ?
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (normalized_compare_name, dataset_id),
+    ).fetchone()
+    if conflicting_row is not None:
+        raise RetrieverError(
+            f"Dataset name {normalized_name!r} is already used by dataset {conflicting_row['id']} ({conflicting_row['dataset_name']!r})."
+        )
+    now = utc_now()
+    connection.execute(
+        """
+        UPDATE datasets
+        SET dataset_name = ?, dataset_name_normalized = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (normalized_name, normalized_compare_name, now, dataset_id),
+    )
+    return dataset_summary_by_id(connection, dataset_id)
 
 
 def refresh_document_dataset_cache(connection: sqlite3.Connection, document_id: int) -> int | None:
