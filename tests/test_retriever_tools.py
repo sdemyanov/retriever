@@ -4071,6 +4071,120 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(saved_scopes_payload["scopes"]["review"]["dataset"][0]["id"], dataset_id)
         self.assertEqual(saved_scopes_payload["scopes"]["review"]["dataset"][0]["name"], "Renamed Set")
 
+    def test_slash_bates_within_intersects_ranges_and_rejects_cross_slot_and_mixed_prefix(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        first_exit, first_payload, _, _ = self.run_cli("slash", str(self.root), "/bates", "ABC0001-ABC0010")
+        within_exit, within_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "--within", "ABC0005-ABC0007")
+        cross_exit, cross_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "--within", "alpha")
+        mixed_exit, mixed_payload, _, _ = self.run_cli("slash", str(self.root), "/bates", "ABC0001-XYZ0002")
+
+        self.assertEqual(first_exit, 0)
+        self.assertIsNotNone(first_payload)
+        self.assertEqual(first_payload["scope"]["bates"], {"begin": "ABC0001", "end": "ABC0010"})
+
+        self.assertEqual(within_exit, 0)
+        self.assertIsNotNone(within_payload)
+        self.assertEqual(within_payload["scope"]["bates"], {"begin": "ABC0005", "end": "ABC0007"})
+
+        self.assertEqual(cross_exit, 2)
+        self.assertIsNotNone(cross_payload)
+        self.assertIn("only composes within the current slot", cross_payload["error"])
+
+        self.assertEqual(mixed_exit, 2)
+        self.assertIsNotNone(mixed_payload)
+        self.assertIn("Mixed-prefix Bates ranges", mixed_payload["error"])
+
+    def test_slash_search_errors_when_scope_dataset_reference_is_deleted(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("sample dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        create_exit, _, _, _ = self.run_cli("create-dataset", str(self.root), "Review Set")
+        self.assertEqual(create_exit, 0)
+        scope_exit, _, _, _ = self.run_cli("slash", str(self.root), "/dataset", "Review Set")
+        self.assertEqual(scope_exit, 0)
+        delete_exit, _, _, _ = self.run_cli("delete-dataset", str(self.root), "--dataset-name", "Review Set")
+        self.assertEqual(delete_exit, 0)
+
+        search_exit, search_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(search_exit, 2)
+        self.assertIsNotNone(search_payload)
+        self.assertIn("no longer exists", search_payload["error"])
+
+    def test_slash_search_errors_when_scope_from_run_reference_is_missing(self) -> None:
+        retriever_tools.bootstrap(self.root)
+        self.paths["session_path"].write_text(
+            json.dumps(
+                {
+                    "schema_version": retriever_tools.SESSION_SCHEMA_VERSION,
+                    "scope": {"from_run_id": 999},
+                    "browsing": {},
+                    "display": {},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        search_exit, search_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(search_exit, 2)
+        self.assertIsNotNone(search_payload)
+        self.assertIn("scope.from_run_id no longer exists", search_payload["error"])
+
+    def test_slash_sort_and_paging_persist_browsing_state(self) -> None:
+        for index in range(25):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 25)
+
+        sort_exit, sort_payload, _, _ = self.run_cli("slash", str(self.root), "/sort", "file_name asc")
+
+        self.assertEqual(sort_exit, 0)
+        self.assertIsNotNone(sort_payload)
+        self.assertEqual(sort_payload["results"][0]["file_name"], "doc-00.txt")
+        self.assertEqual(sort_payload["header"]["sort"], "Sort: file_name asc")
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["browsing"]["sort"], [["file_name", "asc"]])
+        self.assertEqual(session_payload["browsing"]["offset"], 0)
+
+        next_exit, next_payload, _, _ = self.run_cli("slash", str(self.root), "/next")
+        page_exit, page_payload, _, _ = self.run_cli("slash", str(self.root), "/page", "last")
+        previous_exit, previous_payload, _, _ = self.run_cli("slash", str(self.root), "/previous")
+        default_exit, default_payload, _, _ = self.run_cli("slash", str(self.root), "/sort", "default")
+
+        self.assertEqual(next_exit, 0)
+        self.assertIsNotNone(next_payload)
+        self.assertEqual(next_payload["page"], 2)
+        self.assertEqual(next_payload["offset"], 20)
+        self.assertEqual(next_payload["results"][0]["file_name"], "doc-20.txt")
+
+        self.assertEqual(page_exit, 0)
+        self.assertIsNotNone(page_payload)
+        self.assertEqual(page_payload["page"], 2)
+        self.assertEqual(page_payload["offset"], 20)
+
+        self.assertEqual(previous_exit, 0)
+        self.assertIsNotNone(previous_payload)
+        self.assertEqual(previous_payload["page"], 1)
+        self.assertEqual(previous_payload["offset"], 0)
+
+        self.assertEqual(default_exit, 0)
+        self.assertIsNotNone(default_payload)
+        self.assertEqual(default_payload["offset"], 0)
+
+        final_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertNotIn("sort", final_session_payload["browsing"])
+        self.assertEqual(final_session_payload["browsing"]["offset"], 0)
+
     def test_deleting_source_backed_dataset_hides_documents_until_reingest(self) -> None:
         document_path = self.root / "sample.txt"
         document_path.write_text("sample dataset body\n", encoding="utf-8")

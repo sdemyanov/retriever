@@ -1433,6 +1433,8 @@ def resolve_document_search(
         "filters": filter_summary,
         "sort": normalized_sort_field or ("bates" if is_bates_query and query.strip() else ("relevance" if query.strip() else "date_created")),
         "order": (order or ("asc" if (is_bates_query or (query.strip() and (sort_field in (None, "relevance")))) else "desc")).lower(),
+        "sort_spec": f"{normalized_sort_field or ('bates' if is_bates_query and query.strip() else ('relevance' if query.strip() else 'date_created'))} "
+        f"{(order or ('asc' if (is_bates_query or (query.strip() and (sort_field in (None, 'relevance')))) else 'desc')).lower()}",
         "results": sorted_results,
     }
 
@@ -1458,6 +1460,7 @@ def search(
     try:
         apply_schema(connection, root)
         selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
+        derived_scope = derive_search_scope(query, raw_filters)
 
         results: list[dict[str, object]] = []
         for match in selection["results"]:
@@ -1559,11 +1562,22 @@ def search(
             "filters": selection["filters"],
             "sort": selection["sort"],
             "order": selection["order"],
+            "sort_spec": selection["sort_spec"],
             "page": page,
             "per_page": per_page,
             "total_hits": total_hits,
             "total_pages": total_pages,
             "results": paged_results,
+            "scope": derived_scope,
+            "header": build_search_header_payload(derived_scope, {
+                "sort": selection["sort"],
+                "order": selection["order"],
+                "sort_spec": selection["sort_spec"],
+                "page": page,
+                "per_page": per_page,
+                "total_hits": total_hits,
+                "total_pages": total_pages,
+            }),
         }
     finally:
         connection.close()
@@ -1616,15 +1630,57 @@ def format_scope_header(scope: dict[str, object]) -> str:
     return "Scope: (none)" if not parts else "Scope: " + ", ".join(parts)
 
 
+def derive_search_scope(query: str, raw_filters: object | None) -> dict[str, object]:
+    scope: dict[str, object] = {}
+    bates_begin, bates_end = parse_bates_query(query)
+    if bates_begin is not None and bates_end is not None:
+        scope["bates"] = {"begin": bates_begin, "end": bates_end}
+    elif query.strip():
+        scope["keyword"] = query
+    if raw_filters:
+        if uses_legacy_tuple_filters(raw_filters):
+            parsed_filters = parse_filter_args(raw_filters)  # type: ignore[arg-type]
+            comparator_map = {
+                "eq": "=",
+                "neq": "!=",
+                "gt": ">",
+                "gte": ">=",
+                "lt": "<",
+                "lte": "<=",
+                "contains": "LIKE",
+                "is-null": "IS NULL",
+                "not-null": "IS NOT NULL",
+            }
+            rendered_parts: list[str] = []
+            for parsed_filter in parsed_filters:
+                operator = str(parsed_filter["operator"])
+                field_name = str(parsed_filter["field_name"])
+                value = parsed_filter["value"]
+                if operator in {"is-null", "not-null"}:
+                    rendered_parts.append(f"{field_name} {comparator_map[operator]}")
+                elif operator == "contains":
+                    rendered_parts.append(f"{field_name} LIKE '%{value}%'")
+                else:
+                    rendered_parts.append(f"{field_name} {comparator_map[operator]} {value!r}")
+            if rendered_parts:
+                scope["filter"] = " AND ".join(rendered_parts)
+        else:
+            expressions = normalize_sql_filter_expressions(raw_filters)
+            if expressions:
+                scope["filter"] = " AND ".join(f"({expression})" for expression in expressions)
+    return scope
+
+
 def build_search_header_payload(scope: dict[str, object], payload: dict[str, object]) -> dict[str, str]:
     total_hits = int(payload.get("total_hits") or 0)
     page = int(payload.get("page") or 1)
     per_page = int(payload.get("per_page") or DEFAULT_PAGE_SIZE)
     start_index = 0 if total_hits == 0 else ((page - 1) * per_page) + 1
     end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
+    sort_summary = str(payload.get("sort_spec") or f"{payload.get('sort')} {payload.get('order')}")
     return {
         "scope": format_scope_header(scope),
-        "sort": f"Sort: {payload.get('sort')} {payload.get('order')}",
+        "sort": f"Sort: {sort_summary}",
         "page": f"Page: {page} of {payload.get('total_pages')}  (docs {start_index}-{end_index} of {total_hits})",
     }
 
@@ -1739,9 +1795,86 @@ def stable_sort_results_by_field(
     return [item for _, item in non_null_items] + null_items
 
 
+def coerce_sort_specs(raw_value: object) -> list[tuple[str, str]]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized_specs: list[tuple[str, str]] = []
+    for item in raw_value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        field_name = normalize_inline_whitespace(str(item[0] or ""))
+        direction = normalize_inline_whitespace(str(item[1] or "")).lower()
+        if not field_name or direction not in {"asc", "desc"}:
+            continue
+        normalized_specs.append((field_name, direction))
+    return normalized_specs
+
+
+def serialize_sort_specs(sort_specs: list[tuple[str, str]] | None) -> list[list[str]]:
+    if not sort_specs:
+        return []
+    return [[field_name, direction] for field_name, direction in sort_specs]
+
+
+def sort_specs_text(sort_specs: list[tuple[str, str]] | None) -> str | None:
+    if not sort_specs:
+        return None
+    return ", ".join(f"{field_name} {direction}" for field_name, direction in sort_specs)
+
+
+def resolve_sort_field_name(connection: sqlite3.Connection, raw_field_name: str) -> str:
+    field_def = resolve_field_definition(connection, raw_field_name)
+    if field_def.get("source") == "virtual":
+        raise RetrieverError(f"Cannot sort by virtual filter field: {raw_field_name}")
+    return str(field_def["field_name"])
+
+
+def parse_slash_sort_specs(connection: sqlite3.Connection, raw_text: str) -> list[tuple[str, str]]:
+    if not normalize_inline_whitespace(raw_text):
+        raise RetrieverError("Usage: /sort <column asc|desc[, column asc|desc...]>")
+    parts = split_quoted_comma_values(raw_text)
+    if not parts:
+        raise RetrieverError("Usage: /sort <column asc|desc[, column asc|desc...]>")
+    sort_specs: list[tuple[str, str]] = []
+    for part in parts:
+        tokens = shlex_split_slash_tail(part)
+        if len(tokens) != 2:
+            raise RetrieverError("Each sort entry must be exactly '<column> <asc|desc>'.")
+        field_name = resolve_sort_field_name(connection, tokens[0])
+        direction = normalize_inline_whitespace(tokens[1]).lower()
+        if direction not in {"asc", "desc"}:
+            raise RetrieverError("Sort direction must be 'asc' or 'desc'.")
+        sort_specs.append((field_name, direction))
+    return sort_specs
+
+
+def apply_sort_specs(
+    results: list[dict[str, object]],
+    sort_specs: list[tuple[str, str]] | None,
+) -> list[dict[str, object]]:
+    if not sort_specs:
+        return results
+    effective_specs = list(sort_specs)
+    if not any(field_name == "id" for field_name, _ in effective_specs):
+        effective_specs.append(("id", "asc"))
+    sorted_results = list(results)
+    for field_name, direction in reversed(effective_specs):
+        if field_name == "id":
+            sorted_results = sorted(
+                sorted_results,
+                key=lambda item: int(item["id"]),
+                reverse=direction == "desc",
+            )
+            continue
+        sorted_results = stable_sort_results_by_field(sorted_results, field_name, direction)
+    return sorted_results
+
+
 def resolve_scope_document_search(
     connection: sqlite3.Connection,
     raw_scope: object,
+    *,
+    sort_specs: list[tuple[str, str]] | None = None,
 ) -> dict[str, object]:
     scope, clauses, params, filter_summary = build_scope_search_filters(connection, raw_scope)
     keyword_query = normalize_inline_whitespace(str(scope.get("keyword") or ""))
@@ -1787,13 +1920,19 @@ def resolve_scope_document_search(
         for document_id, match in matches.items()
     ]
     stable_results = sorted(results, key=lambda item: int(item["id"]))
-    if bates_query:
+    if sort_specs:
+        sorted_results = apply_sort_specs(stable_results, sort_specs)
+        sort_name = sort_specs[0][0]
+        order_name = sort_specs[0][1]
+        sort_spec = sort_specs_text(sort_specs) or f"{sort_name} {order_name}"
+    elif bates_query:
         sorted_results = sorted(
             stable_results,
             key=lambda item: item.get("bates_sort_key") or (1, "", 0, ""),
         )
         sort_name = "bates"
         order_name = "asc"
+        sort_spec = "bates asc"
     elif keyword_query:
         sorted_results = stable_sort_results_by_field(stable_results, "date_created", "desc")
         sorted_results = sorted(
@@ -1802,10 +1941,12 @@ def resolve_scope_document_search(
         )
         sort_name = "relevance"
         order_name = "asc"
+        sort_spec = "relevance asc"
     else:
         sorted_results = stable_sort_results_by_field(stable_results, "date_created", "desc")
         sort_name = "date_created"
         order_name = "desc"
+        sort_spec = "date_created desc"
 
     query_label = keyword_query or bates_query or ""
     return {
@@ -1814,6 +1955,7 @@ def resolve_scope_document_search(
         "filters": filter_summary,
         "sort": sort_name,
         "order": order_name,
+        "sort_spec": sort_spec,
         "results": sorted_results,
     }
 
@@ -1824,19 +1966,23 @@ def search_with_scope(
     *,
     page: int = 1,
     per_page: int = DEFAULT_PAGE_SIZE,
+    offset: int | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
 ) -> dict[str, object]:
     if page < 1:
         raise RetrieverError("Page must be >= 1.")
     if per_page < 1:
         raise RetrieverError("per-page must be >= 1.")
     per_page = min(per_page, MAX_PAGE_SIZE)
+    if offset is not None and offset < 0:
+        raise RetrieverError("Offset must be >= 0.")
 
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        selection = resolve_scope_document_search(connection, raw_scope)
+        selection = resolve_scope_document_search(connection, raw_scope, sort_specs=sort_specs)
 
         results: list[dict[str, object]] = []
         for match in selection["results"]:
@@ -1887,7 +2033,11 @@ def search_with_scope(
 
         total_hits = len(results)
         total_pages = max(1, (total_hits + per_page - 1) // per_page)
-        start = (page - 1) * per_page
+        start = (page - 1) * per_page if offset is None else offset
+        if total_hits > 0 and start >= total_hits:
+            start = (total_pages - 1) * per_page
+        start = max(0, start)
+        page = (start // per_page) + 1
         end = start + per_page
         paged_results = results[start:end]
         paged_rows = [item["row"] for item in paged_results]
@@ -1937,8 +2087,10 @@ def search_with_scope(
             "filters": selection["filters"],
             "sort": selection["sort"],
             "order": selection["order"],
+            "sort_spec": selection["sort_spec"],
             "page": page,
             "per_page": per_page,
+            "offset": start,
             "total_hits": total_hits,
             "total_pages": total_pages,
             "results": paged_results,
@@ -1960,14 +2112,39 @@ def session_page_size(session_state: dict[str, object]) -> int:
     return min(page_size, MAX_PAGE_SIZE)
 
 
-def persist_scope_to_session(paths: dict[str, Path], scope: dict[str, object]) -> dict[str, object]:
+def session_browsing_state(session_state: dict[str, object]) -> dict[str, object]:
+    browsing = session_state.get("browsing")
+    return browsing if isinstance(browsing, dict) else {}
+
+
+def session_sort_specs(session_state: dict[str, object]) -> list[tuple[str, str]]:
+    return coerce_sort_specs(session_browsing_state(session_state).get("sort"))
+
+
+def clear_session_browsing(session_state: dict[str, object]) -> dict[str, object]:
+    session_state["browsing"] = {}
+    return session_state
+
+
+def persist_session_state(paths: dict[str, Path], session_state: dict[str, object]) -> dict[str, object]:
+    write_session_state(paths, session_state)
+    return read_session_state(paths)
+
+
+def persist_scope_to_session(
+    paths: dict[str, Path],
+    scope: dict[str, object],
+    *,
+    reset_browsing: bool = True,
+) -> dict[str, object]:
     session_state = read_session_state(paths)
     normalized_scope = coerce_scope_payload(scope)
     if normalized_scope:
         normalized_scope["set_at"] = utc_now()
     session_state["scope"] = normalized_scope
-    write_session_state(paths, session_state)
-    return session_state
+    if reset_browsing:
+        clear_session_browsing(session_state)
+    return persist_session_state(paths, session_state)
 
 
 def find_saved_scope_name(saved_scopes_state: dict[str, object], requested_name: str) -> str | None:
@@ -2140,9 +2317,49 @@ def resolve_scope_dataset_selection(connection: sqlite3.Connection, raw_values: 
     return resolved_entries
 
 
+def persist_browsing_search_result(
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+    payload: dict[str, object],
+    sort_specs: list[tuple[str, str]] | None,
+) -> dict[str, object]:
+    session_state["scope"] = coerce_scope_payload(payload.get("scope"))
+    browsing_payload: dict[str, object] = {
+        "offset": int(payload.get("offset") or 0),
+        "total_known": int(payload.get("total_hits") or 0),
+        "run_at": utc_now(),
+    }
+    if sort_specs:
+        browsing_payload["sort"] = serialize_sort_specs(sort_specs)
+    session_state["browsing"] = browsing_payload
+    persist_session_state(paths, session_state)
+    return payload
+
+
+def run_browsing_search_from_session(
+    root: Path,
+    paths: dict[str, Path],
+    session_state: dict[str, object] | None = None,
+    *,
+    offset: int | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
+) -> dict[str, object]:
+    normalized_session_state = read_session_state(paths) if session_state is None else session_state
+    effective_sort_specs = sort_specs if sort_specs is not None else session_sort_specs(normalized_session_state)
+    current_offset = int(session_browsing_state(normalized_session_state).get("offset") or 0)
+    payload = search_with_scope(
+        root,
+        normalized_session_state.get("scope", {}),
+        per_page=session_page_size(normalized_session_state),
+        offset=current_offset if offset is None else offset,
+        sort_specs=effective_sort_specs or None,
+    )
+    return persist_browsing_search_result(paths, normalized_session_state, payload, effective_sort_specs or None)
+
+
 def run_scope_search_from_session(root: Path, paths: dict[str, Path], scope: dict[str, object]) -> dict[str, object]:
     session_state = persist_scope_to_session(paths, scope)
-    return search_with_scope(root, session_state.get("scope", {}), per_page=session_page_size(session_state))
+    return run_browsing_search_from_session(root, paths, session_state, offset=0)
 
 
 def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
@@ -2169,8 +2386,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
                 return {"status": "ok", "scope": scope}
             subcommand = scope_args[0]
             if subcommand == "clear":
-                persist_scope_to_session(paths, {})
-                return {"status": "ok", "scope": {}}
+                return run_scope_search_from_session(root, paths, {})
             if subcommand == "save":
                 if len(scope_args) != 2:
                     raise RetrieverError("Usage: /scope save <name>")
@@ -2186,6 +2402,47 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
                 loaded_scope = coerce_scope_payload(saved_scope)
                 return run_scope_search_from_session(root, paths, loaded_scope)
             raise RetrieverError(f"Unknown /scope command: {subcommand}")
+
+        if command_name == "sort":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /sort <column asc|desc[, column asc|desc...]> or /sort default")
+            updated_session_state = read_session_state(paths)
+            if normalized_tail == "default":
+                return run_browsing_search_from_session(root, paths, updated_session_state, offset=0, sort_specs=[])
+            sort_specs = parse_slash_sort_specs(connection, normalized_tail)
+            return run_browsing_search_from_session(root, paths, updated_session_state, offset=0, sort_specs=sort_specs)
+
+        if command_name in {"next", "previous"}:
+            updated_session_state = read_session_state(paths)
+            per_page = session_page_size(updated_session_state)
+            current_offset = int(session_browsing_state(updated_session_state).get("offset") or 0)
+            target_offset = current_offset + per_page if command_name == "next" else max(0, current_offset - per_page)
+            return run_browsing_search_from_session(root, paths, updated_session_state, offset=target_offset)
+
+        if command_name == "page":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /page <N|first|last|next|previous>")
+            updated_session_state = read_session_state(paths)
+            per_page = session_page_size(updated_session_state)
+            current_offset = int(session_browsing_state(updated_session_state).get("offset") or 0)
+            page_token = normalize_inline_whitespace(normalized_tail).lower()
+            if page_token == "first":
+                target_offset = 0
+            elif page_token == "last":
+                target_offset = 10**12
+            elif page_token == "next":
+                target_offset = current_offset + per_page
+            elif page_token == "previous":
+                target_offset = max(0, current_offset - per_page)
+            else:
+                try:
+                    page_number = int(page_token)
+                except ValueError as exc:
+                    raise RetrieverError("Usage: /page <N|first|last|next|previous>") from exc
+                if page_number < 1:
+                    raise RetrieverError("Page number must be >= 1.")
+                target_offset = (page_number - 1) * per_page
+            return run_browsing_search_from_session(root, paths, updated_session_state, offset=target_offset)
 
         if command_name == "search":
             if not normalized_tail:
@@ -2259,7 +2516,9 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
                 dataset_id = int(dataset_summary["id"])
                 dataset_name = str(dataset_summary["dataset_name"])
                 refresh_dataset_name_refs_in_scope(scope, dataset_id, dataset_name)
-                persist_scope_to_session(paths, scope)
+                updated_session_state = read_session_state(paths)
+                updated_session_state["scope"] = coerce_scope_payload(scope)
+                persist_session_state(paths, updated_session_state)
                 refresh_dataset_name_refs_in_saved_scopes(paths, dataset_id, dataset_name)
                 return renamed_payload
             dataset_names = split_quoted_comma_values(normalized_tail)
