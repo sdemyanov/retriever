@@ -9,6 +9,7 @@ import mailbox
 import os
 import random
 import re
+import shutil
 import sqlite3
 import tempfile
 import types
@@ -921,8 +922,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             )
         )
 
-    def write_production_fixture(self, *, loadfile_volume_prefix: str | None = None) -> Path:
-        production_root = self.root / "Synthetic_Production"
+    def write_production_fixture(
+        self,
+        *,
+        production_name: str = "Synthetic_Production",
+        control_prefix: str = "PDX",
+        loadfile_volume_prefix: str | None = None,
+    ) -> Path:
+        production_root = self.root / production_name
         data_dir = production_root / "DATA"
         text_dir = production_root / "TEXT" / "TEXT001"
         image_dir = production_root / "IMAGES" / "IMG001"
@@ -932,10 +939,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         loadfile_root = (loadfile_volume_prefix or production_root.name).strip()
 
+        def bates(number: int) -> str:
+            return f"{control_prefix}{number:06d}"
+
         def loadfile_path(*parts: str) -> str:
             return ".\\" + "\\".join([loadfile_root, *parts])
 
-        (text_dir / "PDX000001.txt").write_text(
+        (text_dir / f"{bates(1)}.txt").write_text(
             (
                 "From: Elena Steven <elena@example.com>\n"
                 "To: Harry Montoro <harry@example.com>\n"
@@ -946,7 +956,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (text_dir / "PDX000003.txt").write_text(
+        (text_dir / f"{bates(3)}.txt").write_text(
             (
                 "From: Review Team\n"
                 "Sent: 04/14/2026 09:00 AM\n\n"
@@ -955,21 +965,21 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (text_dir / "PDX000004.txt").write_text("Native-backed production doc\nUse native preview first.\n", encoding="utf-8")
+        (text_dir / f"{bates(4)}.txt").write_text("Native-backed production doc\nUse native preview first.\n", encoding="utf-8")
 
-        self.write_tiff_fixture(image_dir / "PDX000001.tif", (255, 0, 0))
-        self.write_tiff_fixture(image_dir / "PDX000002.tif", (0, 255, 0))
-        self.write_tiff_fixture(image_dir / "PDX000003.tif", (0, 0, 255))
-        self.write_tiff_fixture(image_dir / "PDX000005.tif", (128, 128, 0))
-        self.write_tiff_fixture(image_dir / "PDX000006.tif", (0, 128, 128))
-        self.write_minimal_pdf(native_dir / "PDX000004.pdf", "Native preview document")
+        self.write_tiff_fixture(image_dir / f"{bates(1)}.tif", (255, 0, 0))
+        self.write_tiff_fixture(image_dir / f"{bates(2)}.tif", (0, 255, 0))
+        self.write_tiff_fixture(image_dir / f"{bates(3)}.tif", (0, 0, 255))
+        self.write_tiff_fixture(image_dir / f"{bates(5)}.tif", (128, 128, 0))
+        self.write_tiff_fixture(image_dir / f"{bates(6)}.tif", (0, 128, 128))
+        self.write_minimal_pdf(native_dir / f"{bates(4)}.pdf", "Native preview document")
 
         headers = ["Begin Bates", "End Bates", "Begin Attachment", "End Attachment", "Text Precedence", "FILE_PATH"]
         rows = [
-            ["PDX000001", "PDX000002", "PDX000001", "PDX000003", loadfile_path("TEXT", "TEXT001", "PDX000001.txt"), ""],
-            ["PDX000003", "PDX000003", "", "", loadfile_path("TEXT", "TEXT001", "PDX000003.txt"), ""],
-            ["PDX000004", "PDX000004", "", "", loadfile_path("TEXT", "TEXT001", "PDX000004.txt"), loadfile_path("NATIVES", "NAT001", "PDX000004.pdf")],
-            ["PDX000005", "PDX000006", "", "", "", ""],
+            [bates(1), bates(2), bates(1), bates(3), loadfile_path("TEXT", "TEXT001", f"{bates(1)}.txt"), ""],
+            [bates(3), bates(3), "", "", loadfile_path("TEXT", "TEXT001", f"{bates(3)}.txt"), ""],
+            [bates(4), bates(4), "", "", loadfile_path("TEXT", "TEXT001", f"{bates(4)}.txt"), loadfile_path("NATIVES", "NAT001", f"{bates(4)}.pdf")],
+            [bates(5), bates(6), "", "", "", ""],
         ]
         delimiter = b"\x14"
         quote = b"\xfe"
@@ -977,16 +987,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         def dat_line(fields: list[str]) -> bytes:
             return delimiter.join(quote + field.encode("latin-1") + quote for field in fields) + b"\r\n"
 
-        (data_dir / "Synthetic_Production.dat").write_bytes(dat_line(headers) + b"".join(dat_line(row) for row in rows))
+        (data_dir / f"{production_name}.dat").write_bytes(dat_line(headers) + b"".join(dat_line(row) for row in rows))
 
         opt_lines = [
-            f"PDX000001,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000001.tif')},Y,,,2",
-            f"PDX000002,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000002.tif')},,,,",
-            f"PDX000003,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000003.tif')},Y,,,1",
-            f"PDX000005,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000005.tif')},Y,,,2",
-            f"PDX000006,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000006.tif')},,,,",
+            f"{bates(1)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(1)}.tif')},Y,,,2",
+            f"{bates(2)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(2)}.tif')},,,,",
+            f"{bates(3)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(3)}.tif')},Y,,,1",
+            f"{bates(5)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(5)}.tif')},Y,,,2",
+            f"{bates(6)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(6)}.tif')},,,,",
         ]
-        (data_dir / "Synthetic_Production.opt").write_text("\n".join(opt_lines) + "\n", encoding="utf-8")
+        (data_dir / f"{production_name}.opt").write_text("\n".join(opt_lines) + "\n", encoding="utf-8")
         return production_root
 
     def test_bootstrap_migrates_legacy_schema_and_backfills_content_type(self) -> None:
@@ -7761,7 +7771,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(missing_parent["lifecycle_status"], "missing")
         self.assertEqual(missing_child["lifecycle_status"], "missing")
 
-    def test_plain_ingest_skips_detected_production_roots(self) -> None:
+    def test_plain_ingest_auto_routes_detected_production_roots(self) -> None:
         self.write_production_fixture()
         loose_file = self.root / "notes.txt"
         loose_file.write_text("loose workspace note\n", encoding="utf-8")
@@ -7769,14 +7779,234 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         retriever_tools.bootstrap(self.root)
         ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
 
-        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["new"], 5)
+        self.assertEqual(ingest_result["updated"], 0)
         self.assertEqual(ingest_result["failed"], 0)
-        self.assertEqual(ingest_result["skipped_production_roots"], ["Synthetic_Production"])
-        self.assertIn("use ingest-production", ingest_result["warnings"][0])
+        self.assertEqual(ingest_result["ingested_production_roots"], ["Synthetic_Production"])
+        self.assertEqual(ingest_result["skipped_production_roots"], [])
+        self.assertEqual(ingest_result["production_documents_created"], 4)
+        self.assertEqual(ingest_result["production_documents_updated"], 0)
+        self.assertEqual(ingest_result["production_documents_unchanged"], 0)
+        self.assertEqual(ingest_result["production_documents_retired"], 0)
+        self.assertEqual(ingest_result["production_families_reconstructed"], 1)
+        self.assertEqual(ingest_result["production_docs_missing_linked_text"], 0)
+        self.assertEqual(ingest_result["production_docs_missing_linked_images"], 1)
+        self.assertEqual(ingest_result["production_docs_missing_linked_natives"], 0)
+        self.assertNotIn("warnings", ingest_result)
 
         browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
-        self.assertEqual(browse_result["total_hits"], 1)
-        self.assertEqual(browse_result["results"][0]["file_name"], "notes.txt")
+        self.assertEqual(browse_result["total_hits"], 5)
+        self.assertIn("notes.txt", [item["file_name"] for item in browse_result["results"]])
+
+        production_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000001.logical"
+        )
+        self.assertEqual(production_row["source_kind"], retriever_tools.PRODUCTION_SOURCE_KIND)
+
+    def test_plain_ingest_auto_routes_multiple_production_roots_without_double_indexing_loose_artifacts(self) -> None:
+        self.write_production_fixture()
+        self.write_production_fixture(production_name="Second_Production", control_prefix="QDX")
+        loose_file = self.root / "summary.txt"
+        loose_file.write_text("workspace summary\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 9)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(
+            ingest_result["ingested_production_roots"],
+            ["Second_Production", "Synthetic_Production"],
+        )
+        self.assertEqual(ingest_result["skipped_production_roots"], [])
+        self.assertEqual(ingest_result["production_documents_created"], 8)
+        self.assertEqual(ingest_result["production_documents_updated"], 0)
+        self.assertEqual(ingest_result["production_documents_unchanged"], 0)
+        self.assertEqual(ingest_result["production_documents_retired"], 0)
+        self.assertEqual(ingest_result["production_families_reconstructed"], 2)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            production_doc_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM documents WHERE source_kind = ?",
+                (retriever_tools.PRODUCTION_SOURCE_KIND,),
+            ).fetchone()["count"]
+            loose_artifact_rows = connection.execute(
+                """
+                SELECT rel_path
+                FROM documents
+                WHERE rel_path LIKE 'Synthetic_Production/TEXT/%'
+                   OR rel_path LIKE 'Synthetic_Production/IMAGES/%'
+                   OR rel_path LIKE 'Synthetic_Production/NATIVES/%'
+                   OR rel_path LIKE 'Second_Production/TEXT/%'
+                   OR rel_path LIKE 'Second_Production/IMAGES/%'
+                   OR rel_path LIKE 'Second_Production/NATIVES/%'
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(production_doc_count, 8)
+        self.assertEqual(loose_artifact_rows, [])
+
+    def test_plain_ingest_with_file_type_filter_still_skips_detected_production_roots(self) -> None:
+        self.write_production_fixture()
+        loose_file = self.root / "notes.txt"
+        loose_file.write_text("loose workspace note\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types="txt")
+
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["ingested_production_roots"], [])
+        self.assertEqual(ingest_result["skipped_production_roots"], ["Synthetic_Production"])
+        self.assertEqual(ingest_result["production_documents_created"], 0)
+        self.assertIn("use ingest-production", ingest_result["warnings"][0])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            production_doc_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM documents WHERE source_kind = ?",
+                (retriever_tools.PRODUCTION_SOURCE_KIND,),
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+        self.assertEqual(production_doc_count, 0)
+
+    def test_plain_ingest_auto_routed_production_matches_direct_ingest_production(self) -> None:
+        production_root = self.write_production_fixture()
+
+        def production_snapshot(workspace_root: Path) -> tuple[list[dict[str, object]], dict[str, list[tuple[str, str, int]]]]:
+            connection = retriever_tools.connect_db(retriever_tools.workspace_paths(workspace_root)["db_path"])
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT id, control_number, begin_bates, end_bates, begin_attachment, end_attachment,
+                           parent_document_id, rel_path, file_name, content_type, text_status
+                    FROM documents
+                    WHERE source_kind = ?
+                    ORDER BY control_number ASC, id ASC
+                    """,
+                    (retriever_tools.PRODUCTION_SOURCE_KIND,),
+                ).fetchall()
+                control_by_id = {int(row["id"]): str(row["control_number"]) for row in rows}
+                documents: list[dict[str, object]] = []
+                source_parts: dict[str, list[tuple[str, str, int]]] = {}
+                for row in rows:
+                    documents.append(
+                        {
+                            "control_number": row["control_number"],
+                            "begin_bates": row["begin_bates"],
+                            "end_bates": row["end_bates"],
+                            "begin_attachment": row["begin_attachment"],
+                            "end_attachment": row["end_attachment"],
+                            "parent_control_number": (
+                                control_by_id[int(row["parent_document_id"])]
+                                if row["parent_document_id"] is not None
+                                else None
+                            ),
+                            "rel_path": row["rel_path"],
+                            "file_name": row["file_name"],
+                            "content_type": row["content_type"],
+                            "text_status": row["text_status"],
+                        }
+                    )
+                    part_rows = connection.execute(
+                        """
+                        SELECT part_kind, rel_source_path, ordinal
+                        FROM document_source_parts
+                        WHERE document_id = ?
+                        ORDER BY part_kind ASC, ordinal ASC, id ASC
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                    source_parts[str(row["control_number"])] = [
+                        (str(part["part_kind"]), str(part["rel_source_path"]), int(part["ordinal"]))
+                        for part in part_rows
+                    ]
+                return documents, source_parts
+            finally:
+                connection.close()
+
+        retriever_tools.bootstrap(self.root)
+        direct_result = retriever_tools.ingest_production(self.root, production_root)
+        direct_documents, direct_source_parts = production_snapshot(self.root)
+
+        with tempfile.TemporaryDirectory(prefix="retriever-auto-production-") as auto_tempdir:
+            auto_root = Path(auto_tempdir)
+            shutil.copytree(production_root, auto_root / production_root.name)
+            auto_paths = retriever_tools.workspace_paths(auto_root)
+            retriever_tools.ensure_layout(auto_paths)
+            auto_paths["tool_path"].write_bytes(TOOL_BYTES)
+
+            retriever_tools.bootstrap(auto_root)
+            auto_result = retriever_tools.ingest(auto_root, recursive=True, raw_file_types=None)
+            auto_documents, auto_source_parts = production_snapshot(auto_root)
+
+        self.assertEqual(direct_result["created"], 4)
+        self.assertEqual(auto_result["production_documents_created"], 4)
+        self.assertEqual(auto_result["production_documents_updated"], 0)
+        self.assertEqual(auto_result["production_documents_retired"], 0)
+        self.assertEqual(auto_result["production_families_reconstructed"], direct_result["families_reconstructed"])
+        self.assertEqual(auto_result["ingested_production_roots"], ["Synthetic_Production"])
+        self.assertEqual(auto_documents, direct_documents)
+        self.assertEqual(auto_source_parts, direct_source_parts)
+
+    def test_plain_ingest_continues_after_detected_production_root_failure(self) -> None:
+        self.write_production_fixture(production_name="Valid_Production", control_prefix="VDX")
+        broken_root = self.root / "Broken_Production"
+        (broken_root / "DATA").mkdir(parents=True, exist_ok=True)
+        broken_text_dir = broken_root / "TEXT" / "TEXT001"
+        broken_text_dir.mkdir(parents=True, exist_ok=True)
+        (broken_root / "IMAGES" / "IMG001").mkdir(parents=True, exist_ok=True)
+        (broken_text_dir / "BDX000001.txt").write_text("broken production text should stay unindexed\n", encoding="utf-8")
+        loose_file = self.root / "notes.txt"
+        loose_file.write_text("loose workspace note\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            retriever_tools.upsert_production_row(
+                connection,
+                dataset_id=None,
+                rel_root="Broken_Production",
+                production_name="Broken_Production",
+                metadata_load_rel_path="Broken_Production/DATA/Broken_Production.dat",
+                image_load_rel_path="Broken_Production/DATA/Broken_Production.opt",
+                source_type="concordance-dat-opt",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 5)
+        self.assertEqual(ingest_result["failed"], 1)
+        self.assertEqual(ingest_result["ingested_production_roots"], ["Valid_Production"])
+        self.assertEqual(ingest_result["production_documents_created"], 4)
+        self.assertTrue(any(item["rel_path"] == "Broken_Production" for item in ingest_result["failures"]))
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            broken_doc_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM documents WHERE rel_path LIKE 'Broken_Production/%'",
+            ).fetchone()["count"]
+            valid_doc_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM documents
+                WHERE source_kind = ?
+                  AND production_id = (SELECT id FROM productions WHERE rel_root = ?)
+                """,
+                (retriever_tools.PRODUCTION_SOURCE_KIND, "Valid_Production"),
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+
+        self.assertEqual(broken_doc_count, 0)
+        self.assertEqual(valid_doc_count, 4)
 
     def test_ingest_production_creates_logical_documents_bates_lookup_and_preview_precedence(self) -> None:
         production_root = self.write_production_fixture()

@@ -6,269 +6,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
         apply_schema(connection, root)
         reconcile_custom_fields_registry(connection, repair=True)
         resolved_production_root = resolve_production_root_argument(root, production_root)
-        signature = production_signature_for_root(root, resolved_production_root)
-        if signature is None:
-            raise RetrieverError(f"Path does not look like a supported processed production: {resolved_production_root}")
-
-        metadata_load_path = Path(signature["metadata_load_path"])
-        image_load_path = Path(signature["image_load_path"]) if signature["image_load_path"] is not None else None
-        metadata = parse_production_metadata_load(metadata_load_path)
-        image_rows = parse_production_image_load(image_load_path)
-        dataset_id, dataset_source_id = ensure_source_backed_dataset(
-            connection,
-            source_kind=PRODUCTION_SOURCE_KIND,
-            source_locator=str(signature["rel_root"]),
-            dataset_name=production_dataset_name(str(signature["rel_root"]), str(signature["production_name"])),
-        )
-        production_id = upsert_production_row(
-            connection,
-            dataset_id=dataset_id,
-            rel_root=str(signature["rel_root"]),
-            production_name=str(signature["production_name"]),
-            metadata_load_rel_path=relative_document_path(root, metadata_load_path),
-            image_load_rel_path=relative_document_path(root, image_load_path) if image_load_path is not None else None,
-            source_type=str(signature["source_type"]),
-        )
-        connection.commit()
-
-        existing_rows = connection.execute(
-            """
-            SELECT *
-            FROM documents
-            WHERE production_id = ?
-            """,
-            (production_id,),
-        ).fetchall()
-        existing_by_control_number = {str(row["control_number"]): row for row in existing_rows if row["control_number"]}
-        seen_control_numbers: set[str] = set()
-
-        resolved_image_rows: list[dict[str, object]] = []
-        for image_row in image_rows:
-            resolved_path = resolve_production_source_path(root, resolved_production_root, image_row["image_path"])
-            resolved_image_rows.append({**image_row, "resolved_path": resolved_path})
-
-        stats: dict[str, int] = {
-            "created": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "retired": 0,
-            "families_reconstructed": 0,
-            "page_images_linked": 0,
-            "docs_missing_linked_text": 0,
-            "docs_missing_linked_images": 0,
-            "docs_missing_linked_natives": 0,
-        }
-        failures: list[dict[str, str]] = []
-
-        for record in metadata["rows"]:
-            begin_bates = str(record.get("begin_bates") or "").strip()
-            end_bates = str(record.get("end_bates") or begin_bates).strip()
-            if not begin_bates:
-                continue
-            control_number = begin_bates
-            seen_control_numbers.add(control_number)
-            existing_row = existing_by_control_number.get(control_number)
-            connection.execute("BEGIN")
-            try:
-                existing_signature = existing_production_row_signature(connection, existing_row)
-                text_path = resolve_production_source_path(root, resolved_production_root, record.get("text_path"))
-                native_path = resolve_production_source_path(root, resolved_production_root, record.get("native_path"))
-                matching_image_paths = [
-                    Path(image_row["resolved_path"])
-                    for image_row in resolved_image_rows
-                    if image_row.get("resolved_path") is not None
-                    and bates_inclusive_contains(begin_bates, end_bates, image_row["page_bates"])
-                ]
-                if record.get("text_path") and (text_path is None or not text_path.exists()):
-                    stats["docs_missing_linked_text"] += 1
-                if image_rows and not matching_image_paths:
-                    stats["docs_missing_linked_images"] += 1
-                if record.get("native_path") and (native_path is None or not native_path.exists()):
-                    stats["docs_missing_linked_natives"] += 1
-
-                extracted_payload = build_production_extracted_payload(
-                    root,
-                    production_name=str(signature["production_name"]),
-                    control_number=control_number,
-                    begin_bates=begin_bates,
-                    end_bates=end_bates,
-                    begin_attachment=record.get("begin_attachment"),
-                    end_attachment=record.get("end_attachment"),
-                    text_path=text_path if text_path is not None and text_path.exists() else None,
-                    image_paths=matching_image_paths,
-                    native_path=native_path if native_path is not None and native_path.exists() else None,
-                )
-                preferred_native = extracted_payload.pop("preferred_native", None)
-                extracted = apply_manual_locks(existing_row, extracted_payload)
-                source_parts = production_source_parts(
-                    root,
-                    text_path=text_path if text_path is not None and text_path.exists() else None,
-                    image_paths=matching_image_paths,
-                    native_path=native_path if native_path is not None and native_path.exists() else None,
-                )
-                rel_path = production_logical_rel_path(str(signature["rel_root"]), control_number).as_posix()
-                file_name = (
-                    (preferred_native.name if isinstance(preferred_native, Path) else None)
-                    or (native_path.name if native_path is not None and native_path.exists() else None)
-                    or f"{control_number}.production"
-                )
-                desired_signature = production_row_signature(
-                    existing_row,
-                    rel_path=rel_path,
-                    file_name=file_name,
-                    source_kind=PRODUCTION_SOURCE_KIND,
-                    production_id=production_id,
-                    begin_bates=begin_bates,
-                    end_bates=end_bates,
-                    begin_attachment=record.get("begin_attachment"),
-                    end_attachment=record.get("end_attachment"),
-                    extracted=extracted,
-                    source_parts=source_parts,
-                )
-                if existing_row is not None:
-                    cleanup_document_artifacts(paths, connection, existing_row)
-                document_id = upsert_document_row(
-                    connection,
-                    rel_path,
-                    preferred_native if isinstance(preferred_native, Path) else (text_path if text_path is not None and text_path.exists() else None),
-                    existing_row,
-                    extracted,
-                    file_name=file_name,
-                    parent_document_id=None,
-                    control_number=control_number,
-                    dataset_id=dataset_id,
-                    control_number_batch=None,
-                    control_number_family_sequence=None,
-                    control_number_attachment_sequence=None,
-                    source_kind=PRODUCTION_SOURCE_KIND,
-                    production_id=production_id,
-                    begin_bates=begin_bates,
-                    end_bates=end_bates,
-                    begin_attachment=record.get("begin_attachment"),
-                    end_attachment=record.get("end_attachment"),
-                    file_type_override=(
-                        normalize_extension(preferred_native)
-                        if isinstance(preferred_native, Path)
-                        else (normalize_extension(native_path) if native_path is not None else None)
-                    ),
-                    file_size_override=production_document_file_size(
-                        text_path if text_path is not None and text_path.exists() else None,
-                        matching_image_paths,
-                        native_path if native_path is not None and native_path.exists() else None,
-                    ),
-                    file_hash_override=(
-                        sha256_file(preferred_native)
-                        if isinstance(preferred_native, Path)
-                        else (sha256_file(text_path) if text_path is not None and text_path.exists() else None)
-                    ),
-                )
-                seed_source_text_revision_for_document(
-                    connection,
-                    paths,
-                    document_id=document_id,
-                    extracted=extracted,
-                    existing_row=existing_row,
-                )
-                ensure_dataset_document_membership(
-                    connection,
-                    dataset_id=dataset_id,
-                    document_id=document_id,
-                    dataset_source_id=dataset_source_id,
-                )
-                preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
-                chunks = chunk_text(str(extracted.get("text_content") or ""))
-                replace_document_related_rows(connection, document_id, extracted | {"file_name": file_name}, chunks, preview_rows)
-                replace_document_source_parts(connection, document_id, source_parts)
-                connection.commit()
-
-                if existing_row is None:
-                    stats["created"] += 1
-                elif existing_row["lifecycle_status"] == "active" and existing_signature == desired_signature:
-                    stats["unchanged"] += 1
-                else:
-                    stats["updated"] += 1
-                stats["page_images_linked"] += len(matching_image_paths)
-            except Exception as exc:
-                connection.rollback()
-                failures.append({"control_number": control_number, "error": f"{type(exc).__name__}: {exc}"})
-
-        for row in existing_rows:
-            control_number = str(row["control_number"] or "")
-            if control_number and control_number in seen_control_numbers:
-                continue
-            connection.execute("BEGIN")
-            try:
-                cleanup_document_artifacts(paths, connection, row)
-                delete_document_related_rows(connection, int(row["id"]))
-                connection.execute(
-                    """
-                    UPDATE documents
-                    SET lifecycle_status = 'deleted', parent_document_id = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (utc_now(), row["id"]),
-                )
-                connection.commit()
-                stats["retired"] += 1
-            except Exception:
-                connection.rollback()
-                raise
-
-        connection.execute("BEGIN")
-        try:
-            parent_link_updates = update_production_family_relationships(connection, production_id)
-            attachment_preview_updates = 0
-            preview_document_rows = connection.execute(
-                """
-                SELECT DISTINCT documents.id
-                FROM documents
-                JOIN document_previews ON document_previews.document_id = documents.id
-                WHERE documents.production_id = ?
-                  AND documents.lifecycle_status != 'deleted'
-                  AND document_previews.preview_type = 'html'
-                ORDER BY documents.id ASC
-                """,
-                (production_id,),
-            ).fetchall()
-            for preview_document_row in preview_document_rows:
-                attachment_preview_updates += sync_document_attachment_preview_links(
-                    connection,
-                    paths,
-                    int(preview_document_row["id"]),
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        stats["families_reconstructed"] = len(
-            connection.execute(
-                """
-                SELECT id
-                FROM documents
-                WHERE production_id = ?
-                  AND parent_document_id IS NOT NULL
-                  AND lifecycle_status != 'deleted'
-                """,
-                (production_id,),
-            ).fetchall()
-        )
-        stats["parent_link_updates"] = parent_link_updates
-        stats["attachment_preview_updates"] = attachment_preview_updates
-
-        return {
-            "status": "ok",
-            "workspace_root": str(root.resolve()),
-            "production_root": str(resolved_production_root),
-            "production_rel_root": str(signature["rel_root"]),
-            "production_name": str(signature["production_name"]),
-            "production_id": production_id,
-            "metadata_load_rel_path": relative_document_path(root, metadata_load_path),
-            "image_load_rel_path": relative_document_path(root, image_load_path) if image_load_path is not None else None,
-            "tool_version": TOOL_VERSION,
-            "schema_version": SCHEMA_VERSION,
-            "failures": failures,
-            **stats,
-        }
+        return ingest_resolved_production_root(connection, paths, root, resolved_production_root)
     finally:
         connection.close()
 
@@ -361,8 +99,19 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             "pst_chat_conversations": 0,
             "pst_chat_documents_reassigned": 0,
             "pst_chat_child_documents_updated": 0,
+            "production_documents_created": 0,
+            "production_documents_updated": 0,
+            "production_documents_unchanged": 0,
+            "production_documents_retired": 0,
+            "production_families_reconstructed": 0,
+            "production_docs_missing_linked_text": 0,
+            "production_docs_missing_linked_images": 0,
+            "production_docs_missing_linked_natives": 0,
         }
         failures: list[dict[str, str]] = []
+        ingested_production_roots: list[str] = []
+        skipped_production_roots: list[str] = []
+        warnings: list[str] = []
 
         for descriptor in slack_export_descriptors:
             export_root = Path(descriptor["root"])
@@ -395,6 +144,59 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )
+
+        if allowed_types is None:
+            for signature in production_signatures:
+                production_rel_root = str(signature["rel_root"])
+                resolved_production_root = Path(signature["root"]).resolve()
+                try:
+                    production_result = ingest_resolved_production_root(
+                        connection,
+                        paths,
+                        root,
+                        resolved_production_root,
+                    )
+                    ingested_production_roots.append(production_rel_root)
+                    stats["new"] += int(production_result["created"])
+                    stats["updated"] += int(production_result["updated"])
+                    stats["production_documents_created"] += int(production_result["created"])
+                    stats["production_documents_updated"] += int(production_result["updated"])
+                    stats["production_documents_unchanged"] += int(production_result["unchanged"])
+                    stats["production_documents_retired"] += int(production_result["retired"])
+                    stats["production_families_reconstructed"] += int(production_result["families_reconstructed"])
+                    stats["production_docs_missing_linked_text"] += int(production_result["docs_missing_linked_text"])
+                    stats["production_docs_missing_linked_images"] += int(production_result["docs_missing_linked_images"])
+                    stats["production_docs_missing_linked_natives"] += int(production_result["docs_missing_linked_natives"])
+                    for failure in list(production_result.get("failures", [])):
+                        control_number = normalize_whitespace(str(failure.get("control_number") or ""))
+                        failure_entry: dict[str, str] = {
+                            "rel_path": (
+                                production_logical_rel_path(production_rel_root, control_number).as_posix()
+                                if control_number
+                                else production_rel_root
+                            ),
+                            "production_rel_root": production_rel_root,
+                            "error": str(failure.get("error") or ""),
+                        }
+                        if control_number:
+                            failure_entry["control_number"] = control_number
+                        failures.append(failure_entry)
+                    stats["failed"] += len(list(production_result.get("failures", [])))
+                except Exception as exc:
+                    stats["failed"] += 1
+                    failures.append(
+                        {
+                            "rel_path": production_rel_root,
+                            "production_rel_root": production_rel_root,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+        else:
+            skipped_production_roots = [str(signature["rel_root"]) for signature in production_signatures]
+            warnings = [
+                f"Detected processed production root at {signature['rel_root']}; use ingest-production instead."
+                for signature in production_signatures
+            ]
 
         existing_rows = connection.execute(
             """
@@ -586,12 +388,10 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"]
         result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"]
         result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
-        result["skipped_production_roots"] = [str(signature["rel_root"]) for signature in production_signatures]
-        if production_signatures:
-            result["warnings"] = [
-                f"Detected processed production root at {signature['rel_root']}; use ingest-production instead."
-                for signature in production_signatures
-            ]
+        result["ingested_production_roots"] = ingested_production_roots
+        result["skipped_production_roots"] = skipped_production_roots
+        if warnings:
+            result["warnings"] = warnings
         result["workspace_parent_documents"] = workspace_inventory["parent_documents"]
         result["workspace_missing_parent_documents"] = workspace_inventory["missing_parent_documents"]
         result["workspace_attachment_children"] = workspace_inventory["attachment_children"]

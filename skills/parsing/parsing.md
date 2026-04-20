@@ -14,7 +14,7 @@
 - `xlsx`: read sheets with `openpyxl`, generate one CSV preview per sheet
 - `pptx`: extract deck-level slide text and speaker notes from OOXML, render embedded slide images when present, and generate one HTML preview for the whole deck
 - archives such as `zip` remain unsupported; Retriever does not inspect archive contents
-- processed productions are supported through explicit `ingest-production`, not regular loose-file ingest
+- processed productions are supported through `ingest-production`, and plain `ingest` without `--file-types` auto-routes detected production roots into that same production pipeline
 
 ## Encoding behavior
 
@@ -90,7 +90,9 @@
 
 ## Production behavior
 
-- Processed productions are ingested only through `ingest-production`; plain `ingest` should detect likely production roots and skip them with a warning.
+- Processed productions are ingested through the production pipeline.
+- Plain `ingest` without `--file-types` should detect likely production roots and auto-route them through production ingest.
+- Plain `ingest` with `--file-types` should still detect likely production roots but skip them with a warning instead of triggering full production ingest.
 - Phase 4 targets Concordance-style `DAT` + `OPT` with `TEXT/`, `IMAGES/`, and optional `NATIVES/`.
 - Retriever creates one logical document row per load-file row, not one row per page image or text file.
 - Produced `Begin Bates` becomes the document `control_number`.
