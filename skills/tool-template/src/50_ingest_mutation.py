@@ -564,9 +564,19 @@ def value_from_type(field_type: str, value: str | None) -> object:
 def resolve_field_definition(connection: sqlite3.Connection, field_name: str) -> dict[str, str]:
     field_name = FIELD_NAME_ALIASES.get(field_name, field_name)
     if field_name in BUILTIN_FIELD_TYPES:
-        return {"field_name": field_name, "field_type": BUILTIN_FIELD_TYPES[field_name], "source": "builtin"}
+        return {
+            "field_name": field_name,
+            "field_type": BUILTIN_FIELD_TYPES[field_name],
+            "source": "builtin",
+            "displayable": "true",
+        }
     if field_name in VIRTUAL_FILTER_FIELD_TYPES:
-        return {"field_name": field_name, "field_type": VIRTUAL_FILTER_FIELD_TYPES[field_name], "source": "virtual"}
+        return {
+            "field_name": field_name,
+            "field_type": VIRTUAL_FILTER_FIELD_TYPES[field_name],
+            "source": "virtual",
+            "displayable": "true" if field_name in DISPLAYABLE_VIRTUAL_FIELDS else "false",
+        }
 
     row = connection.execute(
         """
@@ -578,13 +588,23 @@ def resolve_field_definition(connection: sqlite3.Connection, field_name: str) ->
     ).fetchone()
     columns = table_columns(connection, "documents")
     if row is not None and row["field_name"] in columns:
-        return {"field_name": row["field_name"], "field_type": row["field_type"], "source": "custom"}
+        return {
+            "field_name": row["field_name"],
+            "field_type": row["field_type"],
+            "source": "custom",
+            "displayable": "true",
+        }
     if field_name in columns:
         sqlite_type = next(
             (info["type"] for info in table_info(connection, "documents") if info["name"] == field_name),
             "",
         )
-        return {"field_name": field_name, "field_type": infer_registry_field_type(sqlite_type), "source": "column"}
+        return {
+            "field_name": field_name,
+            "field_type": infer_registry_field_type(sqlite_type),
+            "source": "column",
+            "displayable": "true",
+        }
     raise RetrieverError(f"Unknown field: {field_name}")
 
 
@@ -740,6 +760,28 @@ def delete_dataset(
         return {
             "status": "ok",
             **result,
+        }
+    finally:
+        connection.close()
+
+
+def rename_dataset(root: Path, old_name: str, new_name: str) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        dataset_row = resolve_dataset_row(connection, dataset_name=old_name)
+        connection.execute("BEGIN")
+        try:
+            renamed_summary = rename_dataset_row(connection, int(dataset_row["id"]), new_name)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "dataset": renamed_summary,
         }
     finally:
         connection.close()

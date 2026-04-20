@@ -5,6 +5,7 @@ import asyncio
 import argparse
 import base64
 import csv
+import difflib
 import hashlib
 import html
 import io
@@ -15,6 +16,7 @@ import os
 import posixpath
 import platform
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -78,8 +80,9 @@ except Exception:  # pragma: no cover - required PST backend probe
     pypff = None
 
 
-TOOL_VERSION = "0.16.1"
-SCHEMA_VERSION = 18
+TOOL_VERSION = "0.17.0"
+SCHEMA_VERSION = 19
+SESSION_SCHEMA_VERSION = 1
 REQUIREMENTS_VERSION = "2026-04-16-phase4-pst"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
 MANUAL_FIELD_LOCKS_COLUMN = "manual_field_locks_json"
@@ -88,6 +91,10 @@ CHUNK_TARGET_CHARS = 3200
 CHUNK_OVERLAP_CHARS = 250
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
+MAX_SCOPE_DATASETS = 999
+MAX_FILTER_EXPRESSION_LENGTH = 8192
+MAX_FILTER_IN_LIST_ITEMS = 999
+MAX_SAVED_SCOPES = 256
 DEFAULT_CHUNK_PAGE_SIZE = 50
 MAX_CHUNK_PAGE_SIZE = 200
 GET_DOC_SUMMARY_CHARS = 1200
@@ -375,6 +382,11 @@ VIRTUAL_FILTER_FIELD_TYPES = {
     "is_attachment": "boolean",
     "has_attachments": "boolean",
     "production_name": "text",
+}
+DISPLAYABLE_VIRTUAL_FIELDS = {
+    "dataset_name",
+    "is_attachment",
+    "production_name",
 }
 CATALOG_EXCLUDED_BUILTIN_FIELDS = {
     "active_search_text_revision_id",

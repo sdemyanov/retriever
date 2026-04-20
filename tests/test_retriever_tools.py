@@ -3930,6 +3930,147 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         dataset_names = [item["dataset_name"] for item in list_payload["datasets"]]
         self.assertNotIn("Review Set", dataset_names)
 
+    def test_create_dataset_rejects_normalized_name_collision(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        first_exit, first_payload, _, _ = self.run_cli("create-dataset", str(self.root), "Review Set")
+        second_exit, second_payload, _, _ = self.run_cli("create-dataset", str(self.root), "  review   set  ")
+
+        self.assertEqual(first_exit, 0)
+        self.assertIsNotNone(first_payload)
+        self.assertEqual(second_exit, 2)
+        self.assertIsNotNone(second_payload)
+        self.assertIn("already exists", second_payload["error"])
+
+    def test_search_cli_accepts_sql_like_filter_boolean_groups(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+        (self.root / "gamma.md").write_text("gamma body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 3)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "--filter",
+            "(file_name = 'alpha.txt' OR file_name = 'beta.txt') AND file_type = 'txt'",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["total_hits"], 2)
+        self.assertEqual(sorted(item["file_name"] for item in payload["results"]), ["alpha.txt", "beta.txt"])
+
+    def test_search_cli_sql_like_filter_errors_are_actionable(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        unknown_exit, unknown_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "--filter",
+            "authr = 'Alice Example'",
+        )
+        mismatch_exit, mismatch_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "--filter",
+            "is_attachment > 5",
+        )
+
+        self.assertEqual(unknown_exit, 2)
+        self.assertIsNotNone(unknown_payload)
+        self.assertIn("Unknown field 'authr'", unknown_payload["error"])
+        self.assertIn("author", unknown_payload["error"])
+
+        self.assertEqual(mismatch_exit, 2)
+        self.assertIsNotNone(mismatch_payload)
+        self.assertIn("Field 'is_attachment' is boolean", mismatch_payload["error"])
+        self.assertIn("IS NULL", mismatch_payload["error"])
+
+    def test_slash_search_persists_scope_and_search_within_keyword(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha beta body\n", encoding="utf-8")
+        (self.root / "second.txt").write_text("alpha only body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_exit, first_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+
+        self.assertEqual(first_exit, 0)
+        self.assertIsNotNone(first_payload)
+        self.assertEqual(first_payload["scope"]["keyword"], "alpha")
+        self.assertIn("keyword='alpha'", first_payload["header"]["scope"])
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["schema_version"], retriever_tools.SESSION_SCHEMA_VERSION)
+        self.assertEqual(session_payload["scope"]["keyword"], "alpha")
+
+        second_exit, second_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "--within", "beta")
+
+        self.assertEqual(second_exit, 0)
+        self.assertIsNotNone(second_payload)
+        self.assertEqual(second_payload["scope"]["keyword"], "(alpha) AND (beta)")
+        self.assertEqual(second_payload["total_hits"], 1)
+        self.assertEqual(second_payload["results"][0]["file_name"], "alpha.txt")
+
+    def test_slash_scope_save_load_and_dataset_rename_refresh_saved_scope_labels(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("sample dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        create_exit, create_payload, _, _ = self.run_cli("create-dataset", str(self.root), "Review Set")
+        self.assertEqual(create_exit, 0)
+        self.assertIsNotNone(create_payload)
+        dataset_id = int(create_payload["dataset"]["id"])
+        add_exit, _, _, _ = self.run_cli(
+            "add-to-dataset",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+            "--doc-id",
+            str(row["id"]),
+        )
+        self.assertEqual(add_exit, 0)
+
+        dataset_exit, dataset_payload, _, _ = self.run_cli("slash", str(self.root), "/dataset", "Review Set")
+        save_exit, save_payload, _, _ = self.run_cli("slash", str(self.root), "/scope", "save", "review")
+        rename_exit, rename_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            '/dataset rename "Review Set" "Renamed Set"',
+        )
+        load_exit, load_payload, _, _ = self.run_cli("slash", str(self.root), "/scope", "load", "review")
+
+        self.assertEqual(dataset_exit, 0)
+        self.assertIsNotNone(dataset_payload)
+        self.assertEqual(dataset_payload["scope"]["dataset"][0]["name"], "Review Set")
+
+        self.assertEqual(save_exit, 0)
+        self.assertIsNotNone(save_payload)
+        self.assertEqual(save_payload["name"], "review")
+
+        self.assertEqual(rename_exit, 0)
+        self.assertIsNotNone(rename_payload)
+        self.assertEqual(rename_payload["dataset"]["dataset_name"], "Renamed Set")
+
+        self.assertEqual(load_exit, 0)
+        self.assertIsNotNone(load_payload)
+        self.assertEqual(load_payload["scope"]["dataset"][0]["id"], dataset_id)
+        self.assertEqual(load_payload["scope"]["dataset"][0]["name"], "Renamed Set")
+        self.assertEqual(load_payload["total_hits"], 1)
+
+        saved_scopes_payload = json.loads(self.paths["saved_scopes_path"].read_text(encoding="utf-8"))
+        self.assertEqual(saved_scopes_payload["schema_version"], retriever_tools.SESSION_SCHEMA_VERSION)
+        self.assertEqual(saved_scopes_payload["scopes"]["review"]["dataset"][0]["id"], dataset_id)
+        self.assertEqual(saved_scopes_payload["scopes"]["review"]["dataset"][0]["name"], "Renamed Set")
+
     def test_deleting_source_backed_dataset_hides_documents_until_reingest(self) -> None:
         document_path = self.root / "sample.txt"
         document_path.write_text("sample dataset body\n", encoding="utf-8")

@@ -424,6 +424,173 @@ def backfill_dataset_memberships(connection: sqlite3.Connection) -> int:
     return updated
 
 
+def backfill_dataset_name_normalized(connection: sqlite3.Connection) -> int:
+    if not table_exists(connection, "datasets"):
+        return 0
+    columns = table_columns(connection, "datasets")
+    if "dataset_name" not in columns or "dataset_name_normalized" not in columns:
+        return 0
+    rows = connection.execute(
+        """
+        SELECT id, dataset_name, dataset_name_normalized
+        FROM datasets
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        dataset_name = normalized_dataset_name_or_default(str(row["dataset_name"] or ""))
+        normalized_name = normalize_dataset_name_for_compare(dataset_name)
+        if (
+            normalize_inline_whitespace(str(row["dataset_name"] or "")) == dataset_name
+            and normalize_inline_whitespace(str(row["dataset_name_normalized"] or "")) == normalized_name
+        ):
+            continue
+        connection.execute(
+            """
+            UPDATE datasets
+            SET dataset_name = ?, dataset_name_normalized = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (dataset_name, normalized_name, utc_now(), int(row["id"])),
+        )
+        updated += 1
+    return updated
+
+
+def merge_dataset_identity_duplicates(connection: sqlite3.Connection) -> int:
+    if not table_exists(connection, "datasets"):
+        return 0
+    rows = connection.execute(
+        """
+        SELECT id, source_kind, dataset_locator
+        FROM datasets
+        ORDER BY LOWER(source_kind) ASC, dataset_locator ASC, id ASC
+        """
+    ).fetchall()
+    ids_by_identity: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for row in rows:
+        identity = (
+            normalize_whitespace(str(row["source_kind"] or "")).lower(),
+            normalize_whitespace(str(row["dataset_locator"] or "")),
+        )
+        ids_by_identity[identity].append(int(row["id"]))
+
+    merged = 0
+    for duplicate_ids in ids_by_identity.values():
+        if len(duplicate_ids) < 2:
+            continue
+        keep_id = min(duplicate_ids)
+        for drop_id in sorted(dataset_id for dataset_id in duplicate_ids if dataset_id != keep_id):
+            source_rows = connection.execute(
+                """
+                SELECT id, source_kind, source_locator, created_at, updated_at
+                FROM dataset_sources
+                WHERE dataset_id = ?
+                ORDER BY id ASC
+                """,
+                (drop_id,),
+            ).fetchall()
+            source_id_map: dict[int, int] = {}
+            for source_row in source_rows:
+                new_source_id = ensure_dataset_source_row(
+                    connection,
+                    dataset_id=keep_id,
+                    source_kind=str(source_row["source_kind"]),
+                    source_locator=str(source_row["source_locator"]),
+                )
+                source_id_map[int(source_row["id"])] = new_source_id
+
+            membership_rows = connection.execute(
+                """
+                SELECT id, document_id, dataset_source_id, created_at, updated_at
+                FROM dataset_documents
+                WHERE dataset_id = ?
+                ORDER BY id ASC
+                """,
+                (drop_id,),
+            ).fetchall()
+            for membership_row in membership_rows:
+                dataset_source_id = membership_row["dataset_source_id"]
+                remapped_source_id = (
+                    source_id_map.get(int(dataset_source_id))
+                    if dataset_source_id is not None
+                    else None
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO dataset_documents (
+                      dataset_id, document_id, dataset_source_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        keep_id,
+                        int(membership_row["document_id"]),
+                        remapped_source_id,
+                        membership_row["created_at"] or utc_now(),
+                        membership_row["updated_at"] or utc_now(),
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM dataset_documents WHERE id = ?",
+                    (int(membership_row["id"]),),
+                )
+
+            connection.execute("UPDATE documents SET dataset_id = ? WHERE dataset_id = ?", (keep_id, drop_id))
+            connection.execute("UPDATE productions SET dataset_id = ? WHERE dataset_id = ?", (keep_id, drop_id))
+            connection.execute("UPDATE container_sources SET dataset_id = ? WHERE dataset_id = ?", (keep_id, drop_id))
+            connection.execute("DELETE FROM dataset_sources WHERE dataset_id = ?", (drop_id,))
+            connection.execute("DELETE FROM datasets WHERE id = ?", (drop_id,))
+            merged += 1
+    return merged
+
+
+def suffix_dataset_name_collisions(connection: sqlite3.Connection) -> int:
+    if not table_exists(connection, "datasets"):
+        return 0
+    rows = connection.execute(
+        """
+        SELECT id, dataset_name
+        FROM datasets
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    renamed = 0
+    used_names: set[str] = set()
+    for row in rows:
+        dataset_id = int(row["id"])
+        base_name = normalized_dataset_name_or_default(str(row["dataset_name"] or ""))
+        candidate = base_name
+        suffix = 2
+        normalized_candidate = normalize_dataset_name_for_compare(candidate)
+        while normalized_candidate in used_names:
+            candidate = f"{base_name}_{suffix}"
+            normalized_candidate = normalize_dataset_name_for_compare(candidate)
+            suffix += 1
+        used_names.add(normalized_candidate)
+        if candidate == base_name and normalize_inline_whitespace(str(row["dataset_name"] or "")) == base_name:
+            connection.execute(
+                """
+                UPDATE datasets
+                SET dataset_name_normalized = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (normalized_candidate, utc_now(), dataset_id),
+            )
+            continue
+        connection.execute(
+            """
+            UPDATE datasets
+            SET dataset_name = ?, dataset_name_normalized = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (candidate, normalized_candidate, utc_now(), dataset_id),
+        )
+        if candidate != base_name or normalize_inline_whitespace(str(row["dataset_name"] or "")) != base_name:
+            renamed += 1
+    return renamed
+
+
 def ensure_control_number_batch_row(
     connection: sqlite3.Connection,
     batch_number: int,
@@ -777,6 +944,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "run_items", "last_heartbeat_at TEXT")
     ensure_column(connection, "productions", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     ensure_column(connection, "container_sources", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
+    ensure_column(connection, "datasets", "dataset_name_normalized TEXT")
     backfilled_legacy_control_number = backfill_legacy_column(
         connection,
         "documents",
@@ -843,7 +1011,6 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         ON dataset_documents(dataset_id, document_id, COALESCE(dataset_source_id, 0))
         """
     )
-    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_source_locator_unique ON datasets(source_kind, dataset_locator)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_productions_dataset_id ON productions(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_container_sources_dataset_id ON container_sources(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_container_sources_source_kind ON container_sources(source_kind)")
@@ -953,6 +1120,11 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     dataset_membership_migration_needed = prior_schema_version is None or prior_schema_version < 12
     backfilled_dataset_ids = backfill_dataset_ids(connection, root) if dataset_membership_migration_needed else 0
     backfilled_dataset_memberships = backfill_dataset_memberships(connection) if dataset_membership_migration_needed else 0
+    backfilled_dataset_name_normalized = backfill_dataset_name_normalized(connection)
+    merged_duplicate_dataset_identities = merge_dataset_identity_duplicates(connection)
+    suffixed_dataset_name_collisions = suffix_dataset_name_collisions(connection)
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_source_locator_unique ON datasets(source_kind, dataset_locator)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_name_normalized_unique ON datasets(dataset_name_normalized)")
     backfilled_custodian = backfill_custodian(connection)
     backfilled_control_numbers = backfill_control_numbers(connection)
     rebuilt_control_number_batches = backfill_control_number_batches(connection)
@@ -964,6 +1136,9 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         "backfilled_custodian": backfilled_custodian,
         "backfilled_dataset_ids": backfilled_dataset_ids,
         "backfilled_dataset_memberships": backfilled_dataset_memberships,
+        "backfilled_dataset_name_normalized": backfilled_dataset_name_normalized,
+        "merged_duplicate_dataset_identities": merged_duplicate_dataset_identities,
+        "suffixed_dataset_name_collisions": suffixed_dataset_name_collisions,
         "backfilled_source_kinds": backfilled_source_kinds,
         "rewrote_internal_rel_path_prefix": rewrote_internal_rel_path_prefix,
         "backfilled_control_numbers": backfilled_control_numbers,
