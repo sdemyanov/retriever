@@ -892,11 +892,13 @@ def create_run(
     raw_job_name: str | None = None,
     job_version_number: int | None = None,
     dataset_names: list[str] | None = None,
+    document_ids: list[int] | None = None,
     query: str = "",
     raw_bates: str | None = None,
     raw_filters: list[list[str]] | None = None,
     from_run_id: int | None = None,
     select_from_scope: bool = False,
+    activation_policy: str = "manual",
     family_mode: str = "exact",
     seed_limit: int | None = None,
 ) -> dict[str, object]:
@@ -905,7 +907,11 @@ def create_run(
         if raw_job_name is not None
         else None
     )
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
     normalized_family_mode = normalize_run_family_mode(family_mode)
+    normalized_activation_policy = normalize_run_activation_policy(activation_policy)
+    if normalized_document_ids and (query.strip() or raw_bates or raw_filters or dataset_names or from_run_id is not None or select_from_scope):
+        raise RetrieverError("create-run accepts either --doc-id selectors or scope/query selectors, not both.")
     if seed_limit is not None and seed_limit < 1:
         raise RetrieverError("Run limit must be >= 1.")
 
@@ -914,19 +920,23 @@ def create_run(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        selector = build_effective_scope_selector(
-            connection,
-            paths,
-            query=query,
-            raw_bates=raw_bates,
-            raw_filters=raw_filters,
-            dataset_names=dataset_names,
-            from_run_id=from_run_id,
-            select_from_scope=select_from_scope,
-        )
-        if not scope_run_selector_has_inputs(selector):
-            raise RetrieverError("Run selector must include at least one inclusion input.")
-        preferred_from_run_id = preferred_scope_selector_from_run_id(selector)
+        if normalized_document_ids:
+            selector = {"document_ids": normalized_document_ids}
+            preferred_from_run_id = None
+        else:
+            selector = build_effective_scope_selector(
+                connection,
+                paths,
+                query=query,
+                raw_bates=raw_bates,
+                raw_filters=raw_filters,
+                dataset_names=dataset_names,
+                from_run_id=from_run_id,
+                select_from_scope=select_from_scope,
+            )
+            if not scope_run_selector_has_inputs(selector):
+                raise RetrieverError("Run selector must include at least one inclusion input.")
+            preferred_from_run_id = preferred_scope_selector_from_run_id(selector)
         job_version_row = require_job_version_row(
             connection,
             job_version_id=job_version_id,
@@ -938,15 +948,79 @@ def create_run(
             (job_version_row["job_id"],),
         ).fetchone()
         assert job_row is not None
-        snapshot_rows = plan_scope_run_snapshot_rows(
-            connection,
-            root=root,
-            job_row=job_row,
-            job_version_row=job_version_row,
-            selector=selector,
-            family_mode=normalized_family_mode,
-            seed_limit=seed_limit,
-        )
+        job_kind = normalize_job_kind(str(job_row["job_kind"]))
+        if normalized_activation_policy != "manual" and job_kind not in REVISION_PRODUCING_JOB_KINDS:
+            raise RetrieverError(
+                f"Run activation policy '{normalized_activation_policy}' is only supported for "
+                f"revision-producing jobs ({', '.join(sorted(REVISION_PRODUCING_JOB_KINDS))}); "
+                f"job '{job_row['job_name']}' is kind '{job_kind}'."
+            )
+        if normalized_document_ids:
+            selected_document_rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
+            seed_document_ids = [int(row["id"]) for row in selected_document_rows]
+            if seed_limit is not None:
+                seed_document_ids = seed_document_ids[:seed_limit]
+            reasons_by_document_id = {
+                document_id: {
+                    "direct_reasons": [{"type": "document_id", "document_id": document_id}],
+                    "family_seed_document_ids": [],
+                }
+                for document_id in seed_document_ids
+            }
+            if normalized_family_mode == "with_family":
+                final_document_ids = expand_seed_documents_with_family(connection, seed_document_ids, reasons_by_document_id)
+            else:
+                final_document_ids = list(seed_document_ids)
+            if final_document_ids:
+                document_rows = connection.execute(
+                    f"""
+                    SELECT *
+                    FROM documents
+                    WHERE id IN ({', '.join('?' for _ in final_document_ids)})
+                    ORDER BY id ASC
+                    """,
+                    final_document_ids,
+                ).fetchall()
+                document_row_by_id = {int(row["id"]): row for row in document_rows}
+            else:
+                document_row_by_id = {}
+            snapshot_rows = []
+            for ordinal, document_id in enumerate(final_document_ids):
+                document_row = document_row_by_id.get(int(document_id))
+                if document_row is None:
+                    continue
+                pinned_input = compute_document_input_reference_for_job_version(
+                    connection,
+                    root=root,
+                    document_row=document_row,
+                    job_row=job_row,
+                    job_version_row=job_version_row,
+                    frozen_input_revision_id=None,
+                    frozen_content_hash=None,
+                )
+                snapshot_rows.append(
+                    {
+                        "document_id": int(document_id),
+                        "ordinal": ordinal,
+                        "inclusion_reason": reasons_by_document_id.get(
+                            int(document_id),
+                            {"direct_reasons": [], "family_seed_document_ids": []},
+                        ),
+                        "pinned_input_revision_id": pinned_input["pinned_input_revision_id"],
+                        "pinned_input_identity": pinned_input["pinned_input_identity"],
+                        "pinned_content_hash": pinned_input["pinned_content_hash"],
+                    }
+                )
+        else:
+            snapshot_rows = plan_scope_run_snapshot_rows(
+                connection,
+                root=root,
+                job_row=job_row,
+                job_version_row=job_version_row,
+                selector=selector,
+                family_mode=normalized_family_mode,
+                seed_limit=seed_limit,
+            )
         connection.execute("BEGIN")
         try:
             run_id = create_run_row(
@@ -954,6 +1028,7 @@ def create_run(
                 job_version_id=int(job_version_row["id"]),
                 selector=selector,
                 exclude_selector={},
+                activation_policy=normalized_activation_policy,
                 family_mode=normalized_family_mode,
                 seed_limit=seed_limit,
                 from_run_id=preferred_from_run_id,
@@ -1553,6 +1628,28 @@ def complete_run_item(
                     job_output_rows=job_output_rows,
                     output_values_by_name=output_values,
                 )
+            result_row = connection.execute(
+                """
+                SELECT *
+                FROM results
+                WHERE id = ?
+                """,
+                (result_id,),
+            ).fetchone()
+            assert result_row is not None
+            activation_payload = maybe_activate_created_text_revision(
+                connection,
+                paths,
+                run_row=require_run_row_by_id(connection, int(run_item_row["run_id"])),
+                job_version_row=job_version_row,
+                document_id=int(run_item_row["document_id"]),
+                result_id=result_id,
+                text_revision_id=(
+                    int(result_row["created_text_revision_id"])
+                    if result_row["created_text_revision_id"] is not None
+                    else None
+                ),
+            )
             create_attempt_row(
                 connection,
                 run_item_id=run_item_id,
@@ -1591,6 +1688,8 @@ def complete_run_item(
                 "result": result_summary_by_id(connection, result_id),
                 "run": run_status_by_id(connection, int(run_item_row["run_id"])),
             }
+            if activation_payload is not None:
+                payload["activation"] = activation_payload
             connection.commit()
         except Exception:
             connection.rollback()

@@ -5609,10 +5609,23 @@ def build_parser() -> argparse.ArgumentParser:
     create_run_parser.add_argument("--job-version", dest="job_version_number", type=int, help="Job version number when selecting by job name")
     add_scope_run_selector_arguments(create_run_parser)
     create_run_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to include in the run (repeatable)",
+    )
+    create_run_parser.add_argument(
         "--family-mode",
         default="exact",
         choices=sorted(RUN_FAMILY_MODES),
         help="Whether to include only seed docs or their family members too",
+    )
+    create_run_parser.add_argument(
+        "--activation-policy",
+        default="manual",
+        choices=sorted(RUN_ACTIVATION_POLICIES),
+        help="Whether revision-producing jobs should auto-promote created text revisions",
     )
     create_run_parser.add_argument("--limit", dest="seed_limit", type=int, help="Limit the directly matched seed set")
 
@@ -6100,11 +6113,13 @@ def main() -> int:
                         raw_job_name=args.job_name,
                         job_version_number=args.job_version_number,
                         dataset_names=args.dataset_names,
+                        document_ids=args.document_ids,
                         query=args.query,
                         raw_bates=args.bates,
                         raw_filters=args.filters,
                         from_run_id=args.from_run_id,
                         select_from_scope=args.select_from_scope,
+                        activation_policy=args.activation_policy,
                         family_mode=args.family_mode,
                         seed_limit=args.seed_limit,
                     ),
