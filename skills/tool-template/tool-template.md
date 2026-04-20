@@ -2,13 +2,13 @@
 
 ## Template metadata
 
-- tool version: `0.13.5`
-- schema version: `18`
-- requirements version: `2026-04-19-phase9-export-preview-materialization`
+- tool version: `0.17.1`
+- schema version: `19`
+- requirements version: `2026-04-20-phase10-conversations-and-export-previews`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `8ec0c47ff9ce6029fa67f54f99324c79392c82215c8c52fd6569f7bd85a2587e`
+- source checksum (SHA256): `c3ec7753f2b0621c0ca21ce93663da4a85a0b6b0e25059647545fe9aae4cc707`
 
 ## Current command surface
 
@@ -24,6 +24,7 @@ The current template implements:
 - `catalog`
 - `export-csv`
 - `export-previews`
+- `export-archive`
 - `get-doc`
 - `list-chunks`
 - `search-chunks`
@@ -61,6 +62,15 @@ The current template implements:
 - `activate-text-revision`
 
 Stats and review commands remain later-phase work.
+
+For Cowork-agent execution, prefer the queue path:
+
+- `claim-run-items`
+- `get-run-item-context`
+- `complete-run-item`
+- `fail-run-item`
+
+`execute-run` remains the legacy direct executor for deterministic tests and future external-provider work.
 
 ## Output modes
 

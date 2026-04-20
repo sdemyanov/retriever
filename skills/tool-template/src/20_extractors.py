@@ -3,7 +3,7 @@ def preview_base_path_for_rel_path(rel_path: str) -> Path:
     if source_rel_path is not None:
         return Path("previews") / Path(source_rel_path) / "messages"
     base = Path(rel_path)
-    if base.parts and base.parts[0] == ".retriever":
+    if base.parts and base.parts[0] == INTERNAL_REL_PATH_PREFIX:
         base = Path(*base.parts[1:])
     if base.parts and base.parts[0] == "previews":
         return base.parent
@@ -55,7 +55,7 @@ def document_native_target(paths: dict[str, Path], row: sqlite3.Row | None) -> d
     if row is None:
         return None
     rel_path = str(row["rel_path"])
-    abs_path = paths["root"] / rel_path
+    abs_path = document_absolute_path(paths, rel_path)
     if not abs_path.exists():
         return None
     return {
@@ -101,7 +101,7 @@ def build_preview_target_payload(
 
 
 def preview_target_payload_from_preview_row(paths: dict[str, Path], preview_row: sqlite3.Row) -> dict[str, object]:
-    rel_preview = str(Path(".retriever") / preview_row["rel_preview_path"])
+    rel_preview = str(Path(INTERNAL_REL_PATH_PREFIX) / preview_row["rel_preview_path"])
     abs_preview = str(paths["state_dir"] / preview_row["rel_preview_path"])
     return build_preview_target_payload(
         rel_path=rel_preview,
@@ -155,7 +155,7 @@ def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection:
     rel_path = row["rel_path"]
     return build_preview_target_payload(
         rel_path=str(rel_path),
-        abs_path=str(paths["root"] / rel_path),
+        abs_path=str(document_absolute_path(paths, rel_path)),
         preview_type="native",
         label=None,
         ordinal=0,
@@ -174,7 +174,19 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
         (document_id,),
     ).fetchall()
     if not preview_rows:
-        abs_path = paths["root"] / rel_path
+        native_target = document_native_target(paths, document_row)
+        source_targets = production_source_part_targets(paths, connection, document_row)
+        if native_target is not None and document_prefers_native_primary_preview(document_row):
+            targets = [native_target]
+            for target in source_targets:
+                if target["rel_path"] not in {existing["rel_path"] for existing in targets}:
+                    targets.append(target)
+            return targets
+        if source_targets:
+            return source_targets
+        if native_target is not None:
+            return [native_target]
+        abs_path = document_absolute_path(paths, rel_path)
         return [
             build_preview_target_payload(
                 rel_path=rel_path,
@@ -678,7 +690,11 @@ def extract_rtf_file(path: Path) -> dict[str, object]:
                 "preview_type": "html",
                 "label": "text",
                 "ordinal": 0,
-                "content": build_html_preview({}, body_text=text_content),
+                "content": build_html_preview(
+                    {},
+                    body_text=text_content,
+                    document_title=title or path.stem or path.name,
+                ),
             }
         ]
     )
@@ -1069,23 +1085,23 @@ def build_email_extracted_payload(
     if not normalized_text and normalized_html:
         normalized_text = strip_html_tags(normalized_html)
     normalized_text = normalize_whitespace(normalized_text)
+    resolved_subject = normalize_generated_document_title(subject)
     participants = extract_email_chain_participants(
         normalized_text,
         [author, recipients or None],
     )
     preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
-    preview_title = subject or "Retriever Email Preview"
+    preview_title = resolved_subject or "Retriever Email Preview"
     preview = build_html_preview(
         {
             "From": author or "",
             "To": recipients or "",
             "Date": format_chat_preview_timestamp(date_created) or date_created or "",
-            "Subject": subject or "",
+            "Subject": resolved_subject or "",
         },
         body_html=preview_html_body,
         body_text=normalized_text,
         document_title=preview_title,
-        heading=preview_title,
     )
     return {
         "page_count": 1,
@@ -1094,8 +1110,8 @@ def build_email_extracted_payload(
         "date_created": date_created,
         "date_modified": None,
         "participants": participants,
-        "title": subject or None,
-        "subject": subject or None,
+        "title": resolved_subject,
+        "subject": resolved_subject,
         "recipients": recipients or None,
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
@@ -1277,7 +1293,8 @@ def build_chat_extracted_payload(
     )
     resolved_date_created = str(metadata["date_created"]) if metadata.get("date_created") else date_created
     resolved_date_modified = str(metadata["date_modified"]) if metadata.get("date_modified") else None
-    resolved_title = title or (str(metadata["title"]) if metadata.get("title") else None)
+    metadata_title = normalize_generated_document_title(str(metadata["title"])) if metadata.get("title") else None
+    resolved_title = normalize_generated_document_title(title) or metadata_title
     return {
         "page_count": 1,
         "author": None,
@@ -1321,18 +1338,19 @@ def build_calendar_extracted_payload(
     if not normalized_text and normalized_html:
         normalized_text = strip_html_tags(normalized_html)
     normalized_text = normalize_whitespace(normalized_text)
+    resolved_subject = normalize_generated_document_title(subject)
     preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
+    preview_title = resolved_subject or "Retriever Calendar Preview"
     preview = build_html_preview(
         {
             "Organizer": author or "",
             "Date": format_chat_preview_timestamp(date_created) or date_created or "",
-            "Title": subject or "",
+            "Title": resolved_subject or "",
             "Attendees": recipients or "",
         },
         body_html=preview_html_body,
         body_text=normalized_text,
-        document_title=subject or "Retriever Calendar Preview",
-        heading="Retriever Calendar Preview",
+        document_title=preview_title,
     )
     return {
         "page_count": 1,
@@ -1341,8 +1359,8 @@ def build_calendar_extracted_payload(
         "date_created": date_created,
         "date_modified": None,
         "participants": author or None,
-        "title": subject or None,
-        "subject": subject or None,
+        "title": resolved_subject,
+        "subject": resolved_subject,
         "recipients": recipients or None,
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
@@ -1371,7 +1389,7 @@ def pst_folder_path_contains(folder_path: object, marker: str) -> bool:
 
 
 def infer_pst_chat_title(subject: str | None, text_body: str | None) -> str | None:
-    normalized_subject = normalize_whitespace(str(subject or ""))
+    normalized_subject = normalize_generated_document_title(subject)
     if normalized_subject:
         return normalized_subject
     normalized_text = normalize_whitespace(str(text_body or ""))

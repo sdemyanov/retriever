@@ -28,6 +28,143 @@ def derive_job_output_response_schema(job_output_rows: list[sqlite3.Row]) -> dic
     }
 
 
+def default_job_output_value(value_type: str) -> object:
+    normalized_value_type = normalize_job_output_value_type(value_type)
+    if normalized_value_type == "boolean":
+        return False
+    if normalized_value_type == "integer":
+        return 0
+    if normalized_value_type == "real":
+        return 0
+    if normalized_value_type == "json":
+        return {}
+    return ""
+
+
+def build_text_structured_execution_payload(
+    job_version_row: sqlite3.Row,
+    job_output_rows: list[sqlite3.Row],
+) -> dict[str, object]:
+    output_defaults = {
+        str(row["output_name"]): default_job_output_value(str(row["value_type"]))
+        for row in job_output_rows
+    }
+    instruction_text = normalize_whitespace(str(job_version_row["instruction_text"] or ""))
+    prompt_lines = [
+        "Read the provided document text and extract the requested outputs.",
+        "Return only a JSON object that matches response_schema exactly.",
+        "If a value cannot be determined, use the matching fallback value from output_defaults.",
+    ]
+    if instruction_text:
+        prompt_lines.append(f"Job instruction: {instruction_text}")
+    return {
+        "capability": "text_structured",
+        "task_prompt": "\n".join(prompt_lines),
+        "output_defaults": output_defaults,
+        "completion_command": "complete-run-item",
+        "completion_template": {
+            "raw_output_json": {key: f"<raw {key} value>" for key in output_defaults},
+            "normalized_output_json": {key: f"<normalized {key} value>" for key in output_defaults},
+            "output_values_json": {key: f"<final {key} value>" for key in output_defaults},
+        },
+    }
+
+
+def build_translation_execution_payload(job_version_row: sqlite3.Row) -> dict[str, object]:
+    parameters = decode_json_text(job_version_row["parameters_json"], default={}) or {}
+    if not isinstance(parameters, dict):
+        parameters = {}
+    target_language = normalize_whitespace(
+        str(
+            parameters.get("target_language")
+            or parameters.get("target_lang")
+            or parameters.get("language")
+            or ""
+        )
+    )
+    instruction_text = normalize_whitespace(str(job_version_row["instruction_text"] or ""))
+    prompt_lines = [
+        f"Translate the entire input text into {target_language or 'the requested target language'}.",
+        "Return only the translated text, with no JSON wrapper or commentary.",
+    ]
+    if instruction_text:
+        prompt_lines.append(f"Job instruction: {instruction_text}")
+    return {
+        "capability": "text_translation",
+        "target_language": target_language or None,
+        "task_prompt": "\n".join(prompt_lines),
+        "completion_command": "complete-run-item",
+        "completion_template": {
+            "raw_output_json": {
+                "translated_text": "<translated text>",
+                "target_language": target_language or "<target language>",
+            },
+            "normalized_output_json": {
+                "translated_text": "<translated text>",
+                "target_language": target_language or "<target language>",
+            },
+            "created_text_revision_json": {
+                "revision_kind": "translation",
+                "language": target_language or "<target language>",
+                "text_content": "<translated text>",
+            },
+        },
+    }
+
+
+def build_vision_ocr_execution_payload(job_version_row: sqlite3.Row) -> dict[str, object]:
+    instruction_text = normalize_whitespace(str(job_version_row["instruction_text"] or ""))
+    prompt_lines = [
+        "Read the page image and transcribe all readable text in natural reading order.",
+        "Return plain text only. Do not wrap the output in JSON or Markdown.",
+    ]
+    if instruction_text:
+        prompt_lines.append(f"Job instruction: {instruction_text}")
+    return {
+        "capability": "vision_ocr",
+        "task_prompt": "\n".join(prompt_lines),
+        "completion_command": "complete-run-item",
+        "completion_template": {
+            "page_text": "<ocr page text>",
+        },
+    }
+
+
+def build_vision_description_execution_payload(job_version_row: sqlite3.Row) -> dict[str, object]:
+    instruction_text = normalize_whitespace(str(job_version_row["instruction_text"] or ""))
+    prompt_lines = [
+        "Describe the page image in clear, search-friendly prose.",
+        "Prioritize visible people, objects, scenes, charts, handwriting, stamps, and other salient visual details.",
+        "Return plain text only. Do not wrap the output in JSON or Markdown.",
+    ]
+    if instruction_text:
+        prompt_lines.append(f"Job instruction: {instruction_text}")
+    return {
+        "capability": "vision_description",
+        "task_prompt": "\n".join(prompt_lines),
+        "completion_command": "complete-run-item",
+        "completion_template": {
+            "page_text": "<image description text>",
+        },
+    }
+
+
+def build_capability_execution_payload(
+    job_version_row: sqlite3.Row,
+    job_output_rows: list[sqlite3.Row],
+) -> dict[str, object] | None:
+    capability = normalize_whitespace(str(job_version_row["capability"] or ""))
+    if capability == "text_structured":
+        return build_text_structured_execution_payload(job_version_row, job_output_rows)
+    if capability == "text_translation":
+        return build_translation_execution_payload(job_version_row)
+    if capability == "vision_description":
+        return build_vision_description_execution_payload(job_version_row)
+    if capability == "vision_ocr":
+        return build_vision_ocr_execution_payload(job_version_row)
+    return None
+
+
 def best_effort_document_source_path(root: Path, document_row: sqlite3.Row) -> str | None:
     source_rel_path = normalize_whitespace(str(document_row["source_rel_path"] or ""))
     if not source_rel_path:
@@ -116,8 +253,13 @@ def build_run_item_context_payload(
         artifact_path = resolve_workspace_artifact_path(root, artifact_rel_path)
         if artifact_path is None or not artifact_path.exists():
             raise RetrieverError(f"Run item {run_item_row['id']} points at a missing OCR artifact: {artifact_rel_path!r}")
+        page_input_kind = (
+            "image_description_page_image"
+            if normalize_job_kind(str(job_row["job_kind"])) == "image_description"
+            else "ocr_page_image"
+        )
         input_payload = {
-            "kind": "ocr_page_image",
+            "kind": page_input_kind,
             "page_number": int(run_item_row["page_number"] or 0),
             "artifact_rel_path": artifact_rel_path,
             "artifact_path": str(artifact_path),
@@ -151,6 +293,7 @@ def build_run_item_context_payload(
         "job_version": job_version_row_to_payload(job_version_row),
         "job_outputs": [job_output_row_to_payload(row) for row in job_output_rows],
         "response_schema": response_schema,
+        "execution": build_capability_execution_payload(job_version_row, job_output_rows),
         "document": {
             "id": int(document_row["id"]),
             "file_name": document_row["file_name"],

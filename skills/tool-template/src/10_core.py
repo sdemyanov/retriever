@@ -10,6 +10,15 @@ def build_content_type_by_extension() -> dict[str, str]:
 
 CONTENT_TYPE_BY_EXTENSION = build_content_type_by_extension()
 
+ATTACHMENT_SUFFIX_PATTERN = re.compile(
+    r"^(?P<title>.+?)\s+(?P<label>(?:and\s+(?:back\s*up|backup)\s+)?attachments?)\s*:\s*(?P<attachments>.+)$",
+    re.IGNORECASE,
+)
+HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN = re.compile(
+    r"<!-- RETRIEVER_ATTACHMENT_LINKS_START -->.*?<!-- RETRIEVER_ATTACHMENT_LINKS_END -->",
+    re.DOTALL,
+)
+
 SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS workspace_meta (
@@ -29,6 +38,7 @@ SCHEMA_STATEMENTS = [
       source_kind TEXT NOT NULL,
       dataset_locator TEXT NOT NULL,
       dataset_name TEXT NOT NULL,
+      dataset_name_normalized TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
@@ -353,7 +363,44 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS run_workers (
+      id INTEGER PRIMARY KEY,
+      run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      claimed_by TEXT NOT NULL,
+      launch_mode TEXT NOT NULL DEFAULT 'inline',
+      worker_task_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      max_batches INTEGER,
+      batches_prepared INTEGER NOT NULL DEFAULT 0,
+      items_completed INTEGER NOT NULL DEFAULT 0,
+      items_failed INTEGER NOT NULL DEFAULT 0,
+      last_heartbeat_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      cancel_requested_at TEXT,
+      summary_json TEXT NOT NULL DEFAULT '{}',
+      UNIQUE(run_id, claimed_by)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS ocr_page_outputs (
+      id INTEGER PRIMARY KEY,
+      run_item_id INTEGER NOT NULL REFERENCES run_items(id) ON DELETE CASCADE,
+      run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      page_number INTEGER NOT NULL,
+      text_content TEXT NOT NULL,
+      raw_output_json TEXT,
+      normalized_output_json TEXT,
+      provider_metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      UNIQUE(run_item_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS image_description_page_outputs (
       id INTEGER PRIMARY KEY,
       run_item_id INTEGER NOT NULL REFERENCES run_items(id) ON DELETE CASCADE,
       run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -543,6 +590,8 @@ def workspace_paths(root: Path) -> dict[str, Path]:
         "root": root,
         "state_dir": state_dir,
         "db_path": state_dir / "retriever.db",
+        "session_path": state_dir / "session.json",
+        "saved_scopes_path": state_dir / "saved_scopes.json",
         "previews_dir": state_dir / "previews",
         "text_revisions_dir": state_dir / "text-revisions",
         "bin_dir": state_dir / "bin",
@@ -891,6 +940,239 @@ def normalize_whitespace(text: str) -> str:
     return text.strip()
 
 
+def normalize_inline_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", str(text or "")).strip())
+
+
+def normalize_dataset_name_for_compare(dataset_name: str) -> str:
+    normalized = normalize_inline_whitespace(dataset_name)
+    return normalized.casefold()
+
+
+def normalize_saved_scope_name(scope_name: str) -> str:
+    return normalize_dataset_name_for_compare(scope_name)
+
+
+def default_session_state() -> dict[str, object]:
+    return {
+        "schema_version": SESSION_SCHEMA_VERSION,
+        "scope": {},
+        "browsing": {},
+        "display": {},
+    }
+
+
+def default_saved_scopes_state() -> dict[str, object]:
+    return {
+        "schema_version": SESSION_SCHEMA_VERSION,
+        "scopes": {},
+    }
+
+
+def coerce_scope_dataset_entries(raw_value: object) -> list[dict[str, object]]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized_entries: list[dict[str, object]] = []
+    seen_ids: set[int] = set()
+    for item in raw_value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            dataset_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        dataset_name = normalize_inline_whitespace(str(item.get("name") or ""))
+        if not dataset_name or dataset_id in seen_ids:
+            continue
+        seen_ids.add(dataset_id)
+        normalized_entries.append({"id": dataset_id, "name": dataset_name})
+    return normalized_entries
+
+
+def coerce_scope_payload(raw_scope: object) -> dict[str, object]:
+    if not isinstance(raw_scope, dict):
+        return {}
+    scope: dict[str, object] = {}
+    keyword = raw_scope.get("keyword")
+    if isinstance(keyword, str) and keyword.strip():
+        scope["keyword"] = keyword
+    bates = raw_scope.get("bates")
+    if isinstance(bates, dict):
+        begin = normalize_inline_whitespace(str(bates.get("begin") or ""))
+        end = normalize_inline_whitespace(str(bates.get("end") or ""))
+        if begin and end:
+            scope["bates"] = {"begin": begin, "end": end}
+    filter_expression = raw_scope.get("filter")
+    if isinstance(filter_expression, str) and filter_expression.strip():
+        scope["filter"] = filter_expression
+    dataset_entries = coerce_scope_dataset_entries(raw_scope.get("dataset"))
+    if dataset_entries:
+        scope["dataset"] = dataset_entries
+    from_run_id = raw_scope.get("from_run_id")
+    if from_run_id is not None:
+        try:
+            scope["from_run_id"] = int(from_run_id)
+        except (TypeError, ValueError):
+            pass
+    set_at = raw_scope.get("set_at")
+    if isinstance(set_at, str) and set_at.strip():
+        scope["set_at"] = set_at
+    return scope
+
+
+def coerce_saved_scope_payload(raw_scope: object) -> dict[str, object]:
+    scope = coerce_scope_payload(raw_scope)
+    saved_at = raw_scope.get("saved_at") if isinstance(raw_scope, dict) else None
+    if isinstance(saved_at, str) and saved_at.strip():
+        scope["saved_at"] = saved_at
+    scope.pop("set_at", None)
+    return scope
+
+
+def coerce_browsing_sort_payload(raw_value: object) -> list[list[str]]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized_specs: list[list[str]] = []
+    for item in raw_value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        field_name = normalize_inline_whitespace(str(item[0] or ""))
+        direction = normalize_inline_whitespace(str(item[1] or "")).lower()
+        if not field_name or direction not in {"asc", "desc"}:
+            continue
+        normalized_specs.append([field_name, direction])
+    return normalized_specs
+
+
+def coerce_browsing_payload(raw_browsing: object) -> dict[str, object]:
+    if not isinstance(raw_browsing, dict):
+        return {}
+    browsing: dict[str, object] = {}
+    sort_specs = coerce_browsing_sort_payload(raw_browsing.get("sort"))
+    if sort_specs:
+        browsing["sort"] = sort_specs
+    offset = raw_browsing.get("offset")
+    if isinstance(offset, int) and offset >= 0:
+        browsing["offset"] = offset
+    total_known = raw_browsing.get("total_known")
+    if isinstance(total_known, int) and total_known >= 0:
+        browsing["total_known"] = total_known
+    run_at = raw_browsing.get("run_at")
+    if isinstance(run_at, str) and run_at.strip():
+        browsing["run_at"] = run_at
+    return browsing
+
+
+def coerce_display_payload(raw_display: object) -> dict[str, object]:
+    if not isinstance(raw_display, dict):
+        return {}
+    display: dict[str, object] = {}
+    columns = raw_display.get("columns")
+    if isinstance(columns, list):
+        normalized_columns = [normalize_inline_whitespace(str(value)) for value in columns if normalize_inline_whitespace(str(value))]
+        if normalized_columns:
+            display["columns"] = normalized_columns
+    page_size = raw_display.get("page_size")
+    if isinstance(page_size, int) and page_size > 0:
+        display["page_size"] = page_size
+    return display
+
+
+def coerce_session_state(raw_value: object) -> dict[str, object]:
+    session = default_session_state()
+    if not isinstance(raw_value, dict):
+        return session
+    schema_version = raw_value.get("schema_version")
+    if isinstance(schema_version, int):
+        session["schema_version"] = schema_version
+    session["scope"] = coerce_scope_payload(raw_value.get("scope"))
+    session["browsing"] = coerce_browsing_payload(raw_value.get("browsing"))
+    session["display"] = coerce_display_payload(raw_value.get("display"))
+    return session
+
+
+def coerce_saved_scopes_state(raw_value: object) -> dict[str, object]:
+    saved_scopes = default_saved_scopes_state()
+    if not isinstance(raw_value, dict):
+        return saved_scopes
+    schema_version = raw_value.get("schema_version")
+    if isinstance(schema_version, int):
+        saved_scopes["schema_version"] = schema_version
+    scopes = raw_value.get("scopes")
+    if not isinstance(scopes, dict):
+        return saved_scopes
+    normalized_scopes: dict[str, object] = {}
+    for scope_name, scope_payload in scopes.items():
+        if not isinstance(scope_name, str):
+            continue
+        normalized_name = normalize_saved_scope_name(scope_name)
+        if not normalized_name:
+            continue
+        normalized_scopes[scope_name] = coerce_saved_scope_payload(scope_payload)
+    saved_scopes["scopes"] = normalized_scopes
+    return saved_scopes
+
+
+def read_json_state(path: Path, default_factory) -> dict[str, object]:
+    if not path.exists():
+        return default_factory()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RetrieverError(f"Could not read state file {path}: {exc}") from exc
+    coerced = default_factory()
+    if default_factory is default_session_state:
+        coerced = coerce_session_state(payload)
+    elif default_factory is default_saved_scopes_state:
+        coerced = coerce_saved_scopes_state(payload)
+    return coerced
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temp_path = Path(file_handle.name)
+    try:
+        with file_handle:
+            json.dump(payload, file_handle, indent=2, sort_keys=True)
+            file_handle.write("\n")
+            file_handle.flush()
+        temp_path.replace(path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def read_session_state(paths: dict[str, Path]) -> dict[str, object]:
+    return read_json_state(paths["session_path"], default_session_state)
+
+
+def write_session_state(paths: dict[str, Path], payload: dict[str, object]) -> None:
+    coerced = coerce_session_state(payload)
+    coerced["schema_version"] = SESSION_SCHEMA_VERSION
+    write_json_atomic(paths["session_path"], coerced)
+
+
+def read_saved_scopes_state(paths: dict[str, Path]) -> dict[str, object]:
+    return read_json_state(paths["saved_scopes_path"], default_saved_scopes_state)
+
+
+def write_saved_scopes_state(paths: dict[str, Path], payload: dict[str, object]) -> None:
+    coerced = coerce_saved_scopes_state(payload)
+    coerced["schema_version"] = SESSION_SCHEMA_VERSION
+    write_json_atomic(paths["saved_scopes_path"], coerced)
+
+
 def normalize_extension(path: Path) -> str:
     return path.suffix.lower().lstrip(".")
 
@@ -1010,10 +1292,30 @@ def normalize_internal_rel_path(path: Path) -> str:
     return normalized.lstrip("/")
 
 
+INTERNAL_REL_PATH_PREFIX = "_retriever"
+
+
 def is_internal_rel_path(rel_path: str | None) -> bool:
     if not rel_path:
         return False
-    return normalize_internal_rel_path(Path(rel_path)).startswith(".retriever/")
+    return normalize_internal_rel_path(Path(rel_path)).startswith(f"{INTERNAL_REL_PATH_PREFIX}/")
+
+
+def document_absolute_path(paths: dict[str, Path], rel_path: str | None) -> Path:
+    """Resolve a documents.rel_path (possibly internal) to its absolute location.
+
+    Internal rel_paths (those beginning with ``_retriever/``) address files that
+    live under the workspace's ``.retriever`` state directory. Regular rel_paths
+    are relative to the workspace root.
+    """
+    text = str(rel_path or "").strip()
+    if not text:
+        return paths["root"]
+    path = Path(text)
+    if path.parts and path.parts[0] == INTERNAL_REL_PATH_PREFIX:
+        state_relative = Path(*path.parts[1:]) if len(path.parts) > 1 else Path()
+        return paths["state_dir"] / state_relative
+    return paths["root"] / text
 
 
 def normalize_source_item_id(value: object) -> str:
@@ -1033,7 +1335,7 @@ def container_source_rel_path_from_message_rel_path(rel_path: str | None) -> str
         return None
     normalized = normalize_internal_rel_path(Path(rel_path))
     parts = Path(normalized).parts
-    if len(parts) < 5 or parts[0] != ".retriever" or parts[1] != "sources":
+    if len(parts) < 5 or parts[0] != INTERNAL_REL_PATH_PREFIX or parts[1] != "sources":
         return None
     try:
         messages_index = parts.index("messages")
@@ -1105,6 +1407,11 @@ def manual_dataset_locator(dataset_name: str | None = None) -> str:
     return f"manual:{sha256_text(f'{seed}:{utc_now()}')[:16]}"
 
 
+def normalized_dataset_name_or_default(dataset_name: str | None, default: str = "Dataset") -> str:
+    normalized = normalize_inline_whitespace(str(dataset_name or ""))
+    return normalized or default
+
+
 def get_dataset_row(
     connection: sqlite3.Connection,
     *,
@@ -1129,29 +1436,50 @@ def ensure_dataset_row(
     dataset_name: str,
 ) -> int:
     now = utc_now()
+    normalized_dataset_name = normalized_dataset_name_or_default(dataset_name)
+    normalized_compare_name = normalize_dataset_name_for_compare(normalized_dataset_name)
     existing_row = get_dataset_row(
         connection,
         source_kind=source_kind,
         dataset_locator=dataset_locator,
     )
     if existing_row is None:
-        connection.execute(
-            """
-            INSERT INTO datasets (
-              source_kind, dataset_locator, dataset_name, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (source_kind, dataset_locator, dataset_name, now, now),
-        )
+        try:
+            connection.execute(
+                """
+                INSERT INTO datasets (
+                  source_kind, dataset_locator, dataset_name, dataset_name_normalized, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (source_kind, dataset_locator, normalized_dataset_name, normalized_compare_name, now, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            conflicting_row = connection.execute(
+                """
+                SELECT id, dataset_name
+                FROM datasets
+                WHERE dataset_name_normalized = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (normalized_compare_name,),
+            ).fetchone()
+            if conflicting_row is not None:
+                raise RetrieverError(
+                    f"Dataset name {normalized_dataset_name!r} is already used by dataset {conflicting_row['id']} ({conflicting_row['dataset_name']!r})."
+                ) from exc
+            raise
         return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
-    if str(existing_row["dataset_name"]) != dataset_name:
+    existing_name = normalized_dataset_name_or_default(str(existing_row["dataset_name"] or ""))
+    existing_normalized = normalize_inline_whitespace(str(existing_row["dataset_name_normalized"] or ""))
+    if existing_normalized != normalize_dataset_name_for_compare(existing_name):
         connection.execute(
             """
             UPDATE datasets
-            SET dataset_name = ?, updated_at = ?
+            SET dataset_name = ?, dataset_name_normalized = ?, updated_at = ?
             WHERE id = ?
             """,
-            (dataset_name, now, existing_row["id"]),
+            (existing_name, normalize_dataset_name_for_compare(existing_name), now, existing_row["id"]),
         )
     return int(existing_row["id"])
 
@@ -1163,7 +1491,7 @@ def create_dataset_row(
     source_kind: str | None = None,
     dataset_locator: str | None = None,
 ) -> int:
-    normalized_name = normalize_whitespace(dataset_name) or "Dataset"
+    normalized_name = normalized_dataset_name_or_default(dataset_name)
     normalized_source_kind = normalize_whitespace(str(source_kind or MANUAL_DATASET_SOURCE_KIND)).lower()
     normalized_locator = normalize_whitespace(str(dataset_locator or ""))
     if not normalized_locator:
@@ -1399,14 +1727,14 @@ def get_dataset_row_by_id(connection: sqlite3.Connection, dataset_id: int) -> sq
 
 
 def find_dataset_rows_by_name(connection: sqlite3.Connection, dataset_name: str) -> list[sqlite3.Row]:
-    normalized_name = normalize_whitespace(dataset_name)
+    normalized_name = normalize_dataset_name_for_compare(dataset_name)
     if not normalized_name:
         return []
     return connection.execute(
         """
         SELECT *
         FROM datasets
-        WHERE dataset_name = ?
+        WHERE dataset_name_normalized = ?
         ORDER BY id ASC
         """,
         (normalized_name,),
@@ -1425,20 +1753,48 @@ def resolve_dataset_row(
         row = get_dataset_row_by_id(connection, dataset_id)
         if row is None:
             raise RetrieverError(f"Unknown dataset id: {dataset_id}")
-        if dataset_name is not None and normalize_whitespace(str(row["dataset_name"] or "")) != normalize_whitespace(dataset_name):
+        if dataset_name is not None and normalize_dataset_name_for_compare(str(row["dataset_name"] or "")) != normalize_dataset_name_for_compare(dataset_name):
             raise RetrieverError(
-                f"Dataset id {dataset_id} is named {row['dataset_name']!r}, not {normalize_whitespace(dataset_name)!r}."
+                f"Dataset id {dataset_id} is named {row['dataset_name']!r}, not {normalize_inline_whitespace(dataset_name)!r}."
             )
         return row
     matches = find_dataset_rows_by_name(connection, str(dataset_name or ""))
     if not matches:
         raise RetrieverError(f"Unknown dataset name: {dataset_name}")
-    if len(matches) > 1:
-        ids = ", ".join(str(row["id"]) for row in matches)
-        raise RetrieverError(
-            f"Dataset name {normalize_whitespace(str(dataset_name or ''))!r} is ambiguous; use --dataset-id. Matching ids: {ids}."
-        )
     return matches[0]
+
+
+def rename_dataset_row(connection: sqlite3.Connection, dataset_id: int, new_dataset_name: str) -> dict[str, object]:
+    dataset_row = get_dataset_row_by_id(connection, dataset_id)
+    if dataset_row is None:
+        raise RetrieverError(f"Unknown dataset id: {dataset_id}")
+    normalized_name = normalized_dataset_name_or_default(new_dataset_name)
+    normalized_compare_name = normalize_dataset_name_for_compare(normalized_name)
+    conflicting_row = connection.execute(
+        """
+        SELECT id, dataset_name
+        FROM datasets
+        WHERE dataset_name_normalized = ?
+          AND id != ?
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (normalized_compare_name, dataset_id),
+    ).fetchone()
+    if conflicting_row is not None:
+        raise RetrieverError(
+            f"Dataset name {normalized_name!r} is already used by dataset {conflicting_row['id']} ({conflicting_row['dataset_name']!r})."
+        )
+    now = utc_now()
+    connection.execute(
+        """
+        UPDATE datasets
+        SET dataset_name = ?, dataset_name_normalized = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (normalized_name, normalized_compare_name, now, dataset_id),
+    )
+    return dataset_summary_by_id(connection, dataset_id)
 
 
 def refresh_document_dataset_cache(connection: sqlite3.Connection, document_id: int) -> int | None:
@@ -1786,7 +2142,7 @@ def prune_unused_filesystem_dataset(connection: sqlite3.Connection) -> bool:
 def container_message_rel_path(source_rel_path: str, source_item_id: str, file_suffix: str) -> str:
     encoded = encode_source_item_id_for_path(source_item_id)
     return (
-        Path(".retriever")
+        Path(INTERNAL_REL_PATH_PREFIX)
         / "sources"
         / Path(source_rel_path)
         / "messages"
@@ -2066,7 +2422,7 @@ def append_unique_participants(
 
 def email_headers_to_metadata(headers: dict[str, str]) -> dict[str, str | None]:
     recipients = ", ".join(headers[key] for key in ("to", "cc", "bcc") if headers.get(key)) or None
-    subject = headers.get("subject") or None
+    subject = normalize_generated_document_title(headers.get("subject"))
     participants: list[str] = []
     seen: set[str] = set()
     append_unique_participants(
@@ -2082,6 +2438,35 @@ def email_headers_to_metadata(headers: dict[str, str]) -> dict[str, str | None]:
         "subject": subject,
         "title": subject,
     }
+
+def attachment_list_looks_like_filenames(raw_value: str) -> bool:
+    candidates = [
+        normalize_whitespace(part).strip(" \t\r\n'\"()[]{}")
+        for part in re.split(r"\s*[;,]\s*", raw_value)
+        if normalize_whitespace(part)
+    ]
+    if not candidates:
+        candidate = normalize_whitespace(raw_value).strip(" \t\r\n'\"()[]{}")
+        if not candidate:
+            return False
+        candidates = [candidate]
+    filename_like = 0
+    for candidate in candidates:
+        leaf = candidate.replace("\\", "/").rsplit("/", 1)[-1]
+        if re.search(r"\.[A-Za-z0-9]{1,8}$", leaf):
+            filename_like += 1
+    return filename_like > 0
+
+
+def normalize_generated_document_title(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or "")) or None
+    if not normalized:
+        return None
+    match = ATTACHMENT_SUFFIX_PATTERN.match(normalized)
+    if match is None or not attachment_list_looks_like_filenames(match.group("attachments")):
+        return normalized
+    trimmed_title = normalize_whitespace(match.group("title").rstrip(" -:;,"))
+    return trimmed_title or normalized
 
 
 EMAIL_MESSAGE_ID_PATTERN = re.compile(r"<\s*([^<>]+?)\s*>|([^\s<>;,]+@[^\s<>;,]+)")
@@ -2594,20 +2979,54 @@ def inline_cid_references_in_html(
     return CID_REFERENCE_PATTERN.sub(_replace, html_body)
 
 
+def render_html_preview_attachment_links(links: list[dict[str, str]]) -> str:
+    if not links:
+        return ""
+    items: list[str] = []
+    for link in links:
+        href = html.escape(str(link.get("href") or ""))
+        label = html.escape(str(link.get("label") or "Attachment"))
+        detail = normalize_whitespace(str(link.get("detail") or ""))
+        detail_html = f' <span class="retriever-attachment-meta">({html.escape(detail)})</span>' if detail else ""
+        items.append(f'<li><a href="{href}">{label}</a>{detail_html}</li>')
+    return (
+        "<!-- RETRIEVER_ATTACHMENT_LINKS_START -->"
+        '<section class="retriever-attachments"><h2>Attachments</h2><ul>'
+        + "".join(items)
+        + "</ul></section>"
+        "<!-- RETRIEVER_ATTACHMENT_LINKS_END -->"
+    )
+
+
+def inject_html_preview_attachment_links(html_text: str, links: list[dict[str, str]]) -> str:
+    cleaned = HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN.sub("", html_text)
+    section = render_html_preview_attachment_links(links)
+    if not section:
+        return cleaned
+    if "</h1>" in cleaned:
+        return cleaned.replace("</h1>", f"</h1>{section}", 1)
+    if "<body>" in cleaned:
+        return cleaned.replace("<body>", f"<body>{section}", 1)
+    return cleaned + section
+
+
 def build_html_preview(
     headers: dict[str, str],
     body_html: str | None = None,
     body_text: str | None = None,
     *,
-    document_title: str = "Retriever Preview",
+    document_title: str,
     head_html: str | None = None,
-    heading: str = "Retriever Preview",
+    heading: str | None = None,
 ) -> str:
     header_html = "".join(
         f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
         for key, value in headers.items()
         if value
     )
+    resolved_heading = document_title if heading is None else heading
+    heading_html = f"<h1>{html.escape(resolved_heading)}</h1>" if resolved_heading else ""
+    header_section = f"<table>{header_html}</table><hr/>" if header_html else ""
     if body_html:
         body_section = body_html
     else:
@@ -2619,11 +3038,8 @@ def build_html_preview(
         f"<title>{html.escape(document_title)}</title>"
         f"{head_html or ''}"
         "</head><body>"
-        f"<h1>{html.escape(heading)}</h1>"
-        "<table>"
-        f"{header_html}"
-        "</table>"
-        "<hr/>"
+        f"{heading_html}"
+        f"{header_section}"
         f"{body_section}"
         "</body></html>"
     )
@@ -2633,7 +3049,7 @@ def build_chat_preview_html(
     headers: dict[str, str],
     body_text: str,
     *,
-    document_title: str = "Retriever Chat Preview",
+    document_title: str,
     entries: list[dict[str, object]] | None = None,
 ) -> str:
     chat_entries = entries if entries is not None else iter_chat_transcript_entries(body_text, max_lines=4000)
@@ -2706,7 +3122,6 @@ def build_chat_preview_html(
         body_html=body_section,
         document_title=document_title,
         head_html=head_html,
-        heading="Retriever Chat Preview",
     )
 
 
