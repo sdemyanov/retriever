@@ -981,6 +981,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "document_email_threading", "updated_at TEXT NOT NULL DEFAULT ''")
     ensure_column(connection, "document_previews", "target_fragment TEXT")
     ensure_column(connection, "job_versions", "capability TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "runs", "activation_policy TEXT NOT NULL DEFAULT 'manual'")
     ensure_column(connection, "run_items", "result_id INTEGER REFERENCES results(id) ON DELETE SET NULL")
     ensure_column(connection, "run_items", "page_number INTEGER")
     ensure_column(connection, "run_items", "input_artifact_rel_path TEXT")

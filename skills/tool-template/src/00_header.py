@@ -80,7 +80,7 @@ except Exception:  # pragma: no cover - required PST backend probe
     pypff = None
 
 
-TOOL_VERSION = "0.17.1"
+TOOL_VERSION = "0.17.2"
 SCHEMA_VERSION = 19
 SESSION_SCHEMA_VERSION = 1
 REQUIREMENTS_VERSION = "2026-04-20-phase10-conversations-and-export-previews"
