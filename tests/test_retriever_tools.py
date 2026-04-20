@@ -1614,13 +1614,131 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_claim_complete_translation_run_with_always_activation_promotes_revision(self) -> None:
+        note_path = self.root / "memo-activate.txt"
+        note_path.write_text("Original English memo text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("memo-activate.txt")
+        source_revision_id = int(document_row["source_text_revision_id"])
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Translate RU",
+            "translation",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "translate_ru",
+            "--provider",
+            "static_text",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Translate to Russian.",
+            "--parameters-json",
+            "{\"target_language\":\"ru\",\"translated_text\":\"RU::{text}\"}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertEqual(create_run_payload["run"]["activation_policy"], "always")
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "translator-ru",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        completion_template = context_payload["context"]["execution"]["completion_template"]
+        raw_output = dict(completion_template["raw_output_json"])
+        raw_output["translated_text"] = "RU::Original English memo text."
+        normalized_output = dict(completion_template["normalized_output_json"])
+        normalized_output["translated_text"] = "RU::Original English memo text."
+        created_text_revision = dict(completion_template["created_text_revision_json"])
+        created_text_revision["text_content"] = "RU::Original English memo text."
+
+        complete_exit, complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "translator-ru",
+            "--raw-output-json",
+            json.dumps(raw_output),
+            "--normalized-output-json",
+            json.dumps(normalized_output),
+            "--created-text-revision-json",
+            json.dumps(created_text_revision),
+        )
+        self.assertEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+        self.assertIn("activation", complete_payload)
+        result_payload = complete_payload["result"]
+        translated_revision_id = int(result_payload["created_text_revision_id"])
+        self.assertEqual(complete_payload["activation"]["text_revision"]["id"], translated_revision_id)
+        self.assertEqual(complete_payload["activation"]["activation_policy"], "always")
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["source_text_revision_id"], source_revision_id)
+        self.assertEqual(updated_row["active_search_text_revision_id"], translated_revision_id)
+        self.assertEqual(updated_row["active_text_source_kind"], "translation")
+
+        revision_exit, revision_payload, _, _ = self.run_cli(
+            "list-text-revisions",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(revision_exit, 0)
+        self.assertIsNotNone(revision_payload)
+        revisions_by_id = {int(item["id"]): item for item in revision_payload["text_revisions"]}
+        self.assertTrue(revisions_by_id[translated_revision_id]["is_active_search_revision"])
+
         repeat_complete_exit, repeat_complete_payload, _, _ = self.run_cli(
             "complete-run-item",
             str(self.root),
             "--run-item-id",
             str(run_item_id),
             "--claimed-by",
-            "translator-es",
+            "translator-ru",
             "--raw-output-json",
             json.dumps(raw_output),
             "--normalized-output-json",
@@ -1632,6 +1750,48 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(repeat_complete_payload)
         self.assertTrue(repeat_complete_payload["idempotent"])
         self.assertEqual(repeat_complete_payload["result"]["id"], result_payload["id"])
+
+    def test_create_run_rejects_always_activation_for_structured_extraction(self) -> None:
+        note_path = self.root / "contract-activation.txt"
+        note_path.write_text("Contract text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("contract-activation.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Extract Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "extract_contract_metadata",
+            "--instruction",
+            "Extract metadata fields from the contract.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, stderr_text = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertNotEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertIn("only supported", create_run_payload["error"])
 
     def test_translation_run_item_context_includes_execution_template(self) -> None:
         note_path = self.root / "translation.txt"
@@ -2785,6 +2945,90 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(final_prepare_payload["worker"]["needs_ocr_finalization"])
         self.assertEqual(final_prepare_payload["worker"]["next_action"], "finalize_ocr")
 
+    def test_finalize_ocr_run_with_always_activation_promotes_revision(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Queued OCR Auto Activate", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "queued_ocr_auto_activate",
+            "--instruction",
+            "OCR each page image.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertEqual(create_run_payload["run"]["activation_policy"], "always")
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "ocr-activate-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        for item in claim_payload["run_items"]:
+            page_number = int(item["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(item["id"]),
+                "--claimed-by",
+                "ocr-activate-worker",
+                "--page-text",
+                f"OCR auto page {page_number}",
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "finalize-ocr-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertEqual(len(finalize_payload["activations"]), 1)
+        result_payload = finalize_payload["results"][0]
+        created_revision_id = int(result_payload["created_text_revision_id"])
+        self.assertEqual(finalize_payload["activations"][0]["text_revision"]["id"], created_revision_id)
+        self.assertEqual(finalize_payload["activations"][0]["activation_policy"], "always")
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_search_text_revision_id"], created_revision_id)
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
     def test_image_description_page_run_items_finalize_into_document_result(self) -> None:
         production_root = self.write_production_fixture()
 
@@ -2921,6 +3165,95 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_finalize_image_description_run_with_always_activation_promotes_revision(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Queued Image Description Auto Activate",
+            "image_description",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "queued_image_description_auto_activate",
+            "--instruction",
+            "Describe each page image in search-friendly prose.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertEqual(create_run_payload["run"]["activation_policy"], "always")
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "image-description-activate-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        for item in claim_payload["run_items"]:
+            page_number = int(item["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(item["id"]),
+                "--claimed-by",
+                "image-description-activate-worker",
+                "--page-text",
+                f"Image description auto page {page_number}",
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "finalize-image-description-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertEqual(len(finalize_payload["activations"]), 1)
+        result_payload = finalize_payload["results"][0]
+        created_revision_id = int(result_payload["created_text_revision_id"])
+        self.assertEqual(finalize_payload["activations"][0]["text_revision"]["id"], created_revision_id)
+        self.assertEqual(finalize_payload["activations"][0]["activation_policy"], "always")
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_search_text_revision_id"], created_revision_id)
+        self.assertEqual(updated_row["active_text_source_kind"], "image_description")
 
     def test_prepare_run_batch_requests_image_description_finalization_after_completed_pages(self) -> None:
         production_root = self.write_production_fixture()

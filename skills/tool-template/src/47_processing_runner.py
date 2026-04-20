@@ -688,6 +688,19 @@ async def execute_run_async(
             input_identity=str(snapshot_row["pinned_input_identity"]),
         )
         if existing_result_row is not None:
+            maybe_activate_created_text_revision(
+                connection,
+                paths,
+                run_row=run_row,
+                job_version_row=job_version_row,
+                document_id=int(snapshot_row["document_id"]),
+                result_id=int(existing_result_row["id"]),
+                text_revision_id=(
+                    int(existing_result_row["created_text_revision_id"])
+                    if existing_result_row["created_text_revision_id"] is not None
+                    else None
+                ),
+            )
             terminal_status = str(run_item_row["status"] or "")
             if terminal_status not in {"completed", "skipped"} or run_item_row["result_id"] != existing_result_row["id"]:
                 update_run_item_row(
@@ -781,6 +794,15 @@ async def execute_run_async(
                     job_output_rows=job_output_rows,
                     output_values_by_name=provider_result["output_values"],  # type: ignore[arg-type]
                 )
+            maybe_activate_created_text_revision(
+                connection,
+                paths,
+                run_row=run_row,
+                job_version_row=job_version_row,
+                document_id=int(snapshot_row["document_id"]),
+                result_id=result_id,
+                text_revision_id=created_text_revision_id,
+            )
             create_attempt_row(
                 connection,
                 run_item_id=int(run_item_row["id"]),

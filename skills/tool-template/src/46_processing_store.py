@@ -871,6 +871,7 @@ def run_row_to_payload(row: sqlite3.Row) -> dict[str, object]:
         "from_run_id": row["from_run_id"],
         "selector": decode_json_text(row["selector_json"], default={}) or {},
         "exclude_selector": decode_json_text(row["exclude_selector_json"], default={}) or {},
+        "activation_policy": str(row["activation_policy"] or "manual"),
         "family_mode": row["family_mode"],
         "seed_limit": row["seed_limit"],
         "status": row["status"],
@@ -905,6 +906,7 @@ def create_run_row(
     job_version_id: int,
     selector: dict[str, object],
     exclude_selector: dict[str, object],
+    activation_policy: str,
     family_mode: str,
     seed_limit: int | None,
     from_run_id: int | None,
@@ -918,6 +920,7 @@ def create_run_row(
           from_run_id,
           selector_json,
           exclude_selector_json,
+          activation_policy,
           family_mode,
           seed_limit,
           status,
@@ -929,13 +932,14 @@ def create_run_row(
           started_at,
           completed_at,
           canceled_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, NULL, NULL, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, NULL, NULL, NULL)
         """,
         (
             job_version_id,
             from_run_id,
             compact_json_text(selector),
             compact_json_text(exclude_selector),
+            activation_policy,
             family_mode,
             seed_limit,
             status,
@@ -943,6 +947,32 @@ def create_run_row(
         ),
     )
     return int(cursor.lastrowid)
+
+
+def maybe_activate_created_text_revision(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_row: sqlite3.Row,
+    job_version_row: sqlite3.Row,
+    document_id: int,
+    result_id: int,
+    text_revision_id: int | None,
+) -> dict[str, object] | None:
+    if text_revision_id is None:
+        return None
+    activation_policy = normalize_run_activation_policy(str(run_row["activation_policy"] or "manual"))
+    if activation_policy != "always":
+        return None
+    return activate_text_revision_for_document(
+        connection,
+        paths,
+        document_id=document_id,
+        text_revision_id=text_revision_id,
+        activation_policy=activation_policy,
+        activated_by_job_version_id=int(job_version_row["id"]),
+        source_result_id=result_id,
+    )
 
 
 def replace_run_snapshot_documents(
@@ -2932,6 +2962,7 @@ def finalize_ocr_results_for_run(
         (run_id,),
     ).fetchall()
     finalized_results: list[dict[str, object]] = []
+    activations: list[dict[str, object]] = []
     for snapshot_row in snapshot_rows:
         document_id = int(snapshot_row["document_id"])
         existing_result_row = find_active_result_row(
@@ -2951,6 +2982,17 @@ def finalize_ocr_results_for_run(
                 """,
                 (result_id, run_id, document_id),
             )
+            activation_payload = maybe_activate_created_text_revision(
+                connection,
+                paths,
+                run_row=run_row,
+                job_version_row=job_version_row,
+                document_id=document_id,
+                result_id=result_id,
+                text_revision_id=int(existing_result_row["created_text_revision_id"]),
+            )
+            if activation_payload is not None:
+                activations.append(activation_payload)
             finalized_results.append(result_summary_by_id(connection, result_id))
             continue
 
@@ -3032,6 +3074,17 @@ def finalize_ocr_results_for_run(
             """,
             (result_id, run_id, document_id),
         )
+        activation_payload = maybe_activate_created_text_revision(
+            connection,
+            paths,
+            run_row=run_row,
+            job_version_row=job_version_row,
+            document_id=document_id,
+            result_id=result_id,
+            text_revision_id=created_text_revision_id,
+        )
+        if activation_payload is not None:
+            activations.append(activation_payload)
         finalized_results.append(result_summary_by_id(connection, result_id))
 
     refresh_run_progress(connection, run_id)
@@ -3039,6 +3092,7 @@ def finalize_ocr_results_for_run(
         "status": "ok",
         "run": run_status_by_id(connection, run_id),
         "results": finalized_results,
+        "activations": activations,
     }
 
 
@@ -3092,6 +3146,7 @@ def finalize_image_description_results_for_run(
         (run_id,),
     ).fetchall()
     finalized_results: list[dict[str, object]] = []
+    activations: list[dict[str, object]] = []
     for snapshot_row in snapshot_rows:
         document_id = int(snapshot_row["document_id"])
         existing_result_row = find_active_result_row(
@@ -3111,6 +3166,17 @@ def finalize_image_description_results_for_run(
                 """,
                 (result_id, run_id, document_id),
             )
+            activation_payload = maybe_activate_created_text_revision(
+                connection,
+                paths,
+                run_row=run_row,
+                job_version_row=job_version_row,
+                document_id=document_id,
+                result_id=result_id,
+                text_revision_id=int(existing_result_row["created_text_revision_id"]),
+            )
+            if activation_payload is not None:
+                activations.append(activation_payload)
             finalized_results.append(result_summary_by_id(connection, result_id))
             continue
 
@@ -3194,6 +3260,17 @@ def finalize_image_description_results_for_run(
             """,
             (result_id, run_id, document_id),
         )
+        activation_payload = maybe_activate_created_text_revision(
+            connection,
+            paths,
+            run_row=run_row,
+            job_version_row=job_version_row,
+            document_id=document_id,
+            result_id=result_id,
+            text_revision_id=created_text_revision_id,
+        )
+        if activation_payload is not None:
+            activations.append(activation_payload)
         finalized_results.append(result_summary_by_id(connection, result_id))
 
     refresh_run_progress(connection, run_id)
@@ -3201,6 +3278,7 @@ def finalize_image_description_results_for_run(
         "status": "ok",
         "run": run_status_by_id(connection, run_id),
         "results": finalized_results,
+        "activations": activations,
     }
 
 

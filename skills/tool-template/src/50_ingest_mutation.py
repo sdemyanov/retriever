@@ -792,6 +792,7 @@ def create_run(
     exclude_control_numbers: list[str] | None = None,
     exclude_query: str | None = None,
     exclude_filters: list[list[str]] | None = None,
+    activation_policy: str = "manual",
     family_mode: str = "exact",
     seed_limit: int | None = None,
 ) -> dict[str, object]:
@@ -801,6 +802,7 @@ def create_run(
         else None
     )
     normalized_family_mode = normalize_run_family_mode(family_mode)
+    normalized_activation_policy = normalize_run_activation_policy(activation_policy)
     if seed_limit is not None and seed_limit < 1:
         raise RetrieverError("Run limit must be >= 1.")
 
@@ -841,6 +843,12 @@ def create_run(
             (job_version_row["job_id"],),
         ).fetchone()
         assert job_row is not None
+        job_kind = normalize_job_kind(str(job_row["job_kind"]))
+        if normalized_activation_policy != "manual" and job_kind not in REVISION_PRODUCING_JOB_KINDS:
+            raise RetrieverError(
+                f"Run activation policy {normalized_activation_policy!r} is only supported for "
+                f"{', '.join(sorted(REVISION_PRODUCING_JOB_KINDS))} jobs."
+            )
         snapshot_rows = plan_run_snapshot_rows(
             connection,
             root=root,
@@ -858,6 +866,7 @@ def create_run(
                 job_version_id=int(job_version_row["id"]),
                 selector=selector,
                 exclude_selector=exclude_selector,
+                activation_policy=normalized_activation_policy,
                 family_mode=normalized_family_mode,
                 seed_limit=seed_limit,
                 from_run_id=from_run_id,
@@ -1457,6 +1466,28 @@ def complete_run_item(
                     job_output_rows=job_output_rows,
                     output_values_by_name=output_values,
                 )
+            result_row = connection.execute(
+                """
+                SELECT *
+                FROM results
+                WHERE id = ?
+                """,
+                (result_id,),
+            ).fetchone()
+            assert result_row is not None
+            activation_payload = maybe_activate_created_text_revision(
+                connection,
+                paths,
+                run_row=require_run_row_by_id(connection, int(run_item_row["run_id"])),
+                job_version_row=job_version_row,
+                document_id=int(run_item_row["document_id"]),
+                result_id=result_id,
+                text_revision_id=(
+                    int(result_row["created_text_revision_id"])
+                    if result_row["created_text_revision_id"] is not None
+                    else None
+                ),
+            )
             create_attempt_row(
                 connection,
                 run_item_id=run_item_id,
@@ -1495,6 +1526,8 @@ def complete_run_item(
                 "result": result_summary_by_id(connection, result_id),
                 "run": run_status_by_id(connection, int(run_item_row["run_id"])),
             }
+            if activation_payload is not None:
+                payload["activation"] = activation_payload
             connection.commit()
         except Exception:
             connection.rollback()

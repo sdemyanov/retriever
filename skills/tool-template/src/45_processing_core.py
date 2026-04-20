@@ -5,6 +5,7 @@ JOB_KINDS = {
     "structured_extraction",
     "translation",
 }
+REVISION_PRODUCING_JOB_KINDS = {"image_description", "ocr", "translation"}
 JOB_CAPABILITIES = {
     "text_structured",
     "text_translation",
@@ -33,6 +34,7 @@ RUN_STATUSES = {"canceled", "completed", "failed", "planned", "running"}
 RUN_WORKER_MODES = {"background", "inline"}
 RUN_WORKER_STATUSES = {"active", "canceled", "completed", "failed", "orphaned", "stopped"}
 TEXT_REVISION_ACTIVATION_POLICIES = {"always", "if_empty", "if_poor", "manual"}
+RUN_ACTIVATION_POLICIES = {"always", "manual"}
 DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS = 900
 DEFAULT_RUN_ITEM_CONTEXT_INLINE_BYTES = 50 * 1024
 DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE = 10
@@ -172,6 +174,16 @@ def normalize_text_revision_activation_policy(policy: str) -> str:
         raise RetrieverError(
             f"Unsupported activation policy: {policy!r}. "
             f"Expected one of {', '.join(sorted(TEXT_REVISION_ACTIVATION_POLICIES))}."
+        )
+    return normalized
+
+
+def normalize_run_activation_policy(policy: str) -> str:
+    normalized = normalize_whitespace(policy).lower()
+    if normalized not in RUN_ACTIVATION_POLICIES:
+        raise RetrieverError(
+            f"Unsupported run activation policy: {policy!r}. "
+            f"Expected one of {', '.join(sorted(RUN_ACTIVATION_POLICIES))}."
         )
     return normalized
 

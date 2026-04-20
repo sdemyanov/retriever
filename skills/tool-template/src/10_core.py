@@ -282,6 +282,7 @@ SCHEMA_STATEMENTS = [
       from_run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
       selector_json TEXT NOT NULL,
       exclude_selector_json TEXT NOT NULL DEFAULT '{}',
+      activation_policy TEXT NOT NULL DEFAULT 'manual',
       family_mode TEXT NOT NULL DEFAULT 'exact',
       seed_limit INTEGER,
       status TEXT NOT NULL DEFAULT 'planned',
