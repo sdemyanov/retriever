@@ -23,11 +23,17 @@ Use this skill when the user says things like:
 2. Read [../schema/schema.md](../schema/schema.md) if field names or operators are unclear.
 3. Use [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py) as the command source if workspace materialization is needed.
 
+## View vs compose
+
+- Use `--mode view` only when the user asked to see results as a table or is using the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`).
+- In `view` mode, the tool returns a `rendered_markdown` field containing the complete pre-formatted result table. Your entire reply should be the contents of `rendered_markdown` verbatim: no preamble, no trailing commentary, no code fences, and no reformatting.
+- Use `--mode compose` for everything else. Compose is the safe default for summaries, counts, explanations, drafting, comparison, or any answer that is about the documents rather than the table of results itself.
+
 ## Execution rules
 
 - Prefer SQL-like `--filter "<expression>"` filters over tuple-style field/operator/value fragments.
 - The filter grammar targets Retriever's logical document fields, including schema-defined virtual fields such as `production_name`, `is_attachment`, and `has_attachments`.
-- Use the canonical stateless `search` CLI flags: `--filter`, `--sort`, `--order`, `--page`, `--per-page`, and `--columns`.
+- Use the canonical stateless `search` CLI flags: `--filter`, `--sort`, `--order`, `--page`, `--per-page`, `--columns`, and `--mode`.
 - For requests like "show 10 ...", map the requested count to `--page 1 --per-page 10`; do not invent `--limit`.
 - For sorted browse requests, use `--sort <field>` and `--order asc|desc`; do not invent `--sort-by` or `--sort-order`.
 - Use canonical built-in field names such as `date_created`, not ad hoc variants like `created_date`.
@@ -36,8 +42,9 @@ Use this skill when the user says things like:
 - For a single Bates/control token or a Bates range expression, prefer the Bates-aware search path over plain keyword FTS.
 - For persistent investigation flows, prefer the slash surface: `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, and `/columns`.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
+- If the user asked to see a table, call search with `--mode view` and forward `rendered_markdown` exactly.
 - Always show the active scope/header before the result table so the user can see the selector, sort, and page state.
-- **Mandatory output format** — render every result set as a table driven by the active display columns from search-strategy.md:
+- **Mandatory compose-mode output format** — when you called search with `--mode compose` (the default), render every result set as a table driven by the active display columns from search-strategy.md:
 
   ```
   Scope: ...

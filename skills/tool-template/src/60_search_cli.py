@@ -1059,6 +1059,8 @@ def compact_search_payload(payload: dict[str, object]) -> dict[str, object]:
         compact_payload["display"] = payload["display"]
     if payload_has_meaningful_value(payload.get("warnings")):
         compact_payload["warnings"] = payload["warnings"]
+    if payload_has_meaningful_value(payload.get("rendered_markdown")):
+        compact_payload["rendered_markdown"] = payload["rendered_markdown"]
     return compact_payload
 
 
@@ -1518,12 +1520,14 @@ def search(
     page: int,
     per_page: int,
     raw_columns: str | None = None,
+    mode: str = "compose",
 ) -> dict[str, object]:
     if page < 1:
         raise RetrieverError("Page must be >= 1.")
     if per_page < 1:
         raise RetrieverError("per-page must be >= 1.")
     per_page = min(per_page, MAX_PAGE_SIZE)
+    normalized_mode = normalize_search_mode(mode)
 
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -1674,6 +1678,8 @@ def search(
         }
         if display_warnings:
             payload["warnings"] = display_warnings
+        if normalized_mode == "view":
+            payload["rendered_markdown"] = render_search_markdown(payload, display_column_defs)
         return payload
     finally:
         connection.close()
@@ -1688,8 +1694,9 @@ def search_docs(
     page: int,
     per_page: int,
     raw_columns: str | None = None,
+    mode: str = "compose",
 ) -> dict[str, object]:
-    return search(root, query, raw_filters, sort_field, order, page, per_page, raw_columns)
+    return search(root, query, raw_filters, sort_field, order, page, per_page, raw_columns, mode)
 
 
 def format_scope_bates_value(bates_scope: object) -> str:
@@ -1784,6 +1791,15 @@ def build_search_header_payload(scope: dict[str, object], payload: dict[str, obj
 
 def default_display_columns() -> list[str]:
     return list(DEFAULT_DISPLAY_COLUMNS)
+
+
+def normalize_search_mode(mode: object | None) -> str:
+    normalized = normalize_inline_whitespace(str(mode or "compose")).lower()
+    if not normalized:
+        return "compose"
+    if normalized not in {"compose", "view"}:
+        raise RetrieverError(f"Unknown search mode: {mode!r}. Expected 'compose' or 'view'.")
+    return normalized
 
 
 def session_display_state(session_state: dict[str, object]) -> dict[str, object]:
@@ -1997,6 +2013,218 @@ def build_search_result_display_values(
         column_def["name"]: search_result_display_value(row, item, column_def["name"], column_def["type"])
         for column_def in column_defs
     }
+
+
+def best_summary_title(item: dict[str, object]) -> str | None:
+    for candidate in (
+        item.get("title"),
+        item.get("subject"),
+        item.get("file_name"),
+        item.get("control_number"),
+    ):
+        normalized = normalize_inline_whitespace(str(candidate or ""))
+        if normalized:
+            return normalized
+    return None
+
+
+def summary_display_value(item: dict[str, object], field_name: str, field_type: str) -> object:
+    if field_name == "title":
+        return best_summary_title(item)
+    if field_name == "dataset_name":
+        dataset_names = item.get("dataset_names")
+        if isinstance(dataset_names, list):
+            normalized_names = [normalize_inline_whitespace(str(value)) for value in dataset_names if normalize_inline_whitespace(str(value))]
+            return ", ".join(normalized_names) or None
+        return normalize_inline_whitespace(str(item.get("dataset_name") or "")) or None
+    if field_name == "production_name":
+        return normalize_inline_whitespace(str(item.get("production_name") or "")) or None
+    if field_name == "is_attachment":
+        if item.get("parent_document_id") is not None:
+            return "Yes"
+        child_kind = normalize_inline_whitespace(str(item.get("child_document_kind") or ""))
+        return "Yes" if child_kind == CHILD_DOCUMENT_KIND_ATTACHMENT else "No"
+    if field_name in item:
+        value = item.get(field_name)
+    else:
+        metadata = item.get("metadata")
+        value = metadata.get(field_name) if isinstance(metadata, dict) else None
+    if field_type == "boolean":
+        if value in (None, ""):
+            return None
+        return "Yes" if bool(value) else "No"
+    if isinstance(value, list):
+        normalized_values = [normalize_inline_whitespace(str(entry)) for entry in value if normalize_inline_whitespace(str(entry))]
+        return ", ".join(normalized_values) or None
+    if isinstance(value, str):
+        return value or None
+    return value
+
+
+def markdown_table_cell_text(value: object) -> str:
+    normalized = normalize_inline_whitespace(str(value or ""))
+    if not normalized:
+        return ""
+    return normalized.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def markdown_link_text(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def format_search_markdown_date(value: object) -> str:
+    parsed = parse_utc_timestamp(value)
+    if parsed is None:
+        return markdown_table_cell_text(value)
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def markdown_search_target(item: dict[str, object]) -> str | None:
+    for key in ("preview_abs_path", "abs_path"):
+        normalized = normalize_inline_whitespace(str(item.get(key) or ""))
+        if not normalized:
+            continue
+        if normalized.startswith("computer://"):
+            return normalized
+        return f"computer://{normalized}"
+    return None
+
+
+def summarize_child_content_type(item: dict[str, object], *, attachment: bool) -> str | None:
+    if attachment:
+        return "Attachment"
+    child_kind = normalize_inline_whitespace(str(item.get("child_document_kind") or ""))
+    if child_kind:
+        return child_kind.replace("_", " ").title()
+    return None
+
+
+def render_search_markdown_cell(
+    item: dict[str, object],
+    column_def: dict[str, str],
+    *,
+    child_prefix: str = "",
+    child_content_type: str | None = None,
+    standalone_child_parent: str | None = None,
+) -> str:
+    column_name = str(column_def["name"])
+    field_type = str(column_def["type"])
+    display_values = item.get("display_values")
+    if isinstance(display_values, dict) and column_name in display_values and not child_prefix:
+        value = display_values.get(column_name)
+    else:
+        value = summary_display_value(item, column_name, field_type)
+    if column_name == "content_type" and child_content_type and not value:
+        value = child_content_type
+    if column_name in {"date_created", "date_modified"}:
+        return format_search_markdown_date(value)
+    if column_name == "title":
+        title_text = normalize_inline_whitespace(str(value or best_summary_title(item) or "Untitled"))
+        if child_prefix:
+            title_text = f"{child_prefix}{title_text}"
+        if standalone_child_parent:
+            title_text = f"{title_text} ({standalone_child_parent})"
+        target = markdown_search_target(item)
+        if target:
+            return f"[{markdown_link_text(title_text)}]({target})"
+        return markdown_table_cell_text(title_text)
+    return markdown_table_cell_text(value)
+
+
+def render_search_markdown_row(
+    item: dict[str, object],
+    column_defs: list[dict[str, str]],
+    *,
+    child_prefix: str = "",
+    child_content_type: str | None = None,
+    standalone_child_parent: str | None = None,
+) -> str:
+    cells = [
+        render_search_markdown_cell(
+            item,
+            column_def,
+            child_prefix=child_prefix,
+            child_content_type=child_content_type,
+            standalone_child_parent=standalone_child_parent,
+        )
+        for column_def in column_defs
+    ]
+    return "| " + " | ".join(cells) + " |"
+
+
+def render_search_markdown(payload: dict[str, object], column_defs: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    header = payload.get("header")
+    if isinstance(header, dict):
+        for key in ("scope", "sort", "page"):
+            value = header.get(key)
+            if payload_has_meaningful_value(value):
+                lines.append(str(value))
+
+    column_names = [str(column_def["name"]) for column_def in column_defs]
+    lines.append("")
+    lines.append("| " + " | ".join(column_names) + " |")
+    lines.append("|" + "|".join("---" for _ in column_names) + "|")
+
+    results = payload.get("results")
+    if isinstance(results, list):
+        for raw_item in results:
+            if not isinstance(raw_item, dict):
+                continue
+            parent_context = None
+            parent = raw_item.get("parent")
+            if isinstance(parent, dict):
+                parent_title = best_summary_title(parent)
+                if parent_title:
+                    parent_context = f"parent: {parent_title}"
+            child_kind = normalize_inline_whitespace(str(raw_item.get("child_document_kind") or ""))
+            lines.append(
+                render_search_markdown_row(
+                    raw_item,
+                    column_defs,
+                    child_prefix="↳ " if parent_context else "",
+                    child_content_type=summarize_child_content_type(
+                        raw_item,
+                        attachment=child_kind == CHILD_DOCUMENT_KIND_ATTACHMENT,
+                    ),
+                    standalone_child_parent=parent_context,
+                )
+            )
+            attachments = raw_item.get("attachments")
+            if isinstance(attachments, list):
+                for attachment in attachments:
+                    if isinstance(attachment, dict):
+                        lines.append(
+                            render_search_markdown_row(
+                                attachment,
+                                column_defs,
+                                child_prefix="↳ ",
+                                child_content_type="Attachment",
+                            )
+                        )
+            child_documents = raw_item.get("child_documents")
+            if isinstance(child_documents, list):
+                for child in child_documents:
+                    if isinstance(child, dict):
+                        lines.append(
+                            render_search_markdown_row(
+                                child,
+                                column_defs,
+                                child_prefix="↳ ",
+                                child_content_type=summarize_child_content_type(child, attachment=False),
+                            )
+                        )
+
+    total_hits = int(payload.get("total_hits") or 0)
+    page = int(payload.get("page") or 1)
+    per_page = int(payload.get("per_page") or DEFAULT_PAGE_SIZE)
+    start_index = 0 if total_hits == 0 else ((page - 1) * per_page) + 1
+    end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
+    footer = f"Documents {start_index}\u2013{end_index} of {total_hits}."
+    if page < int(payload.get("total_pages") or 1):
+        footer += " Ask for the next page to see more."
+    lines.extend(["", footer])
+    return "\n".join(lines)
 
 
 def scope_dataset_name_suggestions(connection: sqlite3.Connection, dataset_name: str) -> list[str]:
@@ -2418,6 +2646,7 @@ def search_with_scope(
         payload["header"] = build_search_header_payload(selection["scope"], payload)
         if warnings:
             payload["warnings"] = warnings
+        payload["rendered_markdown"] = render_search_markdown(payload, effective_display_column_defs)
         return payload
     finally:
         connection.close()
@@ -5321,6 +5550,7 @@ def add_search_arguments(parser: argparse.ArgumentParser) -> None:
         help="Results per page",
     )
     parser.add_argument("--columns", help="Comma-separated result columns")
+    parser.add_argument("--mode", choices=("compose", "view"), default="compose", help="Search response mode")
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -5930,14 +6160,14 @@ def main() -> int:
         if args.command == "search":
             return emit_cli_payload(
                 "search",
-                search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page, args.columns),
+                search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page, args.columns, args.mode),
                 verbose=args.verbose,
             )
 
         if args.command == "search-docs":
             return emit_cli_payload(
                 "search-docs",
-                search_docs(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page, args.columns),
+                search_docs(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page, args.columns, args.mode),
                 verbose=args.verbose,
             )
 
