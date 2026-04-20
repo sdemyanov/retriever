@@ -5767,6 +5767,78 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("filter-only", error_payload["error"])
         self.assertIn("has_attachments", error_payload["error"])
 
+    def test_search_cli_view_mode_returns_rendered_markdown_with_current_compact_shape(self) -> None:
+        (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "sample",
+            "--mode",
+            "view",
+            "--columns",
+            "title,control_number",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertIn("results", search_payload)
+        self.assertNotIn("documents", search_payload)
+        self.assertIn("rendered_markdown", search_payload)
+        rendered = str(search_payload["rendered_markdown"])
+        self.assertIn("Scope: keyword='sample'", rendered)
+        self.assertIn("| title | control_number |", rendered)
+        self.assertIn("](computer://", rendered)
+        self.assertIn("Documents 1–1 of 1.", rendered)
+        self.assertNotIn("| # |", rendered)
+
+    def test_search_cli_view_mode_renders_attachment_rows_and_parent_context(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Upgrade test",
+            body_text="Hello team,\nThis is the email body.",
+            attachment_name="notes.txt",
+            attachment_text="confidential attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        parent_exit, parent_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "Upgrade test",
+            "--mode",
+            "view",
+        )
+        self.assertEqual(parent_exit, 0)
+        self.assertIsNotNone(parent_payload)
+        assert parent_payload is not None
+        parent_rendered = str(parent_payload["rendered_markdown"])
+        self.assertIn("[Upgrade test](computer://", parent_rendered)
+        self.assertIn("[↳ notes.txt](computer://", parent_rendered)
+        self.assertIn("| Attachment |", parent_rendered)
+
+        attachment_exit, attachment_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "confidential attachment detail",
+            "--mode",
+            "view",
+        )
+        self.assertEqual(attachment_exit, 0)
+        self.assertIsNotNone(attachment_payload)
+        assert attachment_payload is not None
+        attachment_rendered = str(attachment_payload["rendered_markdown"])
+        self.assertIn("[↳ notes.txt (parent: Upgrade test)](computer://", attachment_rendered)
+
     def test_slash_search_persists_scope_and_search_within_keyword(self) -> None:
         (self.root / "alpha.txt").write_text("alpha beta body\n", encoding="utf-8")
         (self.root / "second.txt").write_text("alpha only body\n", encoding="utf-8")

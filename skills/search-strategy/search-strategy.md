@@ -10,9 +10,15 @@
 - A scope is a conjunctive selector over document fields. In the current implementation it may include a keyword slot, a Bates slot, a SQL-like filter slot, a dataset slot, and a `from_run_id` slot.
 - Build metadata constraints with repeatable SQL-like `--filter "<expression>"` clauses. Repeated `--filter` flags AND-compose.
 - The filter grammar applies to Retriever's logical document field set, not only raw table columns. Supported names include built-in fields, registered custom fields, and schema-defined virtual fields such as `production_name`, `is_attachment`, and `has_attachments`.
-- Use the canonical stateless `search` CLI flags `--sort`, `--order`, `--page`, `--per-page`, and `--columns` for sorting, paging, and display control.
+- Use the canonical stateless `search` CLI flags `--sort`, `--order`, `--page`, `--per-page`, `--columns`, and `--mode` for sorting, paging, display control, and response mode.
 - Map "show N" style requests to `--page 1 --per-page N`; do not invent `--limit`.
 - Use canonical built-in field names such as `date_created`, not ad hoc variants like `created_date`.
+
+## View vs compose
+
+- `--mode compose` is the default. Use it when the user wants a summary, count, explanation, draft, comparison, or any answer that is about the documents rather than the listing itself.
+- `--mode view` is for table-shaped requests only. In view mode the tool returns a `rendered_markdown` field containing the complete pre-formatted result table.
+- When `rendered_markdown` is present for a view request, forward it verbatim as the entire reply: no preamble, no trailing commentary, no code fences, and no reformatting.
 
 Supported SQL-like filter operators:
 
@@ -51,7 +57,7 @@ Production-aware query behavior:
 
 ## OUTPUT FORMAT (mandatory)
 
-Unless the user explicitly asks for a different layout, every search result set MUST use a table driven by the active display column set.
+When you are in compose mode and the user explicitly wants a rendered result set, every search result set MUST use a table driven by the active display column set.
 This is mandatory for all result types: keyword searches, filtered browses, ranked requests ("show 10 largest"), and any other document listing.
 Always show the active search header immediately before the table:
 
