@@ -821,19 +821,12 @@ def create_run(
     job_version_id: int | None = None,
     raw_job_name: str | None = None,
     job_version_number: int | None = None,
-    dataset_ids: list[int] | None = None,
     dataset_names: list[str] | None = None,
-    document_ids: list[int] | None = None,
-    control_numbers: list[str] | None = None,
-    query: str | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
     raw_filters: list[list[str]] | None = None,
     from_run_id: int | None = None,
-    exclude_dataset_ids: list[int] | None = None,
-    exclude_dataset_names: list[str] | None = None,
-    exclude_document_ids: list[int] | None = None,
-    exclude_control_numbers: list[str] | None = None,
-    exclude_query: str | None = None,
-    exclude_filters: list[list[str]] | None = None,
+    select_from_scope: bool = False,
     family_mode: str = "exact",
     seed_limit: int | None = None,
 ) -> dict[str, object]:
@@ -846,32 +839,24 @@ def create_run(
     if seed_limit is not None and seed_limit < 1:
         raise RetrieverError("Run limit must be >= 1.")
 
-    selector = normalize_run_selector_spec(
-        dataset_ids=dataset_ids,
-        dataset_names=dataset_names,
-        document_ids=document_ids,
-        control_numbers=control_numbers,
-        query=query,
-        raw_filters=raw_filters,
-        from_run_id=from_run_id,
-    )
-    exclude_selector = normalize_run_selector_spec(
-        dataset_ids=exclude_dataset_ids,
-        dataset_names=exclude_dataset_names,
-        document_ids=exclude_document_ids,
-        control_numbers=exclude_control_numbers,
-        query=exclude_query,
-        raw_filters=exclude_filters,
-        from_run_id=None,
-    )
-    if not selector_has_inputs(selector):
-        raise RetrieverError("Run selector must include at least one inclusion input.")
-
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        selector = build_effective_scope_selector(
+            connection,
+            paths,
+            query=query,
+            raw_bates=raw_bates,
+            raw_filters=raw_filters,
+            dataset_names=dataset_names,
+            from_run_id=from_run_id,
+            select_from_scope=select_from_scope,
+        )
+        if not scope_run_selector_has_inputs(selector):
+            raise RetrieverError("Run selector must include at least one inclusion input.")
+        preferred_from_run_id = preferred_scope_selector_from_run_id(selector)
         job_version_row = require_job_version_row(
             connection,
             job_version_id=job_version_id,
@@ -883,13 +868,12 @@ def create_run(
             (job_version_row["job_id"],),
         ).fetchone()
         assert job_row is not None
-        snapshot_rows = plan_run_snapshot_rows(
+        snapshot_rows = plan_scope_run_snapshot_rows(
             connection,
             root=root,
             job_row=job_row,
             job_version_row=job_version_row,
             selector=selector,
-            exclude_selector=exclude_selector,
             family_mode=normalized_family_mode,
             seed_limit=seed_limit,
         )
@@ -899,10 +883,10 @@ def create_run(
                 connection,
                 job_version_id=int(job_version_row["id"]),
                 selector=selector,
-                exclude_selector=exclude_selector,
+                exclude_selector={},
                 family_mode=normalized_family_mode,
                 seed_limit=seed_limit,
-                from_run_id=from_run_id,
+                from_run_id=preferred_from_run_id,
                 status="planned",
             )
             replace_run_snapshot_documents(

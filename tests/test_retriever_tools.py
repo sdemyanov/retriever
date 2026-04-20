@@ -7,6 +7,7 @@ import json
 import io
 import mailbox
 import os
+import random
 import re
 import sqlite3
 import tempfile
@@ -32,6 +33,52 @@ REGRESSION_CORPUS_ROOT = REPO_ROOT / "phase0" / "regression_corpus"
 
 retriever_tools = None
 TOOL_BYTES = b""
+RANDOMIZED_FILTER_TEST_SEED = 20260419
+RANDOMIZED_FILTER_FIELD_TYPES = {
+    "file_name": "text",
+    "review_note": "text",
+    "review_score": "integer",
+    "review_date": "date",
+    "is_hot": "boolean",
+}
+RANDOMIZED_FILTER_LITERAL_POOLS = {
+    "file_name": [
+        "alpha.txt",
+        "beta.txt",
+        "gamma.txt",
+        "thread.eml",
+        "notes.txt",
+        "zeta.txt",
+    ],
+    "review_note": [
+        "alpha memo",
+        "beta's note",
+        "needs review",
+        "mail thread",
+        "child's attachment",
+        "missing note",
+    ],
+    "review_score": [-1, 1, 5, 7, 9, 12],
+    "review_date": [
+        "2026-04-01",
+        "2026-04-02",
+        "2026-04-03",
+        "2026-04-05",
+        "2026-04-09",
+    ],
+    "is_hot": [True, False],
+}
+RANDOMIZED_FILTER_LIKE_PATTERNS = {
+    "file_name": ["alpha%", "%txt", "%notes%", "thread%", "%eml"],
+    "review_note": ["%memo%", "%note%", "%review%", "%thread%", "%attachment%"],
+    "review_date": ["2026-04-%", "%-03", "2026-04-0_", "%-09"],
+}
+RANDOMIZED_FILTER_OPERATOR_CHOICES = {
+    "text": ["=", "!=", "<", "<=", ">", ">=", "LIKE", "NOT LIKE", "IN", "NOT IN", "BETWEEN", "NOT BETWEEN", "IS NULL", "IS NOT NULL"],
+    "date": ["=", "!=", "<", "<=", ">", ">=", "LIKE", "NOT LIKE", "IN", "NOT IN", "BETWEEN", "NOT BETWEEN", "IS NULL", "IS NOT NULL"],
+    "integer": ["=", "!=", "<", "<=", ">", ">=", "IN", "NOT IN", "BETWEEN", "NOT BETWEEN", "IS NULL", "IS NOT NULL"],
+    "boolean": ["=", "!=", "IS NULL", "IS NOT NULL"],
+}
 
 def load_python_module(path: Path, module_name: str):
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -363,6 +410,237 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         if attachment_name is not None and attachment_text is not None:
             message.add_attachment(attachment_text, subtype="plain", filename=attachment_name)
         path.write_bytes(message.as_bytes(policy=policy.default))
+
+    def create_structured_extraction_job_version(self, job_name: str) -> int:
+        sanitized_job_name = re.sub(r"[^a-zA-Z0-9_]+", "_", job_name.strip()).strip("_").lower()
+        if sanitized_job_name and sanitized_job_name[0].isdigit():
+            sanitized_job_name = f"job_{sanitized_job_name}"
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            job_name,
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            sanitized_job_name,
+            "--instruction",
+            "Extract a stable value.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        return int(create_version_payload["job_version"]["id"])
+
+    def setup_randomized_sql_filter_corpus(self) -> list[dict[str, object]]:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+        (self.root / "gamma.txt").write_text("gamma body\n", encoding="utf-8")
+        self.write_email_message(
+            self.root / "thread.eml",
+            subject="Filter thread",
+            body_text="Parent email body text.",
+            attachment_name="notes.txt",
+            attachment_text="Attachment detail.",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 4)
+
+        for field_name, field_type in (
+            ("review_score", "integer"),
+            ("review_date", "date"),
+            ("is_hot", "boolean"),
+            ("review_note", "text"),
+        ):
+            add_field_exit, _, _, _ = self.run_cli("add-field", str(self.root), field_name, field_type)
+            self.assertEqual(add_field_exit, 0)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        beta_row = self.fetch_document_row("beta.txt")
+        gamma_row = self.fetch_document_row("gamma.txt")
+        parent_row = self.fetch_document_row("thread.eml")
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        updates = {
+            int(alpha_row["id"]): (1, "2026-04-01", 1, "alpha memo"),
+            int(beta_row["id"]): (5, "2026-04-02", 0, "beta's note"),
+            int(gamma_row["id"]): (None, "2026-04-03", None, "needs review"),
+            int(parent_row["id"]): (7, "2026-04-04", 1, "mail thread"),
+            int(child_row["id"]): (9, "2026-04-05", 0, "child's attachment"),
+        }
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            for document_id, (review_score, review_date, is_hot, review_note) in updates.items():
+                connection.execute(
+                    """
+                    UPDATE documents
+                    SET review_score = ?, review_date = ?, is_hot = ?, review_note = ?
+                    WHERE id = ?
+                    """,
+                    (review_score, review_date, is_hot, review_note, document_id),
+                )
+            connection.commit()
+
+            rows = connection.execute(
+                f"""
+                SELECT id AS doc_id, file_name, review_note, review_score, review_date, is_hot
+                FROM documents
+                WHERE id IN ({", ".join("?" for _ in updates)})
+                ORDER BY id ASC
+                """,
+                tuple(updates),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        return [dict(row) for row in rows]
+
+    def reference_doc_ids_for_sql_filter(
+        self,
+        corpus_rows: list[dict[str, object]],
+        expression: str,
+    ) -> list[int]:
+        reference_connection = sqlite3.connect(":memory:")
+        try:
+            reference_connection.execute(
+                """
+                CREATE TABLE docs (
+                  doc_id INTEGER PRIMARY KEY,
+                  file_name TEXT,
+                  review_note TEXT,
+                  review_score INTEGER,
+                  review_date TEXT,
+                  is_hot INTEGER
+                )
+                """
+            )
+            reference_connection.executemany(
+                """
+                INSERT INTO docs (doc_id, file_name, review_note, review_score, review_date, is_hot)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        int(row["doc_id"]),
+                        row["file_name"],
+                        row["review_note"],
+                        row["review_score"],
+                        row["review_date"],
+                        row["is_hot"],
+                    )
+                    for row in corpus_rows
+                ],
+            )
+            return [
+                int(row[0])
+                for row in reference_connection.execute(
+                    f"SELECT doc_id FROM docs WHERE {expression} ORDER BY doc_id ASC"
+                ).fetchall()
+            ]
+        finally:
+            reference_connection.close()
+
+    def render_sql_filter_literal(self, field_type: str, value: object) -> str:
+        if field_type == "boolean":
+            return "TRUE" if bool(value) else "FALSE"
+        if field_type == "integer":
+            return str(int(value))
+        escaped = str(value).replace("'", "''")
+        return f"'{escaped}'"
+
+    def build_random_sql_filter_predicate(self, rng: random.Random) -> dict[str, object]:
+        field_name = rng.choice(sorted(RANDOMIZED_FILTER_FIELD_TYPES))
+        field_type = RANDOMIZED_FILTER_FIELD_TYPES[field_name]
+        operator = rng.choice(RANDOMIZED_FILTER_OPERATOR_CHOICES[field_type])
+        predicate: dict[str, object] = {
+            "kind": "predicate",
+            "field_name": field_name,
+            "field_type": field_type,
+            "operator": operator,
+        }
+        if operator in {"IS NULL", "IS NOT NULL"}:
+            return predicate
+        if operator in {"LIKE", "NOT LIKE"}:
+            predicate["operand"] = rng.choice(RANDOMIZED_FILTER_LIKE_PATTERNS[field_name])
+            return predicate
+        if operator in {"IN", "NOT IN"}:
+            values = RANDOMIZED_FILTER_LITERAL_POOLS[field_name]
+            predicate["operand"] = [rng.choice(values) for _ in range(rng.randint(1, 4))]
+            return predicate
+        if operator in {"BETWEEN", "NOT BETWEEN"}:
+            values = RANDOMIZED_FILTER_LITERAL_POOLS[field_name]
+            predicate["operand"] = (rng.choice(values), rng.choice(values))
+            return predicate
+        predicate["operand"] = rng.choice(RANDOMIZED_FILTER_LITERAL_POOLS[field_name])
+        return predicate
+
+    def build_random_sql_filter_node(self, rng: random.Random, *, depth: int = 0) -> dict[str, object]:
+        if depth >= 3 or (depth > 0 and rng.random() < 0.45):
+            node = self.build_random_sql_filter_predicate(rng)
+        else:
+            branch_kind = rng.choice(["and", "or", "not", "predicate"])
+            if branch_kind == "predicate":
+                node = self.build_random_sql_filter_predicate(rng)
+            elif branch_kind == "not":
+                node = {
+                    "kind": "not",
+                    "child": self.build_random_sql_filter_node(rng, depth=depth + 1),
+                }
+            else:
+                node = {
+                    "kind": branch_kind,
+                    "left": self.build_random_sql_filter_node(rng, depth=depth + 1),
+                    "right": self.build_random_sql_filter_node(rng, depth=depth + 1),
+                }
+        if depth > 0 and rng.random() < 0.2:
+            return {"kind": "group", "child": node}
+        return node
+
+    def render_random_sql_filter_node(self, node: dict[str, object], *, parent_precedence: int = 0) -> str:
+        kind = str(node["kind"])
+        if kind == "predicate":
+            field_name = str(node["field_name"])
+            field_type = str(node["field_type"])
+            operator = str(node["operator"])
+            precedence = 4
+            if operator in {"IS NULL", "IS NOT NULL"}:
+                text = f"{field_name} {operator}"
+            elif operator in {"LIKE", "NOT LIKE"}:
+                operand = self.render_sql_filter_literal(field_type, node["operand"])
+                text = f"{field_name} {operator} {operand}"
+            elif operator in {"IN", "NOT IN"}:
+                operands = ", ".join(
+                    self.render_sql_filter_literal(field_type, value)
+                    for value in node["operand"]
+                )
+                text = f"{field_name} {operator} ({operands})"
+            elif operator in {"BETWEEN", "NOT BETWEEN"}:
+                left_value, right_value = node["operand"]
+                text = (
+                    f"{field_name} {operator} "
+                    f"{self.render_sql_filter_literal(field_type, left_value)} "
+                    f"AND {self.render_sql_filter_literal(field_type, right_value)}"
+                )
+            else:
+                operand = self.render_sql_filter_literal(field_type, node["operand"])
+                text = f"{field_name} {operator} {operand}"
+        elif kind == "group":
+            return f"({self.render_random_sql_filter_node(node['child'])})"
+        elif kind == "not":
+            precedence = 3
+            text = f"NOT {self.render_random_sql_filter_node(node['child'], parent_precedence=precedence)}"
+        else:
+            operator = "AND" if kind == "and" else "OR"
+            precedence = 2 if operator == "AND" else 1
+            left_text = self.render_random_sql_filter_node(node["left"], parent_precedence=precedence)
+            right_text = self.render_random_sql_filter_node(node["right"], parent_precedence=precedence)
+            text = f"{left_text} {operator} {right_text}"
+        if precedence < parent_precedence:
+            return f"({text})"
+        return text
 
     def write_fake_pst_file(self, name: str = "mailbox.pst", content: bytes = b"pst-v1") -> Path:
         path = self.root / name
@@ -1128,7 +1406,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "issue_tags",
             "--job-version",
             "1",
-            "--query",
+            "--keyword",
             "confidential",
             "--family-mode",
             "with_family",
@@ -1156,7 +1434,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             snapshot_by_document_id[int(child_row["id"])]["inclusion_reason"]["direct_reasons"][0]["type"],
-            "search",
+            "keyword",
         )
         self.assertEqual(
             snapshot_by_document_id[int(parent_row["id"])]["inclusion_reason"]["family_seed_document_ids"],
@@ -1364,8 +1642,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -1515,8 +1793,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -1669,8 +1947,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -1760,8 +2038,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -1914,8 +2192,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -1990,8 +2268,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2082,9 +2360,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
+            "--filter",
+            f"id IN ({', '.join(str(document_id) for document_id in document_ids)})",
         ]
-        for document_id in document_ids:
-            create_run_args.extend(["--doc-id", str(document_id)])
         create_run_exit, create_run_payload, _, _ = self.run_cli(*create_run_args)
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2179,10 +2457,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(first_doc["id"]),
-            "--doc-id",
-            str(second_doc["id"]),
+            "--filter",
+            f"id IN ({first_doc['id']}, {second_doc['id']})",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2314,8 +2590,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2425,10 +2701,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(first_doc["id"]),
-            "--doc-id",
-            str(second_doc["id"]),
+            "--filter",
+            f"id IN ({first_doc['id']}, {second_doc['id']})",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2525,8 +2799,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2595,8 +2869,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(image_only_row["id"]),
+            "--filter",
+            f"id = {image_only_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2734,8 +3008,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(image_only_row["id"]),
+            "--filter",
+            f"id = {image_only_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2822,8 +3096,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(image_only_row["id"]),
+            "--filter",
+            f"id = {image_only_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -2956,8 +3230,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(image_only_row["id"]),
+            "--filter",
+            f"id = {image_only_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -3037,8 +3311,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(native_row["id"]),
+            "--filter",
+            f"id = {native_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -3129,8 +3403,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(image_only_row["id"]),
+            "--filter",
+            f"id = {image_only_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -3279,8 +3553,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "--job-version-id",
             str(job_version_id),
-            "--doc-id",
-            str(document_row["id"]),
+            "--filter",
+            f"id = {document_row['id']}",
         )
         self.assertEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
@@ -3334,6 +3608,237 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(publish_payload)
         updated_row = self.fetch_document_by_id(int(document_row["id"]))
         self.assertEqual(updated_row["counterparty_name"], "Acme Corp")
+
+    def test_create_run_select_from_scope_snapshots_current_scope(self) -> None:
+        (self.root / "alpha.txt").write_text("scopealpha only\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("scopebeta only\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Scope Snapshot", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "scope_snapshot",
+            "--instruction",
+            "Extract a stable value.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "scopealpha")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+        self.assertEqual(scope_payload["total_hits"], 1)
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--select-from-scope",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_payload = create_run_payload["run"]
+        self.assertEqual(run_payload["planned_count"], 1)
+        self.assertEqual(run_payload["selector"]["keyword"], "scopealpha")
+        self.assertEqual([item["document_id"] for item in run_payload["documents"]], [alpha_row["id"]])
+
+        shifted_scope_exit, shifted_scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "scopebeta")
+        self.assertEqual(shifted_scope_exit, 0)
+        self.assertIsNotNone(shifted_scope_payload)
+        self.assertEqual(shifted_scope_payload["total_hits"], 1)
+
+        stored_run_exit, stored_run_payload, _, _ = self.run_cli(
+            "get-run",
+            str(self.root),
+            "--run-id",
+            str(run_payload["id"]),
+        )
+        self.assertEqual(stored_run_exit, 0)
+        self.assertIsNotNone(stored_run_payload)
+        self.assertEqual(stored_run_payload["run"]["selector"]["keyword"], "scopealpha")
+        self.assertEqual([item["document_id"] for item in stored_run_payload["run"]["documents"]], [alpha_row["id"]])
+
+    def test_create_run_select_from_scope_and_narrows_with_explicit_dataset(self) -> None:
+        (self.root / "alpha.txt").write_text("shared dataset body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("shared dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        beta_row = self.fetch_document_row("beta.txt")
+
+        create_scope_dataset_exit, _, _, _ = self.run_cli("create-dataset", str(self.root), "Scope Set")
+        self.assertEqual(create_scope_dataset_exit, 0)
+        create_narrow_dataset_exit, _, _, _ = self.run_cli("create-dataset", str(self.root), "Narrow Set")
+        self.assertEqual(create_narrow_dataset_exit, 0)
+
+        add_scope_set_exit, _, _, _ = self.run_cli(
+            "add-to-dataset",
+            str(self.root),
+            "--dataset-name",
+            "Scope Set",
+            "--doc-id",
+            str(alpha_row["id"]),
+            "--doc-id",
+            str(beta_row["id"]),
+        )
+        self.assertEqual(add_scope_set_exit, 0)
+        add_narrow_set_exit, _, _, _ = self.run_cli(
+            "add-to-dataset",
+            str(self.root),
+            "--dataset-name",
+            "Narrow Set",
+            "--doc-id",
+            str(beta_row["id"]),
+        )
+        self.assertEqual(add_narrow_set_exit, 0)
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Scope Dataset Run", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "scope_dataset_run",
+            "--instruction",
+            "Extract a stable value.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/dataset", "Scope Set")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+        self.assertEqual(scope_payload["total_hits"], 2)
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--select-from-scope",
+            "--dataset",
+            "Narrow Set",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_payload = create_run_payload["run"]
+        self.assertEqual(run_payload["planned_count"], 1)
+        self.assertEqual([item["document_id"] for item in run_payload["documents"]], [beta_row["id"]])
+        self.assertIn("all_of", run_payload["selector"])
+        self.assertEqual(len(run_payload["selector"]["all_of"]), 2)
+        self.assertEqual(run_payload["selector"]["all_of"][0]["dataset"][0]["name"], "Scope Set")
+        self.assertEqual(run_payload["selector"]["all_of"][1]["dataset"][0]["name"], "Narrow Set")
+
+    def test_filter_errors_match_search_create_run_and_export_archive(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        job_version_id = self.create_structured_extraction_job_version("Filter Parity")
+
+        for expression in ("authr = 'Smith'", "is_attachment > 5"):
+            with self.subTest(expression=expression):
+                search_exit, search_payload, _, _ = self.run_cli(
+                    "search",
+                    str(self.root),
+                    "--filter",
+                    expression,
+                )
+                self.assertEqual(search_exit, 2)
+                self.assertIsNotNone(search_payload)
+
+                create_run_exit, create_run_payload, _, _ = self.run_cli(
+                    "create-run",
+                    str(self.root),
+                    "--job-version-id",
+                    str(job_version_id),
+                    "--filter",
+                    expression,
+                )
+                self.assertEqual(create_run_exit, 2)
+                self.assertIsNotNone(create_run_payload)
+                self.assertEqual(create_run_payload["error"], search_payload["error"])
+
+                archive_exit, archive_payload, _, _ = self.run_cli(
+                    "export-archive",
+                    str(self.root),
+                    "filter-error-parity.zip",
+                    "--filter",
+                    expression,
+                )
+                self.assertEqual(archive_exit, 2)
+                self.assertIsNotNone(archive_payload)
+                self.assertEqual(archive_payload["error"], search_payload["error"])
+
+    def test_filter_surface_parity_matches_search_create_run_and_export_archive(self) -> None:
+        corpus_rows = self.setup_randomized_sql_filter_corpus()
+        job_version_id = self.create_structured_extraction_job_version("Surface Filter Parity")
+        expressions = [
+            "review_score BETWEEN 1 AND 7 AND NOT is_hot = FALSE",
+            "(file_name IN ('alpha.txt', 'notes.txt') OR review_note LIKE '%review%') AND review_date IS NOT NULL",
+            "review_score IS NULL OR review_note = 'beta''s note'",
+            "NOT (review_note LIKE '%thread%' OR review_score > 8)",
+            "file_name NOT LIKE '%eml' AND (review_score >= 5 OR is_hot IS NULL)",
+        ]
+
+        for index, expression in enumerate(expressions, start=1):
+            expected_doc_ids = self.reference_doc_ids_for_sql_filter(corpus_rows, expression)
+
+            with self.subTest(expression=expression):
+                search_exit, search_payload, _, _ = self.run_cli(
+                    "search",
+                    str(self.root),
+                    "--filter",
+                    expression,
+                )
+                self.assertEqual(search_exit, 0)
+                self.assertIsNotNone(search_payload)
+                search_doc_ids = sorted(int(item["id"]) for item in search_payload["results"])
+
+                create_run_exit, create_run_payload, _, _ = self.run_cli(
+                    "create-run",
+                    str(self.root),
+                    "--job-version-id",
+                    str(job_version_id),
+                    "--filter",
+                    expression,
+                )
+                self.assertEqual(create_run_exit, 0)
+                self.assertIsNotNone(create_run_payload)
+                create_run_doc_ids = sorted(
+                    int(item["document_id"]) for item in create_run_payload["run"]["documents"]
+                )
+
+                archive_exit, archive_payload, _, _ = self.run_cli(
+                    "export-archive",
+                    str(self.root),
+                    f"filter-surface-parity-{index}.zip",
+                    "--filter",
+                    expression,
+                )
+                self.assertEqual(archive_exit, 0)
+                self.assertIsNotNone(archive_payload)
+                archive_doc_ids = sorted(
+                    int(item["document_id"]) for item in archive_payload["documents"]
+                )
+
+                self.assertEqual(search_doc_ids, expected_doc_ids)
+                self.assertEqual(create_run_doc_ids, expected_doc_ids)
+                self.assertEqual(archive_doc_ids, expected_doc_ids)
 
     def test_connect_db_falls_back_to_delete_when_wal_fails(self) -> None:
         class FakeCursor:
@@ -3989,6 +4494,93 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Field 'is_attachment' is boolean", mismatch_payload["error"])
         self.assertIn("IS NULL", mismatch_payload["error"])
 
+    def test_sql_filter_randomized_semantics_match_sqlite_reference(self) -> None:
+        corpus_rows = self.setup_randomized_sql_filter_corpus()
+        rng = random.Random(RANDOMIZED_FILTER_TEST_SEED)
+
+        for _ in range(40):
+            expression = self.render_random_sql_filter_node(self.build_random_sql_filter_node(rng))
+            expected_doc_ids = self.reference_doc_ids_for_sql_filter(corpus_rows, expression)
+
+            with self.subTest(expression=expression):
+                exit_code, payload, _, _ = self.run_cli(
+                    "search",
+                    str(self.root),
+                    "--filter",
+                    expression,
+                )
+                self.assertEqual(exit_code, 0)
+                self.assertIsNotNone(payload)
+                actual_doc_ids = sorted(int(item["id"]) for item in payload["results"])
+                self.assertEqual(actual_doc_ids, expected_doc_ids)
+
+    def test_sql_filter_in_list_boundary_is_enforced(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            accepted_expression = "file_name IN (" + ", ".join("'a'" for _ in range(retriever_tools.MAX_FILTER_IN_LIST_ITEMS)) + ")"
+            accepted_clause, accepted_params = retriever_tools.compile_sql_filter_expression(connection, accepted_expression)
+            self.assertIn(" IN (", accepted_clause)
+            self.assertEqual(len(accepted_params), retriever_tools.MAX_FILTER_IN_LIST_ITEMS)
+
+            rejected_expression = "file_name IN (" + ", ".join("'a'" for _ in range(retriever_tools.MAX_FILTER_IN_LIST_ITEMS + 1)) + ")"
+            with self.assertRaises(retriever_tools.RetrieverError) as excinfo:
+                retriever_tools.compile_sql_filter_expression(connection, rejected_expression)
+            self.assertIn(
+                f"capped at {retriever_tools.MAX_FILTER_IN_LIST_ITEMS}",
+                str(excinfo.exception),
+            )
+        finally:
+            connection.close()
+
+    def test_search_cli_columns_returns_display_values_and_rejects_filter_only_fields(self) -> None:
+        (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        self.assertEqual(self.run_cli("add-field", str(self.root), "review_score", "integer")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "set-field",
+                str(self.root),
+                "--doc-id",
+                str(row["id"]),
+                "--field",
+                "review_score",
+                "--value",
+                "7",
+            )[0],
+            0,
+        )
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "--columns",
+            "title,review_score,control_number",
+        )
+        error_exit, error_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "--columns",
+            "has_attachments",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        self.assertEqual(search_payload["display"]["columns"], ["title", "review_score", "control_number"])
+        self.assertEqual(search_payload["results"][0]["display_values"]["review_score"], 7)
+        self.assertIn("title", search_payload["results"][0]["display_values"])
+
+        self.assertEqual(error_exit, 2)
+        self.assertIsNotNone(error_payload)
+        self.assertIn("filter-only", error_payload["error"])
+        self.assertIn("has_attachments", error_payload["error"])
+
     def test_slash_search_persists_scope_and_search_within_keyword(self) -> None:
         (self.root / "alpha.txt").write_text("alpha beta body\n", encoding="utf-8")
         (self.root / "second.txt").write_text("alpha only body\n", encoding="utf-8")
@@ -4184,6 +4776,129 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         final_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
         self.assertNotIn("sort", final_session_payload["browsing"])
         self.assertEqual(final_session_payload["browsing"]["offset"], 0)
+
+    def test_slash_columns_commands_persist_display_preferences_and_render_custom_fields(self) -> None:
+        (self.root / "sample.txt").write_text("sample display body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        self.assertEqual(self.run_cli("add-field", str(self.root), "review_score", "integer")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "set-field",
+                str(self.root),
+                "--doc-id",
+                str(row["id"]),
+                "--field",
+                "review_score",
+                "--value",
+                "7",
+            )[0],
+            0,
+        )
+
+        show_exit, show_payload, _, _ = self.run_cli("slash", str(self.root), "/columns")
+        set_exit, set_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/columns set title, review_score, control_number",
+        )
+
+        self.assertEqual(show_exit, 0)
+        self.assertIsNotNone(show_payload)
+        self.assertEqual(
+            show_payload["display"]["columns"],
+            ["content_type", "title", "author", "date_created", "control_number"],
+        )
+
+        self.assertEqual(set_exit, 0)
+        self.assertIsNotNone(set_payload)
+        self.assertEqual(set_payload["display"]["columns"], ["title", "review_score", "control_number"])
+        self.assertEqual(set_payload["results"][0]["display_values"]["review_score"], 7)
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["display"]["columns"], ["title", "review_score", "control_number"])
+
+        add_exit, add_payload, _, _ = self.run_cli("slash", str(self.root), "/columns add dataset_name")
+        self.assertEqual(add_exit, 0)
+        self.assertIsNotNone(add_payload)
+        self.assertEqual(add_payload["display"]["columns"], ["title", "review_score", "control_number", "dataset_name"])
+        self.assertEqual(add_payload["results"][0]["display_values"]["dataset_name"], self.root.name)
+
+        remove_exit, remove_payload, _, _ = self.run_cli("slash", str(self.root), "/columns remove review_score")
+        self.assertEqual(remove_exit, 0)
+        self.assertIsNotNone(remove_payload)
+        self.assertEqual(remove_payload["display"]["columns"], ["title", "control_number", "dataset_name"])
+
+        default_exit, default_payload, _, _ = self.run_cli("slash", str(self.root), "/columns default")
+        self.assertEqual(default_exit, 0)
+        self.assertIsNotNone(default_payload)
+        self.assertEqual(
+            default_payload["display"]["columns"],
+            ["content_type", "title", "author", "date_created", "control_number"],
+        )
+        final_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertNotIn("columns", final_session_payload["display"])
+
+    def test_slash_page_size_persists_display_preferences(self) -> None:
+        for index in range(12):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 12)
+
+        size_exit, size_payload, _, _ = self.run_cli("slash", str(self.root), "/page-size 5")
+        next_exit, next_payload, _, _ = self.run_cli("slash", str(self.root), "/next")
+
+        self.assertEqual(size_exit, 0)
+        self.assertIsNotNone(size_payload)
+        self.assertEqual(size_payload["per_page"], 5)
+        self.assertEqual(size_payload["display"]["page_size"], 5)
+        self.assertEqual(len(size_payload["results"]), 5)
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["display"]["page_size"], 5)
+
+        self.assertEqual(next_exit, 0)
+        self.assertIsNotNone(next_payload)
+        self.assertEqual(next_payload["offset"], 5)
+        self.assertEqual(next_payload["per_page"], 5)
+        self.assertEqual(next_payload["page"], 2)
+
+    def test_slash_search_drops_stale_display_columns_with_warning(self) -> None:
+        (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        self.paths["session_path"].write_text(
+            json.dumps(
+                {
+                    "schema_version": retriever_tools.SESSION_SCHEMA_VERSION,
+                    "scope": {},
+                    "browsing": {},
+                    "display": {"columns": ["title", "missing_column", "has_attachments"]},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        search_exit, search_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "sample")
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        self.assertEqual(search_payload["display"]["columns"], ["title"])
+        self.assertIn("warnings", search_payload)
+        self.assertIn("missing_column", search_payload["warnings"][0])
+        persisted_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(persisted_session_payload["display"]["columns"], ["title"])
 
     def test_deleting_source_backed_dataset_hides_documents_until_reingest(self) -> None:
         document_path = self.root / "sample.txt"
@@ -5851,6 +6566,107 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(rows[1], [self.root.name, alpha_row["control_number"], "2026-04-16", "alpha.txt"])
         self.assertEqual(len(rows), 2)
 
+    def test_export_csv_select_from_scope_exports_current_scope(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+
+        export_path = self.root / ".retriever" / "exports" / "scope.csv"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-csv",
+            str(self.root),
+            "scope.csv",
+            "--field",
+            "file_name",
+            "--select-from-scope",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["document_count"], 1)
+        self.assertEqual(payload["selector"]["mode"], "scope_search")
+        self.assertTrue(payload["selector"]["selected_from_scope"])
+        self.assertEqual(payload["selector"]["scope"]["keyword"], "alpha")
+
+        with export_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        self.assertEqual(rows[0], ["file_name"])
+        self.assertEqual(rows[1], ["alpha.txt"])
+        self.assertEqual(len(rows), 2)
+
+    def test_export_csv_select_from_scope_and_narrows_with_explicit_filter(self) -> None:
+        (self.root / "alpha-one.txt").write_text("alpha body one\n", encoding="utf-8")
+        (self.root / "alpha-two.txt").write_text("alpha body two\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+        self.assertEqual(scope_payload["total_hits"], 2)
+
+        export_path = self.root / ".retriever" / "exports" / "scope-narrowed.csv"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-csv",
+            str(self.root),
+            "scope-narrowed.csv",
+            "--field",
+            "file_name",
+            "--select-from-scope",
+            "--filter",
+            "file_name = 'alpha-two.txt'",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["document_count"], 1)
+        self.assertEqual(payload["selector"]["mode"], "scope_search")
+        self.assertEqual(payload["selector"]["scope"]["keyword"], "alpha")
+        self.assertIn("alpha-two.txt", payload["selector"]["scope"]["filter"])
+
+        with export_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        self.assertEqual(rows[0], ["file_name"])
+        self.assertEqual(rows[1], ["alpha-two.txt"])
+        self.assertEqual(len(rows), 2)
+
+    def test_export_csv_rejects_combining_doc_ids_with_scope_selector(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("alpha.txt")
+        scope_exit, _, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(scope_exit, 0)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "export-csv",
+            str(self.root),
+            "scope-doc-id.csv",
+            "--field",
+            "file_name",
+            "--select-from-scope",
+            "--doc-id",
+            str(row["id"]),
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIsNotNone(payload)
+        self.assertIn("query/filter/scope selectors", payload["error"])
+
     def test_export_csv_cli_preserves_explicit_document_order(self) -> None:
         (self.root / "first.txt").write_text("first body\n", encoding="utf-8")
         (self.root / "second.txt").write_text("second body\n", encoding="utf-8")
@@ -6011,7 +6827,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "export-archive",
             str(self.root),
             "family.zip",
-            "--query",
+            "--keyword",
             "confidential",
             "--family-mode",
             "with_family",
@@ -6025,7 +6841,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["output_rel_path"], ".retriever/exports/family.zip")
         self.assertEqual(payload["family_mode"], "with_family")
         self.assertFalse(payload["portable_workspace"])
-        self.assertEqual(payload["selector"]["query"], "confidential")
+        self.assertEqual(payload["selector"]["keyword"], "confidential")
 
         with zipfile.ZipFile(export_path, "r") as archive:
             names = set(archive.namelist())
@@ -6045,12 +6861,46 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(set(manifest_by_document_id), {int(parent_row["id"]), int(child_row["id"])})
         self.assertEqual(
             manifest_by_document_id[int(child_row["id"])]["inclusion_reason"]["direct_reasons"][0]["type"],
-            "search",
+            "keyword",
         )
         self.assertEqual(
             manifest_by_document_id[int(parent_row["id"])]["inclusion_reason"]["family_seed_document_ids"],
             [int(child_row["id"])],
         )
+
+    def test_export_archive_select_from_scope_exports_current_scope(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+
+        export_path = self.root / ".retriever" / "exports" / "scope.zip"
+        exit_code, payload, _, _ = self.run_cli(
+            "export-archive",
+            str(self.root),
+            "scope.zip",
+            "--select-from-scope",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["document_count"], 1)
+        self.assertEqual(payload["selector"]["keyword"], "alpha")
+
+        with zipfile.ZipFile(export_path, "r") as archive:
+            names = set(archive.namelist())
+            manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+
+        self.assertIn("alpha.txt", names)
+        self.assertNotIn("beta.txt", names)
+        self.assertEqual(manifest["document_count"], 1)
+        self.assertEqual(manifest["selector"]["keyword"], "alpha")
 
     def test_export_archive_portable_workspace_supports_selected_child_with_parent_context_stub(self) -> None:
         email_path = self.root / "thread.eml"
@@ -6074,8 +6924,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "export-archive",
             str(self.root),
             "portable-child.zip",
-            "--doc-id",
-            str(child_row["id"]),
+            "--filter",
+            f"id = {child_row['id']}",
             "--portable-workspace",
         )
 
@@ -6083,7 +6933,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(payload["document_count"], 1)
         self.assertTrue(payload["portable_workspace"])
-        self.assertEqual(payload["selector"]["document_ids"], [child_row["id"]])
+        self.assertEqual(payload["selector"]["filter"], f"(id = {child_row['id']})")
 
         with zipfile.ZipFile(export_path, "r") as archive:
             names = set(archive.namelist())
@@ -6161,14 +7011,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "export-archive",
             str(self.root),
             "production.zip",
-            "--doc-id",
-            str(native_row["id"]),
+            "--filter",
+            f"id = {native_row['id']}",
         )
 
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(payload)
         self.assertEqual(payload["document_count"], 1)
         self.assertEqual(payload["warnings"], [])
+        self.assertEqual(payload["selector"]["filter"], f"(id = {native_row['id']})")
 
         with zipfile.ZipFile(export_path, "r") as archive:
             names = set(archive.namelist())
@@ -6333,6 +7184,34 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(count_payload["documents_with_hits"], 2)
         self.assertEqual(count_payload["total_docs_filtered"], 3)
         self.assertEqual(count_payload["count_mode"], "distinct-documents")
+
+    def test_search_chunks_select_from_scope_narrows_to_scoped_documents(self) -> None:
+        (self.root / "alpha-scope.txt").write_text("Alpha matter termination notice.\n", encoding="utf-8")
+        (self.root / "beta-scope.txt").write_text("Beta project termination notice.\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+        self.assertEqual(scope_payload["total_hits"], 1)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "search-chunks",
+            str(self.root),
+            "termination",
+            "--select-from-scope",
+            "--top-k",
+            "10",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertTrue(payload["selected_from_scope"])
+        self.assertEqual(payload["scope"]["keyword"], "alpha")
+        self.assertEqual([item["file_name"] for item in payload["results"]], ["alpha-scope.txt"])
 
     def test_set_field_validates_custom_date_fields(self) -> None:
         document_path = self.root / "sample.txt"
@@ -6521,6 +7400,33 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("sql", payload)
         self.assertIn("COUNT(DISTINCT d.id)", payload["sql"])
         self.assertIn("JOIN datasets ds", payload["sql"])
+
+    def test_aggregate_select_from_scope_narrows_bucket_population(self) -> None:
+        (self.root / "alpha-scope.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta-scope.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+        self.assertEqual(scope_payload["total_hits"], 1)
+
+        exit_code, payload, _, _ = self.run_cli(
+            "aggregate",
+            str(self.root),
+            "--group-by",
+            "file_name",
+            "--select-from-scope",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertTrue(payload["selected_from_scope"])
+        self.assertEqual(payload["scope"]["keyword"], "alpha")
+        self.assertEqual(payload["buckets"], [{"file_name": "alpha-scope.txt", "count": 1}])
 
     def test_set_field_rejects_system_managed_fields(self) -> None:
         document_path = self.root / "sample.txt"

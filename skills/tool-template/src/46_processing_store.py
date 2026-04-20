@@ -870,7 +870,6 @@ def run_row_to_payload(row: sqlite3.Row) -> dict[str, object]:
         "job_version_id": int(row["job_version_id"]),
         "from_run_id": row["from_run_id"],
         "selector": decode_json_text(row["selector_json"], default={}) or {},
-        "exclude_selector": decode_json_text(row["exclude_selector_json"], default={}) or {},
         "family_mode": row["family_mode"],
         "seed_limit": row["seed_limit"],
         "status": row["status"],

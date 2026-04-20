@@ -1,193 +1,3 @@
-def normalize_run_selector_spec(
-    *,
-    dataset_ids: list[int] | None = None,
-    dataset_names: list[str] | None = None,
-    document_ids: list[int] | None = None,
-    control_numbers: list[str] | None = None,
-    query: str | None = None,
-    raw_filters: list[list[str]] | None = None,
-    from_run_id: int | None = None,
-) -> dict[str, object]:
-    selector: dict[str, object] = {}
-    if dataset_ids:
-        selector["dataset_ids"] = [int(value) for value in dataset_ids]
-    if dataset_names:
-        selector["dataset_names"] = [normalize_whitespace(value) for value in dataset_names if normalize_whitespace(value)]
-    if document_ids:
-        selector["document_ids"] = [int(value) for value in document_ids]
-    if control_numbers:
-        selector["control_numbers"] = [normalize_whitespace(value) for value in control_numbers if normalize_whitespace(value)]
-    if query is not None and query.strip():
-        selector["query"] = query
-    if raw_filters:
-        selector["filters"] = [list(item) for item in raw_filters]
-    if from_run_id is not None:
-        selector["from_run_id"] = int(from_run_id)
-    return selector
-
-
-def selector_has_inputs(selector: dict[str, object]) -> bool:
-    return any(
-        key in selector and selector[key] not in (None, "", [], {})
-        for key in ("dataset_ids", "dataset_names", "document_ids", "control_numbers", "query", "filters", "from_run_id")
-    )
-
-
-def normalize_selector_document_id_list(connection: sqlite3.Connection, document_ids: list[int]) -> list[sqlite3.Row]:
-    unique_ids = [int(value) for value in dict.fromkeys(document_ids)]
-    if not unique_ids:
-        return []
-    placeholders = ", ".join("?" for _ in unique_ids)
-    rows = connection.execute(
-        f"""
-        SELECT *
-        FROM documents
-        WHERE id IN ({placeholders})
-          AND lifecycle_status NOT IN ('missing', 'deleted')
-        ORDER BY id ASC
-        """,
-        unique_ids,
-    ).fetchall()
-    rows_by_id = {int(row["id"]): row for row in rows}
-    missing_ids = [document_id for document_id in unique_ids if document_id not in rows_by_id]
-    if missing_ids:
-        raise RetrieverError(
-            f"Unknown active document id(s): {', '.join(str(document_id) for document_id in missing_ids)}"
-        )
-    return [rows_by_id[document_id] for document_id in unique_ids]
-
-
-def normalize_selector_control_number_list(connection: sqlite3.Connection, control_numbers: list[str]) -> list[sqlite3.Row]:
-    normalized_numbers = [normalize_whitespace(value) for value in control_numbers if normalize_whitespace(value)]
-    unique_numbers = list(dict.fromkeys(normalized_numbers))
-    if not unique_numbers:
-        return []
-    placeholders = ", ".join("?" for _ in unique_numbers)
-    rows = connection.execute(
-        f"""
-        SELECT *
-        FROM documents
-        WHERE control_number IN ({placeholders})
-          AND lifecycle_status NOT IN ('missing', 'deleted')
-        ORDER BY id ASC
-        """,
-        unique_numbers,
-    ).fetchall()
-    rows_by_number = {str(row["control_number"]): row for row in rows}
-    missing_numbers = [control_number for control_number in unique_numbers if control_number not in rows_by_number]
-    if missing_numbers:
-        raise RetrieverError(
-            f"Unknown active control number(s): {', '.join(missing_numbers)}"
-        )
-    return [rows_by_number[control_number] for control_number in unique_numbers]
-
-
-def resolve_dataset_ids_for_selector(
-    connection: sqlite3.Connection,
-    *,
-    dataset_ids: list[int] | None,
-    dataset_names: list[str] | None,
-) -> list[dict[str, object]]:
-    resolved: list[dict[str, object]] = []
-    seen_ids: set[int] = set()
-    for dataset_id in dataset_ids or []:
-        row = connection.execute(
-            """
-            SELECT id, dataset_name
-            FROM datasets
-            WHERE id = ?
-            """,
-            (int(dataset_id),),
-        ).fetchone()
-        if row is None:
-            raise RetrieverError(f"Unknown dataset id: {dataset_id}")
-        if int(row["id"]) in seen_ids:
-            continue
-        seen_ids.add(int(row["id"]))
-        resolved.append({"dataset_id": int(row["id"]), "dataset_name": row["dataset_name"]})
-    for dataset_name in dataset_names or []:
-        normalized_name = normalize_whitespace(dataset_name)
-        if not normalized_name:
-            continue
-        rows = connection.execute(
-            """
-            SELECT id, dataset_name
-            FROM datasets
-            WHERE dataset_name = ?
-            ORDER BY id ASC
-            """,
-            (normalized_name,),
-        ).fetchall()
-        if not rows:
-            raise RetrieverError(f"Unknown dataset name: {normalized_name}")
-        for row in rows:
-            if int(row["id"]) in seen_ids:
-                continue
-            seen_ids.add(int(row["id"]))
-            resolved.append({"dataset_id": int(row["id"]), "dataset_name": row["dataset_name"]})
-    return resolved
-
-
-def fetch_dataset_selector_rows(
-    connection: sqlite3.Connection,
-    dataset_id: int,
-) -> list[sqlite3.Row]:
-    return connection.execute(
-        """
-        SELECT d.*
-        FROM dataset_documents dd
-        JOIN documents d ON d.id = dd.document_id
-        WHERE dd.dataset_id = ?
-          AND d.lifecycle_status NOT IN ('missing', 'deleted')
-        GROUP BY d.id
-        ORDER BY d.id ASC
-        """,
-        (dataset_id,),
-    ).fetchall()
-
-
-def build_search_selector_results(
-    connection: sqlite3.Connection,
-    *,
-    query: str,
-    raw_filters: list[list[str]] | None,
-) -> list[sqlite3.Row]:
-    filter_summary, clauses, params = build_search_filters(connection, raw_filters)
-    del filter_summary
-    bates_query_begin, bates_query_end = parse_bates_query(query)
-    is_bates_query = bates_query_begin is not None and bates_query_end is not None
-    if is_bates_query:
-        matches = search_bates(connection, str(bates_query_begin), str(bates_query_end), clauses, params)
-    elif query.strip():
-        matches = search_fts(connection, query, clauses, params)
-    else:
-        matches = search_browse(connection, clauses, params)
-
-    result_rows: list[dict[str, object]] = []
-    for document_id, match in matches.items():
-        result_rows.append(
-            {
-                "id": document_id,
-                "rank": match["rank"],
-                "snippet": match["snippet"],
-                "bates_sort_key": match.get("bates_sort_key"),
-                "row": match["row"],
-            }
-        )
-    if is_bates_query:
-        sorted_results = sorted(
-            sorted(result_rows, key=lambda item: item["id"]),
-            key=lambda item: (
-                item["rank"] is None,
-                item["rank"],
-                item.get("bates_sort_key") or (1, "", 0, ""),
-            ),
-        )
-    else:
-        sorted_results = sort_search_results(result_rows, None, None, query)
-    return [item["row"] for item in sorted_results]
-
-
 def resolve_from_run_snapshot_rows(connection: sqlite3.Connection, from_run_id: int) -> list[sqlite3.Row]:
     run_row = connection.execute("SELECT id FROM runs WHERE id = ?", (from_run_id,)).fetchone()
     if run_row is None:
@@ -201,96 +11,6 @@ def resolve_from_run_snapshot_rows(connection: sqlite3.Connection, from_run_id: 
         """,
         (from_run_id,),
     ).fetchall()
-
-
-def record_selector_reason(
-    reasons_by_document_id: dict[int, dict[str, object]],
-    document_id: int,
-    reason: dict[str, object],
-) -> None:
-    reason_state = reasons_by_document_id.setdefault(
-        document_id,
-        {"direct_reasons": [], "family_seed_document_ids": []},
-    )
-    direct_reasons = reason_state["direct_reasons"]
-    if reason not in direct_reasons:
-        direct_reasons.append(reason)
-
-
-def resolve_seed_documents_for_selector(
-    connection: sqlite3.Connection,
-    selector: dict[str, object],
-) -> tuple[list[int], dict[int, dict[str, object]], dict[int, dict[str, object]]]:
-    reasons_by_document_id: dict[int, dict[str, object]] = {}
-    frozen_inputs_by_document_id: dict[int, dict[str, object]] = {}
-    seed_document_ids: list[int] = []
-
-    def add_document_row(row: sqlite3.Row, reason: dict[str, object]) -> None:
-        document_id = int(row["id"])
-        if document_id not in reasons_by_document_id:
-            seed_document_ids.append(document_id)
-        record_selector_reason(reasons_by_document_id, document_id, reason)
-
-    from_run_id = selector.get("from_run_id")
-    if from_run_id is not None:
-        for snapshot_row in resolve_from_run_snapshot_rows(connection, int(from_run_id)):
-            document_id = int(snapshot_row["document_id"])
-            if document_id not in reasons_by_document_id:
-                seed_document_ids.append(document_id)
-            record_selector_reason(
-                reasons_by_document_id,
-                document_id,
-                {"type": "from_run", "run_id": int(from_run_id)},
-            )
-            frozen_inputs_by_document_id[document_id] = {
-                "pinned_input_revision_id": (
-                    int(snapshot_row["pinned_input_revision_id"])
-                    if snapshot_row["pinned_input_revision_id"] is not None
-                    else None
-                ),
-                "pinned_content_hash": snapshot_row["pinned_content_hash"],
-            }
-
-    for row in normalize_selector_document_id_list(connection, selector.get("document_ids", [])):  # type: ignore[arg-type]
-        add_document_row(row, {"type": "document_id", "document_id": int(row["id"])})
-
-    for row in normalize_selector_control_number_list(connection, selector.get("control_numbers", [])):  # type: ignore[arg-type]
-        add_document_row(row, {"type": "control_number", "control_number": row["control_number"]})
-
-    for dataset_ref in resolve_dataset_ids_for_selector(
-        connection,
-        dataset_ids=selector.get("dataset_ids"),  # type: ignore[arg-type]
-        dataset_names=selector.get("dataset_names"),  # type: ignore[arg-type]
-    ):
-        for row in fetch_dataset_selector_rows(connection, int(dataset_ref["dataset_id"])):
-            add_document_row(
-                row,
-                {
-                    "type": "dataset",
-                    "dataset_id": int(dataset_ref["dataset_id"]),
-                    "dataset_name": dataset_ref["dataset_name"],
-                },
-            )
-
-    query = str(selector.get("query") or "")
-    raw_filters = selector.get("filters")
-    if query.strip() or raw_filters:
-        search_rows = build_search_selector_results(
-            connection,
-            query=query,
-            raw_filters=raw_filters if isinstance(raw_filters, list) else None,
-        )
-        for row in search_rows:
-            add_document_row(
-                row,
-                {
-                    "type": "search",
-                    "query": query,
-                    "filters": raw_filters if isinstance(raw_filters, list) else [],
-                },
-            )
-
-    return seed_document_ids, reasons_by_document_id, frozen_inputs_by_document_id
 
 
 def expand_seed_documents_with_family(
@@ -341,15 +61,6 @@ def expand_seed_documents_with_family(
             if seed_document_id not in family_seed_ids:
                 family_seed_ids.append(seed_document_id)
     return final_document_ids
-
-
-def apply_excluded_document_ids(
-    document_ids: list[int],
-    excluded_document_ids: set[int],
-) -> list[int]:
-    if not excluded_document_ids:
-        return document_ids
-    return [document_id for document_id in document_ids if document_id not in excluded_document_ids]
 
 
 def compute_source_parts_content_hash(
@@ -488,21 +199,19 @@ def compute_document_input_reference_for_job_version(
     raise RetrieverError(f"Unsupported job input basis for run planning: {input_basis}")
 
 
-def plan_run_snapshot_rows(
+def plan_scope_run_snapshot_rows(
     connection: sqlite3.Connection,
     *,
     root: Path,
     job_row: sqlite3.Row,
     job_version_row: sqlite3.Row,
     selector: dict[str, object],
-    exclude_selector: dict[str, object],
     family_mode: str,
     seed_limit: int | None,
 ) -> list[dict[str, object]]:
-    selected_documents, frozen_inputs_by_document_id = plan_selected_documents(
+    selected_documents, frozen_inputs_by_document_id = plan_scope_selected_documents(
         connection,
         selector=selector,
-        exclude_selector=exclude_selector,
         family_mode=family_mode,
         seed_limit=seed_limit,
     )
@@ -536,31 +245,136 @@ def plan_run_snapshot_rows(
     return snapshot_rows
 
 
-def plan_selected_documents(
+def scope_run_selector_has_inputs(selector: dict[str, object]) -> bool:
+    return bool(scope_selector_instances(selector))
+
+
+def scope_selector_reason_entries(scope: dict[str, object]) -> list[dict[str, object]]:
+    reasons: list[dict[str, object]] = []
+    keyword = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    if keyword:
+        reasons.append({"type": "keyword", "query": keyword})
+
+    bates = scope.get("bates")
+    if isinstance(bates, dict):
+        begin = normalize_inline_whitespace(str(bates.get("begin") or ""))
+        end = normalize_inline_whitespace(str(bates.get("end") or ""))
+        if begin and end:
+            reasons.append({"type": "bates", "begin": begin, "end": end})
+
+    filter_expression = normalize_inline_whitespace(str(scope.get("filter") or ""))
+    if filter_expression:
+        reasons.append({"type": "filter", "expression": filter_expression})
+
+    dataset_entries = coerce_scope_dataset_entries(scope.get("dataset"))
+    if dataset_entries:
+        reasons.append(
+            {
+                "type": "dataset",
+                "dataset_ids": [int(entry["id"]) for entry in dataset_entries],
+                "dataset_names": [str(entry["name"]) for entry in dataset_entries],
+            }
+        )
+
+    if scope.get("from_run_id") is not None:
+        reasons.append({"type": "from_run", "run_id": int(scope["from_run_id"])})
+    return reasons
+
+
+def resolve_seed_documents_for_scope_selector(
+    connection: sqlite3.Connection,
+    selector: dict[str, object],
+) -> tuple[list[int], dict[int, dict[str, object]], dict[int, dict[str, object]]]:
+    selector_instances = scope_selector_instances(selector)
+    if not selector_instances:
+        return [], {}, {}
+
+    reasons_by_document_id: dict[int, dict[str, object]] = {}
+    frozen_inputs_by_document_id: dict[int, dict[str, object]] = {}
+    ordered_results: list[dict[str, object]] | None = None
+    matching_document_ids: set[int] | None = None
+
+    for selector_instance in selector_instances:
+        selection = resolve_scope_document_search(connection, selector_instance)
+        selection_scope = coerce_scope_payload(selection.get("scope"))
+        selection_results = selection["results"]
+        selection_document_ids = {int(item["id"]) for item in selection_results}
+        if ordered_results is None:
+            ordered_results = selection_results
+            matching_document_ids = selection_document_ids
+        else:
+            assert matching_document_ids is not None
+            matching_document_ids &= selection_document_ids
+
+        direct_reasons = scope_selector_reason_entries(selection_scope)
+        if direct_reasons:
+            for item in selection_results:
+                document_id = int(item["id"])
+                reason_state = reasons_by_document_id.setdefault(
+                    document_id,
+                    {"direct_reasons": [], "family_seed_document_ids": []},
+                )
+                for reason in direct_reasons:
+                    if reason not in reason_state["direct_reasons"]:
+                        reason_state["direct_reasons"].append(reason)
+
+        from_run_id = selection_scope.get("from_run_id")
+        if from_run_id is not None:
+            # Later selector clauses win so explicit --from-run-id narrows and pins over scope.
+            for snapshot_row in resolve_from_run_snapshot_rows(connection, int(from_run_id)):
+                document_id = int(snapshot_row["document_id"])
+                frozen_inputs_by_document_id[document_id] = {
+                    "pinned_input_revision_id": (
+                        int(snapshot_row["pinned_input_revision_id"])
+                        if snapshot_row["pinned_input_revision_id"] is not None
+                        else None
+                    ),
+                    "pinned_content_hash": snapshot_row["pinned_content_hash"],
+                }
+
+    if ordered_results is None or matching_document_ids is None:
+        return [], {}, {}
+
+    ordered_matching_ids = [
+        int(item["id"])
+        for item in ordered_results
+        if int(item["id"]) in matching_document_ids
+    ]
+    filtered_reasons = {
+        document_id: reasons_by_document_id.get(
+            document_id,
+            {"direct_reasons": [], "family_seed_document_ids": []},
+        )
+        for document_id in ordered_matching_ids
+    }
+    filtered_frozen_inputs = {
+        document_id: frozen_inputs
+        for document_id, frozen_inputs in frozen_inputs_by_document_id.items()
+        if document_id in matching_document_ids
+    }
+    return ordered_matching_ids, filtered_reasons, filtered_frozen_inputs
+
+
+def plan_scope_selected_documents(
     connection: sqlite3.Connection,
     *,
     selector: dict[str, object],
-    exclude_selector: dict[str, object],
     family_mode: str,
     seed_limit: int | None,
 ) -> tuple[list[dict[str, object]], dict[int, dict[str, object]]]:
-    seed_document_ids, reasons_by_document_id, frozen_inputs_by_document_id = resolve_seed_documents_for_selector(
+    seed_document_ids, reasons_by_document_id, frozen_inputs_by_document_id = resolve_seed_documents_for_scope_selector(
         connection,
         selector,
     )
     if not seed_document_ids:
         return [], frozen_inputs_by_document_id
 
-    excluded_document_ids, _, _ = resolve_seed_documents_for_selector(connection, exclude_selector)
-    excluded_document_id_set = {int(document_id) for document_id in excluded_document_ids}
-    seed_document_ids = apply_excluded_document_ids(seed_document_ids, excluded_document_id_set)
     if seed_limit is not None:
         seed_document_ids = seed_document_ids[:seed_limit]
     if family_mode == "with_family":
         final_document_ids = expand_seed_documents_with_family(connection, seed_document_ids, reasons_by_document_id)
     else:
         final_document_ids = list(seed_document_ids)
-    final_document_ids = apply_excluded_document_ids(final_document_ids, excluded_document_id_set)
     if not final_document_ids:
         return [], frozen_inputs_by_document_id
 
@@ -584,7 +398,10 @@ def plan_selected_documents(
                 "document_id": int(document_id),
                 "ordinal": ordinal,
                 "document_row": document_row,
-                "inclusion_reason": reasons_by_document_id.get(int(document_id), {"direct_reasons": [], "family_seed_document_ids": []}),
+                "inclusion_reason": reasons_by_document_id.get(
+                    int(document_id),
+                    {"direct_reasons": [], "family_seed_document_ids": []},
+                ),
             }
         )
     return selected_documents, frozen_inputs_by_document_id
