@@ -4,39 +4,62 @@
 
 - Use full-text search when the user supplies keywords or phrases.
 - Use browse mode when the user primarily filters by metadata or custom fields.
-- Build filters with repeatable `--filter <field> <op> <value>` clauses.
-- Use the canonical `search` CLI flags `--sort`, `--order`, `--page`, and `--per-page` for sorting and paging.
+- Retriever now exposes two complementary search surfaces:
+  - stateless CLI `search ...`
+  - persistent slash commands `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, and `/previous`
+- A scope is a conjunctive selector over document fields. In the current implementation it may include a keyword slot, a Bates slot, a SQL-like filter slot, a dataset slot, and a `from_run_id` slot.
+- Build metadata constraints with repeatable SQL-like `--filter "<expression>"` clauses. Repeated `--filter` flags AND-compose.
+- The filter grammar applies to Retriever's logical document field set, not only raw table columns. Supported names include built-in fields, registered custom fields, and schema-defined virtual fields such as `production_name`, `is_attachment`, and `has_attachments`.
+- Use the canonical stateless `search` CLI flags `--sort`, `--order`, `--page`, and `--per-page` for sorting and paging.
 - Map "show N" style requests to `--page 1 --per-page N`; do not invent `--limit`.
 - Use canonical built-in field names such as `date_created`, not ad hoc variants like `created_date`.
 
-Supported MVP operators:
+Supported SQL-like filter operators:
 
-- `eq`
-- `neq`
-- `gt`
-- `gte`
-- `lt`
-- `lte`
-- `contains`
-- `is-null`
-- `not-null`
+- `=`
+- `<>`
+- `!=`
+- `<`
+- `<=`
+- `>`
+- `>=`
+- `LIKE`
+- `IS NULL`
+- `IS NOT NULL`
+- `IN (...)`
+- `BETWEEN ... AND ...`
+
+Boolean composition:
+
+- `AND`
+- `OR`
+- `NOT`
+- parentheses
 
 Virtual attachment-family filters:
 
-- `is_attachment eq true` to show only child attachment documents
-- `has_attachments eq true` to show documents that currently have one or more child attachments
-- `production_name contains <text>` to filter production-derived documents by production name
+- `is_attachment = 1` to show only child attachment documents
+- `has_attachments = 1` to show documents that currently have one or more child attachments
+- `production_name LIKE '%Acme%'` to filter production-derived documents by production name
 
 Production-aware query behavior:
 
 - A single Bates/control token such as `SR000123` should prefer Bates-aware lookup over plain keyword FTS.
 - A normalized Bates range such as `SR000123-SR000150` should return all logical documents whose Bates spans overlap that range.
 - Bates range matching must use normalized prefix + numeric parsing, not raw lexicographic string comparison.
+- Slash commands may store Bates state in a dedicated scope slot via `/bates` or `/search <bates>`.
 
 ## OUTPUT FORMAT (mandatory)
 
 Unless the user explicitly asks for a different layout, every search result set MUST use the standard table format below.
 This is mandatory for all result types: keyword searches, filtered browses, ranked requests ("show 10 largest"), and any other document listing.
+Always show the active search header immediately before the table:
+
+```
+Scope: keyword='...', filter=..., dataset=...
+Sort: date_created desc
+Page: 1 of 3  (docs 1-20 of 55)
+```
 
 ### Standard columns — exact order
 
@@ -150,7 +173,9 @@ When the user asks to inspect fields or columns:
 ## Sorting
 
 - Keyword query + no explicit sort: `relevance asc`
-- Filter-only browse + no explicit sort: `updated_at desc`
+- Bates lookup + no explicit sort: `bates asc`
+- Filter-only browse + no explicit sort: `date_created desc`
+- Browse ordering pushes null `date_created` values to the end of the list
 - `relevance` is only valid when query text is present.
 - Validate explicit sort fields against built-in or registered custom fields.
 - Break equal primary sort values by `id asc` so page boundaries stay stable.

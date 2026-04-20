@@ -917,6 +917,55 @@ def coerce_saved_scope_payload(raw_scope: object) -> dict[str, object]:
     return scope
 
 
+def coerce_browsing_sort_payload(raw_value: object) -> list[list[str]]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized_specs: list[list[str]] = []
+    for item in raw_value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        field_name = normalize_inline_whitespace(str(item[0] or ""))
+        direction = normalize_inline_whitespace(str(item[1] or "")).lower()
+        if not field_name or direction not in {"asc", "desc"}:
+            continue
+        normalized_specs.append([field_name, direction])
+    return normalized_specs
+
+
+def coerce_browsing_payload(raw_browsing: object) -> dict[str, object]:
+    if not isinstance(raw_browsing, dict):
+        return {}
+    browsing: dict[str, object] = {}
+    sort_specs = coerce_browsing_sort_payload(raw_browsing.get("sort"))
+    if sort_specs:
+        browsing["sort"] = sort_specs
+    offset = raw_browsing.get("offset")
+    if isinstance(offset, int) and offset >= 0:
+        browsing["offset"] = offset
+    total_known = raw_browsing.get("total_known")
+    if isinstance(total_known, int) and total_known >= 0:
+        browsing["total_known"] = total_known
+    run_at = raw_browsing.get("run_at")
+    if isinstance(run_at, str) and run_at.strip():
+        browsing["run_at"] = run_at
+    return browsing
+
+
+def coerce_display_payload(raw_display: object) -> dict[str, object]:
+    if not isinstance(raw_display, dict):
+        return {}
+    display: dict[str, object] = {}
+    columns = raw_display.get("columns")
+    if isinstance(columns, list):
+        normalized_columns = [normalize_inline_whitespace(str(value)) for value in columns if normalize_inline_whitespace(str(value))]
+        if normalized_columns:
+            display["columns"] = normalized_columns
+    page_size = raw_display.get("page_size")
+    if isinstance(page_size, int) and page_size > 0:
+        display["page_size"] = page_size
+    return display
+
+
 def coerce_session_state(raw_value: object) -> dict[str, object]:
     session = default_session_state()
     if not isinstance(raw_value, dict):
@@ -925,10 +974,8 @@ def coerce_session_state(raw_value: object) -> dict[str, object]:
     if isinstance(schema_version, int):
         session["schema_version"] = schema_version
     session["scope"] = coerce_scope_payload(raw_value.get("scope"))
-    browsing = raw_value.get("browsing")
-    session["browsing"] = browsing if isinstance(browsing, dict) else {}
-    display = raw_value.get("display")
-    session["display"] = display if isinstance(display, dict) else {}
+    session["browsing"] = coerce_browsing_payload(raw_value.get("browsing"))
+    session["display"] = coerce_display_payload(raw_value.get("display"))
     return session
 
 
