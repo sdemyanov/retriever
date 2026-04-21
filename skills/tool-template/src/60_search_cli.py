@@ -6256,7 +6256,78 @@ def build_parser() -> argparse.ArgumentParser:
     clear_conversation_parser.add_argument("--doc-id", type=int, required=True, help="Document id to clear")
 
     subparsers.add_parser("schema-version", help="Print the schema version")
+
+    upgrade_workspace_parser = subparsers.add_parser(
+        "upgrade-workspace",
+        help="Replace the workspace's retriever_tools.py with the canonical plugin copy",
+    )
+    upgrade_workspace_parser.add_argument("workspace", help="Workspace root path")
+    upgrade_workspace_parser.add_argument(
+        "--from",
+        dest="canonical_source",
+        default=None,
+        help="Path to the canonical retriever_tools.py (defaults to auto-discovery)",
+    )
+    upgrade_workspace_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the workspace tool even when it differs from runtime.json",
+    )
+
     return parser
+
+
+def _auto_upgrade_and_maybe_reexec(root: Path, command: str) -> None:
+    """Auto-upgrade the workspace tool if it is cleanly stale.
+
+    Writes one ``retriever-auto-upgrade: <json>`` line to stderr describing
+    the outcome. When an upgrade actually happened, re-exec the freshly
+    installed workspace tool so it handles the current command with its
+    own code (not the currently-running, now-replaced image).
+    """
+    if command in AUTO_UPGRADE_EXEMPT_COMMANDS:
+        return
+    result = maybe_upgrade_workspace_tool(root)
+    if not result:
+        return
+    try:
+        print(
+            "retriever-auto-upgrade: " + json.dumps(result, sort_keys=True),
+            file=sys.stderr,
+        )
+    except Exception:  # pragma: no cover - never fail dispatch over logging
+        pass
+
+    if result.get("status") != "upgraded":
+        return
+
+    tool_path = result.get("tool_path")
+    if not tool_path:
+        return
+    tool_path_obj = Path(str(tool_path))
+    try:
+        running = Path(__file__).resolve()
+    except OSError:
+        running = None
+    try:
+        upgraded = tool_path_obj.resolve()
+    except OSError:
+        upgraded = tool_path_obj
+    if running is not None and upgraded == running:
+        # We are already executing from the upgraded file (unusual, but
+        # possible). Nothing to re-exec.
+        return
+
+    env = os.environ.copy()
+    env["RETRIEVER_AUTO_UPGRADE_REEXEC"] = "1"
+    try:
+        os.execve(sys.executable, [sys.executable, str(tool_path_obj), *sys.argv[1:]], env)
+    except OSError as exc:
+        print(
+            "retriever-auto-upgrade-reexec-failed: "
+            + json.dumps({"error": f"{type(exc).__name__}: {exc}"}, sort_keys=True),
+            file=sys.stderr,
+        )
 
 
 def main() -> int:
@@ -6269,6 +6340,52 @@ def main() -> int:
             return 0
 
         root = Path(args.workspace).expanduser().resolve()
+
+        if args.command == "upgrade-workspace":
+            canonical_source = getattr(args, "canonical_source", None)
+            if canonical_source:
+                canonical_path = Path(canonical_source).expanduser().resolve()
+                if not canonical_path.is_file():
+                    raise RetrieverError(
+                        f"Canonical tool not found at --from path: {canonical_path}"
+                    )
+            else:
+                located = locate_canonical_plugin_tool()
+                if located is None:
+                    # Fallback: the user invoked the canonical plugin tool
+                    # directly (e.g. `python3 skills/tool-template/retriever_tools.py
+                    # upgrade-workspace ...`). In that case __file__ *is* the
+                    # canonical copy; ``locate_canonical_plugin_tool`` skips
+                    # it to avoid self-upgrade loops, but here we want to
+                    # honor it.
+                    try:
+                        self_path = Path(__file__).resolve()
+                    except OSError:
+                        self_path = None
+                    if (
+                        self_path is not None
+                        and self_path.is_file()
+                        and self_path.parent.name == "tool-template"
+                        and self_path.parent.parent.name == "skills"
+                    ):
+                        located = self_path
+                if located is None:
+                    raise RetrieverError(
+                        "Could not auto-discover the canonical retriever_tools.py. "
+                        "Pass --from <path> or set RETRIEVER_CANONICAL_TOOL_PATH."
+                    )
+                canonical_path = located
+            return emit_cli_payload(
+                "upgrade-workspace",
+                upgrade_workspace_tool(
+                    root,
+                    canonical_path,
+                    force=bool(getattr(args, "force", False)),
+                    reason="manual",
+                ),
+            )
+
+        _auto_upgrade_and_maybe_reexec(root, args.command)
 
         if args.command == "doctor":
             return emit_cli_payload("doctor", doctor(root, args.quick))

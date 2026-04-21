@@ -1467,6 +1467,255 @@ def bootstrap(root: Path) -> dict[str, object]:
     raise RetrieverError(f"Bootstrap failed for {paths['db_path']}: {detail}") from last_error
 
 
+# Commands that must not trigger an auto-upgrade. `schema-version` needs to
+# work even when a workspace does not exist yet. `bootstrap` installs the
+# runtime; running the upgrade before it would be meaningless. `doctor`
+# reports on the workspace and should not mutate it. `upgrade-workspace`
+# performs the upgrade explicitly. `slash` delegates to sub-commands that
+# already go through the dispatcher.
+AUTO_UPGRADE_EXEMPT_COMMANDS = frozenset(
+    {
+        "schema-version",
+        "bootstrap",
+        "doctor",
+        "upgrade-workspace",
+        "slash",
+    }
+)
+
+
+def locate_canonical_plugin_tool(current_file: str | None = None) -> Path | None:
+    """Find the plugin's canonical ``skills/tool-template/retriever_tools.py``.
+
+    Resolution order:
+
+    1. ``RETRIEVER_CANONICAL_TOOL_PATH`` environment variable (absolute path).
+    2. Walk ancestors of ``current_file`` (defaults to ``__file__``) looking
+       for ``skills/tool-template/retriever_tools.py``.
+
+    The search always skips ``current_file`` itself, which prevents
+    self-upgrades when the workspace tool happens to live in a path that
+    superficially matches the canonical layout.
+    """
+
+    def _safe_resolve(path: Path) -> Path | None:
+        try:
+            return path.resolve()
+        except OSError:
+            return None
+
+    running_path: Path | None = None
+    if current_file is None:
+        current_file = __file__
+    if current_file:
+        try:
+            running_path = Path(current_file).resolve()
+        except OSError:
+            running_path = None
+
+    env_path = os.environ.get("RETRIEVER_CANONICAL_TOOL_PATH")
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if candidate.is_file():
+            resolved = _safe_resolve(candidate) or candidate
+            if running_path is None or resolved != running_path:
+                return resolved
+
+    if current_file:
+        try:
+            start = Path(current_file).resolve()
+        except OSError:
+            start = None
+        if start is not None:
+            for parent in [start.parent, *start.parents]:
+                candidate = parent / "skills" / "tool-template" / "retriever_tools.py"
+                if not candidate.is_file():
+                    continue
+                resolved = _safe_resolve(candidate)
+                if resolved is None:
+                    continue
+                if running_path is not None and resolved == running_path:
+                    continue
+                return resolved
+    return None
+
+
+def _upgrade_backup_name(runtime_version: str | None, user_modified: bool) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    previous_version = runtime_version or "unknown"
+    suffix = ".user-modified" if user_modified else ""
+    return f"retriever_tools.py.{timestamp}.pre-{previous_version}{suffix}"
+
+
+def upgrade_workspace_tool(
+    root: Path,
+    canonical_path: Path,
+    *,
+    force: bool = False,
+    reason: str = "manual",
+) -> dict[str, object]:
+    """Replace the workspace tool with the canonical plugin copy.
+
+    Writes happen via ``Path.write_bytes`` (open-with-O_TRUNC), so this
+    works under Cowork sandboxes that block explicit ``unlink``/``rm``.
+    """
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    runtime = read_runtime(paths["runtime_path"])
+    runtime_sha = runtime.get("template_sha256") if isinstance(runtime, dict) else None
+    runtime_version = runtime.get("tool_version") if isinstance(runtime, dict) else None
+    workspace_sha = sha256_file(paths["tool_path"])
+    canonical_sha = sha256_file(canonical_path)
+
+    if canonical_sha is None:
+        raise RetrieverError(f"Canonical tool not readable at {canonical_path}")
+
+    if workspace_sha == canonical_sha:
+        return {
+            "status": "no-op",
+            "reason": "already current",
+            "canonical_sha256": canonical_sha,
+            "canonical_path": str(canonical_path),
+            "tool_path": str(paths["tool_path"]),
+            "workspace_tool_version": runtime_version,
+            "canonical_tool_version": TOOL_VERSION,
+        }
+
+    user_modified = (
+        workspace_sha is not None
+        and runtime_sha is not None
+        and workspace_sha != runtime_sha
+    )
+    if user_modified and not force:
+        raise RetrieverError(
+            "Workspace tool has been modified in place "
+            f"(workspace sha {workspace_sha}, runtime sha {runtime_sha}). "
+            "Re-run upgrade-workspace --force to overwrite the modified tool."
+        )
+
+    backup_path: Path | None = None
+    if paths["tool_path"].exists():
+        paths["backups_dir"].mkdir(parents=True, exist_ok=True)
+        backup_path = paths["backups_dir"] / _upgrade_backup_name(runtime_version, user_modified)
+        backup_path.write_bytes(paths["tool_path"].read_bytes())
+
+    paths["bin_dir"].mkdir(parents=True, exist_ok=True)
+    paths["tool_path"].write_bytes(canonical_path.read_bytes())
+
+    new_sha = sha256_file(paths["tool_path"])
+    write_runtime(paths, new_sha)
+
+    # Best-effort: keep workspace_meta in sync. If the database is missing
+    # or unreadable we leave it to the next bootstrap/doctor run rather
+    # than failing the upgrade.
+    meta_updated = False
+    meta_error: str | None = None
+    try:
+        connection = connect_db(paths["db_path"])
+        try:
+            write_workspace_meta(connection, new_sha)
+            meta_updated = True
+        finally:
+            connection.close()
+    except Exception as exc:  # pragma: no cover - best-effort path
+        meta_error = f"{type(exc).__name__}: {exc}"
+
+    result: dict[str, object] = {
+        "status": "upgraded",
+        "reason": reason,
+        "force": force,
+        "was_user_modified": user_modified,
+        "previous_tool_sha256": workspace_sha,
+        "previous_tool_version": runtime_version,
+        "new_tool_sha256": new_sha,
+        "new_tool_version": TOOL_VERSION,
+        "canonical_path": str(canonical_path),
+        "tool_path": str(paths["tool_path"]),
+        "backup_path": str(backup_path) if backup_path else None,
+        "workspace_meta_updated": meta_updated,
+    }
+    if meta_error is not None:
+        result["workspace_meta_error"] = meta_error
+    return result
+
+
+def maybe_upgrade_workspace_tool(root: Path) -> dict[str, object] | None:
+    """Auto-upgrade the workspace tool if it is cleanly stale.
+
+    Returns ``None`` when no action is needed or the situation is ambiguous.
+    Returns a result dict when an upgrade was performed OR explicitly
+    blocked because the workspace tool looks user-modified.
+
+    Rules:
+
+    * No ``.retriever`` directory, no runtime, or no workspace tool -> no-op.
+    * Cannot locate a canonical plugin copy -> no-op (e.g., workspace
+      was copied to a machine without the plugin source).
+    * Workspace tool sha already matches canonical -> no-op.
+    * Workspace tool sha matches ``runtime.template_sha256`` but differs
+      from canonical -> clean-but-stale, upgrade in place.
+    * Workspace tool sha differs from ``runtime.template_sha256`` ->
+      user modified, refuse and return a block result.
+    """
+    paths = workspace_paths(root)
+    if not paths["state_dir"].exists():
+        return None
+    if not paths["tool_path"].exists():
+        return None
+    runtime = read_runtime(paths["runtime_path"])
+    if not isinstance(runtime, dict):
+        return None
+
+    canonical_path = locate_canonical_plugin_tool()
+    if canonical_path is None:
+        return None
+
+    workspace_sha = sha256_file(paths["tool_path"])
+    canonical_sha = sha256_file(canonical_path)
+    if workspace_sha is None or canonical_sha is None:
+        return None
+    if workspace_sha == canonical_sha:
+        return None
+
+    recorded_sha = runtime.get("template_sha256")
+    runtime_version = runtime.get("tool_version")
+
+    if recorded_sha and workspace_sha != recorded_sha:
+        return {
+            "status": "blocked",
+            "reason": "workspace tool has been modified in place",
+            "workspace_tool_sha256": workspace_sha,
+            "workspace_runtime_sha256": recorded_sha,
+            "canonical_sha256": canonical_sha,
+            "canonical_path": str(canonical_path),
+            "workspace_tool_version": runtime_version,
+            "canonical_tool_version": TOOL_VERSION,
+            "hint": (
+                "Run `upgrade-workspace --force` to overwrite the modified "
+                "tool, or revert your local edits."
+            ),
+        }
+
+    try:
+        return upgrade_workspace_tool(
+            root,
+            canonical_path,
+            force=False,
+            reason="auto-stale",
+        )
+    except RetrieverError as exc:
+        return {
+            "status": "error",
+            "reason": "auto-upgrade failed",
+            "detail": str(exc),
+            "canonical_path": str(canonical_path),
+            "canonical_sha256": canonical_sha,
+            "workspace_tool_sha256": workspace_sha,
+            "workspace_tool_version": runtime_version,
+            "canonical_tool_version": TOOL_VERSION,
+        }
+
+
 def write_workspace_meta(connection: sqlite3.Connection, tool_sha256: str | None) -> None:
     now = utc_now()
     connection.execute(

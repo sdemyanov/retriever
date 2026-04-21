@@ -59,7 +59,7 @@ On every later session:
 5. Compare the installed plugin's canonical template checksum to `runtime.json.template_sha256`.
 6. Reuse the existing tool only when the workspace checksum matches `runtime.json` and the canonical template checksum still matches the current workspace tool checksum.
 7. If the canonical template checksum changed, treat that as an upgrade signal even when the plugin version string did not change.
-8. Before any reindex or ingest after reinstall, upgrade the workspace tool if needed, run `bootstrap`, and only then continue to `ingest`.
+8. The workspace tool's own dispatcher performs the auto-upgrade on the next non-exempt command (see below), so the runner does not need an out-of-band upgrade step before `ingest` or reindex; running any ordinary command from a stale-but-clean workspace will upgrade it and re-exec the command transparently.
 
 ## Upgrade rules
 
@@ -67,21 +67,42 @@ Treat the workspace tool as plugin-managed but user-modifiable.
 
 A reinstall with a changed canonical template is still an upgrade, even if the plugin version string stayed the same.
 
+The workspace tool enforces these rules itself on every non-exempt command. The runner is still free to call `upgrade-workspace` explicitly; the auto-upgrade path just removes the need to remember to do it.
+
+### Auto-upgrade dispatch hook
+
+Before executing any command other than `schema-version`, `bootstrap`, `doctor`, `upgrade-workspace`, or `slash`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper.
+
+The helper:
+
+- no-ops when `.retriever/` is absent, when `runtime.json` is missing, when the workspace tool is missing, or when the plugin's canonical copy cannot be located (e.g., on a portable workspace without the plugin installed)
+- finds the plugin's canonical `skills/tool-template/retriever_tools.py` via the `RETRIEVER_CANONICAL_TOOL_PATH` environment variable, then by walking the parents of the currently running tool
+- compares workspace sha vs. canonical sha; if equal, no-op
+- if the workspace sha equals `runtime.template_sha256` (clean-but-stale), upgrades in place: backs up the old copy to `bin/backups/`, replaces the tool via `pathlib.Path.write_bytes` (open-with-O_TRUNC, so no `unlink` in Cowork sandboxes), re-runs `write_runtime` / `write_workspace_meta`, and re-execs the new tool so the current command is handled by the new code
+- if the workspace sha differs from `runtime.template_sha256` (user-modified), refuses to touch the file, writes a `retriever-auto-upgrade: {"status": "blocked", ...}` line to stderr, and lets the current command continue to run from the user's modified tool
+- emits a single `retriever-auto-upgrade: <json>` line to stderr describing the outcome so automation can observe it without polluting the JSON payload on stdout
+
+### Explicit upgrade command
+
+`retriever_tools.py upgrade-workspace <workspace> [--from <path>] [--force]`
+
+- default is to auto-discover the canonical tool the same way the auto path does
+- `--force` is required to overwrite a user-modified workspace tool (it adds a `.user-modified` suffix to the backup name so the edit is recoverable)
+
 ### Unmodified tool
 
 If:
 
 - the tool file exists
 - the checksum matches `runtime.json`
-- either the version is older than the plugin version, or the installed plugin's canonical template checksum differs from `runtime.json.template_sha256`
+- the canonical template checksum differs
 
-Then:
+Then the dispatcher auto-upgrades:
 
 - back up the old copy to `bin/backups/`
-- replace it with the new template
-- run schema migrations if needed
-- update `runtime.json`
-- only then run `ingest` or any reindex flow
+- replace it with the canonical template via open-with-O_TRUNC (no `rm`, no `mv`)
+- re-run `write_runtime` / `write_workspace_meta`
+- re-exec the command in the new tool
 
 ### Modified tool
 
@@ -92,10 +113,10 @@ If:
 
 Then:
 
-- assume the workspace copy was modified
-- do not replace it automatically
-- explain the mismatch to the user
-- offer backup + replace as an explicit action
+- the dispatcher refuses to replace it
+- it emits a `retriever-auto-upgrade: {"status": "blocked", ...}` warning on stderr
+- the current command still runs (from the user's modified copy)
+- an explicit `upgrade-workspace --force` is the documented recovery path
 
 ## runtime.json contract
 
