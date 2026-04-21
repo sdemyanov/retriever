@@ -2671,6 +2671,115 @@ def session_sort_specs(session_state: dict[str, object]) -> list[tuple[str, str]
     return coerce_sort_specs(session_browsing_state(session_state).get("sort"))
 
 
+def saved_scope_summaries(paths: dict[str, Path]) -> list[dict[str, object]]:
+    saved_scopes_state = read_saved_scopes_state(paths)
+    scopes = saved_scopes_state.get("scopes")
+    if not isinstance(scopes, dict):
+        return []
+    return [
+        {
+            "name": str(scope_name),
+            "scope": coerce_saved_scope_payload(scope_payload),
+        }
+        for scope_name, scope_payload in sorted(
+            scopes.items(),
+            key=lambda item: (normalize_saved_scope_name(str(item[0])), str(item[0])),
+        )
+    ]
+
+
+def sortable_field_entries(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    seen_names: set[str] = set()
+    entries: list[dict[str, object]] = []
+    for raw_field_name in known_logical_field_names(connection):
+        field_def = resolve_field_definition(connection, raw_field_name)
+        if field_def.get("source") == "virtual":
+            continue
+        canonical_name = str(field_def["field_name"])
+        if canonical_name in seen_names:
+            continue
+        seen_names.add(canonical_name)
+        entries.append(
+            catalog_field_entry(
+                canonical_name,
+                str(field_def["field_type"]),
+                source=str(field_def["source"]),
+                instruction=field_def.get("instruction"),
+                displayable=str(field_def.get("displayable") or "").lower() == "true",
+            )
+        )
+    return sorted(entries, key=lambda item: (str(item["name"]).lower(), str(item["name"])))
+
+
+def displayable_field_entries(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for field_name in displayable_field_names(connection):
+        field_def = resolve_field_definition(connection, field_name)
+        entries.append(
+            catalog_field_entry(
+                str(field_def["field_name"]),
+                str(field_def["field_type"]),
+                source=str(field_def["source"]),
+                instruction=field_def.get("instruction"),
+                displayable=True,
+            )
+        )
+    return entries
+
+
+def active_sort_payload(scope: dict[str, object], session_state: dict[str, object]) -> dict[str, object]:
+    sort_specs = session_sort_specs(session_state)
+    if sort_specs:
+        field_name, direction = sort_specs[0]
+        return {
+            "sort": field_name,
+            "order": direction,
+            "sort_spec": sort_specs_text(sort_specs) or f"{field_name} {direction}",
+            "sort_source": "override",
+            "sort_override": serialize_sort_specs(sort_specs),
+        }
+
+    if isinstance(scope.get("bates"), dict):
+        return {
+            "sort": "bates",
+            "order": "asc",
+            "sort_spec": "bates asc",
+            "sort_source": "default",
+        }
+
+    if normalize_inline_whitespace(str(scope.get("keyword") or "")):
+        return {
+            "sort": "relevance",
+            "order": "asc",
+            "sort_spec": "relevance asc",
+            "sort_source": "default",
+        }
+
+    return {
+        "sort": "date_created",
+        "order": "desc",
+        "sort_spec": "date_created desc",
+        "sort_source": "default",
+    }
+
+
+def active_page_payload(session_state: dict[str, object]) -> dict[str, int]:
+    per_page = session_page_size(session_state)
+    browsing = session_browsing_state(session_state)
+    offset = int(browsing.get("offset") or 0)
+    total_known = int(browsing.get("total_known") or 0)
+    total_pages = max(1, (total_known + per_page - 1) // per_page)
+    if total_known > 0 and offset >= total_known:
+        offset = max(0, (total_pages - 1) * per_page)
+    return {
+        "page": (offset // per_page) + 1,
+        "per_page": per_page,
+        "offset": offset,
+        "total_known": total_known,
+        "total_pages": total_pages,
+    }
+
+
 def clear_session_browsing(session_state: dict[str, object]) -> dict[str, object]:
     session_state["browsing"] = {}
     return session_state
@@ -3103,6 +3212,10 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
             if not scope_args:
                 return {"status": "ok", "scope": scope}
             subcommand = scope_args[0]
+            if subcommand == "list":
+                if len(scope_args) != 1:
+                    raise RetrieverError("Usage: /scope list")
+                return {"status": "ok", "saved_scopes": saved_scope_summaries(paths)}
             if subcommand == "clear":
                 return run_scope_search_from_session(root, paths, {})
             if subcommand == "save":
@@ -3123,7 +3236,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
 
         if command_name == "page-size":
             if not normalized_tail:
-                raise RetrieverError("Usage: /page-size <N>")
+                return {"status": "ok", "page_size": session_page_size(session_state)}
             updated_session_state = read_session_state(paths)
             display_state = session_display_state(updated_session_state)
             display_state["page_size"] = parse_page_size_value(normalized_tail)
@@ -3142,6 +3255,12 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
                 if warnings:
                     payload["warnings"] = warnings
                 return payload
+
+            if normalized_tail == "list":
+                return {
+                    "status": "ok",
+                    "columns": displayable_field_entries(connection),
+                }
 
             if normalized_tail == "default":
                 display_state = session_display_state(updated_session_state)
@@ -3184,9 +3303,11 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
             return run_browsing_search_from_session(root, paths, updated_session_state)
 
         if command_name == "sort":
-            if not normalized_tail:
-                raise RetrieverError("Usage: /sort <column asc|desc[, column asc|desc...]> or /sort default")
             updated_session_state = read_session_state(paths)
+            if not normalized_tail:
+                return {"status": "ok", **active_sort_payload(scope, updated_session_state)}
+            if normalized_tail == "list":
+                return {"status": "ok", "sortable_fields": sortable_field_entries(connection)}
             if normalized_tail == "default":
                 return run_browsing_search_from_session(root, paths, updated_session_state, offset=0, sort_specs=[])
             sort_specs = parse_slash_sort_specs(connection, normalized_tail)
@@ -3200,9 +3321,9 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
             return run_browsing_search_from_session(root, paths, updated_session_state, offset=target_offset)
 
         if command_name == "page":
-            if not normalized_tail:
-                raise RetrieverError("Usage: /page <N|first|last|next|previous>")
             updated_session_state = read_session_state(paths)
+            if not normalized_tail:
+                return {"status": "ok", **active_page_payload(updated_session_state)}
             per_page = session_page_size(updated_session_state)
             current_offset = int(session_browsing_state(updated_session_state).get("offset") or 0)
             page_token = normalize_inline_whitespace(normalized_tail).lower()
@@ -3226,7 +3347,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
 
         if command_name == "search":
             if not normalized_tail:
-                raise RetrieverError("Usage: /search <text>, /search --within <text>, /search --fts <text>, or /search clear")
+                return {"status": "ok", "keyword": normalize_inline_whitespace(str(scope.get("keyword") or "")) or None}
             if normalized_tail == "clear":
                 scope.pop("keyword", None)
                 scope.pop("bates", None)
@@ -3263,7 +3384,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
 
         if command_name == "bates":
             if not normalized_tail:
-                raise RetrieverError("Usage: /bates <token|range> or /bates clear")
+                return {"status": "ok", "bates": scope.get("bates")}
             if normalized_tail == "clear":
                 scope.pop("bates", None)
                 return run_scope_search_from_session(root, paths, scope)
@@ -3272,7 +3393,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
 
         if command_name == "filter":
             if not normalized_tail:
-                raise RetrieverError("Usage: /filter <expression> or /filter clear")
+                return {"status": "ok", "filter": normalize_inline_whitespace(str(scope.get("filter") or "")) or None}
             if normalized_tail == "clear":
                 scope.pop("filter", None)
                 return run_scope_search_from_session(root, paths, scope)
@@ -3283,8 +3404,12 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
 
         if command_name == "dataset":
             if not normalized_tail:
-                raise RetrieverError("Usage: /dataset <name[, name...]>, /dataset clear, or /dataset rename <old> <new>")
+                return {"status": "ok", "dataset": coerce_scope_dataset_entries(scope.get("dataset"))}
             dataset_args = shlex_split_slash_tail(normalized_tail)
+            if dataset_args and dataset_args[0] == "list":
+                if len(dataset_args) != 1:
+                    raise RetrieverError("Usage: /dataset list")
+                return {"status": "ok", "datasets": list_dataset_summaries(connection)}
             if dataset_args and dataset_args[0] == "clear":
                 scope.pop("dataset", None)
                 return run_scope_search_from_session(root, paths, scope)
@@ -3309,7 +3434,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
 
         if command_name == "from-run":
             if not normalized_tail:
-                raise RetrieverError("Usage: /from-run <id> or /from-run clear")
+                return {"status": "ok", "from_run_id": scope.get("from_run_id")}
             if normalized_tail == "clear":
                 scope.pop("from_run_id", None)
                 return run_scope_search_from_session(root, paths, scope)

@@ -7,6 +7,8 @@
 - Retriever now exposes two complementary search surfaces:
   - stateless CLI `search ...`
   - persistent slash commands `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, and `/columns`
+  - bare commands inspect active state where supported (`/scope`, `/dataset`, `/sort`, `/page`, `/page-size`, `/columns`)
+  - `list` subcommands show available options (`/scope list`, `/dataset list`, `/sort list`, `/columns list`)
 - A scope is a conjunctive selector over document fields. In the current implementation it may include a keyword slot, a Bates slot, a SQL-like filter slot, a dataset slot, and a `from_run_id` slot.
 - Build metadata constraints with repeatable SQL-like `--filter "<expression>"` clauses. Repeated `--filter` flags AND-compose.
 - The filter grammar applies to Retriever's logical document field set, not only raw table columns. Supported names include built-in fields, registered custom fields, and schema-defined virtual fields such as `production_name`, `is_attachment`, and `has_attachments`.
