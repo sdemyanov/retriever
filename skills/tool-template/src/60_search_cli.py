@@ -1680,6 +1680,15 @@ def search(
             payload["warnings"] = display_warnings
         if normalized_mode == "view":
             payload["rendered_markdown"] = render_search_markdown(payload, display_column_defs)
+            explicit_sort_specs = None
+            if sort_field:
+                explicit_sort_specs = [(str(selection["sort"]), str(selection["order"]))]
+            persist_direct_view_search_result(
+                root,
+                payload,
+                display_column_defs,
+                sort_specs=explicit_sort_specs,
+            )
         return payload
     finally:
         connection.close()
@@ -1918,6 +1927,26 @@ def persist_display_columns(
         display_state.pop("columns", None)
     else:
         display_state["columns"] = column_names
+    session_state["display"] = coerce_display_payload(display_state)
+    return persist_session_state(paths, session_state)
+
+
+def persist_display_preferences(
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+    column_defs: list[dict[str, str]],
+    page_size: int,
+) -> dict[str, object]:
+    display_state = session_display_state(session_state)
+    column_names = display_column_names(column_defs)
+    if column_names == default_display_columns():
+        display_state.pop("columns", None)
+    else:
+        display_state["columns"] = column_names
+    if page_size == DEFAULT_PAGE_SIZE:
+        display_state.pop("page_size", None)
+    else:
+        display_state["page_size"] = page_size
     session_state["display"] = coerce_display_payload(display_state)
     return persist_session_state(paths, session_state)
 
@@ -3149,6 +3178,26 @@ def persist_browsing_search_result(
         browsing_payload["sort"] = serialize_sort_specs(sort_specs)
     session_state["browsing"] = browsing_payload
     persist_session_state(paths, session_state)
+    return payload
+
+
+def persist_direct_view_search_result(
+    root: Path,
+    payload: dict[str, object],
+    column_defs: list[dict[str, str]],
+    *,
+    sort_specs: list[tuple[str, str]] | None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    session_state = read_session_state(paths)
+    persisted_session_state = persist_display_preferences(
+        paths,
+        session_state,
+        column_defs,
+        int(payload.get("per_page") or DEFAULT_PAGE_SIZE),
+    )
+    persist_browsing_search_result(paths, persisted_session_state, payload, sort_specs)
     return payload
 
 

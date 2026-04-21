@@ -6301,6 +6301,42 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(next_payload["per_page"], 5)
         self.assertEqual(next_payload["page"], 2)
 
+    def test_view_search_persists_browse_page_size_for_followup_slash_navigation(self) -> None:
+        for index in range(25):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 25)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "document",
+            "--mode",
+            "view",
+            "--per-page",
+            "10",
+        )
+        next_exit, next_payload, _, _ = self.run_cli("slash", str(self.root), "/next")
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        self.assertEqual(search_payload["page"], 1)
+        self.assertEqual(search_payload["per_page"], 10)
+        self.assertEqual(len(search_payload["results"]), 10)
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["display"]["page_size"], 10)
+        self.assertEqual(session_payload["scope"]["keyword"], "document")
+
+        self.assertEqual(next_exit, 0)
+        self.assertIsNotNone(next_payload)
+        self.assertEqual(next_payload["offset"], 10)
+        self.assertEqual(next_payload["per_page"], 10)
+        self.assertEqual(next_payload["page"], 2)
+        self.assertEqual(len(next_payload["results"]), 10)
+
     def test_slash_search_drops_stale_display_columns_with_warning(self) -> None:
         (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
 
