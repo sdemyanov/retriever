@@ -8,7 +8,7 @@
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `1551c486d5b68ad831f7993963d047c0cd6d8e8072d56e3c3c8810b31451780a`
+- source checksum (SHA256): `df6b24376fa4f38115096354a71fc014ef66714a1fc3d6a2aed42a3bacae168c`
 
 ## Current command surface
 
@@ -36,6 +36,7 @@ The current template implements:
 - `merge-into-conversation`
 - `split-from-conversation`
 - `clear-conversation-assignment`
+- `upgrade-workspace`
 - `list-datasets`
 - `create-dataset`
 - `add-to-dataset`
@@ -88,6 +89,17 @@ For Cowork-agent execution, prefer the queue path:
 - Mark it executable
 - Record the copied file checksum in `.retriever/runtime.json`
 - Do not overwrite a modified workspace copy without backup and explicit user approval
+
+## Auto-upgrade dispatch
+
+The tool's `main()` calls `maybe_upgrade_workspace_tool(root)` before any command outside the exempt set `{schema-version, bootstrap, doctor, upgrade-workspace, slash}`. If the workspace copy is clean-but-stale relative to the plugin's canonical template, it is backed up to `.retriever/bin/backups/`, replaced via `pathlib.Path.write_bytes` (open-with-O_TRUNC, so no `unlink` is needed in Cowork sandboxes), and the tool re-execs so the current command runs from the new code. A user-modified copy is refused and a `retriever-auto-upgrade: {"status": "blocked", ...}` line is written to stderr; the current command still runs in that case.
+
+The canonical plugin template is discovered via:
+
+1. `RETRIEVER_CANONICAL_TOOL_PATH` (environment variable)
+2. Parent-walk from the currently running tool looking for `skills/tool-template/retriever_tools.py`
+
+`upgrade-workspace <workspace> [--from <path>] [--force]` is the explicit equivalent of the auto path.
 
 ## Implementation note
 

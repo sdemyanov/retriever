@@ -7,12 +7,29 @@
 - Retriever now exposes two complementary search surfaces:
   - stateless CLI `search ...`
   - persistent slash commands `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, and `/columns`
+  - bare commands inspect active state where supported (`/scope`, `/dataset`, `/sort`, `/page`, `/page-size`, `/columns`)
+  - `list` subcommands show available options (`/scope list`, `/dataset list`, `/sort list`, `/columns list`)
 - A scope is a conjunctive selector over document fields. In the current implementation it may include a keyword slot, a Bates slot, a SQL-like filter slot, a dataset slot, and a `from_run_id` slot.
 - Build metadata constraints with repeatable SQL-like `--filter "<expression>"` clauses. Repeated `--filter` flags AND-compose.
 - The filter grammar applies to Retriever's logical document field set, not only raw table columns. Supported names include built-in fields, registered custom fields, and schema-defined virtual fields such as `production_name`, `is_attachment`, and `has_attachments`.
-- Use the canonical stateless `search` CLI flags `--sort`, `--order`, `--page`, `--per-page`, and `--columns` for sorting, paging, and display control.
+- Use the canonical stateless `search` CLI flags `--sort`, `--order`, `--page`, `--per-page`, `--columns`, and `--mode` for sorting, paging, display control, and response mode.
 - Map "show N" style requests to `--page 1 --per-page N`; do not invent `--limit`.
 - Use canonical built-in field names such as `date_created`, not ad hoc variants like `created_date`.
+
+## View vs compose
+
+- `--mode compose` is the default. Use it when the user wants a summary, count, explanation, draft, comparison, or any answer that is about the documents rather than the listing itself.
+- `--mode view` is for table-shaped requests only. In view mode the tool returns a `rendered_markdown` field containing the complete pre-formatted result table.
+- When `rendered_markdown` is present for a view request, forward it as the entire reply and nothing else: no preamble, no trailing commentary, no code fences, no reformatting, and no follow-up summary sentence.
+- The view-mode response must terminate immediately after the table footer. Any extra prose after `Documents X–Y of Z ...` is a contract violation, not a stylistic choice.
+
+## Compose-mode answer style
+
+- Default to a concise answer. Use one short paragraph for straightforward summaries; use two short paragraphs only when chronology, comparison, or uncertainty genuinely needs the extra space.
+- Ground the answer in the top matching documents rather than in a sweeping collection-wide narrative. When the main conclusion rests on a few documents, name or cite those `control_number` items directly.
+- Prefer "the top hits indicate ..." over definitive broad claims when the answer is based on a limited result page.
+- Do not add commentary about unrelated matches, corpus noise, or synthetic-dataset structure unless the user asked for noise analysis or that caveat materially changes the answer.
+- If there is real ambiguity or mixed evidence, say so briefly instead of smoothing it into a single confident storyline.
 
 Supported SQL-like filter operators:
 
@@ -51,7 +68,7 @@ Production-aware query behavior:
 
 ## OUTPUT FORMAT (mandatory)
 
-Unless the user explicitly asks for a different layout, every search result set MUST use a table driven by the active display column set.
+When you are in compose mode and the user explicitly wants a rendered result set, every search result set MUST use a table driven by the active display column set.
 This is mandatory for all result types: keyword searches, filtered browses, ranked requests ("show 10 largest"), and any other document listing.
 Always show the active search header immediately before the table:
 
@@ -174,7 +191,7 @@ When the user asks to inspect fields or columns:
 
 ## Paging
 
-- Default page size: 20
+- Default page size: 10
 - Show `Documents X-Y of Z`
 - Tell the user how to ask for the next page when there are more results
 

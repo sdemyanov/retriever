@@ -268,6 +268,40 @@ def chunk_text(text: str, max_chars: int = CHUNK_TARGET_CHARS, overlap: int = CH
     return chunks
 
 
+def extracted_search_chunks(extracted: dict[str, object]) -> list[dict[str, object]]:
+    raw_chunks = extracted.get("chunks")
+    if isinstance(raw_chunks, list):
+        normalized_chunks: list[dict[str, object]] = []
+        for index, raw_chunk in enumerate(raw_chunks):
+            if not isinstance(raw_chunk, dict):
+                continue
+            text_content = normalize_whitespace(str(raw_chunk.get("text_content") or ""))
+            if not text_content:
+                continue
+            normalized_chunks.append(
+                {
+                    "chunk_index": int(raw_chunk.get("chunk_index", index)),
+                    "char_start": int(raw_chunk.get("char_start", 0)),
+                    "char_end": int(raw_chunk.get("char_end", len(text_content))),
+                    "token_estimate": int(raw_chunk.get("token_estimate", token_estimate(text_content))),
+                    "text_content": text_content,
+                }
+            )
+        return normalized_chunks
+    return chunk_text(str(extracted.get("text_content") or ""))
+
+
+SPREADSHEET_TYPE_SAMPLE_LIMIT = 50
+SPREADSHEET_MAX_COLUMNS_PER_SHEET = 100
+SPREADSHEET_MAX_COMMENTS_PER_SHEET = 200
+SPREADSHEET_MAX_HYPERLINKS_PER_WORKBOOK = 200
+SPREADSHEET_MAX_NAMED_RANGES = 500
+SPREADSHEET_MAX_ENUM_VALUES = 64
+SPREADSHEET_MAX_PARTICIPANTS = 32
+SPREADSHEET_MAX_SUMMARY_CHARS = 64 * 1024
+SPREADSHEET_XLSX_READ_ONLY_FALLBACK_BYTES = 50 * 1024 * 1024
+
+
 SLACK_USER_DIRECTORY_CACHE: dict[str, dict[str, dict[str, str | None]]] = {}
 SLACK_USER_MENTION_PATTERN = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
 SLACK_CHANNEL_MENTION_PATTERN = re.compile(r"<#([A-Z0-9]+)(?:\|([^>]+))?>")
@@ -847,102 +881,990 @@ def extract_docx_file(path: Path) -> dict[str, object]:
     }
 
 
-def sheet_to_csv(sheet: object) -> str:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    for row in sheet.iter_rows(values_only=True):
-        writer.writerow([stringify_spreadsheet_value(value) for value in row])
-    return output.getvalue()
-
-
 def stringify_spreadsheet_value(value: object) -> object:
     if value is None:
         return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, datetime):
+        return normalize_datetime(value) or value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return value
 
 
-def extract_xlsx_file(path: Path) -> dict[str, object]:
-    dependency_guard(openpyxl, "openpyxl", "xlsx")
-    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)  # type: ignore[union-attr]
-    preview_artifacts: list[dict[str, object]] = []
-    sheet_texts: list[str] = []
-    try:
-        for ordinal, sheet in enumerate(workbook.worksheets):
-            csv_text = sheet_to_csv(sheet)
-            preview_artifacts.append(
+def spreadsheet_column_label(column_index: int) -> str:
+    index = max(1, int(column_index))
+    letters: list[str] = []
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters))
+
+
+def spreadsheet_text_value(value: object) -> str:
+    rendered = stringify_spreadsheet_value(value)
+    if rendered == "":
+        return ""
+    return normalize_inline_whitespace(str(rendered))
+
+
+def spreadsheet_value_is_present(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def spreadsheet_row_last_nonempty_index(values: list[object]) -> int:
+    for index in range(len(values), 0, -1):
+        if spreadsheet_value_is_present(values[index - 1]):
+            return index
+    return 0
+
+
+def normalize_spreadsheet_headers(raw_headers: list[object], column_count: int) -> list[str]:
+    headers: list[str] = []
+    seen: dict[str, int] = {}
+    for column_index in range(1, column_count + 1):
+        raw_value = raw_headers[column_index - 1] if column_index - 1 < len(raw_headers) else None
+        base = spreadsheet_text_value(raw_value) or f"Column {spreadsheet_column_label(column_index)}"
+        key = base.casefold()
+        seen[key] = seen.get(key, 0) + 1
+        headers.append(base if seen[key] == 1 else f"{base} ({seen[key]})")
+    return headers
+
+
+def append_spreadsheet_participants(
+    participants: list[str],
+    seen: set[str],
+    raw_values: list[str | None],
+) -> None:
+    if len(participants) >= SPREADSHEET_MAX_PARTICIPANTS:
+        return
+    append_unique_participants(participants, seen, raw_values)
+    if len(participants) > SPREADSHEET_MAX_PARTICIPANTS:
+        del participants[SPREADSHEET_MAX_PARTICIPANTS:]
+
+
+def spreadsheet_number_format_hint(number_formats: list[str]) -> str | None:
+    for raw_format in number_formats:
+        normalized = str(raw_format or "").strip().lower()
+        if not normalized or normalized == "general":
+            continue
+        if "%" in normalized:
+            return "percent"
+        if "[$" in normalized or any(symbol in normalized for symbol in ("$", "€", "£", "¥", "₹")):
+            return "currency"
+        if any(token in normalized for token in ("yy", "dd", "mmm", "am/pm")):
+            if any(token in normalized for token in ("h", "ss", "am/pm")):
+                return "datetime"
+            return "date"
+    return None
+
+
+def spreadsheet_string_shape(text: str) -> str:
+    normalized = text.strip()
+    lowered = normalized.lower()
+    if not normalized:
+        return "string"
+    if lowered in {"true", "false", "yes", "no", "y", "n"}:
+        return "boolean"
+    if re.fullmatch(r"[$€£¥₹]\s*[-+]?\d[\d,]*(?:\.\d+)?", normalized):
+        return "currency"
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?%", normalized):
+        return "percent"
+    if re.fullmatch(r"[-+]?\d+", normalized):
+        return "integer"
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][-+]?\d+)?", normalized) or re.fullmatch(
+        r"[-+]?\d+[eE][-+]?\d+",
+        normalized,
+    ):
+        return "number"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?", normalized):
+        return "datetime"
+    if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?", normalized, re.IGNORECASE):
+        return "datetime"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+        return "date"
+    if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", normalized):
+        return "date"
+    return "string"
+
+
+def infer_spreadsheet_value_kind(value: object) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, datetime):
+        return "datetime"
+    if isinstance(value, date):
+        return "date"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "integer" if value.is_integer() else "number"
+    if isinstance(value, str):
+        return spreadsheet_string_shape(value)
+    return "string"
+
+
+def infer_spreadsheet_column_type(
+    samples: list[object],
+    number_formats: list[str],
+    *,
+    force_enum: bool = False,
+) -> str:
+    if force_enum:
+        return "enum"
+    format_hint = spreadsheet_number_format_hint(number_formats)
+    if format_hint is not None:
+        return format_hint
+    sample_kinds = {infer_spreadsheet_value_kind(value) for value in samples if spreadsheet_value_is_present(value)}
+    if not sample_kinds:
+        return "string"
+    if sample_kinds <= {"boolean"}:
+        return "boolean"
+    if sample_kinds <= {"integer"}:
+        return "integer"
+    if sample_kinds <= {"integer", "number"}:
+        return "number" if "number" in sample_kinds else "integer"
+    if sample_kinds <= {"date"}:
+        return "date"
+    if sample_kinds <= {"date", "datetime"}:
+        return "datetime" if "datetime" in sample_kinds else "date"
+    if "currency" in sample_kinds and sample_kinds <= {"currency", "integer", "number"}:
+        return "currency"
+    if "percent" in sample_kinds and sample_kinds <= {"percent", "integer", "number"}:
+        return "percent"
+    return "string"
+
+
+def build_spreadsheet_sheet_section(
+    sheet_name: str,
+    column_descriptors: list[str],
+    *,
+    hidden_column_count: int = 0,
+    comment_lines: list[str] | None = None,
+    comment_overflow: int = 0,
+    validation_lines: list[str] | None = None,
+    hyperlink_lines: list[str] | None = None,
+    chart_lines: list[str] | None = None,
+) -> str:
+    lines = [f"Sheet: {sheet_name}"]
+    if column_descriptors:
+        lines.append(f"Columns: {', '.join(column_descriptors)}")
+    else:
+        lines.append("Columns: none detected")
+    if hidden_column_count > 0:
+        lines.append(f"Columns truncated: {hidden_column_count} more columns not listed.")
+    if comment_lines:
+        lines.append("Comments:")
+        lines.extend(comment_lines)
+    if comment_overflow > 0:
+        lines.append(f"Comments truncated: {comment_overflow} more comments not listed.")
+    if validation_lines:
+        lines.append("Validations:")
+        lines.extend(validation_lines)
+    if hyperlink_lines:
+        lines.append("Hyperlinks:")
+        lines.extend(hyperlink_lines)
+    if chart_lines:
+        lines.append("Charts:")
+        lines.extend(chart_lines)
+    return normalize_whitespace("\n".join(lines))
+
+
+def build_spreadsheet_header_section(
+    *,
+    title: str,
+    sheet_names: list[str],
+    author: str | None,
+    subject: str | None,
+    participants: str | None,
+    parse_note: str | None = None,
+) -> str:
+    lines = [
+        f"Workbook: {title}",
+        f"Sheets: {', '.join(sheet_names) if sheet_names else title}",
+    ]
+    if author:
+        lines.append(f"Author: {author}")
+    if subject:
+        lines.append(f"Subject: {subject}")
+    if participants:
+        lines.append(f"Participants: {participants}")
+    if parse_note:
+        lines.append(parse_note)
+    return normalize_whitespace("\n".join(lines))
+
+
+def build_structural_summary_from_sections(sections: list[str]) -> tuple[str, list[dict[str, object]]]:
+    normalized_sections = [normalize_whitespace(section) for section in sections if normalize_whitespace(section)]
+    if not normalized_sections:
+        return "", []
+
+    kept_sections: list[str] = []
+    truncation_note = "Structural summary truncated."
+    for section in normalized_sections:
+        candidate_text = normalize_whitespace("\n\n".join([*kept_sections, section]))
+        if len(candidate_text) <= SPREADSHEET_MAX_SUMMARY_CHARS:
+            kept_sections.append(section)
+            continue
+        candidate_with_note = normalize_whitespace("\n\n".join([*kept_sections, truncation_note]))
+        while kept_sections and len(candidate_with_note) > SPREADSHEET_MAX_SUMMARY_CHARS:
+            kept_sections.pop()
+            candidate_with_note = normalize_whitespace("\n\n".join([*kept_sections, truncation_note]))
+        if len(candidate_with_note) <= SPREADSHEET_MAX_SUMMARY_CHARS:
+            kept_sections.append(truncation_note)
+        else:
+            kept_sections = [truncation_note[:SPREADSHEET_MAX_SUMMARY_CHARS]]
+        break
+
+    text_content = normalize_whitespace("\n\n".join(kept_sections))
+    chunks: list[dict[str, object]] = []
+    chunk_index = 0
+    char_cursor = 0
+    for section_index, section in enumerate(kept_sections):
+        if section_index > 0:
+            char_cursor += 2
+        for section_chunk in chunk_text(section):
+            chunks.append(
                 {
-                    "file_name": f"{path.name}.{slugify(sheet.title)}.csv",
-                    "preview_type": "csv",
-                    "label": sheet.title,
-                    "ordinal": ordinal,
-                    "content": csv_text,
+                    "chunk_index": chunk_index,
+                    "char_start": char_cursor + int(section_chunk["char_start"]),
+                    "char_end": char_cursor + int(section_chunk["char_end"]),
+                    "token_estimate": int(section_chunk["token_estimate"]),
+                    "text_content": str(section_chunk["text_content"]),
                 }
             )
-            text_block = normalize_whitespace(csv_text)
-            if text_block:
-                sheet_texts.append(f"Sheet: {sheet.title}\n{text_block}")
+            chunk_index += 1
+        char_cursor += len(section)
+    return text_content, chunks
+
+
+def parse_spreadsheet_literal_list(formula: str) -> list[str]:
+    inner = formula[1:-1]
+    try:
+        values = next(csv.reader([inner]))
+    except Exception:
+        values = [part.strip() for part in inner.split(",")]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = spreadsheet_text_value(value)
+        if not normalized:
+            continue
+        key = normalized.casefold()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(normalized)
+        if len(deduped) >= SPREADSHEET_MAX_ENUM_VALUES:
+            break
+    return deduped
+
+
+def flatten_openpyxl_range_cells(range_cells: object) -> list[object]:
+    if range_cells is None:
+        return []
+    if isinstance(range_cells, tuple):
+        flattened: list[object] = []
+        for item in range_cells:
+            flattened.extend(flatten_openpyxl_range_cells(item))
+        return flattened
+    return [range_cells]
+
+
+def resolve_openpyxl_reference_values(workbook: object, reference: object) -> list[str]:
+    normalized_reference = normalize_inline_whitespace(str(reference or "")).lstrip("=")
+    if not normalized_reference:
+        return []
+
+    values: list[str] = []
+    if normalized_reference.startswith('"') and normalized_reference.endswith('"'):
+        return parse_spreadsheet_literal_list(normalized_reference)
+
+    destinations: list[tuple[str, str]] = []
+    direct_match = re.fullmatch(r"(?:'((?:[^']|'')+)'|([^!]+))!(.+)", normalized_reference)
+    if direct_match:
+        sheet_name = direct_match.group(1) or direct_match.group(2) or ""
+        destinations.append((sheet_name.replace("''", "'"), direct_match.group(3)))
+    else:
+        defined_name = getattr(workbook, "defined_names", {}).get(normalized_reference)
+        if defined_name is not None:
+            try:
+                destinations.extend(list(defined_name.destinations))
+            except Exception:
+                pass
+
+    seen: set[str] = set()
+    for sheet_name, range_ref in destinations:
+        try:
+            sheet = workbook[sheet_name]
+            resolved_cells = flatten_openpyxl_range_cells(sheet[range_ref])
+        except Exception:
+            continue
+        for cell in resolved_cells:
+            normalized_value = spreadsheet_text_value(getattr(cell, "value", None))
+            if not normalized_value:
+                continue
+            key = normalized_value.casefold()
+            if key not in seen:
+                seen.add(key)
+                values.append(normalized_value)
+            if len(values) >= SPREADSHEET_MAX_ENUM_VALUES:
+                return values
+    return values
+
+
+def extract_openpyxl_chart_text(workbook: object, title: object) -> str | None:
+    if title is None:
+        return None
+    if isinstance(title, str):
+        return spreadsheet_text_value(title) or None
+    tx = getattr(title, "tx", None)
+    rich = getattr(tx, "rich", None) or getattr(title, "rich", None)
+    if rich is not None:
+        parts: list[str] = []
+        for paragraph in getattr(rich, "p", []) or []:
+            for run in getattr(paragraph, "r", []) or []:
+                text_value = spreadsheet_text_value(getattr(run, "t", None))
+                if text_value:
+                    parts.append(text_value)
+        if parts:
+            return " ".join(parts)
+    str_ref = getattr(tx, "strRef", None) or getattr(title, "strRef", None)
+    formula = getattr(str_ref, "f", None)
+    if formula:
+        values = resolve_openpyxl_reference_values(workbook, formula)
+        if values:
+            return values[0]
+    return None
+
+
+def extract_openpyxl_chart_lines(workbook: object, sheet: object) -> list[str]:
+    lines: list[str] = []
+    for chart in getattr(sheet, "_charts", []) or []:
+        title = extract_openpyxl_chart_text(workbook, getattr(chart, "title", None))
+        x_axis = extract_openpyxl_chart_text(workbook, getattr(getattr(chart, "x_axis", None), "title", None))
+        y_axis = extract_openpyxl_chart_text(workbook, getattr(getattr(chart, "y_axis", None), "title", None))
+        parts: list[str] = []
+        if title:
+            parts.append(title)
+        if x_axis:
+            parts.append(f"X axis: {x_axis}")
+        if y_axis:
+            parts.append(f"Y axis: {y_axis}")
+        if parts:
+            lines.append(f"- {'; '.join(parts)}")
+    return lines
+
+
+def openpyxl_validation_map(workbook: object, sheet: object, headers: list[str], header_row_index: int | None) -> dict[int, list[str]]:
+    validation_map: dict[int, list[str]] = {}
+    if header_row_index is None:
+        return validation_map
+    data_validations = getattr(getattr(sheet, "data_validations", None), "dataValidation", None)
+    if not data_validations:
+        return validation_map
+
+    for validation in data_validations:
+        if str(getattr(validation, "type", "")).lower() != "list":
+            continue
+        formula = str(getattr(validation, "formula1", "") or "").strip()
+        if not formula:
+            continue
+        values = resolve_openpyxl_reference_values(workbook, formula)
+        if not values:
+            continue
+        try:
+            ranges = list(getattr(getattr(validation, "cells", None), "ranges", []) or [])
+        except Exception:
+            ranges = []
+        covered_columns: set[int] = set()
+        for cell_range in ranges:
+            if getattr(cell_range, "max_row", 0) and int(cell_range.max_row) < header_row_index:
+                continue
+            for column_index in range(int(cell_range.min_col), int(cell_range.max_col) + 1):
+                covered_columns.add(column_index)
+        for column_index in sorted(covered_columns):
+            validation_map[column_index] = values[:SPREADSHEET_MAX_ENUM_VALUES]
+    return validation_map
+
+
+def extract_openpyxl_named_ranges(workbook: object) -> list[str]:
+    lines: list[str] = []
+    for name, defined_name in getattr(workbook, "defined_names", {}).items():
+        normalized_name = spreadsheet_text_value(name)
+        if not normalized_name:
+            continue
+        lowered = normalized_name.casefold()
+        if lowered in {"_xlnm.print_area", "_xlnm.print_titles"}:
+            continue
+        target = spreadsheet_text_value(getattr(defined_name, "attr_text", None))
+        if not target:
+            try:
+                destinations = [f"{sheet_name}!{range_ref}" for sheet_name, range_ref in defined_name.destinations]
+            except Exception:
+                destinations = []
+            target = ", ".join(destinations)
+        if not target:
+            continue
+        lines.append(f"- {normalized_name} -> {target}")
+        if len(lines) >= SPREADSHEET_MAX_NAMED_RANGES:
+            break
+    return lines
+
+
+def scan_openpyxl_sheet_surface(
+    workbook: object,
+    sheet: object,
+    *,
+    read_only: bool,
+    workbook_hyperlinks_seen: set[str],
+    participants: list[str],
+    participant_seen: set[str],
+) -> dict[str, object]:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    header_row_index: int | None = None
+    raw_headers: list[object] = []
+    observed_columns = 0
+    column_samples: dict[int, list[object]] = defaultdict(list)
+    column_formats: dict[int, list[str]] = defaultdict(list)
+    comment_lines: list[str] = []
+    comment_overflow = 0
+    hyperlink_lines: list[str] = []
+
+    for row_index, row in enumerate(sheet.iter_rows(), start=1):
+        row_values = [getattr(cell, "value", None) for cell in row]
+        writer.writerow([stringify_spreadsheet_value(value) for value in row_values])
+        last_nonempty = spreadsheet_row_last_nonempty_index(row_values)
+
+        if header_row_index is None:
+            if last_nonempty == 0:
+                pass
+            else:
+                header_row_index = row_index
+                raw_headers = row_values[:last_nonempty]
+                observed_columns = max(observed_columns, last_nonempty)
+        else:
+            observed_columns = max(observed_columns, last_nonempty)
+            if last_nonempty > 0:
+                for column_index, cell in enumerate(row[:last_nonempty], start=1):
+                    value = getattr(cell, "value", None)
+                    if not spreadsheet_value_is_present(value):
+                        continue
+                    if len(column_samples[column_index]) < SPREADSHEET_TYPE_SAMPLE_LIMIT:
+                        column_samples[column_index].append(value)
+                    number_format = spreadsheet_text_value(getattr(cell, "number_format", None))
+                    if number_format and len(column_formats[column_index]) < SPREADSHEET_TYPE_SAMPLE_LIMIT:
+                        column_formats[column_index].append(number_format)
+
+        if read_only:
+            continue
+
+        for cell in row:
+            comment = getattr(cell, "comment", None)
+            if comment is not None:
+                author = spreadsheet_text_value(getattr(comment, "author", None)) or "Unknown"
+                body = normalize_whitespace(str(getattr(comment, "text", "") or ""))
+                if body:
+                    append_spreadsheet_participants(participants, participant_seen, [author])
+                    if len(comment_lines) < SPREADSHEET_MAX_COMMENTS_PER_SHEET:
+                        comment_lines.append(f"- {author}: {body}")
+                    else:
+                        comment_overflow += 1
+
+            hyperlink = getattr(cell, "hyperlink", None)
+            target = spreadsheet_text_value(getattr(hyperlink, "target", None) or getattr(hyperlink, "location", None))
+            if not target:
+                continue
+            display = spreadsheet_text_value(getattr(cell, "value", None))
+            rendered = target if not display or display == target else f"{target} ({display})"
+            hyperlink_key = rendered.casefold()
+            if hyperlink_key in workbook_hyperlinks_seen:
+                continue
+            if len(workbook_hyperlinks_seen) >= SPREADSHEET_MAX_HYPERLINKS_PER_WORKBOOK:
+                continue
+            workbook_hyperlinks_seen.add(hyperlink_key)
+            hyperlink_lines.append(f"- {rendered}")
+
+    headers = normalize_spreadsheet_headers(raw_headers, observed_columns)
+    validation_map = {} if read_only else openpyxl_validation_map(workbook, sheet, headers, header_row_index)
+    column_descriptors: list[str] = []
+    visible_column_count = min(len(headers), SPREADSHEET_MAX_COLUMNS_PER_SHEET)
+    for column_index in range(1, visible_column_count + 1):
+        header = headers[column_index - 1]
+        column_type = infer_spreadsheet_column_type(
+            column_samples.get(column_index, []),
+            column_formats.get(column_index, []),
+            force_enum=column_index in validation_map,
+        )
+        column_descriptors.append(f"{header} ({column_type})")
+
+    validation_lines: list[str] = []
+    for column_index in sorted(validation_map):
+        if column_index < 1 or column_index > len(headers):
+            continue
+        values = validation_map[column_index]
+        validation_lines.append(f"- {headers[column_index - 1]} ∈ {{{', '.join(values)}}}")
+
+    chart_lines = [] if read_only else extract_openpyxl_chart_lines(workbook, sheet)
+    return {
+        "sheet_name": str(sheet.title),
+        "preview_csv": output.getvalue(),
+        "column_descriptors": column_descriptors,
+        "hidden_column_count": max(0, len(headers) - SPREADSHEET_MAX_COLUMNS_PER_SHEET),
+        "comment_lines": comment_lines,
+        "comment_overflow": comment_overflow,
+        "validation_lines": validation_lines,
+        "hyperlink_lines": hyperlink_lines,
+        "chart_lines": chart_lines,
+    }
+
+
+def xls_cell_number_format(workbook: object, cell: object) -> str | None:
+    try:
+        xf = workbook.xf_list[cell.xf_index]
+        format_obj = workbook.format_map.get(xf.format_key)
+    except Exception:
+        return None
+    if format_obj is None:
+        return None
+    return spreadsheet_text_value(getattr(format_obj, "format_str", None)) or None
+
+
+def extract_xls_named_ranges(workbook: object) -> list[str]:
+    lines: list[str] = []
+    for name_obj in getattr(workbook, "name_obj_list", []) or []:
+        name = spreadsheet_text_value(getattr(name_obj, "name", None))
+        if not name:
+            continue
+        lowered = name.casefold()
+        if lowered in {"_xlnm.print_area", "_xlnm.print_titles"}:
+            continue
+        target = spreadsheet_text_value(getattr(name_obj, "formula_text", None) or getattr(name_obj, "raw_formula", None))
+        if not target:
+            continue
+        lines.append(f"- {name} -> {target}")
+        if len(lines) >= SPREADSHEET_MAX_NAMED_RANGES:
+            break
+    return lines
+
+
+def scan_xls_sheet_surface(
+    workbook: object,
+    sheet: object,
+    *,
+    workbook_hyperlinks_seen: set[str],
+    participants: list[str],
+    participant_seen: set[str],
+) -> dict[str, object]:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    header_row_index: int | None = None
+    raw_headers: list[object] = []
+    observed_columns = 0
+    column_samples: dict[int, list[object]] = defaultdict(list)
+    column_formats: dict[int, list[str]] = defaultdict(list)
+
+    for row_index in range(sheet.nrows):
+        row = sheet.row(row_index)
+        row_values = [cell.value for cell in row]
+        writer.writerow([stringify_spreadsheet_value(value) for value in row_values])
+        last_nonempty = spreadsheet_row_last_nonempty_index(row_values)
+
+        if header_row_index is None:
+            if last_nonempty == 0:
+                continue
+            header_row_index = row_index + 1
+            raw_headers = row_values[:last_nonempty]
+            observed_columns = max(observed_columns, last_nonempty)
+            continue
+
+        observed_columns = max(observed_columns, last_nonempty)
+        if last_nonempty == 0:
+            continue
+        for column_index, cell in enumerate(row[:last_nonempty], start=1):
+            if not spreadsheet_value_is_present(cell.value):
+                continue
+            if len(column_samples[column_index]) < SPREADSHEET_TYPE_SAMPLE_LIMIT:
+                column_samples[column_index].append(cell.value)
+            number_format = xls_cell_number_format(workbook, cell)
+            if number_format and len(column_formats[column_index]) < SPREADSHEET_TYPE_SAMPLE_LIMIT:
+                column_formats[column_index].append(number_format)
+
+    headers = normalize_spreadsheet_headers(raw_headers, observed_columns)
+    column_descriptors: list[str] = []
+    visible_column_count = min(len(headers), SPREADSHEET_MAX_COLUMNS_PER_SHEET)
+    for column_index in range(1, visible_column_count + 1):
+        header = headers[column_index - 1]
+        column_type = infer_spreadsheet_column_type(column_samples.get(column_index, []), column_formats.get(column_index, []))
+        column_descriptors.append(f"{header} ({column_type})")
+
+    comment_lines: list[str] = []
+    comment_overflow = 0
+    for note in getattr(sheet, "cell_note_map", {}).values():
+        author = spreadsheet_text_value(getattr(note, "author", None)) or "Unknown"
+        body = normalize_whitespace(str(getattr(note, "text", "") or ""))
+        if not body:
+            continue
+        append_spreadsheet_participants(participants, participant_seen, [author])
+        if len(comment_lines) < SPREADSHEET_MAX_COMMENTS_PER_SHEET:
+            comment_lines.append(f"- {author}: {body}")
+        else:
+            comment_overflow += 1
+
+    hyperlink_lines: list[str] = []
+    hyperlink_candidates = list(getattr(sheet, "hyperlink_list", []) or [])
+    hyperlink_candidates.extend(list(getattr(getattr(sheet, "hyperlink_map", {}), "values", lambda: [])()))
+    for hyperlink in hyperlink_candidates:
+        target = spreadsheet_text_value(
+            getattr(hyperlink, "url_or_path", None) or getattr(hyperlink, "target", None) or getattr(hyperlink, "url", None)
+        )
+        if not target:
+            continue
+        display = spreadsheet_text_value(getattr(hyperlink, "desc", None) or getattr(hyperlink, "description", None))
+        rendered = target if not display or display == target else f"{target} ({display})"
+        hyperlink_key = rendered.casefold()
+        if hyperlink_key in workbook_hyperlinks_seen:
+            continue
+        if len(workbook_hyperlinks_seen) >= SPREADSHEET_MAX_HYPERLINKS_PER_WORKBOOK:
+            continue
+        workbook_hyperlinks_seen.add(hyperlink_key)
+        hyperlink_lines.append(f"- {rendered}")
+
+    return {
+        "sheet_name": str(sheet.name),
+        "preview_csv": output.getvalue(),
+        "column_descriptors": column_descriptors,
+        "hidden_column_count": max(0, len(headers) - SPREADSHEET_MAX_COLUMNS_PER_SHEET),
+        "comment_lines": comment_lines,
+        "comment_overflow": comment_overflow,
+        "validation_lines": [],
+        "hyperlink_lines": hyperlink_lines,
+        "chart_lines": [],
+    }
+
+
+def extract_xlsx_file(path: Path) -> dict[str, object]:
+    dependency_guard(openpyxl, "openpyxl", "xlsx")
+    read_only = path.stat().st_size > SPREADSHEET_XLSX_READ_ONLY_FALLBACK_BYTES
+    workbook = openpyxl.load_workbook(path, read_only=read_only, data_only=True)  # type: ignore[union-attr]
+    preview_artifacts: list[dict[str, object]] = []
+    sections: list[str] = []
+    workbook_hyperlinks_seen: set[str] = set()
+    participants: list[str] = []
+    participant_seen: set[str] = set()
+    try:
+        props = getattr(workbook, "properties", None)
+        author = spreadsheet_text_value(getattr(props, "creator", None)) or None
+        title = spreadsheet_text_value(getattr(props, "title", None)) or path.stem
+        subject = spreadsheet_text_value(getattr(props, "subject", None)) or None
+        last_modified_by = spreadsheet_text_value(getattr(props, "lastModifiedBy", None)) or None
+        append_spreadsheet_participants(participants, participant_seen, [author, last_modified_by])
+
+        sheet_names = [str(sheet.title) for sheet in workbook.worksheets]
+        sections.append(
+            build_spreadsheet_header_section(
+                title=title,
+                sheet_names=sheet_names,
+                author=author,
+                subject=subject,
+                participants=None,
+                parse_note=(
+                    "Parse note: large-workbook read-only fallback; workbook properties and named ranges are preserved, "
+                    "but comments, hyperlinks, validations, charts, and other sheet-level details may be incomplete."
+                    if read_only
+                    else None
+                ),
+            )
+        )
+
+        for ordinal, sheet in enumerate(workbook.worksheets):
+            surface = scan_openpyxl_sheet_surface(
+                workbook,
+                sheet,
+                read_only=read_only,
+                workbook_hyperlinks_seen=workbook_hyperlinks_seen,
+                participants=participants,
+                participant_seen=participant_seen,
+            )
+            preview_artifacts.append(
+                {
+                    "file_name": f"{path.name}.{slugify(str(surface['sheet_name']))}.csv",
+                    "preview_type": "csv",
+                    "label": surface["sheet_name"],
+                    "ordinal": ordinal,
+                    "content": surface["preview_csv"],
+                }
+            )
+            sections.append(
+                build_spreadsheet_sheet_section(
+                    str(surface["sheet_name"]),
+                    list(surface["column_descriptors"]),
+                    hidden_column_count=int(surface["hidden_column_count"]),
+                    comment_lines=list(surface["comment_lines"]),
+                    comment_overflow=int(surface["comment_overflow"]),
+                    validation_lines=list(surface["validation_lines"]),
+                    hyperlink_lines=list(surface["hyperlink_lines"]),
+                    chart_lines=list(surface["chart_lines"]),
+                )
+            )
+
+        named_ranges = extract_openpyxl_named_ranges(workbook)
+        if named_ranges:
+            named_range_section_lines = ["Named ranges:"]
+            named_range_section_lines.extend(named_ranges)
+            if len(named_ranges) >= SPREADSHEET_MAX_NAMED_RANGES:
+                named_range_section_lines.append("Named ranges truncated: more named ranges not listed.")
+            sections.append(normalize_whitespace("\n".join(named_range_section_lines)))
     finally:
         workbook.close()
-    text_content = normalize_whitespace("\n\n".join(sheet_texts))
+
+    participants_text = ", ".join(participants) or None
+    if participants_text:
+        sections[0] = build_spreadsheet_header_section(
+            title=title,
+            sheet_names=sheet_names,
+            author=author,
+            subject=subject,
+            participants=participants_text,
+            parse_note=(
+                "Parse note: large-workbook read-only fallback; workbook properties and named ranges are preserved, "
+                "but comments, hyperlinks, validations, charts, and other sheet-level details may be incomplete."
+                if read_only
+                else None
+            ),
+        )
+    text_content, chunks = build_structural_summary_from_sections(sections)
     return {
         "page_count": len(preview_artifacts),
-        "author": None,
+        "author": author,
         "content_type": "Spreadsheet / Table",
-        "date_created": None,
-        "date_modified": None,
-        "participants": None,
-        "title": path.stem,
-        "subject": None,
+        "date_created": normalize_datetime(getattr(props, "created", None)),
+        "date_modified": normalize_datetime(getattr(props, "modified", None)),
+        "participants": participants_text,
+        "title": title,
+        "subject": subject,
         "recipients": None,
         "text_content": text_content,
         "text_status": "empty" if not text_content else "ok",
+        "chunks": chunks,
         "preview_artifacts": preview_artifacts,
     }
 
 
-def xls_sheet_to_csv(sheet: object) -> str:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    for row_idx in range(sheet.nrows):
-        writer.writerow([stringify_spreadsheet_value(sheet.cell_value(row_idx, col_idx)) for col_idx in range(sheet.ncols)])
-    return output.getvalue()
-
-
 def extract_xls_file(path: Path) -> dict[str, object]:
     dependency_guard(xlrd, "xlrd", "xls")
-    workbook = xlrd.open_workbook(path)  # type: ignore[union-attr]
+    workbook = xlrd.open_workbook(path, formatting_info=True)  # type: ignore[union-attr]
     preview_artifacts: list[dict[str, object]] = []
-    sheet_texts: list[str] = []
+    sections: list[str] = []
+    workbook_hyperlinks_seen: set[str] = set()
+    participants: list[str] = []
+    participant_seen: set[str] = set()
+
+    author = spreadsheet_text_value(getattr(workbook, "user_name", None)) or None
+    append_spreadsheet_participants(participants, participant_seen, [author])
+    sheet_names = [str(sheet.name) for sheet in workbook.sheets()]
+    sections.append(
+        build_spreadsheet_header_section(
+            title=path.stem,
+            sheet_names=sheet_names,
+            author=author,
+            subject=None,
+            participants=None,
+        )
+    )
+
     for ordinal, sheet in enumerate(workbook.sheets()):
-        csv_text = xls_sheet_to_csv(sheet)
+        surface = scan_xls_sheet_surface(
+            workbook,
+            sheet,
+            workbook_hyperlinks_seen=workbook_hyperlinks_seen,
+            participants=participants,
+            participant_seen=participant_seen,
+        )
         preview_artifacts.append(
             {
-                "file_name": f"{path.name}.{slugify(sheet.name)}.csv",
+                "file_name": f"{path.name}.{slugify(str(surface['sheet_name']))}.csv",
                 "preview_type": "csv",
-                "label": sheet.name,
+                "label": surface["sheet_name"],
                 "ordinal": ordinal,
-                "content": csv_text,
+                "content": surface["preview_csv"],
             }
         )
-        text_block = normalize_whitespace(csv_text)
-        if text_block:
-            sheet_texts.append(f"Sheet: {sheet.name}\n{text_block}")
-    text_content = normalize_whitespace("\n\n".join(sheet_texts))
+        sections.append(
+            build_spreadsheet_sheet_section(
+                str(surface["sheet_name"]),
+                list(surface["column_descriptors"]),
+                hidden_column_count=int(surface["hidden_column_count"]),
+                comment_lines=list(surface["comment_lines"]),
+                comment_overflow=int(surface["comment_overflow"]),
+                validation_lines=list(surface["validation_lines"]),
+                hyperlink_lines=list(surface["hyperlink_lines"]),
+                chart_lines=list(surface["chart_lines"]),
+            )
+        )
+
+    named_ranges = extract_xls_named_ranges(workbook)
+    if named_ranges:
+        named_range_section_lines = ["Named ranges:"]
+        named_range_section_lines.extend(named_ranges)
+        if len(named_ranges) >= SPREADSHEET_MAX_NAMED_RANGES:
+            named_range_section_lines.append("Named ranges truncated: more named ranges not listed.")
+        sections.append(normalize_whitespace("\n".join(named_range_section_lines)))
+
+    participants_text = ", ".join(participants) or None
+    if participants_text:
+        sections[0] = build_spreadsheet_header_section(
+            title=path.stem,
+            sheet_names=sheet_names,
+            author=author,
+            subject=None,
+            participants=participants_text,
+        )
+
+    text_content, chunks = build_structural_summary_from_sections(sections)
     return {
         "page_count": len(preview_artifacts),
-        "author": None,
+        "author": author,
         "content_type": "Spreadsheet / Table",
         "date_created": None,
         "date_modified": None,
-        "participants": None,
+        "participants": participants_text,
         "title": path.stem,
         "subject": None,
         "recipients": None,
         "text_content": text_content,
         "text_status": "empty" if not text_content else "ok",
+        "chunks": chunks,
         "preview_artifacts": preview_artifacts,
+    }
+
+
+def parse_csv_rows_for_summary(path: Path) -> tuple[list[list[str]], str]:
+    decoded, text_status, _ = decode_bytes(path.read_bytes())
+    normalized_text = decoded.lstrip("\ufeff")
+    rows_source = normalized_text
+    delimiter: str | None = None
+    first_line, _, remainder = normalized_text.partition("\n")
+    directive_match = re.fullmatch(r"\s*sep=(.)\s*", first_line)
+    if directive_match is not None:
+        delimiter = directive_match.group(1)
+        rows_source = remainder
+
+    if delimiter is None:
+        sample = rows_source[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",|\t;")
+            reader = csv.reader(io.StringIO(rows_source), dialect)
+        except csv.Error:
+            reader = csv.reader(io.StringIO(rows_source), csv.excel)
+    else:
+        reader = csv.reader(io.StringIO(rows_source), delimiter=delimiter)
+
+    rows = [[field.strip().strip("\ufeff") for field in row] for row in reader if any(field.strip() for field in row)]
+    return rows, text_status
+
+
+def csv_first_row_looks_like_header(row: list[str]) -> bool:
+    nonempty = [field.strip() for field in row if field.strip()]
+    if not nonempty:
+        return False
+    if len({value.casefold() for value in nonempty}) != len(nonempty):
+        return False
+    if any(len(value) > 120 for value in nonempty):
+        return False
+    numeric_like = sum(1 for value in nonempty if spreadsheet_string_shape(value) in {"integer", "number", "currency", "percent", "date", "datetime"})
+    return numeric_like < len(nonempty)
+
+
+def extract_csv_file(path: Path) -> dict[str, object]:
+    rows, text_status = parse_csv_rows_for_summary(path)
+    title = path.stem
+    if not rows:
+        sections = [
+            build_spreadsheet_header_section(
+                title=title,
+                sheet_names=[title],
+                author=None,
+                subject=None,
+                participants=None,
+            ),
+            build_spreadsheet_sheet_section(title, []),
+        ]
+        text_content, chunks = build_structural_summary_from_sections(sections)
+        return {
+            "page_count": 1,
+            "author": None,
+            "content_type": "Spreadsheet / Table",
+            "date_created": None,
+            "date_modified": None,
+            "participants": None,
+            "title": title,
+            "subject": None,
+            "recipients": None,
+            "text_content": text_content,
+            "text_status": "empty" if not text_content else text_status,
+            "chunks": chunks,
+            "preview_artifacts": [],
+        }
+
+    has_headers = csv_first_row_looks_like_header(rows[0])
+    header_row = rows[0] if has_headers else []
+    data_rows = rows[1:] if has_headers else rows
+    column_count = max((len(row) for row in rows), default=0)
+    headers = normalize_spreadsheet_headers(header_row, column_count)
+
+    column_samples: dict[int, list[object]] = defaultdict(list)
+    for row in data_rows:
+        for column_index in range(1, min(len(row), column_count) + 1):
+            value = row[column_index - 1]
+            if not spreadsheet_value_is_present(value):
+                continue
+            if len(column_samples[column_index]) < SPREADSHEET_TYPE_SAMPLE_LIMIT:
+                column_samples[column_index].append(value)
+
+    column_descriptors: list[str] = []
+    visible_column_count = min(len(headers), SPREADSHEET_MAX_COLUMNS_PER_SHEET)
+    for column_index in range(1, visible_column_count + 1):
+        column_descriptors.append(
+            f"{headers[column_index - 1]} ({infer_spreadsheet_column_type(column_samples.get(column_index, []), [])})"
+        )
+
+    sections = [
+        build_spreadsheet_header_section(
+            title=title,
+            sheet_names=[title],
+            author=None,
+            subject=None,
+            participants=None,
+        ),
+        build_spreadsheet_sheet_section(
+            title,
+            column_descriptors,
+            hidden_column_count=max(0, len(headers) - SPREADSHEET_MAX_COLUMNS_PER_SHEET),
+        ),
+    ]
+    text_content, chunks = build_structural_summary_from_sections(sections)
+    return {
+        "page_count": 1,
+        "author": None,
+        "content_type": "Spreadsheet / Table",
+        "date_created": None,
+        "date_modified": None,
+        "participants": None,
+        "title": title,
+        "subject": None,
+        "recipients": None,
+        "text_content": text_content,
+        "text_status": "empty" if not text_content else text_status,
+        "chunks": chunks,
+        "preview_artifacts": [],
     }
 
 
@@ -2535,6 +3457,8 @@ def extract_document(path: Path, include_attachments: bool = True) -> dict[str, 
     file_type = normalize_extension(path)
     if file_type not in SUPPORTED_FILE_TYPES:
         raise RetrieverError(f"Unsupported file type: .{file_type or '(none)'}")
+    if file_type == "csv":
+        return extract_csv_file(path)
     if file_type in TEXT_FILE_TYPES:
         return extract_plain_text_file(path)
     if file_type in IMAGE_NATIVE_PREVIEW_FILE_TYPES:

@@ -9,6 +9,7 @@ import mailbox
 import os
 import random
 import re
+import shutil
 import sqlite3
 import tempfile
 import types
@@ -769,6 +770,51 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         notes.write(1, 0, "Budget approved")
         workbook.save(str(path))
 
+    def write_xlsx_fixture(self, path: Path) -> None:
+        try:
+            import openpyxl
+            from openpyxl.chart import BarChart, Reference
+            from openpyxl.comments import Comment
+            from openpyxl.workbook.defined_name import DefinedName
+            from openpyxl.worksheet.datavalidation import DataValidation
+        except Exception as exc:  # pragma: no cover - test helper dependency
+            self.skipTest(f"openpyxl unavailable for xlsx fixture generation: {exc}")
+        from datetime import datetime
+
+        workbook = openpyxl.Workbook()
+        budget = workbook.active
+        budget.title = "Budget"
+        budget.append(["Department", "Amount", "Quarter"])
+        budget.append(["Engineering", 1200, "Q1"])
+        budget.append(["Sales", 900, "Q2"])
+        budget["A2"].comment = Comment("Needs review", "Sergey")
+        budget["A2"].hyperlink = "https://example.com/departments/engineering"
+
+        validation = DataValidation(type="list", formula1='"Q1,Q2,Q3,Q4"')
+        budget.add_data_validation(validation)
+        validation.add("C2:C10")
+
+        chart = BarChart()
+        data = Reference(budget, min_col=2, min_row=1, max_row=3)
+        chart.add_data(data, titles_from_data=True)
+        chart.title = "Budget Totals"
+        chart.x_axis.title = "Department"
+        chart.y_axis.title = "Amount"
+        budget.add_chart(chart, "E2")
+
+        notes = workbook.create_sheet("Notes")
+        notes.append(["Memo"])
+        notes.append(["Budget approved"])
+
+        workbook.defined_names.add(DefinedName("DeptList", attr_text="'Budget'!$A$2:$A$3"))
+        workbook.properties.creator = "Rachel Green"
+        workbook.properties.lastModifiedBy = "Sergey"
+        workbook.properties.title = "Quarterly Budget Workbook"
+        workbook.properties.subject = "Finance Planning"
+        workbook.properties.created = datetime(2026, 4, 20, 10, 0, 0)
+        workbook.properties.modified = datetime(2026, 4, 20, 11, 30, 0)
+        workbook.save(path)
+
     def write_pptx_fixture(self, path: Path) -> None:
         image_bytes = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9mQAAAAASUVORK5CYII="
@@ -923,8 +969,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             )
         )
 
-    def write_production_fixture(self, *, loadfile_volume_prefix: str | None = None) -> Path:
-        production_root = self.root / "Synthetic_Production"
+    def write_production_fixture(
+        self,
+        *,
+        production_name: str = "Synthetic_Production",
+        control_prefix: str = "PDX",
+        loadfile_volume_prefix: str | None = None,
+    ) -> Path:
+        production_root = self.root / production_name
         data_dir = production_root / "DATA"
         text_dir = production_root / "TEXT" / "TEXT001"
         image_dir = production_root / "IMAGES" / "IMG001"
@@ -934,10 +986,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         loadfile_root = (loadfile_volume_prefix or production_root.name).strip()
 
+        def bates(number: int) -> str:
+            return f"{control_prefix}{number:06d}"
+
         def loadfile_path(*parts: str) -> str:
             return ".\\" + "\\".join([loadfile_root, *parts])
 
-        (text_dir / "PDX000001.txt").write_text(
+        (text_dir / f"{bates(1)}.txt").write_text(
             (
                 "From: Elena Steven <elena@example.com>\n"
                 "To: Harry Montoro <harry@example.com>\n"
@@ -948,7 +1003,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (text_dir / "PDX000003.txt").write_text(
+        (text_dir / f"{bates(3)}.txt").write_text(
             (
                 "From: Review Team\n"
                 "Sent: 04/14/2026 09:00 AM\n\n"
@@ -957,21 +1012,21 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (text_dir / "PDX000004.txt").write_text("Native-backed production doc\nUse native preview first.\n", encoding="utf-8")
+        (text_dir / f"{bates(4)}.txt").write_text("Native-backed production doc\nUse native preview first.\n", encoding="utf-8")
 
-        self.write_tiff_fixture(image_dir / "PDX000001.tif", (255, 0, 0))
-        self.write_tiff_fixture(image_dir / "PDX000002.tif", (0, 255, 0))
-        self.write_tiff_fixture(image_dir / "PDX000003.tif", (0, 0, 255))
-        self.write_tiff_fixture(image_dir / "PDX000005.tif", (128, 128, 0))
-        self.write_tiff_fixture(image_dir / "PDX000006.tif", (0, 128, 128))
-        self.write_minimal_pdf(native_dir / "PDX000004.pdf", "Native preview document")
+        self.write_tiff_fixture(image_dir / f"{bates(1)}.tif", (255, 0, 0))
+        self.write_tiff_fixture(image_dir / f"{bates(2)}.tif", (0, 255, 0))
+        self.write_tiff_fixture(image_dir / f"{bates(3)}.tif", (0, 0, 255))
+        self.write_tiff_fixture(image_dir / f"{bates(5)}.tif", (128, 128, 0))
+        self.write_tiff_fixture(image_dir / f"{bates(6)}.tif", (0, 128, 128))
+        self.write_minimal_pdf(native_dir / f"{bates(4)}.pdf", "Native preview document")
 
         headers = ["Begin Bates", "End Bates", "Begin Attachment", "End Attachment", "Text Precedence", "FILE_PATH"]
         rows = [
-            ["PDX000001", "PDX000002", "PDX000001", "PDX000003", loadfile_path("TEXT", "TEXT001", "PDX000001.txt"), ""],
-            ["PDX000003", "PDX000003", "", "", loadfile_path("TEXT", "TEXT001", "PDX000003.txt"), ""],
-            ["PDX000004", "PDX000004", "", "", loadfile_path("TEXT", "TEXT001", "PDX000004.txt"), loadfile_path("NATIVES", "NAT001", "PDX000004.pdf")],
-            ["PDX000005", "PDX000006", "", "", "", ""],
+            [bates(1), bates(2), bates(1), bates(3), loadfile_path("TEXT", "TEXT001", f"{bates(1)}.txt"), ""],
+            [bates(3), bates(3), "", "", loadfile_path("TEXT", "TEXT001", f"{bates(3)}.txt"), ""],
+            [bates(4), bates(4), "", "", loadfile_path("TEXT", "TEXT001", f"{bates(4)}.txt"), loadfile_path("NATIVES", "NAT001", f"{bates(4)}.pdf")],
+            [bates(5), bates(6), "", "", "", ""],
         ]
         delimiter = b"\x14"
         quote = b"\xfe"
@@ -979,16 +1034,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         def dat_line(fields: list[str]) -> bytes:
             return delimiter.join(quote + field.encode("latin-1") + quote for field in fields) + b"\r\n"
 
-        (data_dir / "Synthetic_Production.dat").write_bytes(dat_line(headers) + b"".join(dat_line(row) for row in rows))
+        (data_dir / f"{production_name}.dat").write_bytes(dat_line(headers) + b"".join(dat_line(row) for row in rows))
 
         opt_lines = [
-            f"PDX000001,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000001.tif')},Y,,,2",
-            f"PDX000002,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000002.tif')},,,,",
-            f"PDX000003,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000003.tif')},Y,,,1",
-            f"PDX000005,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000005.tif')},Y,,,2",
-            f"PDX000006,Synthetic_Production,{loadfile_path('IMAGES', 'IMG001', 'PDX000006.tif')},,,,",
+            f"{bates(1)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(1)}.tif')},Y,,,2",
+            f"{bates(2)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(2)}.tif')},,,,",
+            f"{bates(3)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(3)}.tif')},Y,,,1",
+            f"{bates(5)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(5)}.tif')},Y,,,2",
+            f"{bates(6)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(6)}.tif')},,,,",
         ]
-        (data_dir / "Synthetic_Production.opt").write_text("\n".join(opt_lines) + "\n", encoding="utf-8")
+        (data_dir / f"{production_name}.opt").write_text("\n".join(opt_lines) + "\n", encoding="utf-8")
         return production_root
 
     def test_bootstrap_migrates_legacy_schema_and_backfills_content_type(self) -> None:
@@ -1959,13 +2014,131 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_claim_complete_translation_run_with_always_activation_promotes_revision(self) -> None:
+        note_path = self.root / "memo-activate.txt"
+        note_path.write_text("Original English memo text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("memo-activate.txt")
+        source_revision_id = int(document_row["source_text_revision_id"])
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Translate RU",
+            "translation",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "translate_ru",
+            "--provider",
+            "static_text",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Translate to Russian.",
+            "--parameters-json",
+            "{\"target_language\":\"ru\",\"translated_text\":\"RU::{text}\"}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertEqual(create_run_payload["run"]["activation_policy"], "always")
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "translator-ru",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        completion_template = context_payload["context"]["execution"]["completion_template"]
+        raw_output = dict(completion_template["raw_output_json"])
+        raw_output["translated_text"] = "RU::Original English memo text."
+        normalized_output = dict(completion_template["normalized_output_json"])
+        normalized_output["translated_text"] = "RU::Original English memo text."
+        created_text_revision = dict(completion_template["created_text_revision_json"])
+        created_text_revision["text_content"] = "RU::Original English memo text."
+
+        complete_exit, complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "translator-ru",
+            "--raw-output-json",
+            json.dumps(raw_output),
+            "--normalized-output-json",
+            json.dumps(normalized_output),
+            "--created-text-revision-json",
+            json.dumps(created_text_revision),
+        )
+        self.assertEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+        self.assertIn("activation", complete_payload)
+        result_payload = complete_payload["result"]
+        translated_revision_id = int(result_payload["created_text_revision_id"])
+        self.assertEqual(complete_payload["activation"]["text_revision"]["id"], translated_revision_id)
+        self.assertEqual(complete_payload["activation"]["activation_policy"], "always")
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["source_text_revision_id"], source_revision_id)
+        self.assertEqual(updated_row["active_search_text_revision_id"], translated_revision_id)
+        self.assertEqual(updated_row["active_text_source_kind"], "translation")
+
+        revision_exit, revision_payload, _, _ = self.run_cli(
+            "list-text-revisions",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(revision_exit, 0)
+        self.assertIsNotNone(revision_payload)
+        revisions_by_id = {int(item["id"]): item for item in revision_payload["text_revisions"]}
+        self.assertTrue(revisions_by_id[translated_revision_id]["is_active_search_revision"])
+
         repeat_complete_exit, repeat_complete_payload, _, _ = self.run_cli(
             "complete-run-item",
             str(self.root),
             "--run-item-id",
             str(run_item_id),
             "--claimed-by",
-            "translator-es",
+            "translator-ru",
             "--raw-output-json",
             json.dumps(raw_output),
             "--normalized-output-json",
@@ -1977,6 +2150,48 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(repeat_complete_payload)
         self.assertTrue(repeat_complete_payload["idempotent"])
         self.assertEqual(repeat_complete_payload["result"]["id"], result_payload["id"])
+
+    def test_create_run_rejects_always_activation_for_structured_extraction(self) -> None:
+        note_path = self.root / "contract-activation.txt"
+        note_path.write_text("Contract text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("contract-activation.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Extract Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "extract_contract_metadata",
+            "--instruction",
+            "Extract metadata fields from the contract.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, stderr_text = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertNotEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertIn("only supported", create_run_payload["error"])
 
     def test_translation_run_item_context_includes_execution_template(self) -> None:
         note_path = self.root / "translation.txt"
@@ -3126,6 +3341,90 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(final_prepare_payload["worker"]["needs_ocr_finalization"])
         self.assertEqual(final_prepare_payload["worker"]["next_action"], "finalize_ocr")
 
+    def test_finalize_ocr_run_with_always_activation_promotes_revision(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Queued OCR Auto Activate", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "queued_ocr_auto_activate",
+            "--instruction",
+            "OCR each page image.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertEqual(create_run_payload["run"]["activation_policy"], "always")
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "ocr-activate-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        for item in claim_payload["run_items"]:
+            page_number = int(item["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(item["id"]),
+                "--claimed-by",
+                "ocr-activate-worker",
+                "--page-text",
+                f"OCR auto page {page_number}",
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "finalize-ocr-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertEqual(len(finalize_payload["activations"]), 1)
+        result_payload = finalize_payload["results"][0]
+        created_revision_id = int(result_payload["created_text_revision_id"])
+        self.assertEqual(finalize_payload["activations"][0]["text_revision"]["id"], created_revision_id)
+        self.assertEqual(finalize_payload["activations"][0]["activation_policy"], "always")
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_search_text_revision_id"], created_revision_id)
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
     def test_image_description_page_run_items_finalize_into_document_result(self) -> None:
         production_root = self.write_production_fixture()
 
@@ -3262,6 +3561,95 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_finalize_image_description_run_with_always_activation_promotes_revision(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Queued Image Description Auto Activate",
+            "image_description",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "queued_image_description_auto_activate",
+            "--instruction",
+            "Describe each page image in search-friendly prose.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertEqual(create_run_payload["run"]["activation_policy"], "always")
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "image-description-activate-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        for item in claim_payload["run_items"]:
+            page_number = int(item["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(item["id"]),
+                "--claimed-by",
+                "image-description-activate-worker",
+                "--page-text",
+                f"Image description auto page {page_number}",
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "finalize-image-description-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertEqual(len(finalize_payload["activations"]), 1)
+        result_payload = finalize_payload["results"][0]
+        created_revision_id = int(result_payload["created_text_revision_id"])
+        self.assertEqual(finalize_payload["activations"][0]["text_revision"]["id"], created_revision_id)
+        self.assertEqual(finalize_payload["activations"][0]["activation_policy"], "always")
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_search_text_revision_id"], created_revision_id)
+        self.assertEqual(updated_row["active_text_source_kind"], "image_description")
 
     def test_prepare_run_batch_requests_image_description_finalization_after_completed_pages(self) -> None:
         production_root = self.write_production_fixture()
@@ -5622,6 +6010,141 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("filter-only", error_payload["error"])
         self.assertIn("has_attachments", error_payload["error"])
 
+    def test_search_cli_keyword_query_paginates_with_explicit_sort(self) -> None:
+        for index in range(25):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"needle document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 25)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "needle",
+            "--sort",
+            "file_name",
+            "--order",
+            "asc",
+            "--per-page",
+            "5",
+            "--page",
+            "2",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertEqual(search_payload["total_hits"], 25)
+        self.assertEqual(search_payload["total_pages"], 5)
+        self.assertEqual(
+            [item["file_name"] for item in search_payload["results"]],
+            [f"doc-{index:02d}.txt" for index in range(5, 10)],
+        )
+        self.assertEqual(search_payload["sort"], "file_name")
+        self.assertEqual(search_payload["order"], "asc")
+
+    def test_search_cli_view_mode_returns_rendered_markdown_with_current_compact_shape(self) -> None:
+        (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "sample",
+            "--mode",
+            "view",
+            "--columns",
+            "title,control_number",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertIn("results", search_payload)
+        self.assertNotIn("documents", search_payload)
+        self.assertIn("rendered_markdown", search_payload)
+        rendered = str(search_payload["rendered_markdown"])
+        self.assertIn("Scope: keyword='sample'", rendered)
+        self.assertIn("| title | control_number |", rendered)
+        self.assertIn("](computer://", rendered)
+        self.assertIn("Documents 1–1 of 1.", rendered)
+        self.assertNotIn("| # |", rendered)
+
+    def test_search_cli_view_mode_renders_attachment_rows_and_parent_context(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Upgrade test",
+            body_text="Hello team,\nThis is the email body.",
+            attachment_name="notes.txt",
+            attachment_text="confidential attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        parent_exit, parent_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "Upgrade test",
+            "--mode",
+            "view",
+        )
+        self.assertEqual(parent_exit, 0)
+        self.assertIsNotNone(parent_payload)
+        assert parent_payload is not None
+        parent_rendered = str(parent_payload["rendered_markdown"])
+        self.assertIn("[Upgrade test](computer://", parent_rendered)
+        self.assertIn("| E-Doc | [↳ notes.txt](computer://", parent_rendered)
+
+        attachment_exit, attachment_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "confidential attachment detail",
+            "--mode",
+            "view",
+        )
+        self.assertEqual(attachment_exit, 0)
+        self.assertIsNotNone(attachment_payload)
+        assert attachment_payload is not None
+        attachment_rendered = str(attachment_payload["rendered_markdown"])
+        self.assertIn("| E-Doc | [↳ notes.txt (parent: Upgrade test)](computer://", attachment_rendered)
+
+    def test_search_cli_view_mode_uses_unrecognized_for_unknown_attachment_types(self) -> None:
+        email_path = self.root / "thread.eml"
+        message = EmailMessage()
+        message["From"] = "Alice Example <alice@example.com>"
+        message["To"] = "Bob Example <bob@example.com>"
+        message["Subject"] = "Binary attachment test"
+        message["Date"] = "Tue, 14 Apr 2026 10:00:00 +0000"
+        message.set_content("Hello team,\nThis email carries a binary attachment.")
+        message.add_attachment(b"\x00\xff\x10\x80", maintype="application", subtype="octet-stream")
+        email_path.write_bytes(message.as_bytes(policy=policy.default))
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "Binary attachment test",
+            "--mode",
+            "view",
+        )
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        rendered = str(search_payload["rendered_markdown"])
+        self.assertIn("| Unrecognized | [↳ attachment-001.bin](computer://", rendered)
+        self.assertNotIn("| ↳ Unrecognized |", rendered)
+        self.assertNotIn("| Attachment | [↳ attachment-001.bin](computer://", rendered)
+
     def test_slash_search_persists_scope_and_search_within_keyword(self) -> None:
         (self.root / "alpha.txt").write_text("alpha beta body\n", encoding="utf-8")
         (self.root / "second.txt").write_text("alpha only body\n", encoding="utf-8")
@@ -5704,6 +6227,65 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(saved_scopes_payload["scopes"]["review"]["dataset"][0]["id"], dataset_id)
         self.assertEqual(saved_scopes_payload["scopes"]["review"]["dataset"][0]["name"], "Renamed Set")
 
+    def test_slash_scope_and_dataset_list_commands_show_current_and_available_state(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("alpha dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        create_exit, create_payload, _, _ = self.run_cli("create-dataset", str(self.root), "Review Set")
+        self.assertEqual(create_exit, 0)
+        self.assertIsNotNone(create_payload)
+        dataset_id = int(create_payload["dataset"]["id"])
+        add_exit, _, _, _ = self.run_cli(
+            "add-to-dataset",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+            "--doc-id",
+            str(row["id"]),
+        )
+        self.assertEqual(add_exit, 0)
+
+        self.assertEqual(self.run_cli("slash", str(self.root), "/search", "alpha")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/dataset", "Review Set")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/scope", "save", "review")[0], 0)
+
+        search_show_exit, search_show_payload, _, _ = self.run_cli("slash", str(self.root), "/search")
+        scope_show_exit, scope_show_payload, _, _ = self.run_cli("slash", str(self.root), "/scope")
+        scope_list_exit, scope_list_payload, _, _ = self.run_cli("slash", str(self.root), "/scope", "list")
+        dataset_show_exit, dataset_show_payload, _, _ = self.run_cli("slash", str(self.root), "/dataset")
+        dataset_list_exit, dataset_list_payload, _, _ = self.run_cli("slash", str(self.root), "/dataset", "list")
+
+        self.assertEqual(search_show_exit, 0)
+        self.assertIsNotNone(search_show_payload)
+        self.assertEqual(search_show_payload["keyword"], "alpha")
+
+        self.assertEqual(scope_show_exit, 0)
+        self.assertIsNotNone(scope_show_payload)
+        self.assertEqual(scope_show_payload["scope"]["keyword"], "alpha")
+        self.assertEqual(scope_show_payload["scope"]["dataset"][0]["name"], "Review Set")
+
+        self.assertEqual(scope_list_exit, 0)
+        self.assertIsNotNone(scope_list_payload)
+        saved_scope_names = [item["name"] for item in scope_list_payload["saved_scopes"]]
+        self.assertEqual(saved_scope_names, ["review"])
+        self.assertEqual(scope_list_payload["saved_scopes"][0]["scope"]["keyword"], "alpha")
+        self.assertEqual(scope_list_payload["saved_scopes"][0]["scope"]["dataset"][0]["name"], "Review Set")
+
+        self.assertEqual(dataset_show_exit, 0)
+        self.assertIsNotNone(dataset_show_payload)
+        self.assertEqual(dataset_show_payload["dataset"][0]["name"], "Review Set")
+
+        self.assertEqual(dataset_list_exit, 0)
+        self.assertIsNotNone(dataset_list_payload)
+        dataset_names = [item["dataset_name"] for item in dataset_list_payload["datasets"]]
+        self.assertIn("Review Set", dataset_names)
+        self.assertIn(self.root.name, dataset_names)
+
     def test_slash_bates_within_intersects_ranges_and_rejects_cross_slot_and_mixed_prefix(self) -> None:
         retriever_tools.bootstrap(self.root)
 
@@ -5770,6 +6352,57 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(search_payload)
         self.assertIn("scope.from_run_id no longer exists", search_payload["error"])
 
+    def test_slash_search_filter_bates_and_from_run_show_current_scope_slots(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        search_set_exit, _, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        filter_set_exit, _, _, _ = self.run_cli("slash", str(self.root), "/filter", "content_type = 'Email'")
+        bates_set_exit, _, _, _ = self.run_cli("slash", str(self.root), "/bates", "ABC0001-ABC0010")
+        self.assertEqual(search_set_exit, 0)
+        self.assertEqual(filter_set_exit, 0)
+        self.assertEqual(bates_set_exit, 0)
+
+        self.paths["session_path"].write_text(
+            json.dumps(
+                {
+                    "schema_version": retriever_tools.SESSION_SCHEMA_VERSION,
+                    "scope": {
+                        "keyword": "alpha",
+                        "filter": "content_type = 'Email'",
+                        "bates": {"begin": "ABC0001", "end": "ABC0010"},
+                        "from_run_id": 42,
+                    },
+                    "browsing": {},
+                    "display": {},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        search_show_exit, search_show_payload, _, _ = self.run_cli("slash", str(self.root), "/search")
+        filter_show_exit, filter_show_payload, _, _ = self.run_cli("slash", str(self.root), "/filter")
+        bates_show_exit, bates_show_payload, _, _ = self.run_cli("slash", str(self.root), "/bates")
+        from_run_show_exit, from_run_show_payload, _, _ = self.run_cli("slash", str(self.root), "/from-run")
+
+        self.assertEqual(search_show_exit, 0)
+        self.assertIsNotNone(search_show_payload)
+        self.assertEqual(search_show_payload["keyword"], "alpha")
+
+        self.assertEqual(filter_show_exit, 0)
+        self.assertIsNotNone(filter_show_payload)
+        self.assertEqual(filter_show_payload["filter"], "content_type = 'Email'")
+
+        self.assertEqual(bates_show_exit, 0)
+        self.assertIsNotNone(bates_show_payload)
+        self.assertEqual(bates_show_payload["bates"], {"begin": "ABC0001", "end": "ABC0010"})
+
+        self.assertEqual(from_run_show_exit, 0)
+        self.assertIsNotNone(from_run_show_payload)
+        self.assertEqual(from_run_show_payload["from_run_id"], 42)
+
     def test_slash_sort_and_paging_persist_browsing_state(self) -> None:
         for index in range(25):
             (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
@@ -5797,18 +6430,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(next_exit, 0)
         self.assertIsNotNone(next_payload)
         self.assertEqual(next_payload["page"], 2)
-        self.assertEqual(next_payload["offset"], 20)
-        self.assertEqual(next_payload["results"][0]["file_name"], "doc-20.txt")
+        self.assertEqual(next_payload["offset"], 10)
+        self.assertEqual(next_payload["results"][0]["file_name"], "doc-10.txt")
 
         self.assertEqual(page_exit, 0)
         self.assertIsNotNone(page_payload)
-        self.assertEqual(page_payload["page"], 2)
+        self.assertEqual(page_payload["page"], 3)
         self.assertEqual(page_payload["offset"], 20)
 
         self.assertEqual(previous_exit, 0)
         self.assertIsNotNone(previous_payload)
-        self.assertEqual(previous_payload["page"], 1)
-        self.assertEqual(previous_payload["offset"], 0)
+        self.assertEqual(previous_payload["page"], 2)
+        self.assertEqual(previous_payload["offset"], 10)
 
         self.assertEqual(default_exit, 0)
         self.assertIsNotNone(default_payload)
@@ -5817,6 +6450,71 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         final_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
         self.assertNotIn("sort", final_session_payload["browsing"])
         self.assertEqual(final_session_payload["browsing"]["offset"], 0)
+
+    def test_slash_sort_page_page_size_and_columns_show_current_and_available_state(self) -> None:
+        for index in range(25):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 25)
+
+        sort_exit, _, _, _ = self.run_cli("slash", str(self.root), "/sort", "file_name asc")
+        self.assertEqual(sort_exit, 0)
+
+        sort_show_exit, sort_show_payload, _, _ = self.run_cli("slash", str(self.root), "/sort")
+        sort_list_exit, sort_list_payload, _, _ = self.run_cli("slash", str(self.root), "/sort", "list")
+        page_size_show_exit, page_size_show_payload, _, _ = self.run_cli("slash", str(self.root), "/page-size")
+        self.assertEqual(self.run_cli("slash", str(self.root), "/page-size 5")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/next")[0], 0)
+        page_show_exit, page_show_payload, _, _ = self.run_cli("slash", str(self.root), "/page")
+        page_size_after_exit, page_size_after_payload, _, _ = self.run_cli("slash", str(self.root), "/page-size")
+        columns_show_exit, columns_show_payload, _, _ = self.run_cli("slash", str(self.root), "/columns")
+        columns_list_exit, columns_list_payload, _, _ = self.run_cli("slash", str(self.root), "/columns", "list")
+
+        self.assertEqual(sort_show_exit, 0)
+        self.assertIsNotNone(sort_show_payload)
+        self.assertEqual(sort_show_payload["sort"], "file_name")
+        self.assertEqual(sort_show_payload["order"], "asc")
+        self.assertEqual(sort_show_payload["sort_spec"], "file_name asc")
+        self.assertEqual(sort_show_payload["sort_source"], "override")
+
+        self.assertEqual(sort_list_exit, 0)
+        self.assertIsNotNone(sort_list_payload)
+        sortable_names = [item["name"] for item in sort_list_payload["sortable_fields"]]
+        self.assertIn("file_name", sortable_names)
+        self.assertIn("title", sortable_names)
+        self.assertNotIn("dataset_name", sortable_names)
+
+        self.assertEqual(page_size_show_exit, 0)
+        self.assertIsNotNone(page_size_show_payload)
+        self.assertEqual(page_size_show_payload["page_size"], retriever_tools.DEFAULT_PAGE_SIZE)
+
+        self.assertEqual(page_show_exit, 0)
+        self.assertIsNotNone(page_show_payload)
+        self.assertEqual(page_show_payload["page"], 2)
+        self.assertEqual(page_show_payload["per_page"], 5)
+        self.assertEqual(page_show_payload["offset"], 5)
+        self.assertEqual(page_show_payload["total_known"], 25)
+        self.assertEqual(page_show_payload["total_pages"], 5)
+
+        self.assertEqual(page_size_after_exit, 0)
+        self.assertIsNotNone(page_size_after_payload)
+        self.assertEqual(page_size_after_payload["page_size"], 5)
+
+        self.assertEqual(columns_show_exit, 0)
+        self.assertIsNotNone(columns_show_payload)
+        self.assertEqual(
+            columns_show_payload["display"]["columns"],
+            ["content_type", "title", "author", "date_created", "control_number"],
+        )
+
+        self.assertEqual(columns_list_exit, 0)
+        self.assertIsNotNone(columns_list_payload)
+        displayable_names = [item["name"] for item in columns_list_payload["columns"]]
+        self.assertIn("title", displayable_names)
+        self.assertIn("dataset_name", displayable_names)
+        self.assertNotIn("has_attachments", displayable_names)
 
     def test_slash_columns_commands_persist_display_preferences_and_render_custom_fields(self) -> None:
         (self.root / "sample.txt").write_text("sample display body\n", encoding="utf-8")
@@ -5909,6 +6607,42 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(next_payload["per_page"], 5)
         self.assertEqual(next_payload["page"], 2)
 
+    def test_view_search_persists_browse_page_size_for_followup_slash_navigation(self) -> None:
+        for index in range(25):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 25)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "document",
+            "--mode",
+            "view",
+            "--per-page",
+            "5",
+        )
+        next_exit, next_payload, _, _ = self.run_cli("slash", str(self.root), "/next")
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        self.assertEqual(search_payload["page"], 1)
+        self.assertEqual(search_payload["per_page"], 5)
+        self.assertEqual(len(search_payload["results"]), 5)
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["display"]["page_size"], 5)
+        self.assertEqual(session_payload["scope"]["keyword"], "document")
+
+        self.assertEqual(next_exit, 0)
+        self.assertIsNotNone(next_payload)
+        self.assertEqual(next_payload["offset"], 5)
+        self.assertEqual(next_payload["per_page"], 5)
+        self.assertEqual(next_payload["page"], 2)
+        self.assertEqual(len(next_payload["results"]), 5)
+
     def test_slash_search_drops_stale_display_columns_with_warning(self) -> None:
         (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
 
@@ -5989,7 +6723,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(row["content_type"], "Spreadsheet / Table")
         self.assertEqual(row["page_count"], 2)
 
-        search_result = retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)
+        search_result = retriever_tools.search(self.root, "Memo", None, None, None, 1, 20)
         self.assertEqual(search_result["results"][0]["file_name"], "ledger.xls")
         self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "csv")
         self.assertTrue(search_result["results"][0]["preview_rel_path"].endswith(".csv"))
@@ -5997,6 +6731,84 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             [target["label"] for target in search_result["results"][0]["preview_targets"]],
             ["Sheet1", "Notes"],
         )
+        value_only_result = retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)
+        self.assertEqual(value_only_result["total_hits"], 0)
+
+    def test_ingest_supports_xlsx_structural_summary_and_sheet_chunks(self) -> None:
+        xlsx_path = self.root / "budget.xlsx"
+        self.write_xlsx_fixture(xlsx_path)
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        row = self.fetch_document_row("budget.xlsx")
+        self.assertEqual(row["content_type"], "Spreadsheet / Table")
+        self.assertEqual(row["page_count"], 2)
+        self.assertEqual(row["author"], "Rachel Green")
+        self.assertEqual(row["title"], "Quarterly Budget Workbook")
+        self.assertEqual(row["subject"], "Finance Planning")
+        self.assertEqual(row["date_created"], "2026-04-20T10:00:00Z")
+        self.assertIsNotNone(row["date_modified"])
+        self.assertIn("Rachel Green", row["participants"])
+        self.assertIn("Sergey", row["participants"])
+
+        search_result = retriever_tools.search(self.root, "Budget Totals", None, None, None, 1, 20)
+        self.assertEqual(search_result["results"][0]["file_name"], "budget.xlsx")
+        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "csv")
+        self.assertEqual(
+            [target["label"] for target in search_result["results"][0]["preview_targets"]],
+            ["Budget", "Notes"],
+        )
+
+        self.assertEqual(
+            retriever_tools.search(self.root, "Needs review", None, None, None, 1, 20)["results"][0]["file_name"],
+            "budget.xlsx",
+        )
+        self.assertEqual(
+            retriever_tools.search(self.root, "DeptList", None, None, None, 1, 20)["results"][0]["file_name"],
+            "budget.xlsx",
+        )
+        self.assertEqual(retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)["total_hits"], 0)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            chunk_rows = connection.execute(
+                """
+                SELECT text_content
+                FROM document_chunks
+                WHERE document_id = ?
+                ORDER BY chunk_index ASC
+                """,
+                (row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertGreaterEqual(len(chunk_rows), 3)
+        self.assertTrue(any("Sheet: Budget" in chunk_row["text_content"] for chunk_row in chunk_rows))
+        self.assertTrue(any("Sheet: Notes" in chunk_row["text_content"] for chunk_row in chunk_rows))
+
+    def test_ingest_supports_csv_structural_summary_without_indexing_values(self) -> None:
+        csv_path = self.root / "pipeline.csv"
+        csv_path.write_text(
+            "sep=,\nCustomer,Amount,Status\nAcme Corp,100,Paid\nBeta LLC,250,Hold\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        row = self.fetch_document_row("pipeline.csv")
+        self.assertEqual(row["content_type"], "Spreadsheet / Table")
+        self.assertEqual(row["page_count"], 1)
+
+        search_result = retriever_tools.search(self.root, "Status", None, None, None, 1, 20)
+        self.assertEqual(search_result["results"][0]["file_name"], "pipeline.csv")
+        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "native")
+        self.assertEqual(retriever_tools.search(self.root, "Acme Corp", None, None, None, 1, 20)["total_hits"], 0)
 
     def test_ingest_supports_pptx_deck_preview_images_and_notes(self) -> None:
         pptx_path = self.root / "deck.pptx"
@@ -7355,7 +8167,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(missing_parent["lifecycle_status"], "missing")
         self.assertEqual(missing_child["lifecycle_status"], "missing")
 
-    def test_plain_ingest_skips_detected_production_roots(self) -> None:
+    def test_plain_ingest_auto_routes_detected_production_roots(self) -> None:
         self.write_production_fixture()
         loose_file = self.root / "notes.txt"
         loose_file.write_text("loose workspace note\n", encoding="utf-8")
@@ -7363,14 +8175,234 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         retriever_tools.bootstrap(self.root)
         ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
 
-        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["new"], 5)
+        self.assertEqual(ingest_result["updated"], 0)
         self.assertEqual(ingest_result["failed"], 0)
-        self.assertEqual(ingest_result["skipped_production_roots"], ["Synthetic_Production"])
-        self.assertIn("use ingest-production", ingest_result["warnings"][0])
+        self.assertEqual(ingest_result["ingested_production_roots"], ["Synthetic_Production"])
+        self.assertEqual(ingest_result["skipped_production_roots"], [])
+        self.assertEqual(ingest_result["production_documents_created"], 4)
+        self.assertEqual(ingest_result["production_documents_updated"], 0)
+        self.assertEqual(ingest_result["production_documents_unchanged"], 0)
+        self.assertEqual(ingest_result["production_documents_retired"], 0)
+        self.assertEqual(ingest_result["production_families_reconstructed"], 1)
+        self.assertEqual(ingest_result["production_docs_missing_linked_text"], 0)
+        self.assertEqual(ingest_result["production_docs_missing_linked_images"], 1)
+        self.assertEqual(ingest_result["production_docs_missing_linked_natives"], 0)
+        self.assertNotIn("warnings", ingest_result)
 
         browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
-        self.assertEqual(browse_result["total_hits"], 1)
-        self.assertEqual(browse_result["results"][0]["file_name"], "notes.txt")
+        self.assertEqual(browse_result["total_hits"], 5)
+        self.assertIn("notes.txt", [item["file_name"] for item in browse_result["results"]])
+
+        production_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000001.logical"
+        )
+        self.assertEqual(production_row["source_kind"], retriever_tools.PRODUCTION_SOURCE_KIND)
+
+    def test_plain_ingest_auto_routes_multiple_production_roots_without_double_indexing_loose_artifacts(self) -> None:
+        self.write_production_fixture()
+        self.write_production_fixture(production_name="Second_Production", control_prefix="QDX")
+        loose_file = self.root / "summary.txt"
+        loose_file.write_text("workspace summary\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 9)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(
+            ingest_result["ingested_production_roots"],
+            ["Second_Production", "Synthetic_Production"],
+        )
+        self.assertEqual(ingest_result["skipped_production_roots"], [])
+        self.assertEqual(ingest_result["production_documents_created"], 8)
+        self.assertEqual(ingest_result["production_documents_updated"], 0)
+        self.assertEqual(ingest_result["production_documents_unchanged"], 0)
+        self.assertEqual(ingest_result["production_documents_retired"], 0)
+        self.assertEqual(ingest_result["production_families_reconstructed"], 2)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            production_doc_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM documents WHERE source_kind = ?",
+                (retriever_tools.PRODUCTION_SOURCE_KIND,),
+            ).fetchone()["count"]
+            loose_artifact_rows = connection.execute(
+                """
+                SELECT rel_path
+                FROM documents
+                WHERE rel_path LIKE 'Synthetic_Production/TEXT/%'
+                   OR rel_path LIKE 'Synthetic_Production/IMAGES/%'
+                   OR rel_path LIKE 'Synthetic_Production/NATIVES/%'
+                   OR rel_path LIKE 'Second_Production/TEXT/%'
+                   OR rel_path LIKE 'Second_Production/IMAGES/%'
+                   OR rel_path LIKE 'Second_Production/NATIVES/%'
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(production_doc_count, 8)
+        self.assertEqual(loose_artifact_rows, [])
+
+    def test_plain_ingest_with_file_type_filter_still_skips_detected_production_roots(self) -> None:
+        self.write_production_fixture()
+        loose_file = self.root / "notes.txt"
+        loose_file.write_text("loose workspace note\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types="txt")
+
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["ingested_production_roots"], [])
+        self.assertEqual(ingest_result["skipped_production_roots"], ["Synthetic_Production"])
+        self.assertEqual(ingest_result["production_documents_created"], 0)
+        self.assertIn("use ingest-production", ingest_result["warnings"][0])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            production_doc_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM documents WHERE source_kind = ?",
+                (retriever_tools.PRODUCTION_SOURCE_KIND,),
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+        self.assertEqual(production_doc_count, 0)
+
+    def test_plain_ingest_auto_routed_production_matches_direct_ingest_production(self) -> None:
+        production_root = self.write_production_fixture()
+
+        def production_snapshot(workspace_root: Path) -> tuple[list[dict[str, object]], dict[str, list[tuple[str, str, int]]]]:
+            connection = retriever_tools.connect_db(retriever_tools.workspace_paths(workspace_root)["db_path"])
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT id, control_number, begin_bates, end_bates, begin_attachment, end_attachment,
+                           parent_document_id, rel_path, file_name, content_type, text_status
+                    FROM documents
+                    WHERE source_kind = ?
+                    ORDER BY control_number ASC, id ASC
+                    """,
+                    (retriever_tools.PRODUCTION_SOURCE_KIND,),
+                ).fetchall()
+                control_by_id = {int(row["id"]): str(row["control_number"]) for row in rows}
+                documents: list[dict[str, object]] = []
+                source_parts: dict[str, list[tuple[str, str, int]]] = {}
+                for row in rows:
+                    documents.append(
+                        {
+                            "control_number": row["control_number"],
+                            "begin_bates": row["begin_bates"],
+                            "end_bates": row["end_bates"],
+                            "begin_attachment": row["begin_attachment"],
+                            "end_attachment": row["end_attachment"],
+                            "parent_control_number": (
+                                control_by_id[int(row["parent_document_id"])]
+                                if row["parent_document_id"] is not None
+                                else None
+                            ),
+                            "rel_path": row["rel_path"],
+                            "file_name": row["file_name"],
+                            "content_type": row["content_type"],
+                            "text_status": row["text_status"],
+                        }
+                    )
+                    part_rows = connection.execute(
+                        """
+                        SELECT part_kind, rel_source_path, ordinal
+                        FROM document_source_parts
+                        WHERE document_id = ?
+                        ORDER BY part_kind ASC, ordinal ASC, id ASC
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                    source_parts[str(row["control_number"])] = [
+                        (str(part["part_kind"]), str(part["rel_source_path"]), int(part["ordinal"]))
+                        for part in part_rows
+                    ]
+                return documents, source_parts
+            finally:
+                connection.close()
+
+        retriever_tools.bootstrap(self.root)
+        direct_result = retriever_tools.ingest_production(self.root, production_root)
+        direct_documents, direct_source_parts = production_snapshot(self.root)
+
+        with tempfile.TemporaryDirectory(prefix="retriever-auto-production-") as auto_tempdir:
+            auto_root = Path(auto_tempdir)
+            shutil.copytree(production_root, auto_root / production_root.name)
+            auto_paths = retriever_tools.workspace_paths(auto_root)
+            retriever_tools.ensure_layout(auto_paths)
+            auto_paths["tool_path"].write_bytes(TOOL_BYTES)
+
+            retriever_tools.bootstrap(auto_root)
+            auto_result = retriever_tools.ingest(auto_root, recursive=True, raw_file_types=None)
+            auto_documents, auto_source_parts = production_snapshot(auto_root)
+
+        self.assertEqual(direct_result["created"], 4)
+        self.assertEqual(auto_result["production_documents_created"], 4)
+        self.assertEqual(auto_result["production_documents_updated"], 0)
+        self.assertEqual(auto_result["production_documents_retired"], 0)
+        self.assertEqual(auto_result["production_families_reconstructed"], direct_result["families_reconstructed"])
+        self.assertEqual(auto_result["ingested_production_roots"], ["Synthetic_Production"])
+        self.assertEqual(auto_documents, direct_documents)
+        self.assertEqual(auto_source_parts, direct_source_parts)
+
+    def test_plain_ingest_continues_after_detected_production_root_failure(self) -> None:
+        self.write_production_fixture(production_name="Valid_Production", control_prefix="VDX")
+        broken_root = self.root / "Broken_Production"
+        (broken_root / "DATA").mkdir(parents=True, exist_ok=True)
+        broken_text_dir = broken_root / "TEXT" / "TEXT001"
+        broken_text_dir.mkdir(parents=True, exist_ok=True)
+        (broken_root / "IMAGES" / "IMG001").mkdir(parents=True, exist_ok=True)
+        (broken_text_dir / "BDX000001.txt").write_text("broken production text should stay unindexed\n", encoding="utf-8")
+        loose_file = self.root / "notes.txt"
+        loose_file.write_text("loose workspace note\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            retriever_tools.upsert_production_row(
+                connection,
+                dataset_id=None,
+                rel_root="Broken_Production",
+                production_name="Broken_Production",
+                metadata_load_rel_path="Broken_Production/DATA/Broken_Production.dat",
+                image_load_rel_path="Broken_Production/DATA/Broken_Production.opt",
+                source_type="concordance-dat-opt",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 5)
+        self.assertEqual(ingest_result["failed"], 1)
+        self.assertEqual(ingest_result["ingested_production_roots"], ["Valid_Production"])
+        self.assertEqual(ingest_result["production_documents_created"], 4)
+        self.assertTrue(any(item["rel_path"] == "Broken_Production" for item in ingest_result["failures"]))
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            broken_doc_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM documents WHERE rel_path LIKE 'Broken_Production/%'",
+            ).fetchone()["count"]
+            valid_doc_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM documents
+                WHERE source_kind = ?
+                  AND production_id = (SELECT id FROM productions WHERE rel_root = ?)
+                """,
+                (retriever_tools.PRODUCTION_SOURCE_KIND, "Valid_Production"),
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+
+        self.assertEqual(broken_doc_count, 0)
+        self.assertEqual(valid_doc_count, 4)
 
     def test_ingest_production_creates_logical_documents_bates_lookup_and_preview_precedence(self) -> None:
         production_root = self.write_production_fixture()
@@ -7645,9 +8677,42 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("updated_at", compact_result["metadata"])
         self.assertNotIn("page_count", compact_result["metadata"])
         self.assertIn("preview_abs_path", compact_result)
+        self.assertNotIn("preview_rel_path", compact_result)
         self.assertIn("preview_targets", verbose_result)
         self.assertIn("manual_field_locks", verbose_result)
         self.assertIn("page_count", verbose_result["metadata"])
+
+    def test_compact_search_keeps_attachment_counts_without_verbose_children(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Upgrade test",
+            body_text="Please review the attached notes.",
+            attachment_name="notes.txt",
+            attachment_text="confidential attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        compact_exit, compact_payload, _, _ = self.run_cli("search", str(self.root), "Upgrade test")
+        verbose_exit, verbose_payload, _, _ = self.run_cli("search", str(self.root), "Upgrade test", "--verbose")
+
+        self.assertEqual(compact_exit, 0)
+        self.assertEqual(verbose_exit, 0)
+        self.assertIsNotNone(compact_payload)
+        self.assertIsNotNone(verbose_payload)
+
+        compact_result = compact_payload["results"][0]
+        verbose_result = verbose_payload["results"][0]
+
+        self.assertEqual(compact_result["attachment_count"], 1)
+        self.assertNotIn("attachments", compact_result)
+        self.assertNotIn("child_documents", compact_result)
+        self.assertNotIn("preview_targets", compact_result)
+        self.assertEqual(verbose_result["attachment_count"], 1)
+        self.assertEqual(verbose_result["attachments"][0]["file_name"], "notes.txt")
 
     def test_catalog_lists_dataset_name_and_date_granularities(self) -> None:
         retriever_tools.bootstrap(self.root)

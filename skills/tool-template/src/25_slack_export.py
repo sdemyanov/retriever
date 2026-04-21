@@ -777,7 +777,7 @@ def ingest_slack_export_root(
                     source_locator=filesystem_dataset_locator(),
                 )
                 preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
-                chunks = chunk_text(str(extracted.get("text_content") or ""))
+                chunks = extracted_search_chunks(extracted)
                 replace_document_related_rows(connection, document_id, extracted | {"file_name": str(plan["file_name"])}, chunks, preview_rows)
                 replace_document_source_parts(
                     connection,
@@ -862,7 +862,7 @@ def ingest_slack_export_root(
                     source_locator=filesystem_dataset_locator(),
                 )
                 preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
-                chunks = chunk_text(str(extracted.get("text_content") or ""))
+                chunks = extracted_search_chunks(extracted)
                 replace_document_related_rows(connection, document_id, extracted | {"file_name": str(thread_plan["file_name"])}, chunks, preview_rows)
                 replace_document_source_parts(
                     connection,

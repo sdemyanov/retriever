@@ -2862,7 +2862,7 @@ def reconcile_attachment_documents(
             existing_row=existing_row,
         )
         preview_rows = write_preview_artifacts(paths, child_rel_path, list(extracted.get("preview_artifacts", [])))
-        chunks = chunk_text(str(extracted.get("text_content") or ""))
+        chunks = extracted_search_chunks(extracted)
         replace_document_related_rows(
             connection,
             document_id,
@@ -3476,7 +3476,7 @@ def ingest_container_source(
                 created_at=scan_started_at,
             )
             preview_rows = write_preview_artifacts(paths, str(normalized["rel_path"]), list(extracted.get("preview_artifacts", [])))
-            chunks = chunk_text(str(extracted.get("text_content") or ""))
+            chunks = extracted_search_chunks(extracted)
             replace_document_related_rows(
                 connection,
                 document_id,
@@ -3851,3 +3851,276 @@ def update_production_family_relationships(connection: sqlite3.Connection, produ
         )
         updated += 1
     return updated
+
+
+def ingest_resolved_production_root(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    workspace_root: Path,
+    resolved_production_root: Path,
+) -> dict[str, object]:
+    workspace_root = workspace_root.resolve()
+    resolved_production_root = resolved_production_root.resolve()
+    signature = production_signature_for_root(workspace_root, resolved_production_root)
+    if signature is None:
+        raise RetrieverError(f"Path does not look like a supported processed production: {resolved_production_root}")
+
+    metadata_load_path = Path(signature["metadata_load_path"])
+    image_load_path = Path(signature["image_load_path"]) if signature["image_load_path"] is not None else None
+    metadata = parse_production_metadata_load(metadata_load_path)
+    image_rows = parse_production_image_load(image_load_path)
+    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+        connection,
+        source_kind=PRODUCTION_SOURCE_KIND,
+        source_locator=str(signature["rel_root"]),
+        dataset_name=production_dataset_name(str(signature["rel_root"]), str(signature["production_name"])),
+    )
+    production_id = upsert_production_row(
+        connection,
+        dataset_id=dataset_id,
+        rel_root=str(signature["rel_root"]),
+        production_name=str(signature["production_name"]),
+        metadata_load_rel_path=relative_document_path(workspace_root, metadata_load_path),
+        image_load_rel_path=relative_document_path(workspace_root, image_load_path) if image_load_path is not None else None,
+        source_type=str(signature["source_type"]),
+    )
+    connection.commit()
+
+    existing_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE production_id = ?
+        """,
+        (production_id,),
+    ).fetchall()
+    existing_by_control_number = {str(row["control_number"]): row for row in existing_rows if row["control_number"]}
+    seen_control_numbers: set[str] = set()
+
+    resolved_image_rows: list[dict[str, object]] = []
+    for image_row in image_rows:
+        resolved_path = resolve_production_source_path(workspace_root, resolved_production_root, image_row["image_path"])
+        resolved_image_rows.append({**image_row, "resolved_path": resolved_path})
+
+    stats: dict[str, int] = {
+        "created": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "retired": 0,
+        "families_reconstructed": 0,
+        "page_images_linked": 0,
+        "docs_missing_linked_text": 0,
+        "docs_missing_linked_images": 0,
+        "docs_missing_linked_natives": 0,
+    }
+    failures: list[dict[str, str]] = []
+
+    for record in metadata["rows"]:
+        begin_bates = str(record.get("begin_bates") or "").strip()
+        end_bates = str(record.get("end_bates") or begin_bates).strip()
+        if not begin_bates:
+            continue
+        control_number = begin_bates
+        seen_control_numbers.add(control_number)
+        existing_row = existing_by_control_number.get(control_number)
+        connection.execute("BEGIN")
+        try:
+            existing_signature = existing_production_row_signature(connection, existing_row)
+            text_path = resolve_production_source_path(workspace_root, resolved_production_root, record.get("text_path"))
+            native_path = resolve_production_source_path(workspace_root, resolved_production_root, record.get("native_path"))
+            matching_image_paths = [
+                Path(image_row["resolved_path"])
+                for image_row in resolved_image_rows
+                if image_row.get("resolved_path") is not None
+                and bates_inclusive_contains(begin_bates, end_bates, image_row["page_bates"])
+            ]
+            if record.get("text_path") and (text_path is None or not text_path.exists()):
+                stats["docs_missing_linked_text"] += 1
+            if image_rows and not matching_image_paths:
+                stats["docs_missing_linked_images"] += 1
+            if record.get("native_path") and (native_path is None or not native_path.exists()):
+                stats["docs_missing_linked_natives"] += 1
+
+            extracted_payload = build_production_extracted_payload(
+                workspace_root,
+                production_name=str(signature["production_name"]),
+                control_number=control_number,
+                begin_bates=begin_bates,
+                end_bates=end_bates,
+                begin_attachment=record.get("begin_attachment"),
+                end_attachment=record.get("end_attachment"),
+                text_path=text_path if text_path is not None and text_path.exists() else None,
+                image_paths=matching_image_paths,
+                native_path=native_path if native_path is not None and native_path.exists() else None,
+            )
+            preferred_native = extracted_payload.pop("preferred_native", None)
+            extracted = apply_manual_locks(existing_row, extracted_payload)
+            source_parts = production_source_parts(
+                workspace_root,
+                text_path=text_path if text_path is not None and text_path.exists() else None,
+                image_paths=matching_image_paths,
+                native_path=native_path if native_path is not None and native_path.exists() else None,
+            )
+            rel_path = production_logical_rel_path(str(signature["rel_root"]), control_number).as_posix()
+            file_name = (
+                (preferred_native.name if isinstance(preferred_native, Path) else None)
+                or (native_path.name if native_path is not None and native_path.exists() else None)
+                or f"{control_number}.production"
+            )
+            desired_signature = production_row_signature(
+                existing_row,
+                rel_path=rel_path,
+                file_name=file_name,
+                source_kind=PRODUCTION_SOURCE_KIND,
+                production_id=production_id,
+                begin_bates=begin_bates,
+                end_bates=end_bates,
+                begin_attachment=record.get("begin_attachment"),
+                end_attachment=record.get("end_attachment"),
+                extracted=extracted,
+                source_parts=source_parts,
+            )
+            if existing_row is not None:
+                cleanup_document_artifacts(paths, connection, existing_row)
+            document_id = upsert_document_row(
+                connection,
+                rel_path,
+                preferred_native if isinstance(preferred_native, Path) else (text_path if text_path is not None and text_path.exists() else None),
+                existing_row,
+                extracted,
+                file_name=file_name,
+                parent_document_id=None,
+                control_number=control_number,
+                dataset_id=dataset_id,
+                control_number_batch=None,
+                control_number_family_sequence=None,
+                control_number_attachment_sequence=None,
+                source_kind=PRODUCTION_SOURCE_KIND,
+                production_id=production_id,
+                begin_bates=begin_bates,
+                end_bates=end_bates,
+                begin_attachment=record.get("begin_attachment"),
+                end_attachment=record.get("end_attachment"),
+                file_type_override=(
+                    normalize_extension(preferred_native)
+                    if isinstance(preferred_native, Path)
+                    else (normalize_extension(native_path) if native_path is not None else None)
+                ),
+                file_size_override=production_document_file_size(
+                    text_path if text_path is not None and text_path.exists() else None,
+                    matching_image_paths,
+                    native_path if native_path is not None and native_path.exists() else None,
+                ),
+                file_hash_override=(
+                    sha256_file(preferred_native)
+                    if isinstance(preferred_native, Path)
+                    else (sha256_file(text_path) if text_path is not None and text_path.exists() else None)
+                ),
+            )
+            seed_source_text_revision_for_document(
+                connection,
+                paths,
+                document_id=document_id,
+                extracted=extracted,
+                existing_row=existing_row,
+            )
+            ensure_dataset_document_membership(
+                connection,
+                dataset_id=dataset_id,
+                document_id=document_id,
+                dataset_source_id=dataset_source_id,
+            )
+            preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
+            chunks = chunk_text(str(extracted.get("text_content") or ""))
+            replace_document_related_rows(connection, document_id, extracted | {"file_name": file_name}, chunks, preview_rows)
+            replace_document_source_parts(connection, document_id, source_parts)
+            connection.commit()
+
+            if existing_row is None:
+                stats["created"] += 1
+            elif existing_row["lifecycle_status"] == "active" and existing_signature == desired_signature:
+                stats["unchanged"] += 1
+            else:
+                stats["updated"] += 1
+            stats["page_images_linked"] += len(matching_image_paths)
+        except Exception as exc:
+            connection.rollback()
+            failures.append({"control_number": control_number, "error": f"{type(exc).__name__}: {exc}"})
+
+    for row in existing_rows:
+        control_number = str(row["control_number"] or "")
+        if control_number and control_number in seen_control_numbers:
+            continue
+        connection.execute("BEGIN")
+        try:
+            cleanup_document_artifacts(paths, connection, row)
+            delete_document_related_rows(connection, int(row["id"]))
+            connection.execute(
+                """
+                UPDATE documents
+                SET lifecycle_status = 'deleted', parent_document_id = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), row["id"]),
+            )
+            connection.commit()
+            stats["retired"] += 1
+        except Exception:
+            connection.rollback()
+            raise
+
+    connection.execute("BEGIN")
+    try:
+        parent_link_updates = update_production_family_relationships(connection, production_id)
+        attachment_preview_updates = 0
+        preview_document_rows = connection.execute(
+            """
+            SELECT DISTINCT documents.id
+            FROM documents
+            JOIN document_previews ON document_previews.document_id = documents.id
+            WHERE documents.production_id = ?
+              AND documents.lifecycle_status != 'deleted'
+              AND document_previews.preview_type = 'html'
+            ORDER BY documents.id ASC
+            """,
+            (production_id,),
+        ).fetchall()
+        for preview_document_row in preview_document_rows:
+            attachment_preview_updates += sync_document_attachment_preview_links(
+                connection,
+                paths,
+                int(preview_document_row["id"]),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    stats["families_reconstructed"] = len(
+        connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE production_id = ?
+              AND parent_document_id IS NOT NULL
+              AND lifecycle_status != 'deleted'
+            """,
+            (production_id,),
+        ).fetchall()
+    )
+    stats["parent_link_updates"] = parent_link_updates
+    stats["attachment_preview_updates"] = attachment_preview_updates
+
+    return {
+        "status": "ok",
+        "workspace_root": str(workspace_root),
+        "production_root": str(resolved_production_root),
+        "production_rel_root": str(signature["rel_root"]),
+        "production_name": str(signature["production_name"]),
+        "production_id": production_id,
+        "metadata_load_rel_path": relative_document_path(workspace_root, metadata_load_path),
+        "image_load_rel_path": relative_document_path(workspace_root, image_load_path) if image_load_path is not None else None,
+        "tool_version": TOOL_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "failures": failures,
+        **stats,
+    }
