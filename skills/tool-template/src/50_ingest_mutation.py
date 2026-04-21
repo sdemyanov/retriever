@@ -203,6 +203,7 @@ def ingest_serial_special_sources(
                 paths,
                 export_root,
                 ingestion_batch_number=current_ingestion_batch,
+                staging_root=ingest_tmp_dir,
             )
             current_ingestion_batch = (
                 int(slack_result["ingestion_batch_number"])
