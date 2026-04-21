@@ -1184,7 +1184,15 @@ def prepare_cli_payload(command: str, payload: dict[str, object], *, verbose: bo
 
 
 def emit_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> int:
-    print(json.dumps(prepare_cli_payload(command, payload, verbose=verbose), indent=2, sort_keys=True))
+    benchmark_mark("prepare_payload_begin", command=command, verbose=verbose)
+    prepared_payload = prepare_cli_payload(command, payload, verbose=verbose)
+    benchmark_mark("prepare_payload_done")
+    serialized = json.dumps(prepared_payload, indent=2, sort_keys=True)
+    benchmark_mark("json_serialized", bytes=len(serialized.encode("utf-8")))
+    sys.stdout.write(serialized + "\n")
+    sys.stdout.flush()
+    benchmark_mark("stdout_written")
+    benchmark_emit(command=command, verbose=verbose)
     return 0
 
 
@@ -1980,7 +1988,9 @@ def search(
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
+        benchmark_mark("schema_begin")
         apply_schema(connection, root)
+        benchmark_mark("schema_done")
         selection = resolve_paged_document_search(
             connection,
             query,
@@ -1990,6 +2000,7 @@ def search(
             page=page,
             per_page=per_page,
         )
+        benchmark_mark("query_done", total_hits=int(selection["total_hits"]))
         derived_scope = derive_search_scope(query, raw_filters)
         raw_column_list = parse_display_columns_argument(raw_columns) if raw_columns is not None else None
         display_column_defs, display_warnings, _ = resolve_display_column_definitions(
@@ -2073,6 +2084,7 @@ def search(
                     }
                 )
 
+        benchmark_mark("full_matchset_built", page_matches=len(results))
         paged_results = results
         total_hits = int(selection["total_hits"])
         total_pages = max(1, (total_hits + per_page - 1) // per_page)
@@ -2144,6 +2156,7 @@ def search(
             item.pop("bates_sort_key", None)
             item.pop("row", None)
 
+        benchmark_mark("page_enriched", page_size=len(paged_results), total_hits=total_hits)
         payload = {
             "query": selection["query"],
             "filters": selection["filters"],
@@ -7054,8 +7067,10 @@ def _auto_upgrade_and_maybe_reexec(root: Path, command: str) -> None:
 
 
 def main() -> int:
+    benchmark_mark("main_entered")
     parser = build_parser()
     args = parser.parse_args()
+    benchmark_mark("argparse_done", command=getattr(args, "command", None))
 
     try:
         if args.command == "schema-version":
