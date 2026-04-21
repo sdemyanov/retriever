@@ -1991,7 +1991,7 @@ def derive_pst_chat_conversation_key(cluster: dict[str, object]) -> str:
 
 def derive_pst_chat_conversation_display_name(cluster: dict[str, object]) -> str:
     generic_folder_names = {"conversation history", "teamsmessagesdata", "teamsmeetings"}
-    participant_summary = render_display_name_list(list(cluster["participant_names"]), max_names=4)
+    participant_summary = render_display_name_title(list(cluster["participant_names"]), max_names=4)
     if "chat" in cluster["thread_types"] and participant_summary:
         return participant_summary
     source_folder_paths = sorted(
@@ -2476,6 +2476,33 @@ def build_conversation_segment_html(
     )
 
 
+def build_conversation_entry_html(
+    conversation_row: sqlite3.Row,
+    *,
+    document_heading: str,
+    target_href: str,
+) -> str:
+    escaped_target_href = html.escape(target_href, quote=True)
+    return build_html_preview(
+        {},
+        body_html=(
+            "<main>"
+            "<section class=\"conversation-segment-card\">"
+            "<h2>Opening conversation document</h2>"
+            f"<p>If you are not redirected automatically, <a href=\"{escaped_target_href}\">open {html.escape(document_heading)}</a>.</p>"
+            "</section>"
+            "</main>"
+        ),
+        document_title=document_heading or (normalize_whitespace(str(conversation_row["display_name"] or "")) or "Conversation document"),
+        head_html=(
+            build_conversation_preview_head_html()
+            + f'<meta http-equiv="refresh" content="0; url={escaped_target_href}"/>'
+            + f"<script>window.location.replace({json.dumps(target_href)});</script>"
+        ),
+        heading=document_heading or "Conversation document",
+    )
+
+
 def load_document_preview_text(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
@@ -2661,20 +2688,12 @@ def refresh_conversation_previews(
                 encoding="utf-8",
             )
         created_at = utc_now()
-        for segment in segment_items:
-            segment["preview_row_template"] = {
-                "rel_preview_path": str(segment["segment_rel_path"]),
-                "preview_type": "html",
-                "label": None,
-                "ordinal": 0,
-                "created_at": created_at,
-            }
         toc_row = {
             "rel_preview_path": toc_rel_path,
             "preview_type": "html",
             "target_fragment": None,
             "label": "contents",
-            "ordinal": 1,
+            "ordinal": 2,
             "created_at": created_at,
         }
         document_ids = [int(document["id"]) for document in documents]
@@ -2691,12 +2710,40 @@ def refresh_conversation_previews(
         ]
         for segment in segment_items:
             for document in segment["documents"]:
+                entry_rel_path = conversation_preview_entry_rel_path(conversation_id, int(document["id"]))
+                entry_abs_path = paths["state_dir"] / entry_rel_path
+                entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
+                entry_target_href = (
+                    f"{Path(str(segment['segment_rel_path'])).name}"
+                    f"#{conversation_preview_anchor(int(document['id']))}"
+                )
+                entry_abs_path.write_text(
+                    build_conversation_entry_html(
+                        conversation_row,
+                        document_heading=conversation_preview_document_heading(document),
+                        target_href=entry_target_href,
+                    ),
+                    encoding="utf-8",
+                )
                 replace_document_preview_rows(
                     connection,
                     int(document["id"]),
                     [
-                        segment["preview_row_template"] | {
+                        {
+                            "rel_preview_path": entry_rel_path,
+                            "preview_type": "html",
+                            "target_fragment": None,
+                            "label": None,
+                            "ordinal": 0,
+                            "created_at": created_at,
+                        },
+                        {
+                            "rel_preview_path": str(segment["segment_rel_path"]),
+                            "preview_type": "html",
                             "target_fragment": conversation_preview_anchor(int(document["id"])),
+                            "label": "segment",
+                            "ordinal": 1,
+                            "created_at": created_at,
                         },
                         toc_row,
                     ],

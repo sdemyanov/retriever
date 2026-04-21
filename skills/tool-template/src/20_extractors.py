@@ -3375,7 +3375,7 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
         preferred_participants = render_display_name_list(chat_thread_participants)
         preferred_title = None
         if normalize_whitespace(str(chat_threading.get("thread_type") or "")).lower() == "chat":
-            preferred_title = render_display_name_list(chat_thread_participants, max_names=4)
+            preferred_title = render_display_name_title(chat_thread_participants, max_names=4)
         chat_entries = synthesize_pst_chat_entries(
             author=normalized_author,
             date_created=normalized_date_created,
