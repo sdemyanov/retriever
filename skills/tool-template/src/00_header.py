@@ -29,12 +29,14 @@ import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
+from typing import Iterator
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
