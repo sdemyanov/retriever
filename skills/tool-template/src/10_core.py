@@ -2456,6 +2456,20 @@ def render_display_name_list(
     return ", ".join(names)
 
 
+def render_display_name_title(
+    raw_values: list[object],
+    *,
+    max_names: int | None = None,
+) -> str | None:
+    names = sorted_unique_display_names(raw_values)
+    if not names:
+        return None
+    if max_names is not None and max_names > 0 and len(names) > max_names:
+        remaining = len(names) - max_names
+        return " / ".join(names[:max_names]) + f" +{remaining} more"
+    return " / ".join(names)
+
+
 def email_headers_to_metadata(headers: dict[str, str]) -> dict[str, str | None]:
     recipients = ", ".join(headers[key] for key in ("to", "cc", "bcc") if headers.get(key)) or None
     subject = normalize_generated_document_title(headers.get("subject"))
@@ -3176,6 +3190,10 @@ def conversation_preview_toc_rel_path(conversation_id: int) -> str:
 def conversation_preview_segment_rel_path(conversation_id: int, segment_token: str) -> str:
     normalized_token = re.sub(r"[^A-Za-z0-9._-]+", "-", normalize_whitespace(segment_token) or "segment").strip("-")
     return (conversation_preview_base_path(conversation_id) / f"segment-{normalized_token or 'segment'}.html").as_posix()
+
+
+def conversation_preview_entry_rel_path(conversation_id: int, document_id: int) -> str:
+    return (conversation_preview_base_path(conversation_id) / f"{conversation_preview_anchor(document_id)}.html").as_posix()
 
 
 def is_conversation_preview_rel_path(rel_preview_path: object) -> bool:
