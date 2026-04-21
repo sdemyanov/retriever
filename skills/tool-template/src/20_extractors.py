@@ -1279,6 +1279,7 @@ def build_chat_extracted_payload(
     preview_file_name: str,
     chat_metadata: dict[str, object] | None = None,
     chat_entries: list[dict[str, object]] | None = None,
+    chat_threading: dict[str, object] | None = None,
 ) -> dict[str, object]:
     normalized_html = None if html_body is None else str(html_body)
     normalized_text = normalize_whitespace(str(text_body or ""))
@@ -1307,6 +1308,7 @@ def build_chat_extracted_payload(
         "recipients": None,
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
+        "chat_threading": dict(chat_threading or {}),
         "attachments": list(attachments or []),
         "preview_artifacts": build_chat_preview_artifacts(
             title=resolved_title,
@@ -1436,13 +1438,19 @@ def synthesize_pst_chat_metadata(
     text_body: str | None,
     chat_metadata: dict[str, object] | None,
     chat_entries: list[dict[str, object]] | None,
+    preferred_title: str | None = None,
+    preferred_participants: str | None = None,
 ) -> dict[str, object] | None:
     metadata = dict(chat_metadata or {})
     resolved_title = infer_pst_chat_title(subject, text_body)
-    if resolved_title and not metadata.get("title"):
+    if preferred_title:
+        metadata["title"] = preferred_title
+    elif resolved_title and not metadata.get("title"):
         metadata["title"] = resolved_title
     normalized_author = normalize_whitespace(str(author or ""))
-    if normalized_author and not metadata.get("participants"):
+    if preferred_participants:
+        metadata["participants"] = preferred_participants
+    elif normalized_author and not metadata.get("participants"):
         metadata["participants"] = normalized_author
     if date_created and not metadata.get("date_created"):
         metadata["date_created"] = date_created
@@ -1700,6 +1708,595 @@ def coerce_pst_attachment_payload(attachment: object) -> bytes | None:
 
 
 PST_PROP_ATTACH_CONTENT_ID = 0x3712
+PST_DEBUG_SCOPE_NAME_PATTERN = re.compile(
+    r"(team|teams|skype|conversation|thread|chat|channel|space|group|participant|member|roster)",
+    re.IGNORECASE,
+)
+PST_DEBUG_GUID_VALUE_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+PST_DEBUG_MAX_TEXT_VALUE_CHARS = 512
+PST_DEBUG_MAX_HEX_PREVIEW_BYTES = 32
+
+
+def normalize_pst_identifier(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, memoryview):
+        value = bytes(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, (int, float)):
+        return str(int(value))
+    normalized = normalize_whitespace(str(value))
+    return normalized or None
+
+
+def iter_pst_collection(
+    owner: object,
+    *,
+    list_attrs: tuple[str, ...],
+    count_getter_pairs: tuple[tuple[str, str], ...],
+):
+    for attr_name in list_attrs:
+        value = getattr(owner, attr_name, None)
+        if value is None:
+            continue
+        try:
+            for item in value:
+                yield item
+            return
+        except TypeError:
+            pass
+    for count_name, getter_name in count_getter_pairs:
+        try:
+            count = int(getattr(owner, count_name))
+        except Exception:
+            continue
+        getter = getattr(owner, getter_name, None)
+        if not callable(getter):
+            continue
+        for index in range(count):
+            try:
+                yield getter(index)
+            except Exception:
+                continue
+        return
+
+
+def pst_message_folder_path(raw_value: object) -> str | None:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, (list, tuple)):
+        parts = [normalize_whitespace(str(part)) for part in raw_value if normalize_whitespace(str(part))]
+        return "/".join(parts) or None
+    normalized = normalize_whitespace(str(raw_value).replace("\\", "/"))
+    normalized = re.sub(r"/+", "/", normalized).strip("/")
+    return normalized or None
+
+
+def normalize_pst_chat_thread_id(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or ""))
+    if not normalized or not normalized.startswith("19:"):
+        return None
+    suffix_index = normalized.lower().find(";messageid=")
+    if suffix_index >= 0:
+        normalized = normalized[:suffix_index]
+    return normalized or None
+
+
+def parse_pst_json_object(raw_value: object) -> dict[str, object] | None:
+    normalized = normalize_whitespace(str(raw_value or ""))
+    if not normalized.startswith("{") or not normalized.endswith("}"):
+        return None
+    try:
+        parsed = json.loads(normalized)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def pst_chat_participant_display_name(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    normalized_name = normalize_participant_token(payload.get("Name"))
+    if normalized_name:
+        return normalized_name
+    normalized_email = normalize_participant_token(payload.get("EmailAddress"))
+    if normalized_email:
+        return normalized_email.lower()
+    return None
+
+
+def pst_chat_participant_names_from_payload(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    participant_names: list[object] = []
+    sender_display_name = pst_chat_participant_display_name(payload.get("Sender"))
+    if sender_display_name:
+        participant_names.append(sender_display_name)
+    recipients = payload.get("Recipients")
+    if isinstance(recipients, list):
+        for recipient in recipients:
+            recipient_display_name = pst_chat_participant_display_name(recipient)
+            if recipient_display_name:
+                participant_names.append(recipient_display_name)
+    return sorted_unique_display_names(participant_names)
+
+
+def pst_message_may_have_chat_threading(folder_path: object, message_class: object) -> bool:
+    if pst_folder_path_contains(folder_path, "/skypespacesdata/teamsmeetings/"):
+        return False
+    if pst_folder_path_contains(folder_path, "/teamsmessagesdata/"):
+        return True
+    if pst_folder_path_contains(folder_path, "/conversation history/"):
+        return True
+    normalized_message_class = normalize_whitespace(str(message_class or "")).lower()
+    return "skypeteams" in normalized_message_class or "microsoft.conversation" in normalized_message_class
+
+
+def extract_pst_chat_threading(message: object) -> dict[str, object] | None:
+    thread_id = None
+    message_id = None
+    parent_message_id = None
+    thread_type = None
+    participant_names: list[object] = []
+
+    for record_set in pst_record_sets(message):
+        for entry in pst_record_entries(record_set):
+            decoded_value = decode_pst_record_entry_value(entry)
+            normalized_value = normalize_whitespace(str(decoded_value or ""))
+            if not normalized_value:
+                continue
+
+            candidate_thread_id = normalize_pst_chat_thread_id(normalized_value)
+            if candidate_thread_id and thread_id is None:
+                thread_id = candidate_thread_id
+            if message_id is None and normalized_value.startswith("19:") and ";messageid=" in normalized_value.lower():
+                message_id = normalize_pst_identifier(normalized_value.rsplit("=", 1)[-1])
+
+            parsed_payload = parse_pst_json_object(normalized_value)
+            if parsed_payload is None:
+                continue
+
+            parsed_thread_id = normalize_pst_chat_thread_id(parsed_payload.get("ThreadId"))
+            if parsed_thread_id:
+                thread_id = parsed_thread_id
+            parsed_message_id = normalize_pst_identifier(parsed_payload.get("MessageId"))
+            if parsed_message_id:
+                message_id = parsed_message_id
+            parsed_parent_message_id = normalize_pst_identifier(parsed_payload.get("ParentMessageId"))
+            if parsed_parent_message_id:
+                parent_message_id = parsed_parent_message_id
+            normalized_thread_type = normalize_whitespace(str(parsed_payload.get("ThreadType") or "")).lower()
+            if normalized_thread_type:
+                thread_type = normalized_thread_type
+            participant_names.extend(pst_chat_participant_names_from_payload(parsed_payload))
+
+    normalized_participants = sorted_unique_display_names(participant_names)
+    if not any((thread_id, message_id, parent_message_id, thread_type, normalized_participants)):
+        return None
+    return {
+        "thread_id": thread_id,
+        "message_id": message_id,
+        "parent_message_id": parent_message_id,
+        "thread_type": thread_type,
+        "participants": normalized_participants,
+    }
+
+
+def pst_message_author(message: object) -> str | None:
+    sender = normalize_whitespace(str(getattr(message, "sender_name", "") or getattr(message, "sender", "") or ""))
+    sender_email = normalize_whitespace(str(getattr(message, "sender_email_address", "") or ""))
+    if sender and sender_email:
+        return f"{sender} <{sender_email}>"
+    return sender or sender_email or None
+
+
+def pst_message_recipients(message: object) -> str | None:
+    parts = [
+        normalize_whitespace(str(getattr(message, "display_to", "") or "")),
+        normalize_whitespace(str(getattr(message, "display_cc", "") or "")),
+        normalize_whitespace(str(getattr(message, "display_bcc", "") or "")),
+    ]
+    recipients = ", ".join(part for part in parts if part)
+    return recipients or None
+
+
+def pst_attachment_file_name(attachment: object, ordinal: int) -> str:
+    raw_name = None
+    if isinstance(attachment, dict):
+        raw_name = attachment.get("file_name") or attachment.get("name") or attachment.get("filename")
+    else:
+        for attr_name in ("name", "filename", "long_filename"):
+            value = getattr(attachment, attr_name, None)
+            if value:
+                raw_name = value
+                break
+    return normalize_attachment_filename(raw_name if isinstance(raw_name, str) else None, ordinal)
+
+
+def pst_message_html_body(message: object) -> str | None:
+    for attr_name in ("html_body", "htmlBody"):
+        value = getattr(message, attr_name, None)
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+    return None
+
+
+def pst_message_text_body(message: object, html_body: str | None) -> str | None:
+    for attr_name in ("plain_text_body", "body", "text_body"):
+        value = getattr(message, attr_name, None)
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            decoded, _, _ = decode_bytes(value)
+            text = normalize_whitespace(decoded)
+        else:
+            text = normalize_whitespace(str(value))
+        if text:
+            return text
+    if html_body:
+        return strip_html_tags(html_body)
+    return None
+
+
+def pst_message_transport_headers(message: object) -> str | None:
+    for attr_name in ("transport_headers",):
+        value = getattr(message, attr_name, None)
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        normalized = str(value)
+        if normalize_whitespace(normalized):
+            return normalized
+    for method_name in ("get_transport_headers",):
+        method = getattr(message, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            value = method()
+        except Exception:
+            continue
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        normalized = str(value)
+        if normalize_whitespace(normalized):
+            return normalized
+    return None
+
+
+def pst_message_conversation_topic(message: object) -> str | None:
+    for attr_name in ("conversation_topic",):
+        value = getattr(message, attr_name, None)
+        normalized = normalize_whitespace(str(value or ""))
+        if normalized:
+            return normalized
+    for method_name in ("get_conversation_topic",):
+        method = getattr(message, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            value = method()
+        except Exception:
+            continue
+        normalized = normalize_whitespace(str(value or ""))
+        if normalized:
+            return normalized
+    return None
+
+
+def pst_record_sets(owner: object):
+    yield from iter_pst_collection(
+        owner,
+        list_attrs=("record_sets",),
+        count_getter_pairs=(("number_of_record_sets", "get_record_set"),),
+    )
+
+
+def pst_record_entries(record_set: object):
+    yield from iter_pst_collection(
+        record_set,
+        list_attrs=("entries", "record_entries"),
+        count_getter_pairs=(("number_of_entries", "get_entry"), ("number_of_record_entries", "get_record_entry")),
+    )
+
+
+def pst_debug_value_preview(raw_value: object, *, max_chars: int = PST_DEBUG_MAX_TEXT_VALUE_CHARS) -> str | None:
+    normalized = normalize_whitespace(str(raw_value or ""))
+    if not normalized:
+        return None
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def pst_debug_record_entry_payload(entry: object, *, entry_index: int) -> dict[str, object]:
+    payload: dict[str, object] = {"entry_index": int(entry_index)}
+    for field_name in (
+        "identifier",
+        "name",
+        "entry_name",
+        "property_name",
+        "named_property_name",
+        "guid",
+        "property_guid",
+        "property_set_guid",
+        "named_property_guid",
+    ):
+        normalized = pst_debug_value_preview(getattr(entry, field_name, None))
+        if normalized:
+            payload[field_name] = normalized
+    try:
+        entry_type = int(getattr(entry, "entry_type", 0) or 0)
+    except Exception:
+        entry_type = None
+    if entry_type is not None:
+        payload["entry_type"] = entry_type
+        payload["entry_type_hex"] = f"0x{entry_type:04X}"
+    try:
+        value_type = int(getattr(entry, "value_type", 0) or 0)
+    except Exception:
+        value_type = None
+    if value_type is not None:
+        payload["value_type"] = value_type
+        payload["value_type_hex"] = f"0x{value_type:04X}"
+    data = getattr(entry, "data", None)
+    if isinstance(data, (bytes, bytearray)):
+        payload["byte_length"] = len(data)
+        payload["hex_preview"] = bytes(data[:PST_DEBUG_MAX_HEX_PREVIEW_BYTES]).hex()
+    decoded_value = decode_pst_record_entry_value(entry)
+    if decoded_value:
+        payload["decoded_value"] = pst_debug_value_preview(decoded_value)
+    return payload
+
+
+def pst_debug_entry_scope_candidate(payload: dict[str, object]) -> str | None:
+    decoded_value = normalize_whitespace(str(payload.get("decoded_value") or ""))
+    if not decoded_value or len(decoded_value) > PST_DEBUG_MAX_TEXT_VALUE_CHARS:
+        return None
+    if decoded_value.lower().startswith("19:"):
+        return decoded_value
+    if PST_DEBUG_GUID_VALUE_PATTERN.search(decoded_value):
+        return decoded_value
+    name_blob = " ".join(
+        normalize_whitespace(str(payload.get(field_name) or ""))
+        for field_name in (
+            "name",
+            "entry_name",
+            "property_name",
+            "named_property_name",
+        )
+    )
+    if PST_DEBUG_SCOPE_NAME_PATTERN.search(name_blob):
+        return decoded_value
+    return None
+
+
+def pst_debug_interesting_entry(payload: dict[str, object]) -> bool:
+    candidate = pst_debug_entry_scope_candidate(payload)
+    if candidate:
+        return True
+    name_blob = " ".join(
+        normalize_whitespace(str(payload.get(field_name) or ""))
+        for field_name in (
+            "name",
+            "entry_name",
+            "property_name",
+            "named_property_name",
+        )
+    )
+    if PST_DEBUG_SCOPE_NAME_PATTERN.search(name_blob):
+        return True
+    decoded_value = normalize_whitespace(str(payload.get("decoded_value") or ""))
+    return bool(decoded_value and decoded_value.lower().startswith("https://teams.microsoft.com/"))
+
+
+def pst_debug_record_sets_payloads(
+    owner: object,
+    *,
+    max_record_entries: int = 128,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
+    record_set_payloads: list[dict[str, object]] = []
+    interesting_entries: list[dict[str, object]] = []
+    candidate_scope_values: list[str] = []
+    seen_candidates: set[str] = set()
+    for record_set_index, record_set in enumerate(pst_record_sets(owner), start=1):
+        entry_payloads: list[dict[str, object]] = []
+        entry_total = 0
+        truncated = False
+        for entry_index, entry in enumerate(pst_record_entries(record_set), start=1):
+            entry_total += 1
+            if entry_index > max_record_entries:
+                truncated = True
+                continue
+            entry_payload = pst_debug_record_entry_payload(entry, entry_index=entry_index)
+            entry_payloads.append(entry_payload)
+            if pst_debug_interesting_entry(entry_payload):
+                interesting_entry = {
+                    "record_set_index": int(record_set_index),
+                    **entry_payload,
+                }
+                interesting_entries.append(interesting_entry)
+            candidate = pst_debug_entry_scope_candidate(entry_payload)
+            if candidate and candidate not in seen_candidates:
+                seen_candidates.add(candidate)
+                candidate_scope_values.append(candidate)
+        record_set_payloads.append(
+            {
+                "record_set_index": int(record_set_index),
+                "entry_count": int(entry_total),
+                "entries_truncated": truncated,
+                "entries": entry_payloads,
+            }
+        )
+    return record_set_payloads, interesting_entries, candidate_scope_values
+
+
+def iter_pst_raw_messages(
+    path: Path,
+    *,
+    include_debug_record_sets: bool = False,
+    max_record_entries: int = 128,
+):
+    dependency_guard(pypff, "libpff-python", "pst")
+
+    def _iter_folder(folder: object, ancestors: list[str]):
+        folder_name = normalize_whitespace(str(getattr(folder, "name", "") or ""))
+        current_ancestors = [*ancestors]
+        if folder_name:
+            current_ancestors.append(folder_name)
+        folder_path = pst_message_folder_path(current_ancestors)
+
+        for message in iter_pst_collection(
+            folder,
+            list_attrs=("sub_messages", "messages"),
+            count_getter_pairs=(("number_of_sub_messages", "get_sub_message"), ("number_of_messages", "get_message")),
+        ):
+            source_item_id = None
+            for attr_name in ("entry_identifier", "entry_identifier_string", "record_key", "search_key", "identifier"):
+                source_item_id = normalize_pst_identifier(getattr(message, attr_name, None))
+                if source_item_id:
+                    break
+            if not source_item_id:
+                raise RetrieverError(f"PST message is missing a stable item identifier in {path}")
+
+            html_body = pst_message_html_body(message)
+            attachments: list[dict[str, object]] = []
+            for ordinal, attachment in enumerate(
+                iter_pst_collection(
+                    message,
+                    list_attrs=("attachments",),
+                    count_getter_pairs=(("number_of_attachments", "get_attachment"),),
+                ),
+                start=1,
+            ):
+                payload = coerce_pst_attachment_payload(attachment)
+                if payload is None:
+                    continue
+                attachments.append(
+                    {
+                        "file_name": pst_attachment_file_name(attachment, ordinal),
+                        "ordinal": ordinal,
+                        "payload": payload,
+                        "file_hash": sha256_bytes(payload),
+                        "content_id": pst_attachment_content_id(attachment),
+                    }
+                )
+
+            message_class = normalize_whitespace(str(getattr(message, "message_class", "") or "")) or None
+            chat_threading = (
+                extract_pst_chat_threading(message)
+                if pst_message_may_have_chat_threading(folder_path, message_class)
+                else None
+            )
+
+            debug_record_sets: list[dict[str, object]] = []
+            debug_interesting_entries: list[dict[str, object]] = []
+            debug_candidate_scope_values: list[str] = []
+            if include_debug_record_sets:
+                (
+                    debug_record_sets,
+                    debug_interesting_entries,
+                    debug_candidate_scope_values,
+                ) = pst_debug_record_sets_payloads(
+                    message,
+                    max_record_entries=max_record_entries,
+                )
+
+            yield {
+                "source_item_id": source_item_id,
+                "folder_path": folder_path,
+                "message_class": message_class,
+                "subject": normalize_whitespace(str(getattr(message, "subject", "") or "")) or None,
+                "conversation_topic": pst_message_conversation_topic(message),
+                "transport_headers": pst_message_transport_headers(message),
+                "author": pst_message_author(message),
+                "recipients": pst_message_recipients(message),
+                "date_created": normalize_datetime(
+                    getattr(message, "delivery_time", None)
+                    or getattr(message, "client_submit_time", None)
+                    or getattr(message, "creation_time", None)
+                ),
+                "text_body": pst_message_text_body(message, html_body),
+                "html_body": html_body,
+                "attachments": attachments,
+                "chat_threading": chat_threading,
+                "high_level_identifiers": {
+                    attr_name: normalize_pst_identifier(getattr(message, attr_name, None))
+                    for attr_name in ("entry_identifier", "entry_identifier_string", "record_key", "search_key", "identifier")
+                    if normalize_pst_identifier(getattr(message, attr_name, None))
+                },
+                "debug_record_sets": debug_record_sets,
+                "debug_interesting_entries": debug_interesting_entries,
+                "debug_candidate_scope_values": debug_candidate_scope_values,
+            }
+
+        for child_folder in iter_pst_collection(
+            folder,
+            list_attrs=("sub_folders", "folders"),
+            count_getter_pairs=(("number_of_sub_folders", "get_sub_folder"), ("number_of_folders", "get_folder")),
+        ):
+            yield from _iter_folder(child_folder, current_ancestors)
+
+    pst_file = pypff.file()  # type: ignore[union-attr]
+    pst_file.open(str(path))
+    try:
+        root_folder = pst_file.get_root_folder()
+        yield from _iter_folder(root_folder, [])
+    finally:
+        try:
+            pst_file.close()
+        except Exception:
+            pass
+
+
+def iter_pst_debug_messages(
+    path: Path,
+    *,
+    max_record_entries: int = 128,
+):
+    for message_dict in iter_pst_raw_messages(
+        path,
+        include_debug_record_sets=True,
+        max_record_entries=max_record_entries,
+    ):
+        chat_text = str(message_dict.get("text_body") or "") or (
+            strip_html_tags(str(message_dict.get("html_body") or ""))
+            if message_dict.get("html_body")
+            else ""
+        )
+        chat_metadata = extract_chat_transcript_metadata(chat_text)
+        message_kind = classify_pst_message_kind(message_dict, chat_metadata)
+        payload = {
+            "source_item_id": message_dict["source_item_id"],
+            "folder_path": message_dict.get("folder_path"),
+            "message_kind": message_kind,
+            "message_class": message_dict.get("message_class"),
+            "subject": message_dict.get("subject"),
+            "conversation_topic": message_dict.get("conversation_topic"),
+            "author": message_dict.get("author"),
+            "recipients": message_dict.get("recipients"),
+            "date_created": message_dict.get("date_created"),
+            "high_level_identifiers": dict(message_dict.get("high_level_identifiers") or {}),
+            "candidate_scope_values": list(message_dict.get("debug_candidate_scope_values") or []),
+            "interesting_properties": list(message_dict.get("debug_interesting_entries") or []),
+            "record_sets": list(message_dict.get("debug_record_sets") or []),
+        }
+        if chat_metadata:
+            payload["chat_metadata"] = {
+                key: chat_metadata[key]
+                for key in ("title", "participants", "date_created", "date_modified", "message_count")
+                if key in chat_metadata and chat_metadata.get(key) not in (None, "")
+            }
+        yield payload
 
 
 def decode_pst_record_entry_value(entry: object) -> str | None:
@@ -1779,242 +2376,23 @@ def pst_attachment_content_id(attachment: object) -> str | None:
     return None
 
 
-def pst_message_folder_path(raw_value: object) -> str | None:
-    if raw_value is None:
-        return None
-    if isinstance(raw_value, (list, tuple)):
-        parts = [normalize_whitespace(str(part)) for part in raw_value if normalize_whitespace(str(part))]
-        return "/".join(parts) or None
-    normalized = normalize_whitespace(str(raw_value).replace("\\", "/"))
-    normalized = re.sub(r"/+", "/", normalized).strip("/")
-    return normalized or None
-
-
 def iter_pst_messages(path: Path):
-    dependency_guard(pypff, "libpff-python", "pst")
-
-    def _normalize_pst_identifier(value: object) -> str | None:
-        if value is None:
-            return None
-        if isinstance(value, memoryview):
-            value = bytes(value)
-        if isinstance(value, bytes):
-            return value.hex()
-        if isinstance(value, (int, float)):
-            return str(int(value))
-        normalized = normalize_whitespace(str(value))
-        return normalized or None
-
-    def _iter_collection(
-        owner: object,
-        *,
-        list_attrs: tuple[str, ...],
-        count_getter_pairs: tuple[tuple[str, str], ...],
-    ):
-        for attr_name in list_attrs:
-            value = getattr(owner, attr_name, None)
-            if value is None:
-                continue
-            try:
-                for item in value:
-                    yield item
-                return
-            except TypeError:
-                pass
-        for count_name, getter_name in count_getter_pairs:
-            try:
-                count = int(getattr(owner, count_name))
-            except Exception:
-                continue
-            getter = getattr(owner, getter_name, None)
-            if not callable(getter):
-                continue
-            for index in range(count):
-                try:
-                    yield getter(index)
-                except Exception:
-                    continue
-            return
-
-    def _message_author(message: object) -> str | None:
-        sender = normalize_whitespace(str(getattr(message, "sender_name", "") or getattr(message, "sender", "") or ""))
-        sender_email = normalize_whitespace(str(getattr(message, "sender_email_address", "") or ""))
-        if sender and sender_email:
-            return f"{sender} <{sender_email}>"
-        return sender or sender_email or None
-
-    def _message_recipients(message: object) -> str | None:
-        parts = [
-            normalize_whitespace(str(getattr(message, "display_to", "") or "")),
-            normalize_whitespace(str(getattr(message, "display_cc", "") or "")),
-            normalize_whitespace(str(getattr(message, "display_bcc", "") or "")),
-        ]
-        recipients = ", ".join(part for part in parts if part)
-        return recipients or None
-
-    def _attachment_file_name(attachment: object, ordinal: int) -> str:
-        raw_name = None
-        if isinstance(attachment, dict):
-            raw_name = attachment.get("file_name") or attachment.get("name") or attachment.get("filename")
-        else:
-            for attr_name in ("name", "filename", "long_filename"):
-                value = getattr(attachment, attr_name, None)
-                if value:
-                    raw_name = value
-                    break
-        return normalize_attachment_filename(raw_name if isinstance(raw_name, str) else None, ordinal)
-
-    def _message_html_body(message: object) -> str | None:
-        for attr_name in ("html_body", "htmlBody"):
-            value = getattr(message, attr_name, None)
-            if value is None:
-                continue
-            if isinstance(value, bytes):
-                return value.decode("utf-8", errors="replace")
-            return str(value)
-        return None
-
-    def _message_text_body(message: object, html_body: str | None) -> str | None:
-        for attr_name in ("plain_text_body", "body", "text_body"):
-            value = getattr(message, attr_name, None)
-            if value is None:
-                continue
-            if isinstance(value, bytes):
-                decoded, _, _ = decode_bytes(value)
-                text = normalize_whitespace(decoded)
-            else:
-                text = normalize_whitespace(str(value))
-            if text:
-                return text
-        if html_body:
-            return strip_html_tags(html_body)
-        return None
-
-    def _message_transport_headers(message: object) -> str | None:
-        for attr_name in ("transport_headers",):
-            value = getattr(message, attr_name, None)
-            if value is None:
-                continue
-            if isinstance(value, bytes):
-                return value.decode("utf-8", errors="replace")
-            normalized = str(value)
-            if normalize_whitespace(normalized):
-                return normalized
-        for method_name in ("get_transport_headers",):
-            method = getattr(message, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                value = method()
-            except Exception:
-                continue
-            if value is None:
-                continue
-            if isinstance(value, bytes):
-                return value.decode("utf-8", errors="replace")
-            normalized = str(value)
-            if normalize_whitespace(normalized):
-                return normalized
-        return None
-
-    def _message_conversation_topic(message: object) -> str | None:
-        for attr_name in ("conversation_topic",):
-            value = getattr(message, attr_name, None)
-            normalized = normalize_whitespace(str(value or ""))
-            if normalized:
-                return normalized
-        for method_name in ("get_conversation_topic",):
-            method = getattr(message, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                value = method()
-            except Exception:
-                continue
-            normalized = normalize_whitespace(str(value or ""))
-            if normalized:
-                return normalized
-        return None
-
-    def _iter_folder(folder: object, ancestors: list[str]):
-        folder_name = normalize_whitespace(str(getattr(folder, "name", "") or ""))
-        current_ancestors = [*ancestors]
-        if folder_name:
-            current_ancestors.append(folder_name)
-        folder_path = pst_message_folder_path(current_ancestors)
-
-        for message in _iter_collection(
-            folder,
-            list_attrs=("sub_messages", "messages"),
-            count_getter_pairs=(("number_of_sub_messages", "get_sub_message"), ("number_of_messages", "get_message")),
-        ):
-            source_item_id = None
-            for attr_name in ("entry_identifier", "entry_identifier_string", "record_key", "search_key", "identifier"):
-                source_item_id = _normalize_pst_identifier(getattr(message, attr_name, None))
-                if source_item_id:
-                    break
-            if not source_item_id:
-                raise RetrieverError(f"PST message is missing a stable item identifier in {path}")
-
-            html_body = _message_html_body(message)
-            attachments: list[dict[str, object]] = []
-            for ordinal, attachment in enumerate(
-                _iter_collection(
-                    message,
-                    list_attrs=("attachments",),
-                    count_getter_pairs=(("number_of_attachments", "get_attachment"),),
-                ),
-                start=1,
-            ):
-                payload = coerce_pst_attachment_payload(attachment)
-                if payload is None:
-                    continue
-                attachments.append(
-                    {
-                        "file_name": _attachment_file_name(attachment, ordinal),
-                        "ordinal": ordinal,
-                        "payload": payload,
-                        "file_hash": sha256_bytes(payload),
-                        "content_id": pst_attachment_content_id(attachment),
-                    }
-                )
-
-            yield {
-                "source_item_id": source_item_id,
-                "folder_path": folder_path,
-                "message_class": normalize_whitespace(str(getattr(message, "message_class", "") or "")) or None,
-                "subject": normalize_whitespace(str(getattr(message, "subject", "") or "")) or None,
-                "conversation_topic": _message_conversation_topic(message),
-                "transport_headers": _message_transport_headers(message),
-                "author": _message_author(message),
-                "recipients": _message_recipients(message),
-                "date_created": normalize_datetime(
-                    getattr(message, "delivery_time", None)
-                    or getattr(message, "client_submit_time", None)
-                    or getattr(message, "creation_time", None)
-                ),
-                "text_body": _message_text_body(message, html_body),
-                "html_body": html_body,
-                "attachments": attachments,
-            }
-
-        for child_folder in _iter_collection(
-            folder,
-            list_attrs=("sub_folders", "folders"),
-            count_getter_pairs=(("number_of_sub_folders", "get_sub_folder"), ("number_of_folders", "get_folder")),
-        ):
-            yield from _iter_folder(child_folder, current_ancestors)
-
-    pst_file = pypff.file()  # type: ignore[union-attr]
-    pst_file.open(str(path))
-    try:
-        root_folder = pst_file.get_root_folder()
-        yield from _iter_folder(root_folder, [])
-    finally:
-        try:
-            pst_file.close()
-        except Exception:
-            pass
+    for payload in iter_pst_raw_messages(path):
+        yield {
+            "source_item_id": payload["source_item_id"],
+            "folder_path": payload.get("folder_path"),
+            "message_class": payload.get("message_class"),
+            "subject": payload.get("subject"),
+            "conversation_topic": payload.get("conversation_topic"),
+            "transport_headers": payload.get("transport_headers"),
+            "author": payload.get("author"),
+            "recipients": payload.get("recipients"),
+            "date_created": payload.get("date_created"),
+            "text_body": payload.get("text_body"),
+            "html_body": payload.get("html_body"),
+            "chat_threading": payload.get("chat_threading"),
+            "attachments": list(payload.get("attachments") or []),
+        }
 
 
 def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object]) -> dict[str, object] | None:
@@ -2069,6 +2447,13 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
     if message_kind == "skip":
         return None
     if message_kind == "chat":
+        raw_chat_threading = message_dict.get("chat_threading")
+        chat_threading = dict(raw_chat_threading) if isinstance(raw_chat_threading, dict) else {}
+        chat_thread_participants = sorted_unique_display_names(normalize_string_list(chat_threading.get("participants")))
+        preferred_participants = render_display_name_list(chat_thread_participants)
+        preferred_title = None
+        if normalize_whitespace(str(chat_threading.get("thread_type") or "")).lower() == "chat":
+            preferred_title = render_display_name_list(chat_thread_participants, max_names=4)
         chat_entries = synthesize_pst_chat_entries(
             author=normalized_author,
             date_created=normalized_date_created,
@@ -2082,9 +2467,11 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
             text_body=chat_text,
             chat_metadata=chat_metadata,
             chat_entries=chat_entries,
+            preferred_title=preferred_title,
+            preferred_participants=preferred_participants,
         )
         extracted = build_chat_extracted_payload(
-            title=normalized_subject,
+            title=preferred_title or normalized_subject,
             author=normalized_author,
             date_created=normalized_date_created,
             text_body=normalized_text_body,
@@ -2093,6 +2480,7 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
             preview_file_name=pst_preview_file_name(source_item_id),
             chat_metadata=resolved_chat_metadata,
             chat_entries=chat_entries,
+            chat_threading=chat_threading,
         )
     elif message_kind == "calendar":
         extracted = build_calendar_extracted_payload(

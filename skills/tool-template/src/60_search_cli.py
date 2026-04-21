@@ -4680,6 +4680,77 @@ def export_previews(
         connection.close()
 
 
+def resolve_workspace_input_path(root: Path, raw_input_path: str) -> Path:
+    normalized_input = raw_input_path.strip()
+    if not normalized_input:
+        raise RetrieverError("Input path cannot be empty.")
+    requested_path = Path(normalized_input).expanduser()
+    if requested_path.is_absolute():
+        return requested_path.resolve()
+    return (root / requested_path).resolve()
+
+
+def inspect_pst_properties(
+    root: Path,
+    raw_pst_path: str,
+    *,
+    source_item_ids: list[str] | None = None,
+    message_kind: str = "all",
+    limit: int = 20,
+    max_record_entries: int = 128,
+) -> dict[str, object]:
+    normalized_message_kind = normalize_whitespace(message_kind).lower() or "all"
+    if normalized_message_kind not in {"all", "chat", "email", "calendar", "skip"}:
+        raise RetrieverError(f"Unsupported PST message-kind filter: {message_kind!r}")
+    if limit < 1:
+        raise RetrieverError("PST inspection limit must be >= 1.")
+    if max_record_entries < 1:
+        raise RetrieverError("PST inspection max-record-entries must be >= 1.")
+
+    pst_path = resolve_workspace_input_path(root, raw_pst_path)
+    if not pst_path.exists():
+        raise RetrieverError(f"PST path not found: {pst_path}")
+    if not pst_path.is_file():
+        raise RetrieverError(f"PST path is not a file: {pst_path}")
+    if normalize_extension(pst_path) != PST_SOURCE_KIND:
+        raise RetrieverError(f"Expected a .pst file, got: {pst_path.name}")
+
+    normalized_source_item_ids = [
+        normalize_whitespace(str(source_item_id))
+        for source_item_id in (source_item_ids or [])
+        if normalize_whitespace(str(source_item_id))
+    ]
+    source_item_id_filter = set(normalized_source_item_ids)
+    scanned = 0
+    matched = 0
+    messages: list[dict[str, object]] = []
+    for payload in iter_pst_debug_messages(pst_path, max_record_entries=max_record_entries):
+        scanned += 1
+        if normalized_message_kind != "all" and str(payload["message_kind"]) != normalized_message_kind:
+            continue
+        if source_item_id_filter and str(payload["source_item_id"]) not in source_item_id_filter:
+            continue
+        matched += 1
+        if len(messages) >= limit:
+            continue
+        messages.append(payload)
+
+    return {
+        "status": "ok",
+        "pst_path": str(pst_path),
+        "pst_rel_path": relative_output_path_or_none(root, pst_path),
+        "message_kind": normalized_message_kind,
+        "source_item_ids": normalized_source_item_ids,
+        "limit": int(limit),
+        "max_record_entries": int(max_record_entries),
+        "scanned": int(scanned),
+        "matched": int(matched),
+        "returned": len(messages),
+        "truncated": matched > len(messages),
+        "messages": messages,
+    }
+
+
 def get_doc(
     root: Path,
     document_id: int,
@@ -5376,6 +5447,37 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_production_parser.add_argument("workspace", help="Workspace root path")
     ingest_production_parser.add_argument("production_root", help="Production root directory inside the workspace")
 
+    inspect_pst_parser = subparsers.add_parser(
+        "inspect-pst-properties",
+        help="Inspect raw PST message fields and named-property candidates for debugging conversation scope ids",
+    )
+    inspect_pst_parser.add_argument("workspace", help="Workspace root path")
+    inspect_pst_parser.add_argument("pst_path", help="PST file path; relative paths resolve from the workspace root")
+    inspect_pst_parser.add_argument(
+        "--source-item-id",
+        dest="source_item_ids",
+        action="append",
+        help="Restrict to one PST message source_item_id (repeatable)",
+    )
+    inspect_pst_parser.add_argument(
+        "--message-kind",
+        default="all",
+        choices=("all", "chat", "email", "calendar", "skip"),
+        help="Filter to one normalized PST message kind",
+    )
+    inspect_pst_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of matching messages to return",
+    )
+    inspect_pst_parser.add_argument(
+        "--max-record-entries",
+        type=int,
+        default=128,
+        help="Maximum number of record entries to serialize per record set",
+    )
+
     search_parser = subparsers.add_parser("search", help="Search indexed documents")
     add_search_arguments(search_parser)
 
@@ -5913,6 +6015,23 @@ def main() -> int:
 
         if args.command == "ingest-production":
             return emit_cli_payload("ingest-production", ingest_production(root, args.production_root))
+
+        if args.command == "inspect-pst-properties":
+            print(
+                json.dumps(
+                    inspect_pst_properties(
+                        root,
+                        args.pst_path,
+                        source_item_ids=args.source_item_ids,
+                        message_kind=args.message_kind,
+                        limit=args.limit,
+                        max_record_entries=args.max_record_entries,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
 
         if args.command == "search":
             return emit_cli_payload(
