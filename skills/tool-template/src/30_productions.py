@@ -359,6 +359,13 @@ def attachment_preview_link_label(row: sqlite3.Row) -> str:
     return control_number or "Attachment"
 
 
+def relative_preview_href(path: Path, parent_preview_path: Path, target_fragment: object = None) -> str:
+    href = urllib_request.pathname2url(
+        os.path.relpath(str(path), start=str(parent_preview_path.parent))
+    )
+    return append_preview_fragment(href, target_fragment)
+
+
 def build_document_attachment_preview_links(
     paths: dict[str, Path],
     connection: sqlite3.Connection,
@@ -376,13 +383,10 @@ def build_document_attachment_preview_links(
         child_preview_path = Path(child_preview_abs_path)
         if not child_preview_path.exists():
             continue
-        relative_href = urllib_request.pathname2url(
-            os.path.relpath(str(child_preview_path), start=str(parent_preview_path.parent))
-        )
         detail = normalize_whitespace(str(child_row["control_number"] or ""))
         links.append(
             {
-                "href": relative_href,
+                "href": relative_preview_href(child_preview_path, parent_preview_path),
                 "label": attachment_preview_link_label(child_row),
                 "detail": detail,
             }
@@ -2233,6 +2237,114 @@ def conversation_preview_document_kind(document: dict[str, object]) -> str:
     return content_type or "Document"
 
 
+def extract_standalone_preview_body_html(preview_html: str) -> str | None:
+    cleaned_preview_html = HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN.sub("", preview_html or "")
+    body_match = re.search(
+        r"<body\b[^>]*>(.*)</body>\s*</html>\s*$",
+        cleaned_preview_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if body_match is None:
+        return None
+    body_html = re.sub(
+        r"^\s*<h1\b[^>]*>.*?</h1>\s*",
+        "",
+        body_match.group(1),
+        count=1,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    body_html = re.sub(
+        r"^\s*<table\b[^>]*>.*?</table>\s*<hr\s*/?>\s*",
+        "",
+        body_html,
+        count=1,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    normalized = body_html.strip()
+    return normalized or None
+
+
+def load_preserved_preview_rows_by_document_id(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_ids: list[int],
+) -> dict[int, list[dict[str, object]]]:
+    if not document_ids:
+        return {}
+    rows = connection.execute(
+        f"""
+        SELECT document_id, rel_preview_path, preview_type, target_fragment, label, ordinal
+        FROM document_previews
+        WHERE document_id IN ({", ".join("?" for _ in document_ids)})
+        ORDER BY document_id ASC, ordinal ASC, id ASC
+        """,
+        document_ids,
+    ).fetchall()
+    preview_rows_by_document_id: dict[int, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        rel_preview_path = normalize_whitespace(str(row["rel_preview_path"] or ""))
+        if not rel_preview_path or is_conversation_preview_rel_path(rel_preview_path):
+            continue
+        if not (paths["state_dir"] / rel_preview_path).exists():
+            continue
+        preview_rows_by_document_id[int(row["document_id"])].append(
+            {
+                "rel_preview_path": rel_preview_path,
+                "preview_type": str(row["preview_type"]),
+                "target_fragment": row["target_fragment"],
+                "label": (str(row["label"]) if row["label"] is not None else None),
+                "ordinal": int(row["ordinal"]),
+            }
+        )
+    return dict(preview_rows_by_document_id)
+
+
+def load_document_preview_body_html(
+    paths: dict[str, Path],
+    preview_rows: list[dict[str, object]],
+) -> str | None:
+    preferred_rows = sorted(
+        preview_rows,
+        key=lambda row: (
+            0 if normalize_whitespace(str(row.get("label") or "")).lower() == "message" else 1,
+            int(row.get("ordinal", 0)),
+        ),
+    )
+    for preview_row in preferred_rows:
+        if normalize_whitespace(str(preview_row.get("preview_type") or "")).lower() != "html":
+            continue
+        preview_path = paths["state_dir"] / str(preview_row["rel_preview_path"])
+        if not preview_path.exists():
+            continue
+        body_html = extract_standalone_preview_body_html(
+            preview_path.read_text(encoding="utf-8")
+        )
+        if body_html:
+            return body_html
+    return None
+
+
+def rebase_preserved_preview_rows(
+    preview_rows: list[dict[str, object]],
+    *,
+    start_ordinal: int,
+    created_at: str,
+) -> list[dict[str, object]]:
+    rebased_rows: list[dict[str, object]] = []
+    for index, preview_row in enumerate(preview_rows):
+        rebased_rows.append(
+            {
+                "rel_preview_path": str(preview_row["rel_preview_path"]),
+                "preview_type": str(preview_row["preview_type"]),
+                "target_fragment": preview_row.get("target_fragment"),
+                "label": preview_row.get("label"),
+                "ordinal": start_ordinal + index,
+                "created_at": created_at,
+            }
+        )
+    return rebased_rows
+
+
 def render_conversation_chat_body_html(text_content: str) -> str:
     chat_entries = iter_chat_transcript_entries(text_content, max_lines=4000)
     if not chat_entries:
@@ -2286,6 +2398,7 @@ def render_conversation_document_section(
     kind_label = conversation_preview_document_kind(document)
     timestamp_label = format_chat_preview_timestamp(conversation_preview_primary_timestamp(document)) or ""
     text_content = str(document.get("text_content") or "")
+    standalone_preview_body_html = document.get("standalone_preview_body_html")
     metadata_items: list[str] = []
     for label, value in (
         ("Control number", document.get("control_number")),
@@ -2293,7 +2406,6 @@ def render_conversation_document_section(
         ("Participants", document.get("participants")),
         ("From", document.get("author")),
         ("To", document.get("recipients")),
-        ("Source", document.get("source_rel_path")),
     ):
         normalized = normalize_whitespace(str(value or ""))
         if not normalized:
@@ -2316,6 +2428,8 @@ def render_conversation_document_section(
     body_html = (
         render_conversation_chat_body_html(text_content)
         if normalize_whitespace(str(document.get("content_type") or "")) == "Chat"
+        else str(standalone_preview_body_html)
+        if isinstance(standalone_preview_body_html, str) and standalone_preview_body_html.strip()
         else f"<pre>{html.escape(text_content or 'No extracted text available.')}</pre>"
     )
     attachment_links_html = ""
@@ -2327,11 +2441,9 @@ def render_conversation_document_section(
         if metadata_items
         else ""
     )
-    header_actions = (
-        f"<a class=\"conversation-permalink\" href=\"#{html.escape(anchor)}\">Permalink</a>"
-        if current_segment_href
-        else ""
-    )
+    # Permalinks are intentionally omitted: Cowork's preview iframe blocks link
+    # clicks, so a fragment anchor here wouldn't actually jump anywhere useful.
+    _ = current_segment_href
     return "".join(
         [
             f'<article class="conversation-document" id="{html.escape(anchor)}">',
@@ -2340,7 +2452,6 @@ def render_conversation_document_section(
             f'<div class="conversation-document-kind">{html.escape(kind_label)}</div>',
             f"<h2>{html.escape(heading)}</h2>",
             "</div>",
-            header_actions,
             "</header>",
             metadata_html,
             f'<div class="conversation-document-body">{body_html}</div>',
@@ -2349,15 +2460,15 @@ def render_conversation_document_section(
         ]
     )
 
-
 def build_conversation_preview_head_html() -> str:
     return (
         "<style>"
         "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background: linear-gradient(180deg, #eef3f8 0%, #f7fafc 100%); color: #122033; }"
         "main { max-width: 1040px; margin: 0 auto; padding: 28px 20px 44px; }"
-        "table { border-collapse: collapse; width: 100%; margin-bottom: 1.25rem; background: rgba(255,255,255,0.88); border: 1px solid #d7e0ea; border-radius: 16px; overflow: hidden; }"
-        "th, td { text-align: left; padding: 0.55rem 0.75rem; border-bottom: 1px solid #e3e8ef; vertical-align: top; }"
-        "th { width: 12rem; color: #516072; font-weight: 600; }"
+        "body > h1 { padding-left: 0.75rem; }"
+        "body > table { border-collapse: collapse; width: calc(100% - 1.5rem); margin: 0 0.75rem 1.25rem; background: rgba(255,255,255,0.88); border: 1px solid #d7e0ea; border-radius: 16px; overflow: hidden; }"
+        "body > table th, body > table td { text-align: left; padding: 0.55rem 0.75rem; border-bottom: 1px solid #e3e8ef; vertical-align: top; }"
+        "body > table th { width: 12rem; color: #516072; font-weight: 600; }"
         ".conversation-nav, .conversation-segments { display: grid; gap: 0.9rem; }"
         ".conversation-segment-card, .conversation-document { background: rgba(255,255,255,0.94); border: 1px solid #d7e0ea; border-radius: 18px; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06); }"
         ".conversation-segment-card { padding: 1rem 1.1rem; }"
@@ -2365,26 +2476,26 @@ def build_conversation_preview_head_html() -> str:
         ".conversation-segment-card p { margin: 0 0 0.65rem; color: #516072; }"
         ".conversation-segment-card ul { margin: 0; padding-left: 1.15rem; }"
         ".conversation-segment-card li { margin: 0.28rem 0; }"
-        ".conversation-segment-card a, .conversation-nav a, .conversation-document a { color: #0b63ce; text-decoration: none; }"
+        ".conversation-segment-card a, .conversation-nav a, .conversation-document-meta a, .retriever-attachments a { color: #0b63ce; text-decoration: none; }"
         ".conversation-nav { margin-bottom: 1rem; }"
         ".conversation-nav-links { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; color: #516072; }"
         ".conversation-document { padding: 1.1rem 1.15rem 1.15rem; margin-bottom: 1rem; scroll-margin-top: 1rem; }"
         ".conversation-document-header { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 0.9rem; }"
         ".conversation-document-header h2 { margin: 0.2rem 0 0; font-size: 1.15rem; }"
         ".conversation-document-kind { font-size: 0.82rem; letter-spacing: 0.06em; text-transform: uppercase; color: #516072; }"
-        ".conversation-permalink { white-space: nowrap; font-size: 0.92rem; }"
         ".conversation-document-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.7rem 1rem; margin: 0 0 1rem; }"
         ".conversation-document-meta div { background: #f8fafc; border: 1px solid #e3e8ef; border-radius: 14px; padding: 0.65rem 0.75rem; }"
         ".conversation-document-meta dt { font-size: 0.8rem; font-weight: 600; color: #607080; margin-bottom: 0.18rem; }"
         ".conversation-document-meta dd { margin: 0; }"
-        ".conversation-document-body pre { white-space: pre-wrap; word-break: break-word; margin: 0; background: #f8fafc; border: 1px solid #d7e0ea; border-radius: 14px; padding: 0.9rem 1rem; }"
+        ".conversation-document-body pre { white-space: pre-wrap; word-break: break-word; margin: 0; background: #f8fafc; border: 1px solid #d7e0ea; border-radius: 14px; padding: 0.9rem 1rem; font-family: inherit; font-size: 1rem; }"
         ".conversation-chat-transcript { display: grid; gap: 0.75rem; }"
         ".conversation-chat-message { display: flex; gap: 0.75rem; align-items: flex-start; border: 1px solid #d0d7de; border-radius: 14px; padding: 0.85rem 0.95rem; background: #f6f8fa; }"
+        ".chat-avatar-svg { width: 2.5rem; height: 2.5rem; flex: 0 0 auto; display: block; }"
         ".conversation-chat-main { min-width: 0; flex: 1 1 auto; }"
         ".conversation-chat-meta { display: flex; gap: 0.55rem; align-items: baseline; margin-bottom: 0.25rem; flex-wrap: wrap; }"
         ".conversation-chat-speaker { font-weight: 600; color: #0969da; }"
         ".conversation-chat-time { color: #57606a; font-size: 0.9rem; }"
-        ".conversation-chat-body { white-space: pre-wrap; line-height: 1.45; }"
+        ".conversation-chat-body { white-space: pre-wrap; line-height: 1.45; font-size: 1rem; }"
         ".conversation-raw-text { margin-top: 0.85rem; }"
         ".conversation-raw-text summary { cursor: pointer; color: #516072; }"
         "</style>"
@@ -2396,7 +2507,6 @@ def build_conversation_toc_html(
     *,
     documents: list[dict[str, object]],
     segment_items: list[dict[str, object]],
-    doc_target_hrefs: dict[int, str],
 ) -> str:
     headers = {
         "Conversation": normalize_whitespace(str(conversation_row["display_name"] or "")) or f"Conversation {int(conversation_row['id'])}",
@@ -2406,15 +2516,15 @@ def build_conversation_toc_html(
     }
     cards: list[str] = []
     for segment in segment_items:
-        doc_links = "".join(
-            f"<li><a href=\"{html.escape(doc_target_hrefs[int(document['id'])])}\">{html.escape(conversation_preview_document_heading(document))}</a></li>"
+        doc_entries = "".join(
+            f"<li>{html.escape(conversation_preview_document_heading(document))}</li>"
             for document in segment["documents"]
         )
         cards.append(
             "<section class=\"conversation-segment-card\">"
-            f"<h2><a href=\"{html.escape(Path(str(segment['segment_rel_path'])).name)}\">{html.escape(str(segment['label']))}</a></h2>"
+            f"<h2>{html.escape(str(segment['label']))}</h2>"
             f"<p>{len(segment['documents'])} document{'s' if len(segment['documents']) != 1 else ''}</p>"
-            f"{'<ul>' + doc_links + '</ul>' if doc_links else ''}"
+            f"{'<ul>' + doc_entries + '</ul>' if doc_entries else ''}"
             "</section>"
         )
     return build_html_preview(
@@ -2438,19 +2548,12 @@ def build_conversation_segment_html(
     attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
 ) -> str:
     current_file_name = Path(current_segment_rel_path).name
-    previous_link = Path(str(segment_items[segment_index - 1]["segment_rel_path"])).name if segment_index > 0 else None
-    next_link = Path(str(segment_items[segment_index + 1]["segment_rel_path"])).name if segment_index + 1 < segment_count else None
     headers = {
         "Conversation": normalize_whitespace(str(conversation_row["display_name"] or "")) or f"Conversation {int(conversation_row['id'])}",
         "Type": normalize_whitespace(str(conversation_row["conversation_type"] or "")),
         "Segment": segment_label,
         "Documents": str(len(segment_items[segment_index]["documents"])),
     }
-    nav_links = ["<a href=\"index.html\">Contents</a>"]
-    if previous_link:
-        nav_links.append(f"<a href=\"{html.escape(previous_link)}\">Previous segment</a>")
-    if next_link:
-        nav_links.append(f"<a href=\"{html.escape(next_link)}\">Next segment</a>")
     sections = "".join(
         render_conversation_document_section(
             document,
@@ -2462,14 +2565,7 @@ def build_conversation_segment_html(
     )
     return build_html_preview(
         headers,
-        body_html=(
-            "<main>"
-            "<div class=\"conversation-nav\">"
-            f"<div class=\"conversation-nav-links\">{' | '.join(nav_links)}</div>"
-            "</div>"
-            f"{sections}"
-            "</main>"
-        ),
+        body_html=f"<main>{sections}</main>",
         document_title=f"{headers['Conversation']} - {segment_label}",
         head_html=build_conversation_preview_head_html(),
         heading=segment_label,
@@ -2479,26 +2575,41 @@ def build_conversation_segment_html(
 def build_conversation_entry_html(
     conversation_row: sqlite3.Row,
     *,
+    document: dict[str, object],
     document_heading: str,
-    target_href: str,
+    segment_label: str | None = None,
+    attachment_links: list[dict[str, str]] | None = None,
+    position_index: int | None = None,
+    total_count: int | None = None,
 ) -> str:
-    escaped_target_href = html.escape(target_href, quote=True)
+    conversation_name = (
+        normalize_whitespace(str(conversation_row["display_name"] or ""))
+        or f"Conversation {int(conversation_row['id'])}"
+    )
+    document_id = int(document["id"])
+    section_html = render_conversation_document_section(
+        document,
+        current_segment_href="entry",
+        doc_target_hrefs={document_id: f"#{conversation_preview_anchor(document_id)}"},
+        attachment_links_by_document_id=(
+            {document_id: attachment_links}
+            if attachment_links
+            else None
+        ),
+    )
+    headers: dict[str, str] = {
+        "Conversation": conversation_name,
+        "Type": normalize_whitespace(str(conversation_row["conversation_type"] or "")),
+    }
+    if segment_label:
+        headers["Segment"] = segment_label
+    if position_index is not None and total_count is not None:
+        headers["Document"] = f"{position_index} of {total_count}"
     return build_html_preview(
-        {},
-        body_html=(
-            "<main>"
-            "<section class=\"conversation-segment-card\">"
-            "<h2>Opening conversation document</h2>"
-            f"<p>If you are not redirected automatically, <a href=\"{escaped_target_href}\">open {html.escape(document_heading)}</a>.</p>"
-            "</section>"
-            "</main>"
-        ),
-        document_title=document_heading or (normalize_whitespace(str(conversation_row["display_name"] or "")) or "Conversation document"),
-        head_html=(
-            build_conversation_preview_head_html()
-            + f'<meta http-equiv="refresh" content="0; url={escaped_target_href}"/>'
-            + f"<script>window.location.replace({json.dumps(target_href)});</script>"
-        ),
+        headers,
+        body_html=f"<main>{section_html}</main>",
+        document_title=document_heading or conversation_name or "Conversation document",
+        head_html=build_conversation_preview_head_html(),
         heading=document_heading or "Conversation document",
     )
 
@@ -2610,6 +2721,18 @@ def load_preview_documents(
                 )
             }
         )
+    preserved_preview_rows_by_document_id = load_preserved_preview_rows_by_document_id(
+        connection,
+        paths,
+        [int(document["id"]) for document in documents],
+    )
+    for document in documents:
+        if normalize_whitespace(str(document.get("content_type") or "")).lower() == "chat":
+            continue
+        document["standalone_preview_body_html"] = load_document_preview_body_html(
+            paths,
+            preserved_preview_rows_by_document_id.get(int(document["id"]), []),
+        )
     documents.sort(key=conversation_preview_sort_key)
     return documents
 
@@ -2648,20 +2771,26 @@ def refresh_conversation_previews(
             }
             for segment_key, items in sorted(segment_documents.items(), key=lambda item: item[0])
         ]
+        document_ids = [int(document["id"]) for document in documents]
+        preserved_preview_rows_by_document_id = load_preserved_preview_rows_by_document_id(
+            connection,
+            paths,
+            document_ids,
+        )
+        total_entries = len(document_ids)
+        toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
+        toc_abs_path = paths["state_dir"] / toc_rel_path
+        toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
         doc_target_hrefs = {
             int(document["id"]): f"{Path(str(segment['segment_rel_path'])).name}#{conversation_preview_anchor(int(document['id']))}"
             for segment in segment_items
             for document in segment["documents"]
         }
-        toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
-        toc_abs_path = paths["state_dir"] / toc_rel_path
-        toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
         toc_abs_path.write_text(
             build_conversation_toc_html(
                 conversation_row,
                 documents=documents,
                 segment_items=segment_items,
-                doc_target_hrefs=doc_target_hrefs,
             ),
             encoding="utf-8",
         )
@@ -2708,23 +2837,33 @@ def refresh_conversation_previews(
                 document_ids,
             ).fetchall()
         ]
+        flat_index = 0
         for segment in segment_items:
+            segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
+            entry_attachment_links = conversation_attachment_links_by_document_id(
+                connection,
+                paths,
+                segment_preview_path=segment_abs_path,
+                documents=list(segment["documents"]),
+            )
             for document in segment["documents"]:
-                entry_rel_path = conversation_preview_entry_rel_path(conversation_id, int(document["id"]))
+                document_id = int(document["id"])
+                entry_rel_path = conversation_preview_entry_rel_path(conversation_id, document_id)
                 entry_abs_path = paths["state_dir"] / entry_rel_path
                 entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
-                entry_target_href = (
-                    f"{Path(str(segment['segment_rel_path'])).name}"
-                    f"#{conversation_preview_anchor(int(document['id']))}"
-                )
                 entry_abs_path.write_text(
                     build_conversation_entry_html(
                         conversation_row,
+                        document=document,
                         document_heading=conversation_preview_document_heading(document),
-                        target_href=entry_target_href,
+                        segment_label=str(segment["label"]),
+                        attachment_links=entry_attachment_links.get(document_id) or [],
+                        position_index=flat_index + 1,
+                        total_count=total_entries,
                     ),
                     encoding="utf-8",
                 )
+                flat_index += 1
                 replace_document_preview_rows(
                     connection,
                     int(document["id"]),
@@ -2733,7 +2872,7 @@ def refresh_conversation_previews(
                             "rel_preview_path": entry_rel_path,
                             "preview_type": "html",
                             "target_fragment": None,
-                            "label": None,
+                            "label": "entry",
                             "ordinal": 0,
                             "created_at": created_at,
                         },
@@ -2746,6 +2885,11 @@ def refresh_conversation_previews(
                             "created_at": created_at,
                         },
                         toc_row,
+                        *rebase_preserved_preview_rows(
+                            preserved_preview_rows_by_document_id.get(document_id, []),
+                            start_ordinal=3,
+                            created_at=created_at,
+                        ),
                     ],
                 )
         cleanup_unreferenced_preview_files(paths, connection, previous_preview_paths)
