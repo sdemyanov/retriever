@@ -25,10 +25,11 @@ Use this skill for any task that needs to bootstrap or maintain a workspace-loca
 - All persistent Retriever state lives under `.retriever/` inside that root.
 - Database paths stored in SQLite must be relative, never absolute.
 - Never silently overwrite a modified `.retriever/bin/retriever_tools.py`.
-- Before replacing a modified tool, back it up under `.retriever/bin/backups/` and get explicit user approval.
+- The tool's own dispatcher auto-upgrades clean-but-stale copies and blocks user-modified copies before running any non-exempt command; see [workspace.md](workspace.md) for the full auto-upgrade contract.
+- Before force-replacing a modified tool via `upgrade-workspace --force`, it is backed up under `.retriever/bin/backups/` with a `.user-modified` suffix.
 - Treat `runtime.json` as the local state record for the installed tool, schema version, and checksum.
 - Treat canonical template checksum drift as an upgrade signal even if the plugin version string is unchanged.
-- On reinstall, refresh the workspace tool and run `bootstrap` before any reindex whenever the installed canonical template changed.
+- On reinstall, the next non-exempt command will auto-upgrade the workspace tool; there is no separate reindex step needed purely because the canonical template changed.
 - If environment checks fail, stop and report the issue clearly instead of partially bootstrapping.
 
 ## Current outcome
