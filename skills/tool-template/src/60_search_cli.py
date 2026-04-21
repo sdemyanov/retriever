@@ -768,9 +768,11 @@ def document_path_payload(
     paths: dict[str, Path],
     connection: sqlite3.Connection,
     row: sqlite3.Row,
+    *,
+    include_preview_targets: bool = True,
 ) -> dict[str, object]:
     preview_target = default_preview_target(paths, row, connection)
-    return {
+    payload = {
         "rel_path": row["rel_path"],
         "abs_path": str(document_absolute_path(paths, row["rel_path"])),
         "preview_rel_path": preview_target["rel_path"],
@@ -778,8 +780,31 @@ def document_path_payload(
         "preview_file_rel_path": preview_target["file_rel_path"],
         "preview_file_abs_path": preview_target["file_abs_path"],
         "preview_target_fragment": preview_target["target_fragment"],
-        "preview_targets": collect_preview_targets(paths, int(row["id"]), row["rel_path"], connection),
     }
+    if include_preview_targets:
+        payload["preview_targets"] = collect_preview_targets(paths, int(row["id"]), row["rel_path"], connection)
+    return payload
+
+
+def fetch_attachment_counts(
+    connection: sqlite3.Connection,
+    parent_ids: list[int],
+) -> dict[int, int]:
+    if not parent_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in parent_ids)
+    rows = connection.execute(
+        f"""
+        SELECT parent_document_id, COUNT(*) AS attachment_count
+        FROM documents
+        WHERE parent_document_id IN ({placeholders})
+          AND COALESCE(child_document_kind, ?) = ?
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+        GROUP BY parent_document_id
+        """,
+        [*parent_ids, CHILD_DOCUMENT_KIND_ATTACHMENT, CHILD_DOCUMENT_KIND_ATTACHMENT],
+    ).fetchall()
+    return {int(row["parent_document_id"]): int(row["attachment_count"]) for row in rows}
 
 
 def fetch_attachment_summaries(
@@ -872,6 +897,27 @@ def fetch_child_document_summaries(
             }
         )
     return grouped
+
+
+def fetch_child_document_counts(
+    connection: sqlite3.Connection,
+    parent_ids: list[int],
+) -> dict[int, int]:
+    if not parent_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in parent_ids)
+    rows = connection.execute(
+        f"""
+        SELECT parent_document_id, COUNT(*) AS child_document_count
+        FROM documents
+        WHERE parent_document_id IN ({placeholders})
+          AND COALESCE(child_document_kind, ?) != ?
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+        GROUP BY parent_document_id
+        """,
+        [*parent_ids, CHILD_DOCUMENT_KIND_ATTACHMENT, CHILD_DOCUMENT_KIND_ATTACHMENT],
+    ).fetchall()
+    return {int(row["parent_document_id"]): int(row["child_document_count"]) for row in rows}
 
 
 def fetch_parent_summaries(
@@ -1511,6 +1557,402 @@ def resolve_document_search(
     }
 
 
+def sql_sort_terms_for_field(
+    connection: sqlite3.Connection,
+    field_name: str,
+    order: str,
+    *,
+    alias: str,
+) -> list[str]:
+    normalized_order = "DESC" if normalize_inline_whitespace(order).lower() == "desc" else "ASC"
+    if field_name == "id":
+        return [f"{alias}.id {normalized_order}"]
+
+    field_def = resolve_field_definition(connection, field_name)
+    if field_def.get("source") == "virtual":
+        raise RetrieverError(f"Cannot sort by virtual filter field: {field_name}")
+
+    canonical_name = str(field_def["field_name"])
+    column_expr = f"{alias}.{quote_identifier(canonical_name)}"
+    field_type = str(field_def["field_type"])
+    if field_type == "date":
+        normalized_expr = f"datetime({column_expr})"
+        return [
+            f"CASE WHEN {column_expr} IS NULL OR {normalized_expr} IS NULL THEN 1 ELSE 0 END ASC",
+            f"{normalized_expr} {normalized_order}",
+        ]
+    if field_type == "text":
+        return [
+            f"CASE WHEN {column_expr} IS NULL THEN 1 ELSE 0 END ASC",
+            f"LOWER({column_expr}) {normalized_order}",
+        ]
+    return [
+        f"CASE WHEN {column_expr} IS NULL THEN 1 ELSE 0 END ASC",
+        f"{column_expr} {normalized_order}",
+    ]
+
+
+def sql_order_by_for_sort_specs(
+    connection: sqlite3.Connection,
+    sort_specs: list[tuple[str, str]],
+    *,
+    alias: str,
+) -> str:
+    effective_specs = list(sort_specs)
+    if not any(field_name == "id" for field_name, _ in effective_specs):
+        effective_specs.append(("id", "asc"))
+    terms: list[str] = []
+    for field_name, direction in effective_specs:
+        terms.extend(sql_sort_terms_for_field(connection, field_name, direction, alias=alias))
+    return ", ".join(terms)
+
+
+def sql_relevance_order_by(
+    connection: sqlite3.Connection,
+    *,
+    row_alias: str,
+    rank_expr: str,
+) -> str:
+    return ", ".join(
+        [
+            f"CASE WHEN {rank_expr} IS NULL THEN 1 ELSE 0 END ASC",
+            f"{rank_expr} ASC",
+            sql_order_by_for_sort_specs(connection, [("date_created", "desc")], alias=row_alias),
+        ]
+    )
+
+
+def sql_bates_order_by(*, row_alias: str, prioritize_rank: bool) -> str:
+    terms: list[str] = []
+    if prioritize_rank:
+        terms.extend(
+            [
+                f"CASE WHEN {row_alias}.rank IS NULL THEN 1 ELSE 0 END ASC",
+                f"{row_alias}.rank ASC",
+            ]
+        )
+    terms.extend(
+        [
+            f"CASE WHEN {row_alias}.bates_sort_value IS NULL THEN 1 ELSE 0 END ASC",
+            f"{row_alias}.bates_sort_value ASC",
+            f"{row_alias}.id ASC",
+        ]
+    )
+    return ", ".join(terms)
+
+
+def search_browse_page(
+    connection: sqlite3.Connection,
+    clauses: list[str],
+    params: list[object],
+    *,
+    limit: int,
+    offset: int,
+    order_by_sql: str,
+) -> dict[str, object]:
+    where_clause = " AND ".join(clauses)
+    count_row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS total_hits
+        FROM documents d
+        WHERE {where_clause}
+        """,
+        params,
+    ).fetchone()
+    total_hits = int(count_row["total_hits"] or 0) if count_row is not None else 0
+    rows = connection.execute(
+        f"""
+        SELECT d.*
+        FROM documents d
+        WHERE {where_clause}
+        ORDER BY {order_by_sql}
+        LIMIT ? OFFSET ?
+        """,
+        [*params, limit, offset],
+    ).fetchall()
+    return {
+        "total_hits": total_hits,
+        "results": [
+            {
+                "id": int(row["id"]),
+                "rank": None,
+                "snippet": metadata_snippet(row),
+                "row": row,
+            }
+            for row in rows
+        ],
+    }
+
+
+def search_bates_page(
+    connection: sqlite3.Connection,
+    query_begin: str,
+    query_end: str,
+    clauses: list[str],
+    params: list[object],
+    *,
+    limit: int,
+    offset: int,
+    order_by_sql: str,
+) -> dict[str, object]:
+    where_clause = " AND ".join(clauses)
+    range_begin_expr = "COALESCE(d.begin_bates, d.control_number)"
+    range_end_expr = "COALESCE(d.end_bates, d.control_number)"
+    single_value = query_begin == query_end
+    if single_value:
+        rank_sql = "CASE WHEN d.control_number = ? OR d.begin_bates = ? OR d.end_bates = ? THEN 0.0 ELSE 1.0 END"
+        rank_params: list[object] = [query_begin, query_begin, query_begin]
+        match_clause = (
+            "d.control_number = ? OR d.begin_bates = ? OR d.end_bates = ? "
+            f"OR ({range_begin_expr} <= ? AND {range_end_expr} >= ?)"
+        )
+        match_params: list[object] = [query_begin, query_begin, query_begin, query_begin, query_begin]
+    else:
+        rank_sql = "2.0"
+        rank_params = []
+        match_clause = f"{range_begin_expr} <= ? AND {range_end_expr} >= ?"
+        match_params = [query_end, query_begin]
+
+    cte_sql = f"""
+        WITH bates_matches AS (
+            SELECT d.*, {rank_sql} AS rank, {range_begin_expr} AS bates_sort_value
+            FROM documents d
+            WHERE {where_clause}
+              AND ({match_clause})
+        )
+    """
+    query_params = [*rank_params, *params, *match_params]
+    count_row = connection.execute(
+        f"""
+        {cte_sql}
+        SELECT COUNT(*) AS total_hits
+        FROM bates_matches
+        """,
+        query_params,
+    ).fetchone()
+    total_hits = int(count_row["total_hits"] or 0) if count_row is not None else 0
+    rows = connection.execute(
+        f"""
+        {cte_sql}
+        SELECT *
+        FROM bates_matches bm
+        ORDER BY {order_by_sql}
+        LIMIT ? OFFSET ?
+        """,
+        [*query_params, limit, offset],
+    ).fetchall()
+    return {
+        "total_hits": total_hits,
+        "results": [
+            {
+                "id": int(row["id"]),
+                "rank": float(row["rank"]) if row["rank"] is not None else None,
+                "snippet": metadata_snippet(row),
+                "bates_sort_key": bates_sort_key(row["bates_sort_value"] or row["control_number"]),
+                "row": row,
+            }
+            for row in rows
+        ],
+    }
+
+
+def search_fts_page(
+    connection: sqlite3.Connection,
+    query: str,
+    clauses: list[str],
+    params: list[object],
+    *,
+    limit: int,
+    offset: int,
+    order_by_sql: str,
+) -> dict[str, object]:
+    query_value = query.strip()
+    if not query_value:
+        return {"total_hits": 0, "results": []}
+
+    where_clause = " AND ".join(clauses)
+    cte_sql = f"""
+        WITH chunk_matches AS (
+            SELECT d.id AS document_id, dc.text_content AS snippet_source, bm25(chunks_fts) AS rank, 0 AS source_priority
+            FROM chunks_fts
+            JOIN document_chunks dc ON dc.id = CAST(chunks_fts.chunk_id AS INTEGER)
+            JOIN documents d ON d.id = dc.document_id
+            WHERE chunks_fts MATCH ? AND {where_clause}
+        ),
+        metadata_matches AS (
+            SELECT d.id AS document_id, NULL AS snippet_source, bm25(documents_fts) AS rank, 1 AS source_priority
+            FROM documents_fts
+            JOIN documents d ON d.id = CAST(documents_fts.document_id AS INTEGER)
+            WHERE documents_fts MATCH ? AND {where_clause}
+        ),
+        all_matches AS (
+            SELECT * FROM chunk_matches
+            UNION ALL
+            SELECT * FROM metadata_matches
+        ),
+        ranked_matches AS (
+            SELECT
+                document_id,
+                snippet_source,
+                rank,
+                source_priority,
+                ROW_NUMBER() OVER (
+                    PARTITION BY document_id
+                    ORDER BY rank ASC, source_priority ASC, document_id ASC
+                ) AS row_number
+            FROM all_matches
+        ),
+        best_matches AS (
+            SELECT document_id, snippet_source, rank
+            FROM ranked_matches
+            WHERE row_number = 1
+        )
+    """
+
+    def fts_params(fts_query: str) -> list[object]:
+        return [fts_query, *params, fts_query, *params]
+
+    count_sql = f"""
+        {cte_sql}
+        SELECT COUNT(*) AS total_hits
+        FROM best_matches
+    """
+    effective_query = query_value
+    try:
+        count_row = connection.execute(count_sql, fts_params(effective_query)).fetchone()
+    except sqlite3.OperationalError:
+        effective_query = f'"{query_value}"'
+        count_row = connection.execute(count_sql, fts_params(effective_query)).fetchone()
+    total_hits = int(count_row["total_hits"] or 0) if count_row is not None else 0
+
+    rows = connection.execute(
+        f"""
+        {cte_sql}
+        SELECT d.*, bm.rank AS rank, bm.snippet_source AS snippet_source
+        FROM best_matches bm
+        JOIN documents d ON d.id = bm.document_id
+        ORDER BY {order_by_sql}
+        LIMIT ? OFFSET ?
+        """,
+        [*fts_params(effective_query), limit, offset],
+    ).fetchall()
+    results: list[dict[str, object]] = []
+    for row in rows:
+        snippet_source = row["snippet_source"] if row["snippet_source"] else metadata_snippet(row)
+        results.append(
+            {
+                "id": int(row["id"]),
+                "rank": float(row["rank"]) if row["rank"] is not None else None,
+                "snippet": make_snippet(snippet_source, query_value),
+                "row": row,
+            }
+        )
+    return {"total_hits": total_hits, "results": results}
+
+
+def resolve_paged_document_search(
+    connection: sqlite3.Connection,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+    *,
+    page: int,
+    per_page: int,
+) -> dict[str, object]:
+    filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+    normalized_sort_field = sort_field
+    bates_query_begin, bates_query_end = parse_bates_query(query)
+    is_bates_query = bates_query_begin is not None and bates_query_end is not None
+    if sort_field == "relevance" and not query.strip():
+        raise RetrieverError("Sort 'relevance' requires a non-empty query.")
+    if sort_field and sort_field != "relevance":
+        sort_field_def = resolve_field_definition(connection, sort_field)
+        if sort_field_def.get("source") == "virtual":
+            raise RetrieverError(f"Cannot sort by virtual filter field: {sort_field}")
+        normalized_sort_field = str(sort_field_def["field_name"])
+
+    offset = max(0, (page - 1) * per_page)
+    if is_bates_query:
+        if normalized_sort_field is None and order is None:
+            selection_page = search_bates_page(
+                connection,
+                str(bates_query_begin),
+                str(bates_query_end),
+                clauses,
+                params,
+                limit=per_page,
+                offset=offset,
+                order_by_sql=sql_bates_order_by(row_alias="bm", prioritize_rank=True),
+            )
+        elif normalized_sort_field == "relevance":
+            selection_page = search_bates_page(
+                connection,
+                str(bates_query_begin),
+                str(bates_query_end),
+                clauses,
+                params,
+                limit=per_page,
+                offset=offset,
+                order_by_sql=sql_relevance_order_by(connection, row_alias="bm", rank_expr="bm.rank"),
+            )
+        else:
+            effective_field = normalized_sort_field or "date_created"
+            effective_order = (order or "desc").lower()
+            selection_page = search_bates_page(
+                connection,
+                str(bates_query_begin),
+                str(bates_query_end),
+                clauses,
+                params,
+                limit=per_page,
+                offset=offset,
+                order_by_sql=sql_order_by_for_sort_specs(connection, [(effective_field, effective_order)], alias="bm"),
+            )
+    elif query.strip():
+        if normalized_sort_field is None or normalized_sort_field == "relevance":
+            order_by_sql = sql_relevance_order_by(connection, row_alias="d", rank_expr="bm.rank")
+        else:
+            order_by_sql = sql_order_by_for_sort_specs(
+                connection,
+                [(normalized_sort_field, (order or "desc").lower())],
+                alias="d",
+            )
+        selection_page = search_fts_page(
+            connection,
+            query,
+            clauses,
+            params,
+            limit=per_page,
+            offset=offset,
+            order_by_sql=order_by_sql,
+        )
+    else:
+        selection_page = search_browse_page(
+            connection,
+            clauses,
+            params,
+            limit=per_page,
+            offset=offset,
+            order_by_sql=sql_order_by_for_sort_specs(
+                connection,
+                [(normalized_sort_field or "date_created", (order or "desc").lower())],
+                alias="d",
+            ),
+        )
+
+    return {
+        "query": query,
+        "filters": filter_summary,
+        "sort": normalized_sort_field or ("bates" if is_bates_query and query.strip() else ("relevance" if query.strip() else "date_created")),
+        "order": (order or ("asc" if (is_bates_query or (query.strip() and (sort_field in (None, "relevance")))) else "desc")).lower(),
+        "sort_spec": f"{normalized_sort_field or ('bates' if is_bates_query and query.strip() else ('relevance' if query.strip() else 'date_created'))} "
+        f"{(order or ('asc' if (is_bates_query or (query.strip() and (sort_field in (None, 'relevance')))) else 'desc')).lower()}",
+        "results": selection_page["results"],
+        "total_hits": int(selection_page["total_hits"]),
+    }
+
+
 def search(
     root: Path,
     query: str,
@@ -1521,6 +1963,8 @@ def search(
     per_page: int,
     raw_columns: str | None = None,
     mode: str = "compose",
+    *,
+    compact_mode: bool = False,
 ) -> dict[str, object]:
     if page < 1:
         raise RetrieverError("Page must be >= 1.")
@@ -1528,13 +1972,22 @@ def search(
         raise RetrieverError("per-page must be >= 1.")
     per_page = min(per_page, MAX_PAGE_SIZE)
     normalized_mode = normalize_search_mode(mode)
+    compact_mode = bool(compact_mode) and normalized_mode == "compose"
 
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
+        selection = resolve_paged_document_search(
+            connection,
+            query,
+            raw_filters,
+            sort_field,
+            order,
+            page=page,
+            per_page=per_page,
+        )
         derived_scope = derive_search_scope(query, raw_filters)
         raw_column_list = parse_display_columns_argument(raw_columns) if raw_columns is not None else None
         display_column_defs, display_warnings, _ = resolve_display_column_definitions(
@@ -1546,75 +1999,103 @@ def search(
         results: list[dict[str, object]] = []
         for match in selection["results"]:
             row = match["row"]
-            results.append(
-                {
-                    "id": int(match["id"]),
-                    "control_number": row["control_number"],
-                    "conversation_id": row["conversation_id"],
-                    "dataset_id": row["dataset_id"],
-                    "parent_document_id": row["parent_document_id"],
-                    "child_document_kind": row["child_document_kind"],
-                    "root_message_key": row["root_message_key"],
-                    "source_kind": row["source_kind"],
-                    "source_rel_path": row["source_rel_path"],
-                    "source_item_id": row["source_item_id"],
-                    "source_folder_path": row["source_folder_path"],
-                    "production_id": row["production_id"],
-                    **document_path_payload(paths, connection, row),
-                    "file_name": row["file_name"],
-                    "file_type": row["file_type"],
-                    "snippet": str(match["snippet"]),
-                    "rank": match["rank"],
-                    "bates_sort_key": match.get("bates_sort_key"),
-                    "metadata": {
-                        "author": row["author"],
-                        "begin_attachment": row["begin_attachment"],
-                        "begin_bates": row["begin_bates"],
-                        "child_document_kind": row["child_document_kind"],
-                        "content_type": row["content_type"],
-                        "conversation_id": row["conversation_id"],
-                        "custodian": row["custodian"],
+            if compact_mode:
+                results.append(
+                    {
+                        "id": int(match["id"]),
+                        "control_number": row["control_number"],
                         "dataset_id": row["dataset_id"],
-                        "date_created": row["date_created"],
-                        "date_modified": row["date_modified"],
-                        "end_attachment": row["end_attachment"],
-                        "end_bates": row["end_bates"],
-                        "page_count": row["page_count"],
-                        "participants": row["participants"],
-                        "recipients": row["recipients"],
+                        "parent_document_id": row["parent_document_id"],
+                        "production_id": row["production_id"],
+                        **document_path_payload(paths, connection, row, include_preview_targets=False),
+                        "file_name": row["file_name"],
+                        "file_type": row["file_type"],
+                        "snippet": str(match["snippet"]),
+                        "rank": match["rank"],
+                        "metadata": {
+                            key: row[key]
+                            for key in COMPACT_METADATA_FIELDS
+                            if key in row.keys() and payload_has_meaningful_value(row[key])
+                        },
+                        "row": row,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "id": int(match["id"]),
+                        "control_number": row["control_number"],
+                        "conversation_id": row["conversation_id"],
+                        "dataset_id": row["dataset_id"],
+                        "parent_document_id": row["parent_document_id"],
+                        "child_document_kind": row["child_document_kind"],
                         "root_message_key": row["root_message_key"],
                         "source_kind": row["source_kind"],
                         "source_rel_path": row["source_rel_path"],
                         "source_item_id": row["source_item_id"],
                         "source_folder_path": row["source_folder_path"],
-                        "subject": row["subject"],
-                        "title": row["title"],
-                        "updated_at": row["updated_at"],
-                    },
-                    "manual_field_locks": normalize_string_list(row[MANUAL_FIELD_LOCKS_COLUMN]),
-                    "row": row,
-                }
-            )
+                        "production_id": row["production_id"],
+                        **document_path_payload(paths, connection, row),
+                        "file_name": row["file_name"],
+                        "file_type": row["file_type"],
+                        "snippet": str(match["snippet"]),
+                        "rank": match["rank"],
+                        "bates_sort_key": match.get("bates_sort_key"),
+                        "metadata": {
+                            "author": row["author"],
+                            "begin_attachment": row["begin_attachment"],
+                            "begin_bates": row["begin_bates"],
+                            "child_document_kind": row["child_document_kind"],
+                            "content_type": row["content_type"],
+                            "conversation_id": row["conversation_id"],
+                            "custodian": row["custodian"],
+                            "dataset_id": row["dataset_id"],
+                            "date_created": row["date_created"],
+                            "date_modified": row["date_modified"],
+                            "end_attachment": row["end_attachment"],
+                            "end_bates": row["end_bates"],
+                            "page_count": row["page_count"],
+                            "participants": row["participants"],
+                            "recipients": row["recipients"],
+                            "root_message_key": row["root_message_key"],
+                            "source_kind": row["source_kind"],
+                            "source_rel_path": row["source_rel_path"],
+                            "source_item_id": row["source_item_id"],
+                            "source_folder_path": row["source_folder_path"],
+                            "subject": row["subject"],
+                            "title": row["title"],
+                            "updated_at": row["updated_at"],
+                        },
+                        "manual_field_locks": normalize_string_list(row[MANUAL_FIELD_LOCKS_COLUMN]),
+                        "row": row,
+                    }
+                )
 
-        sorted_results = results
-        total_hits = len(sorted_results)
+        paged_results = results
+        total_hits = int(selection["total_hits"])
         total_pages = max(1, (total_hits + per_page - 1) // per_page)
-        start = (page - 1) * per_page
-        end = start + per_page
-        paged_results = sorted_results[start:end]
         paged_rows = [item["row"] for item in paged_results]
+        paged_parent_ids = [int(row["id"]) for row in paged_rows if row["parent_document_id"] is None]
         production_names = fetch_production_names(connection, paged_rows)
         dataset_memberships = fetch_document_dataset_memberships(connection, paged_rows)
-        attachment_summaries = fetch_attachment_summaries(
-            connection,
-            paths,
-            [int(row["id"]) for row in paged_rows if row["parent_document_id"] is None],
-        )
-        child_document_summaries = fetch_child_document_summaries(
-            connection,
-            paths,
-            [int(row["id"]) for row in paged_rows if row["parent_document_id"] is None],
-        )
+        attachment_counts: dict[int, int] = {}
+        child_document_counts: dict[int, int] = {}
+        attachment_summaries: dict[int, list[dict[str, object]]] = {}
+        child_document_summaries: dict[int, list[dict[str, object]]] = {}
+        if compact_mode:
+            attachment_counts = fetch_attachment_counts(connection, paged_parent_ids)
+            child_document_counts = fetch_child_document_counts(connection, paged_parent_ids)
+        else:
+            attachment_summaries = fetch_attachment_summaries(
+                connection,
+                paths,
+                paged_parent_ids,
+            )
+            child_document_summaries = fetch_child_document_summaries(
+                connection,
+                paths,
+                paged_parent_ids,
+            )
         parent_summaries = fetch_parent_summaries(
             connection,
             [row for row in paged_rows if row["parent_document_id"] is not None],
@@ -1641,12 +2122,20 @@ def search(
                 item["production_name"] = production_names.get(int(row["production_id"]))
                 item["metadata"]["production_name"] = production_names.get(int(row["production_id"]))
             if row["parent_document_id"] is None:
-                attachments = attachment_summaries.get(int(row["id"]), [])
-                item["attachment_count"] = len(attachments)
-                item["attachments"] = attachments
-                child_documents = child_document_summaries.get(int(row["id"]), [])
-                item["child_document_count"] = len(child_documents)
-                item["child_documents"] = child_documents
+                if compact_mode:
+                    attachment_count = attachment_counts.get(int(row["id"]), 0)
+                    if attachment_count > 0:
+                        item["attachment_count"] = attachment_count
+                    child_document_count = child_document_counts.get(int(row["id"]), 0)
+                    if child_document_count > 0:
+                        item["child_document_count"] = child_document_count
+                else:
+                    attachments = attachment_summaries.get(int(row["id"]), [])
+                    item["attachment_count"] = len(attachments)
+                    item["attachments"] = attachments
+                    child_documents = child_document_summaries.get(int(row["id"]), [])
+                    item["child_document_count"] = len(child_documents)
+                    item["child_documents"] = child_documents
             else:
                 item["parent"] = parent_summaries.get(int(row["parent_document_id"]))
             item["display_values"] = build_search_result_display_values(row, item, display_column_defs)
@@ -1704,8 +2193,21 @@ def search_docs(
     per_page: int,
     raw_columns: str | None = None,
     mode: str = "compose",
+    *,
+    compact_mode: bool = False,
 ) -> dict[str, object]:
-    return search(root, query, raw_filters, sort_field, order, page, per_page, raw_columns, mode)
+    return search(
+        root,
+        query,
+        raw_filters,
+        sort_field,
+        order,
+        page,
+        per_page,
+        raw_columns,
+        mode,
+        compact_mode=compact_mode,
+    )
 
 
 def format_scope_bates_value(bates_scope: object) -> str:
@@ -2531,6 +3033,117 @@ def resolve_scope_document_search(
     }
 
 
+def resolve_paged_scope_document_search(
+    connection: sqlite3.Connection,
+    raw_scope: object,
+    *,
+    sort_specs: list[tuple[str, str]] | None = None,
+    offset: int,
+    per_page: int,
+) -> dict[str, object]:
+    scope, clauses, params, filter_summary = build_scope_search_filters(connection, raw_scope)
+    keyword_query = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    bates_scope = scope.get("bates")
+    bates_query = format_scope_bates_value(bates_scope)
+    bates_begin = normalize_inline_whitespace(str(bates_scope.get("begin") or "")) if isinstance(bates_scope, dict) else ""
+    bates_end = normalize_inline_whitespace(str(bates_scope.get("end") or "")) if isinstance(bates_scope, dict) else ""
+
+    if bates_query and keyword_query:
+        legacy_selection = resolve_scope_document_search(connection, scope, sort_specs=sort_specs)
+        total_hits = len(legacy_selection["results"])
+        paged_results = legacy_selection["results"][offset: offset + per_page]
+        return {
+            "scope": scope,
+            "query": legacy_selection["query"],
+            "filters": filter_summary,
+            "sort": legacy_selection["sort"],
+            "order": legacy_selection["order"],
+            "sort_spec": legacy_selection["sort_spec"],
+            "results": paged_results,
+            "total_hits": total_hits,
+        }
+
+    if sort_specs:
+        sort_name = sort_specs[0][0]
+        order_name = sort_specs[0][1]
+        sort_spec = sort_specs_text(sort_specs) or f"{sort_name} {order_name}"
+    elif bates_query:
+        sort_name = "bates"
+        order_name = "asc"
+        sort_spec = "bates asc"
+    elif keyword_query:
+        sort_name = "relevance"
+        order_name = "asc"
+        sort_spec = "relevance asc"
+    else:
+        sort_name = "date_created"
+        order_name = "desc"
+        sort_spec = "date_created desc"
+
+    if bates_query:
+        if sort_specs:
+            selection_page = search_bates_page(
+                connection,
+                bates_begin,
+                bates_end,
+                clauses,
+                params,
+                limit=per_page,
+                offset=offset,
+                order_by_sql=sql_order_by_for_sort_specs(connection, sort_specs, alias="bm"),
+            )
+        else:
+            selection_page = search_bates_page(
+                connection,
+                bates_begin,
+                bates_end,
+                clauses,
+                params,
+                limit=per_page,
+                offset=offset,
+                order_by_sql=sql_bates_order_by(row_alias="bm", prioritize_rank=False),
+            )
+    elif keyword_query:
+        if sort_specs:
+            order_by_sql = sql_order_by_for_sort_specs(connection, sort_specs, alias="d")
+        else:
+            order_by_sql = sql_relevance_order_by(connection, row_alias="d", rank_expr="bm.rank")
+        selection_page = search_fts_page(
+            connection,
+            keyword_query,
+            clauses,
+            params,
+            limit=per_page,
+            offset=offset,
+            order_by_sql=order_by_sql,
+        )
+    else:
+        if sort_specs:
+            order_by_sql = sql_order_by_for_sort_specs(connection, sort_specs, alias="d")
+        else:
+            order_by_sql = sql_order_by_for_sort_specs(connection, [("date_created", "desc")], alias="d")
+        selection_page = search_browse_page(
+            connection,
+            clauses,
+            params,
+            limit=per_page,
+            offset=offset,
+            order_by_sql=order_by_sql,
+        )
+
+    query_label = keyword_query or bates_query or ""
+    return {
+        "scope": scope,
+        "query": query_label,
+        "filters": filter_summary,
+        "sort": sort_name,
+        "order": order_name,
+        "sort_spec": sort_spec,
+        "results": selection_page["results"],
+        "total_hits": int(selection_page["total_hits"]),
+    }
+
+
 def search_with_scope(
     root: Path,
     raw_scope: object,
@@ -2555,7 +3168,14 @@ def search_with_scope(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        selection = resolve_scope_document_search(connection, raw_scope, sort_specs=sort_specs)
+        requested_offset = (page - 1) * per_page if offset is None else offset
+        selection = resolve_paged_scope_document_search(
+            connection,
+            raw_scope,
+            sort_specs=sort_specs,
+            offset=requested_offset,
+            per_page=per_page,
+        )
         effective_display_column_defs = display_column_defs or default_display_column_definitions(connection)
 
         results: list[dict[str, object]] = []
@@ -2602,18 +3222,70 @@ def search_with_scope(
                     },
                     "manual_field_locks": normalize_string_list(row[MANUAL_FIELD_LOCKS_COLUMN]),
                     "row": row,
-                }
-            )
+                    }
+                )
 
-        total_hits = len(results)
+        total_hits = int(selection["total_hits"])
         total_pages = max(1, (total_hits + per_page - 1) // per_page)
-        start = (page - 1) * per_page if offset is None else offset
+        start = requested_offset
         if total_hits > 0 and start >= total_hits:
             start = (total_pages - 1) * per_page
+            selection = resolve_paged_scope_document_search(
+                connection,
+                raw_scope,
+                sort_specs=sort_specs,
+                offset=start,
+                per_page=per_page,
+            )
+            results = []
+            for match in selection["results"]:
+                row = match["row"]
+                results.append(
+                    {
+                        "id": int(match["id"]),
+                        "control_number": row["control_number"],
+                        "dataset_id": row["dataset_id"],
+                        "parent_document_id": row["parent_document_id"],
+                        "source_kind": row["source_kind"],
+                        "source_rel_path": row["source_rel_path"],
+                        "source_item_id": row["source_item_id"],
+                        "source_folder_path": row["source_folder_path"],
+                        "production_id": row["production_id"],
+                        **document_path_payload(paths, connection, row),
+                        "file_name": row["file_name"],
+                        "file_type": row["file_type"],
+                        "snippet": str(match["snippet"]),
+                        "rank": match["rank"],
+                        "bates_sort_key": match.get("bates_sort_key"),
+                        "metadata": {
+                            "author": row["author"],
+                            "begin_attachment": row["begin_attachment"],
+                            "begin_bates": row["begin_bates"],
+                            "content_type": row["content_type"],
+                            "custodian": row["custodian"],
+                            "dataset_id": row["dataset_id"],
+                            "date_created": row["date_created"],
+                            "date_modified": row["date_modified"],
+                            "end_attachment": row["end_attachment"],
+                            "end_bates": row["end_bates"],
+                            "page_count": row["page_count"],
+                            "participants": row["participants"],
+                            "recipients": row["recipients"],
+                            "source_kind": row["source_kind"],
+                            "source_rel_path": row["source_rel_path"],
+                            "source_item_id": row["source_item_id"],
+                            "source_folder_path": row["source_folder_path"],
+                            "subject": row["subject"],
+                            "title": row["title"],
+                            "updated_at": row["updated_at"],
+                        },
+                        "manual_field_locks": normalize_string_list(row[MANUAL_FIELD_LOCKS_COLUMN]),
+                        "row": row,
+                    }
+                )
         start = max(0, start)
         page = (start // per_page) + 1
-        end = start + per_page
-        paged_results = results[start:end]
+        paged_results = results
         paged_rows = [item["row"] for item in paged_results]
         production_names = fetch_production_names(connection, paged_rows)
         dataset_memberships = fetch_document_dataset_memberships(connection, paged_rows)
@@ -6451,14 +7123,36 @@ def main() -> int:
         if args.command == "search":
             return emit_cli_payload(
                 "search",
-                search(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page, args.columns, args.mode),
+                search(
+                    root,
+                    args.query,
+                    args.filters,
+                    args.sort,
+                    args.order,
+                    args.page,
+                    args.per_page,
+                    args.columns,
+                    args.mode,
+                    compact_mode=(not args.verbose and args.mode == "compose"),
+                ),
                 verbose=args.verbose,
             )
 
         if args.command == "search-docs":
             return emit_cli_payload(
                 "search-docs",
-                search_docs(root, args.query, args.filters, args.sort, args.order, args.page, args.per_page, args.columns, args.mode),
+                search_docs(
+                    root,
+                    args.query,
+                    args.filters,
+                    args.sort,
+                    args.order,
+                    args.page,
+                    args.per_page,
+                    args.columns,
+                    args.mode,
+                    compact_mode=(not args.verbose and args.mode == "compose"),
+                ),
                 verbose=args.verbose,
             )
 

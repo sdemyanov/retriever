@@ -5767,6 +5767,40 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("filter-only", error_payload["error"])
         self.assertIn("has_attachments", error_payload["error"])
 
+    def test_search_cli_keyword_query_paginates_with_explicit_sort(self) -> None:
+        for index in range(25):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"needle document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 25)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "needle",
+            "--sort",
+            "file_name",
+            "--order",
+            "asc",
+            "--per-page",
+            "5",
+            "--page",
+            "2",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertEqual(search_payload["total_hits"], 25)
+        self.assertEqual(search_payload["total_pages"], 5)
+        self.assertEqual(
+            [item["file_name"] for item in search_payload["results"]],
+            [f"doc-{index:02d}.txt" for index in range(5, 10)],
+        )
+        self.assertEqual(search_payload["sort"], "file_name")
+        self.assertEqual(search_payload["order"], "asc")
+
     def test_search_cli_view_mode_returns_rendered_markdown_with_current_compact_shape(self) -> None:
         (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
 
@@ -8021,6 +8055,38 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("preview_targets", verbose_result)
         self.assertIn("manual_field_locks", verbose_result)
         self.assertIn("page_count", verbose_result["metadata"])
+
+    def test_compact_search_keeps_attachment_counts_without_verbose_children(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Upgrade test",
+            body_text="Please review the attached notes.",
+            attachment_name="notes.txt",
+            attachment_text="confidential attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        compact_exit, compact_payload, _, _ = self.run_cli("search", str(self.root), "Upgrade test")
+        verbose_exit, verbose_payload, _, _ = self.run_cli("search", str(self.root), "Upgrade test", "--verbose")
+
+        self.assertEqual(compact_exit, 0)
+        self.assertEqual(verbose_exit, 0)
+        self.assertIsNotNone(compact_payload)
+        self.assertIsNotNone(verbose_payload)
+
+        compact_result = compact_payload["results"][0]
+        verbose_result = verbose_payload["results"][0]
+
+        self.assertEqual(compact_result["attachment_count"], 1)
+        self.assertNotIn("attachments", compact_result)
+        self.assertNotIn("child_documents", compact_result)
+        self.assertNotIn("preview_targets", compact_result)
+        self.assertEqual(verbose_result["attachment_count"], 1)
+        self.assertEqual(verbose_result["attachments"][0]["file_name"], "notes.txt")
 
     def test_catalog_lists_dataset_name_and_date_granularities(self) -> None:
         retriever_tools.bootstrap(self.root)
