@@ -5867,8 +5867,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         assert parent_payload is not None
         parent_rendered = str(parent_payload["rendered_markdown"])
         self.assertIn("[Upgrade test](computer://", parent_rendered)
-        self.assertIn("[↳ notes.txt](computer://", parent_rendered)
-        self.assertIn("| Attachment |", parent_rendered)
+        self.assertIn("| E-Doc | [↳ notes.txt](computer://", parent_rendered)
 
         attachment_exit, attachment_payload, _, _ = self.run_cli(
             "search",
@@ -5881,7 +5880,37 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(attachment_payload)
         assert attachment_payload is not None
         attachment_rendered = str(attachment_payload["rendered_markdown"])
-        self.assertIn("[↳ notes.txt (parent: Upgrade test)](computer://", attachment_rendered)
+        self.assertIn("| E-Doc | [↳ notes.txt (parent: Upgrade test)](computer://", attachment_rendered)
+
+    def test_search_cli_view_mode_uses_unrecognized_for_unknown_attachment_types(self) -> None:
+        email_path = self.root / "thread.eml"
+        message = EmailMessage()
+        message["From"] = "Alice Example <alice@example.com>"
+        message["To"] = "Bob Example <bob@example.com>"
+        message["Subject"] = "Binary attachment test"
+        message["Date"] = "Tue, 14 Apr 2026 10:00:00 +0000"
+        message.set_content("Hello team,\nThis email carries a binary attachment.")
+        message.add_attachment(b"\x00\xff\x10\x80", maintype="application", subtype="octet-stream")
+        email_path.write_bytes(message.as_bytes(policy=policy.default))
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "Binary attachment test",
+            "--mode",
+            "view",
+        )
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        rendered = str(search_payload["rendered_markdown"])
+        self.assertIn("| Unrecognized | [↳ attachment-001.bin](computer://", rendered)
+        self.assertNotIn("| ↳ Unrecognized |", rendered)
+        self.assertNotIn("| Attachment | [↳ attachment-001.bin](computer://", rendered)
 
     def test_slash_search_persists_scope_and_search_within_keyword(self) -> None:
         (self.root / "alpha.txt").write_text("alpha beta body\n", encoding="utf-8")
