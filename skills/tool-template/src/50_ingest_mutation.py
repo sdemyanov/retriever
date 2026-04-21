@@ -327,7 +327,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     dataset_source_id=filesystem_dataset_source_id,
                 )
                 preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
-                chunks = chunk_text(str(extracted.get("text_content") or ""))
+                chunks = extracted_search_chunks(extracted)
                 replace_document_related_rows(connection, document_id, extracted | {"file_name": path.name}, chunks, preview_rows)
                 reconcile_attachment_documents(
                     connection,

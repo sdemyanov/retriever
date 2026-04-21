@@ -768,6 +768,51 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         notes.write(1, 0, "Budget approved")
         workbook.save(str(path))
 
+    def write_xlsx_fixture(self, path: Path) -> None:
+        try:
+            import openpyxl
+            from openpyxl.chart import BarChart, Reference
+            from openpyxl.comments import Comment
+            from openpyxl.workbook.defined_name import DefinedName
+            from openpyxl.worksheet.datavalidation import DataValidation
+        except Exception as exc:  # pragma: no cover - test helper dependency
+            self.skipTest(f"openpyxl unavailable for xlsx fixture generation: {exc}")
+        from datetime import datetime
+
+        workbook = openpyxl.Workbook()
+        budget = workbook.active
+        budget.title = "Budget"
+        budget.append(["Department", "Amount", "Quarter"])
+        budget.append(["Engineering", 1200, "Q1"])
+        budget.append(["Sales", 900, "Q2"])
+        budget["A2"].comment = Comment("Needs review", "Sergey")
+        budget["A2"].hyperlink = "https://example.com/departments/engineering"
+
+        validation = DataValidation(type="list", formula1='"Q1,Q2,Q3,Q4"')
+        budget.add_data_validation(validation)
+        validation.add("C2:C10")
+
+        chart = BarChart()
+        data = Reference(budget, min_col=2, min_row=1, max_row=3)
+        chart.add_data(data, titles_from_data=True)
+        chart.title = "Budget Totals"
+        chart.x_axis.title = "Department"
+        chart.y_axis.title = "Amount"
+        budget.add_chart(chart, "E2")
+
+        notes = workbook.create_sheet("Notes")
+        notes.append(["Memo"])
+        notes.append(["Budget approved"])
+
+        workbook.defined_names.add(DefinedName("DeptList", attr_text="'Budget'!$A$2:$A$3"))
+        workbook.properties.creator = "Rachel Green"
+        workbook.properties.lastModifiedBy = "Sergey"
+        workbook.properties.title = "Quarterly Budget Workbook"
+        workbook.properties.subject = "Finance Planning"
+        workbook.properties.created = datetime(2026, 4, 20, 10, 0, 0)
+        workbook.properties.modified = datetime(2026, 4, 20, 11, 30, 0)
+        workbook.save(path)
+
     def write_pptx_fixture(self, path: Path) -> None:
         image_bytes = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9mQAAAAASUVORK5CYII="
@@ -6490,7 +6535,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(row["content_type"], "Spreadsheet / Table")
         self.assertEqual(row["page_count"], 2)
 
-        search_result = retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)
+        search_result = retriever_tools.search(self.root, "Memo", None, None, None, 1, 20)
         self.assertEqual(search_result["results"][0]["file_name"], "ledger.xls")
         self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "csv")
         self.assertTrue(search_result["results"][0]["preview_rel_path"].endswith(".csv"))
@@ -6498,6 +6543,84 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             [target["label"] for target in search_result["results"][0]["preview_targets"]],
             ["Sheet1", "Notes"],
         )
+        value_only_result = retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)
+        self.assertEqual(value_only_result["total_hits"], 0)
+
+    def test_ingest_supports_xlsx_structural_summary_and_sheet_chunks(self) -> None:
+        xlsx_path = self.root / "budget.xlsx"
+        self.write_xlsx_fixture(xlsx_path)
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        row = self.fetch_document_row("budget.xlsx")
+        self.assertEqual(row["content_type"], "Spreadsheet / Table")
+        self.assertEqual(row["page_count"], 2)
+        self.assertEqual(row["author"], "Rachel Green")
+        self.assertEqual(row["title"], "Quarterly Budget Workbook")
+        self.assertEqual(row["subject"], "Finance Planning")
+        self.assertEqual(row["date_created"], "2026-04-20T10:00:00Z")
+        self.assertIsNotNone(row["date_modified"])
+        self.assertIn("Rachel Green", row["participants"])
+        self.assertIn("Sergey", row["participants"])
+
+        search_result = retriever_tools.search(self.root, "Budget Totals", None, None, None, 1, 20)
+        self.assertEqual(search_result["results"][0]["file_name"], "budget.xlsx")
+        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "csv")
+        self.assertEqual(
+            [target["label"] for target in search_result["results"][0]["preview_targets"]],
+            ["Budget", "Notes"],
+        )
+
+        self.assertEqual(
+            retriever_tools.search(self.root, "Needs review", None, None, None, 1, 20)["results"][0]["file_name"],
+            "budget.xlsx",
+        )
+        self.assertEqual(
+            retriever_tools.search(self.root, "DeptList", None, None, None, 1, 20)["results"][0]["file_name"],
+            "budget.xlsx",
+        )
+        self.assertEqual(retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)["total_hits"], 0)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            chunk_rows = connection.execute(
+                """
+                SELECT text_content
+                FROM document_chunks
+                WHERE document_id = ?
+                ORDER BY chunk_index ASC
+                """,
+                (row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertGreaterEqual(len(chunk_rows), 3)
+        self.assertTrue(any("Sheet: Budget" in chunk_row["text_content"] for chunk_row in chunk_rows))
+        self.assertTrue(any("Sheet: Notes" in chunk_row["text_content"] for chunk_row in chunk_rows))
+
+    def test_ingest_supports_csv_structural_summary_without_indexing_values(self) -> None:
+        csv_path = self.root / "pipeline.csv"
+        csv_path.write_text(
+            "sep=,\nCustomer,Amount,Status\nAcme Corp,100,Paid\nBeta LLC,250,Hold\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        row = self.fetch_document_row("pipeline.csv")
+        self.assertEqual(row["content_type"], "Spreadsheet / Table")
+        self.assertEqual(row["page_count"], 1)
+
+        search_result = retriever_tools.search(self.root, "Status", None, None, None, 1, 20)
+        self.assertEqual(search_result["results"][0]["file_name"], "pipeline.csv")
+        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "native")
+        self.assertEqual(retriever_tools.search(self.root, "Acme Corp", None, None, None, 1, 20)["total_hits"], 0)
 
     def test_ingest_supports_pptx_deck_preview_images_and_notes(self) -> None:
         pptx_path = self.root / "deck.pptx"

@@ -2762,7 +2762,7 @@ def reconcile_attachment_documents(
             existing_row=existing_row,
         )
         preview_rows = write_preview_artifacts(paths, child_rel_path, list(extracted.get("preview_artifacts", [])))
-        chunks = chunk_text(str(extracted.get("text_content") or ""))
+        chunks = extracted_search_chunks(extracted)
         replace_document_related_rows(
             connection,
             document_id,
@@ -3371,7 +3371,7 @@ def ingest_container_source(
                 created_at=scan_started_at,
             )
             preview_rows = write_preview_artifacts(paths, str(normalized["rel_path"]), list(extracted.get("preview_artifacts", [])))
-            chunks = chunk_text(str(extracted.get("text_content") or ""))
+            chunks = extracted_search_chunks(extracted)
             replace_document_related_rows(
                 connection,
                 document_id,
