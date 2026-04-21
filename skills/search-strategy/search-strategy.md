@@ -20,7 +20,8 @@
 
 - `--mode compose` is the default. Use it when the user wants a summary, count, explanation, draft, comparison, or any answer that is about the documents rather than the listing itself.
 - `--mode view` is for table-shaped requests only. In view mode the tool returns a `rendered_markdown` field containing the complete pre-formatted result table.
-- When `rendered_markdown` is present for a view request, forward it verbatim as the entire reply: no preamble, no trailing commentary, no code fences, and no reformatting.
+- When `rendered_markdown` is present for a view request, forward it as the entire reply and nothing else: no preamble, no trailing commentary, no code fences, no reformatting, and no follow-up summary sentence.
+- The view-mode response must terminate immediately after the table footer. Any extra prose after `Documents X–Y of Z ...` is a contract violation, not a stylistic choice.
 
 Supported SQL-like filter operators:
 
