@@ -989,7 +989,7 @@ def compact_metadata_payload(metadata: object) -> dict[str, object]:
 
 def compact_search_result_payload(item: dict[str, object]) -> dict[str, object]:
     compact: dict[str, object] = {"id": item["id"]}
-    for key in ("control_number", "file_name", "file_type", "preview_rel_path", "preview_abs_path", "snippet", "rank"):
+    for key in ("control_number", "file_name", "file_type", "preview_abs_path", "snippet", "rank"):
         if key in item and payload_has_meaningful_value(item[key]):
             compact[key] = item[key]
 
