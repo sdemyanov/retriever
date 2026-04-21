@@ -118,6 +118,50 @@ MAX_AGGREGATE_LIMIT = 200
 CONTROL_NUMBER_PREFIX = "DOC"
 CONTROL_NUMBER_BATCH_WIDTH = 3
 CONTROL_NUMBER_FAMILY_WIDTH = 8
+
+BENCHMARK_ENABLED = os.environ.get("RETRIEVER_BENCHMARK") == "1"
+BENCHMARK_EVENTS: list[dict[str, object]] = []
+if BENCHMARK_ENABLED:
+    BENCHMARK_EVENTS.append({"name": "module_import_start", "ts": time.perf_counter()})
+
+
+def benchmark_mark(name: str, **fields: object) -> None:
+    if not BENCHMARK_ENABLED:
+        return
+    event: dict[str, object] = {"name": name, "ts": time.perf_counter()}
+    if fields:
+        event.update(fields)
+    BENCHMARK_EVENTS.append(event)
+
+
+def benchmark_payload(**fields: object) -> dict[str, object]:
+    events: list[dict[str, object]] = []
+    deltas: list[dict[str, object]] = []
+    for event in BENCHMARK_EVENTS:
+        events.append({key: value for key, value in event.items() if key != "ts"})
+    for previous, current in zip(BENCHMARK_EVENTS, BENCHMARK_EVENTS[1:]):
+        deltas.append(
+            {
+                "from": previous["name"],
+                "to": current["name"],
+                "delta_ms": round((float(current["ts"]) - float(previous["ts"])) * 1000.0, 3),
+            }
+        )
+    payload: dict[str, object] = {
+        "enabled": BENCHMARK_ENABLED,
+        "events": events,
+        "deltas": deltas,
+    }
+    if fields:
+        payload.update(fields)
+    return payload
+
+
+def benchmark_emit(**fields: object) -> None:
+    if not BENCHMARK_ENABLED:
+        return
+    sys.stderr.write(json.dumps({"_bench": benchmark_payload(**fields)}) + "\n")
+    sys.stderr.flush()
 CONTROL_NUMBER_ATTACHMENT_WIDTH = 3
 EMU_PER_PIXEL = 9525
 IMAGE_NATIVE_PREVIEW_FILE_TYPES = {
