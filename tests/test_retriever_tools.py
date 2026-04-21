@@ -5553,6 +5553,155 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ],
         )
 
+    def test_ingest_slack_rerun_adds_late_day_file_to_existing_conversation(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        thread_ts = "1671235434.237949"
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Kickoff thread",
+                        "user": "U04SERGEY1",
+                        "ts": thread_ts,
+                        "thread_ts": thread_ts,
+                        "reply_count": 1,
+                    },
+                    {
+                        "type": "message",
+                        "text": "Standalone channel update",
+                        "user": "U04MAX0001",
+                        "ts": "1671235834.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        first_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_result["new"], 2)
+        self.assertEqual(first_result["failed"], 0)
+        self.assertEqual(first_result["slack_documents_created"], 2)
+
+        day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        child_rel_path = retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
+        child_row = self.fetch_document_row(child_rel_path)
+        first_child_id = child_row["id"]
+        first_child_control_number = child_row["control_number"]
+
+        (channel_dir / "2022-12-17.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Following up on kickoff",
+                        "user": "U04MAX0001",
+                        "ts": "1671321834.237949",
+                        "thread_ts": thread_ts,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        second_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(second_result["new"], 1)
+        self.assertEqual(second_result["updated"], 2)
+        self.assertEqual(second_result["failed"], 0)
+        self.assertEqual(second_result["slack_exports_detected"], 1)
+        self.assertEqual(second_result["slack_day_documents_scanned"], 2)
+        self.assertEqual(second_result["slack_documents_created"], 1)
+        self.assertEqual(second_result["slack_documents_updated"], 2)
+
+        updated_day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        updated_child_row = self.fetch_document_row(child_rel_path)
+
+        self.assertEqual(updated_day_one_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(day_two_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(updated_child_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(updated_child_row["id"], first_child_id)
+        self.assertEqual(updated_child_row["control_number"], first_child_control_number)
+        self.assertEqual(updated_child_row["parent_document_id"], updated_day_one_row["id"])
+        self.assertEqual(day_two_row["text_status"], "empty")
+
+        reply_search = retriever_tools.search(self.root, "Following up on kickoff", None, None, None, 1, 20)
+        self.assertEqual(reply_search["total_hits"], 1)
+        self.assertEqual(reply_search["results"][0]["id"], updated_child_row["id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            source_parts = connection.execute(
+                """
+                SELECT part_kind, rel_source_path, ordinal
+                FROM document_source_parts
+                WHERE document_id = ?
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (updated_child_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            [(row["part_kind"], row["rel_source_path"]) for row in source_parts],
+            [
+                ("slack_thread_root_day", "data/slack/general/2022-12-16.json"),
+                ("slack_thread_reply_day", "data/slack/general/2022-12-17.json"),
+            ],
+        )
+
     def test_ingest_groups_loose_eml_messages_into_one_conversation(self) -> None:
         root_path = self.root / "root.eml"
         reply_path = self.root / "reply.eml"
