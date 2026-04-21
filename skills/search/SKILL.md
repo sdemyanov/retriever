@@ -47,6 +47,9 @@ Use this skill when the user says things like:
 - Use `list` subcommands for discoverability: `/scope list` lists saved scopes, `/dataset list` lists available datasets, `/sort list` lists sortable fields, and `/columns list` lists displayable fields.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
 - If the user asked to see a table, call search with `--mode view` and reply with only `rendered_markdown`. Never append an interpretive summary in the same turn.
+- In compose mode, default to a concise answer: one short paragraph for straightforward summaries, or two short paragraphs when a timeline/contrast genuinely helps. Do not turn ordinary summaries into long narrative memos unless the user asked for depth.
+- In compose mode, ground the main claims in the top matching documents. Prefer naming or citing the most relevant `control_number` items instead of synthesizing a broad story from distant/low-signal hits.
+- Do not volunteer collection-noise commentary, unrelated matches, or corpus-quality caveats unless the user asked for noise analysis, asked what matched unexpectedly, or the noise materially changes the answer.
 - Always show the active scope/header before the result table so the user can see the selector, sort, and page state.
 - **Mandatory compose-mode output format** — when you called search with `--mode compose` (the default), render every result set as a table driven by the active display columns from search-strategy.md:
 
