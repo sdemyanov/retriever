@@ -5921,6 +5921,65 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(saved_scopes_payload["scopes"]["review"]["dataset"][0]["id"], dataset_id)
         self.assertEqual(saved_scopes_payload["scopes"]["review"]["dataset"][0]["name"], "Renamed Set")
 
+    def test_slash_scope_and_dataset_list_commands_show_current_and_available_state(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("alpha dataset body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        create_exit, create_payload, _, _ = self.run_cli("create-dataset", str(self.root), "Review Set")
+        self.assertEqual(create_exit, 0)
+        self.assertIsNotNone(create_payload)
+        dataset_id = int(create_payload["dataset"]["id"])
+        add_exit, _, _, _ = self.run_cli(
+            "add-to-dataset",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+            "--doc-id",
+            str(row["id"]),
+        )
+        self.assertEqual(add_exit, 0)
+
+        self.assertEqual(self.run_cli("slash", str(self.root), "/search", "alpha")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/dataset", "Review Set")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/scope", "save", "review")[0], 0)
+
+        search_show_exit, search_show_payload, _, _ = self.run_cli("slash", str(self.root), "/search")
+        scope_show_exit, scope_show_payload, _, _ = self.run_cli("slash", str(self.root), "/scope")
+        scope_list_exit, scope_list_payload, _, _ = self.run_cli("slash", str(self.root), "/scope", "list")
+        dataset_show_exit, dataset_show_payload, _, _ = self.run_cli("slash", str(self.root), "/dataset")
+        dataset_list_exit, dataset_list_payload, _, _ = self.run_cli("slash", str(self.root), "/dataset", "list")
+
+        self.assertEqual(search_show_exit, 0)
+        self.assertIsNotNone(search_show_payload)
+        self.assertEqual(search_show_payload["keyword"], "alpha")
+
+        self.assertEqual(scope_show_exit, 0)
+        self.assertIsNotNone(scope_show_payload)
+        self.assertEqual(scope_show_payload["scope"]["keyword"], "alpha")
+        self.assertEqual(scope_show_payload["scope"]["dataset"][0]["name"], "Review Set")
+
+        self.assertEqual(scope_list_exit, 0)
+        self.assertIsNotNone(scope_list_payload)
+        saved_scope_names = [item["name"] for item in scope_list_payload["saved_scopes"]]
+        self.assertEqual(saved_scope_names, ["review"])
+        self.assertEqual(scope_list_payload["saved_scopes"][0]["scope"]["keyword"], "alpha")
+        self.assertEqual(scope_list_payload["saved_scopes"][0]["scope"]["dataset"][0]["name"], "Review Set")
+
+        self.assertEqual(dataset_show_exit, 0)
+        self.assertIsNotNone(dataset_show_payload)
+        self.assertEqual(dataset_show_payload["dataset"][0]["name"], "Review Set")
+
+        self.assertEqual(dataset_list_exit, 0)
+        self.assertIsNotNone(dataset_list_payload)
+        dataset_names = [item["dataset_name"] for item in dataset_list_payload["datasets"]]
+        self.assertIn("Review Set", dataset_names)
+        self.assertIn(self.root.name, dataset_names)
+
     def test_slash_bates_within_intersects_ranges_and_rejects_cross_slot_and_mixed_prefix(self) -> None:
         retriever_tools.bootstrap(self.root)
 
@@ -5987,6 +6046,57 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(search_payload)
         self.assertIn("scope.from_run_id no longer exists", search_payload["error"])
 
+    def test_slash_search_filter_bates_and_from_run_show_current_scope_slots(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        search_set_exit, _, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        filter_set_exit, _, _, _ = self.run_cli("slash", str(self.root), "/filter", "content_type = 'Email'")
+        bates_set_exit, _, _, _ = self.run_cli("slash", str(self.root), "/bates", "ABC0001-ABC0010")
+        self.assertEqual(search_set_exit, 0)
+        self.assertEqual(filter_set_exit, 0)
+        self.assertEqual(bates_set_exit, 0)
+
+        self.paths["session_path"].write_text(
+            json.dumps(
+                {
+                    "schema_version": retriever_tools.SESSION_SCHEMA_VERSION,
+                    "scope": {
+                        "keyword": "alpha",
+                        "filter": "content_type = 'Email'",
+                        "bates": {"begin": "ABC0001", "end": "ABC0010"},
+                        "from_run_id": 42,
+                    },
+                    "browsing": {},
+                    "display": {},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        search_show_exit, search_show_payload, _, _ = self.run_cli("slash", str(self.root), "/search")
+        filter_show_exit, filter_show_payload, _, _ = self.run_cli("slash", str(self.root), "/filter")
+        bates_show_exit, bates_show_payload, _, _ = self.run_cli("slash", str(self.root), "/bates")
+        from_run_show_exit, from_run_show_payload, _, _ = self.run_cli("slash", str(self.root), "/from-run")
+
+        self.assertEqual(search_show_exit, 0)
+        self.assertIsNotNone(search_show_payload)
+        self.assertEqual(search_show_payload["keyword"], "alpha")
+
+        self.assertEqual(filter_show_exit, 0)
+        self.assertIsNotNone(filter_show_payload)
+        self.assertEqual(filter_show_payload["filter"], "content_type = 'Email'")
+
+        self.assertEqual(bates_show_exit, 0)
+        self.assertIsNotNone(bates_show_payload)
+        self.assertEqual(bates_show_payload["bates"], {"begin": "ABC0001", "end": "ABC0010"})
+
+        self.assertEqual(from_run_show_exit, 0)
+        self.assertIsNotNone(from_run_show_payload)
+        self.assertEqual(from_run_show_payload["from_run_id"], 42)
+
     def test_slash_sort_and_paging_persist_browsing_state(self) -> None:
         for index in range(25):
             (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
@@ -6034,6 +6144,71 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         final_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
         self.assertNotIn("sort", final_session_payload["browsing"])
         self.assertEqual(final_session_payload["browsing"]["offset"], 0)
+
+    def test_slash_sort_page_page_size_and_columns_show_current_and_available_state(self) -> None:
+        for index in range(25):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 25)
+
+        sort_exit, _, _, _ = self.run_cli("slash", str(self.root), "/sort", "file_name asc")
+        self.assertEqual(sort_exit, 0)
+
+        sort_show_exit, sort_show_payload, _, _ = self.run_cli("slash", str(self.root), "/sort")
+        sort_list_exit, sort_list_payload, _, _ = self.run_cli("slash", str(self.root), "/sort", "list")
+        page_size_show_exit, page_size_show_payload, _, _ = self.run_cli("slash", str(self.root), "/page-size")
+        self.assertEqual(self.run_cli("slash", str(self.root), "/page-size 5")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/next")[0], 0)
+        page_show_exit, page_show_payload, _, _ = self.run_cli("slash", str(self.root), "/page")
+        page_size_after_exit, page_size_after_payload, _, _ = self.run_cli("slash", str(self.root), "/page-size")
+        columns_show_exit, columns_show_payload, _, _ = self.run_cli("slash", str(self.root), "/columns")
+        columns_list_exit, columns_list_payload, _, _ = self.run_cli("slash", str(self.root), "/columns", "list")
+
+        self.assertEqual(sort_show_exit, 0)
+        self.assertIsNotNone(sort_show_payload)
+        self.assertEqual(sort_show_payload["sort"], "file_name")
+        self.assertEqual(sort_show_payload["order"], "asc")
+        self.assertEqual(sort_show_payload["sort_spec"], "file_name asc")
+        self.assertEqual(sort_show_payload["sort_source"], "override")
+
+        self.assertEqual(sort_list_exit, 0)
+        self.assertIsNotNone(sort_list_payload)
+        sortable_names = [item["name"] for item in sort_list_payload["sortable_fields"]]
+        self.assertIn("file_name", sortable_names)
+        self.assertIn("title", sortable_names)
+        self.assertNotIn("dataset_name", sortable_names)
+
+        self.assertEqual(page_size_show_exit, 0)
+        self.assertIsNotNone(page_size_show_payload)
+        self.assertEqual(page_size_show_payload["page_size"], retriever_tools.DEFAULT_PAGE_SIZE)
+
+        self.assertEqual(page_show_exit, 0)
+        self.assertIsNotNone(page_show_payload)
+        self.assertEqual(page_show_payload["page"], 2)
+        self.assertEqual(page_show_payload["per_page"], 5)
+        self.assertEqual(page_show_payload["offset"], 5)
+        self.assertEqual(page_show_payload["total_known"], 25)
+        self.assertEqual(page_show_payload["total_pages"], 5)
+
+        self.assertEqual(page_size_after_exit, 0)
+        self.assertIsNotNone(page_size_after_payload)
+        self.assertEqual(page_size_after_payload["page_size"], 5)
+
+        self.assertEqual(columns_show_exit, 0)
+        self.assertIsNotNone(columns_show_payload)
+        self.assertEqual(
+            columns_show_payload["display"]["columns"],
+            ["content_type", "title", "author", "date_created", "control_number"],
+        )
+
+        self.assertEqual(columns_list_exit, 0)
+        self.assertIsNotNone(columns_list_payload)
+        displayable_names = [item["name"] for item in columns_list_payload["columns"]]
+        self.assertIn("title", displayable_names)
+        self.assertIn("dataset_name", displayable_names)
+        self.assertNotIn("has_attachments", displayable_names)
 
     def test_slash_columns_commands_persist_display_preferences_and_render_custom_fields(self) -> None:
         (self.root / "sample.txt").write_text("sample display body\n", encoding="utf-8")

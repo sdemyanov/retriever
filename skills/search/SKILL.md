@@ -25,7 +25,7 @@ Use this skill when the user says things like:
 
 ## View vs compose
 
-- Use `--mode view` only when the user asked to see results as a table or is using the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`).
+- Use `--mode view` only when the user asked to see results as a table or is using the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, plus read-only `list` forms such as `/scope list`, `/dataset list`, `/sort list`, and `/columns list`).
 - In `view` mode, the tool returns a `rendered_markdown` field containing the complete pre-formatted result table. Your entire reply should be the contents of `rendered_markdown` verbatim: no preamble, no trailing commentary, no code fences, and no reformatting.
 - Use `--mode compose` for everything else. Compose is the safe default for summaries, counts, explanations, drafting, comparison, or any answer that is about the documents rather than the table of results itself.
 
@@ -41,6 +41,8 @@ Use this skill when the user says things like:
 - Use browse mode when the user is mostly filtering, and keyword search when they provide terms.
 - For a single Bates/control token or a Bates range expression, prefer the Bates-aware search path over plain keyword FTS.
 - For persistent investigation flows, prefer the slash surface: `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, and `/columns`.
+- Bare slash commands are read-only state inspection when supported: `/scope` shows the active scope, `/dataset` the active dataset selector, `/sort` the active sort, `/page` the current page state, `/page-size` the active page size, and `/columns` the active display columns.
+- Use `list` subcommands for discoverability: `/scope list` lists saved scopes, `/dataset list` lists available datasets, `/sort list` lists sortable fields, and `/columns list` lists displayable fields.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
 - If the user asked to see a table, call search with `--mode view` and forward `rendered_markdown` exactly.
 - Always show the active scope/header before the result table so the user can see the selector, sort, and page state.
