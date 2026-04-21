@@ -14,6 +14,7 @@ import json
 import mailbox
 import mimetypes
 import os
+import pickle
 import posixpath
 import platform
 import re
@@ -29,7 +30,7 @@ import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email import policy
