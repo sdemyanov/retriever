@@ -979,6 +979,12 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "document_email_threading", "conversation_topic TEXT")
     ensure_column(connection, "document_email_threading", "normalized_subject TEXT")
     ensure_column(connection, "document_email_threading", "updated_at TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "document_chat_threading", "thread_id TEXT")
+    ensure_column(connection, "document_chat_threading", "message_id TEXT")
+    ensure_column(connection, "document_chat_threading", "parent_message_id TEXT")
+    ensure_column(connection, "document_chat_threading", "thread_type TEXT")
+    ensure_column(connection, "document_chat_threading", "participants_json TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(connection, "document_chat_threading", "updated_at TEXT NOT NULL DEFAULT ''")
     ensure_column(connection, "document_previews", "target_fragment TEXT")
     ensure_column(connection, "job_versions", "capability TEXT NOT NULL DEFAULT ''")
     ensure_column(connection, "run_items", "result_id INTEGER REFERENCES results(id) ON DELETE SET NULL")
@@ -1080,6 +1086,11 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_document_email_threading_normalized_subject ON document_email_threading(normalized_subject)"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_chat_threading_thread_id ON document_chat_threading(thread_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_chat_threading_message_id ON document_chat_threading(message_id)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_chat_threading_parent_message_id ON document_chat_threading(parent_message_id)"
     )
     connection.execute("DROP INDEX IF EXISTS idx_documents_display_sort")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_control_number_unique ON documents(control_number)")

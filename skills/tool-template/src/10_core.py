@@ -134,6 +134,17 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS document_chat_threading (
+      document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+      thread_id TEXT,
+      message_id TEXT,
+      parent_message_id TEXT,
+      thread_type TEXT,
+      participants_json TEXT NOT NULL DEFAULT '[]',
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS productions (
       id INTEGER PRIMARY KEY,
       dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
@@ -2418,6 +2429,30 @@ def append_unique_participants(
             if key not in seen:
                 seen.add(key)
                 participants.append(rendered)
+
+
+def sorted_unique_display_names(raw_values: list[object]) -> list[str]:
+    unique_names: dict[str, str] = {}
+    for raw_value in raw_values:
+        normalized = normalize_participant_token(raw_value)
+        if not normalized:
+            continue
+        unique_names.setdefault(normalized.casefold(), normalized)
+    return sorted(unique_names.values(), key=str.casefold)
+
+
+def render_display_name_list(
+    raw_values: list[object],
+    *,
+    max_names: int | None = None,
+) -> str | None:
+    names = sorted_unique_display_names(raw_values)
+    if not names:
+        return None
+    if max_names is not None and max_names > 0 and len(names) > max_names:
+        remaining = len(names) - max_names
+        return ", ".join(names[:max_names]) + f" +{remaining} more"
+    return ", ".join(names)
 
 
 def email_headers_to_metadata(headers: dict[str, str]) -> dict[str, str | None]:

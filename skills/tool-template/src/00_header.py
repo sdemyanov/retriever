@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover - required PST backend probe
 
 
 TOOL_VERSION = "0.17.1"
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 SESSION_SCHEMA_VERSION = 1
 REQUIREMENTS_VERSION = "2026-04-20-phase10-conversations-and-export-previews"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"

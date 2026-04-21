@@ -727,6 +727,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         message_class: str | None = None,
         transport_headers: str | None = None,
         conversation_topic: str | None = None,
+        chat_threading: dict[str, object] | None = None,
     ) -> dict[str, object]:
         attachments: list[dict[str, object]] = []
         if attachment_name is not None and attachment_text is not None:
@@ -746,6 +747,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "message_class": message_class,
             "transport_headers": transport_headers,
             "conversation_topic": conversation_topic,
+            "chat_threading": dict(chat_threading or {}),
             "text_body": body_text,
             "html_body": None,
             "attachments": attachments,
@@ -1035,6 +1037,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 WHERE type = 'table' AND name = 'document_email_threading'
                 """
             ).fetchone()
+            chat_threading_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'document_chat_threading'
+                """
+            ).fetchone()
             dataset_row = connection.execute(
                 """
                 SELECT *
@@ -1065,6 +1074,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNone(row["root_message_key"])
         self.assertIsNotNone(conversations_table)
         self.assertIsNotNone(email_threading_table)
+        self.assertIsNotNone(chat_threading_table)
         self.assertIsNotNone(dataset_row)
         self.assertEqual(dataset_row["source_kind"], retriever_tools.FILESYSTEM_SOURCE_KIND)
         self.assertEqual(dataset_row["dataset_locator"], ".")
@@ -4186,6 +4196,184 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(doctor_result["pst_backend"]["status"], "fail")
         self.assertIn("libpff-python", doctor_result["pst_backend"]["detail"])
 
+    def test_inspect_pst_properties_surfaces_chat_scope_candidates(self) -> None:
+        pst_path = self.write_fake_pst_file()
+
+        class FakeRecordEntry:
+            def __init__(self, *, entry_type: int, value_type: int, data: bytes, property_name: str | None = None):
+                self.entry_type = entry_type
+                self.value_type = value_type
+                self.data = data
+                self.property_name = property_name
+
+        class FakeRecordSet:
+            def __init__(self, entries: list[object]):
+                self.entries = entries
+
+        class FakeMessage:
+            def __init__(
+                self,
+                *,
+                entry_identifier: str,
+                message_class: str,
+                subject: str,
+                body: str,
+                sender_name: str,
+                sender_email_address: str,
+                display_to: str = "",
+                delivery_time: str = "2024-04-23T23:50:00Z",
+                record_sets: list[object] | None = None,
+            ):
+                self.entry_identifier = entry_identifier
+                self.message_class = message_class
+                self.subject = subject
+                self.body = body
+                self.sender_name = sender_name
+                self.sender_email_address = sender_email_address
+                self.display_to = display_to
+                self.delivery_time = delivery_time
+                self.attachments = []
+                self.record_sets = record_sets or []
+
+        class FakeFolder:
+            def __init__(
+                self,
+                name: str,
+                *,
+                messages: list[object] | None = None,
+                sub_folders: list[object] | None = None,
+            ):
+                self.name = name
+                self.messages = messages or []
+                self.sub_folders = sub_folders or []
+
+        class FakePstFile:
+            def __init__(self, root_folder: object):
+                self.root_folder = root_folder
+
+            def open(self, raw_path: str) -> None:
+                self.opened_path = raw_path
+
+            def get_root_folder(self) -> object:
+                return self.root_folder
+
+            def close(self) -> None:
+                return None
+
+        teams_thread_id = "19:meeting_abc@thread.v2"
+        teams_channel_id = "19:channel_xyz@thread.skype"
+        root_folder = FakeFolder(
+            "Top of Personal Folders",
+            sub_folders=[
+                FakeFolder(
+                    "TeamsMessagesData",
+                    messages=[
+                        FakeMessage(
+                            entry_identifier="pst-chat-001",
+                            message_class="IPM.Note.Microsoft.Conversation",
+                            subject="Hey",
+                            body="Hey",
+                            sender_name="Sergey Demyanov",
+                            sender_email_address="sergey@example.com",
+                            record_sets=[
+                                FakeRecordSet(
+                                    [
+                                        FakeRecordEntry(
+                                            entry_type=0x8001,
+                                            value_type=0x001F,
+                                            data=(teams_thread_id + "\x00").encode("utf-16-le"),
+                                            property_name="TeamsThreadId",
+                                        )
+                                    ]
+                                )
+                            ],
+                        ),
+                        FakeMessage(
+                            entry_identifier="pst-chat-002",
+                            message_class="IPM.Note.Microsoft.Conversation",
+                            subject="test",
+                            body="test",
+                            sender_name="Sergey Demyanov",
+                            sender_email_address="sergey@example.com",
+                            record_sets=[
+                                FakeRecordSet(
+                                    [
+                                        FakeRecordEntry(
+                                            entry_type=0x8002,
+                                            value_type=0x001F,
+                                            data=(teams_channel_id + "\x00").encode("utf-16-le"),
+                                            property_name="TeamsChannelId",
+                                        )
+                                    ]
+                                )
+                            ],
+                        ),
+                    ],
+                ),
+                FakeFolder(
+                    "Inbox",
+                    messages=[
+                        FakeMessage(
+                            entry_identifier="pst-email-001",
+                            message_class="IPM.Note",
+                            subject="Email subject",
+                            body="Email body",
+                            sender_name="Alice Example",
+                            sender_email_address="alice@example.com",
+                            display_to="Bob Example <bob@example.com>",
+                        )
+                    ],
+                ),
+            ],
+        )
+        fake_pypff = types.SimpleNamespace(file=lambda: FakePstFile(root_folder))
+
+        with mock.patch.object(retriever_tools, "pypff", fake_pypff):
+            exit_code, payload, _, _ = self.run_cli(
+                "inspect-pst-properties",
+                str(self.root),
+                str(pst_path.name),
+                "--message-kind",
+                "chat",
+                "--limit",
+                "1",
+                "--max-record-entries",
+                "4",
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["pst_rel_path"], "mailbox.pst")
+        self.assertEqual(payload["message_kind"], "chat")
+        self.assertEqual(payload["scanned"], 3)
+        self.assertEqual(payload["matched"], 2)
+        self.assertEqual(payload["returned"], 1)
+        self.assertTrue(payload["truncated"])
+        first_message = payload["messages"][0]
+        self.assertEqual(first_message["source_item_id"], "pst-chat-001")
+        self.assertEqual(first_message["message_kind"], "chat")
+        self.assertEqual(first_message["candidate_scope_values"], [teams_thread_id])
+        self.assertEqual(first_message["interesting_properties"][0]["property_name"], "TeamsThreadId")
+        self.assertEqual(first_message["interesting_properties"][0]["decoded_value"], teams_thread_id)
+
+        with mock.patch.object(retriever_tools, "pypff", fake_pypff):
+            filtered_exit, filtered_payload, _, _ = self.run_cli(
+                "inspect-pst-properties",
+                str(self.root),
+                str(pst_path.name),
+                "--message-kind",
+                "chat",
+                "--source-item-id",
+                "pst-chat-002",
+            )
+
+        self.assertEqual(filtered_exit, 0)
+        self.assertIsNotNone(filtered_payload)
+        self.assertEqual(filtered_payload["matched"], 1)
+        self.assertEqual(filtered_payload["returned"], 1)
+        self.assertEqual(filtered_payload["messages"][0]["source_item_id"], "pst-chat-002")
+        self.assertEqual(filtered_payload["messages"][0]["candidate_scope_values"], [teams_channel_id])
+
     def test_ingest_supports_ics_calendar_files(self) -> None:
         calendar_path = self.root / "invite.ics"
         calendar_path.write_text(
@@ -6806,7 +6994,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Kickoff thread for launch planning.", preview_html)
         self.assertIn(f'id="doc-{row["id"]}"', preview_html)
 
-    def test_ingest_groups_pst_chat_messages_by_source_folder_path(self) -> None:
+    def test_ingest_groups_pst_chat_messages_by_thread_id_over_shared_folder_path(self) -> None:
         self.write_fake_pst_file()
         messages = [
             self.build_fake_pst_message(
@@ -6817,6 +7005,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 author="Alice Example",
                 recipients=None,
                 date_created="2026-04-15T09:00:00Z",
+                chat_threading={
+                    "thread_id": "19:launch-thread@unq.gbl.spaces",
+                    "message_id": "1713882000000",
+                    "thread_type": "chat",
+                    "participants": ["Alice Example", "Bob Example"],
+                },
             ),
             self.build_fake_pst_message(
                 source_item_id="pst-chat-002",
@@ -6826,6 +7020,27 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 author="Bob Example",
                 recipients=None,
                 date_created="2026-04-16T09:00:00Z",
+                chat_threading={
+                    "thread_id": "19:launch-thread@unq.gbl.spaces",
+                    "message_id": "1713968400000",
+                    "thread_type": "chat",
+                    "participants": ["Bob Example", "Alice Example"],
+                },
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-chat-003",
+                subject=None,
+                body_text="Separate one-off Teams thread.",
+                folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                author="Alice Example",
+                recipients=None,
+                date_created="2026-04-16T11:00:00Z",
+                chat_threading={
+                    "thread_id": "19:separate-thread@unq.gbl.spaces",
+                    "message_id": "1713975600000",
+                    "thread_type": "chat",
+                    "participants": ["Alice Example", "Carol Example"],
+                },
             ),
         ]
 
@@ -6834,15 +7049,43 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
 
         self.assertEqual(ingest_result["failed"], 0)
-        self.assertEqual(ingest_result["pst_messages_created"], 2)
-        self.assertEqual(ingest_result["pst_chat_conversations"], 1)
+        self.assertEqual(ingest_result["pst_messages_created"], 3)
+        self.assertEqual(ingest_result["pst_chat_conversations"], 2)
 
         first_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-001"))
         second_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-002"))
+        third_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-003"))
         self.assertIsNotNone(first_row["conversation_id"])
         self.assertEqual(first_row["conversation_id"], second_row["conversation_id"])
+        self.assertNotEqual(first_row["conversation_id"], third_row["conversation_id"])
         self.assertEqual(first_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
         self.assertEqual(second_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+        self.assertEqual(third_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+        self.assertEqual(first_row["title"], "Alice Example, Bob Example")
+        self.assertEqual(second_row["title"], "Alice Example, Bob Example")
+        self.assertEqual(third_row["title"], "Alice Example, Carol Example")
+        self.assertEqual(first_row["participants"], "Alice Example, Bob Example")
+        self.assertEqual(second_row["participants"], "Alice Example, Bob Example")
+        self.assertEqual(third_row["participants"], "Alice Example, Carol Example")
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            threading_rows = connection.execute(
+                """
+                SELECT document_id, thread_id, thread_type
+                FROM document_chat_threading
+                ORDER BY document_id ASC
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(
+            [(row["document_id"], row["thread_id"], row["thread_type"]) for row in threading_rows],
+            [
+                (first_row["id"], "19:launch-thread@unq.gbl.spaces", "chat"),
+                (second_row["id"], "19:launch-thread@unq.gbl.spaces", "chat"),
+                (third_row["id"], "19:separate-thread@unq.gbl.spaces", "chat"),
+            ],
+        )
 
         search_result = retriever_tools.search(self.root, "Follow-up from the same Teams space", None, None, None, 1, 20)
         result = search_result["results"][0]
@@ -6854,6 +7097,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         preview_html = self.preview_target_file_path(result["preview_targets"][0]).read_text(encoding="utf-8")
         self.assertIn(f'id="doc-{first_row["id"]}"', preview_html)
         self.assertIn(f'id="doc-{second_row["id"]}"', preview_html)
+        self.assertNotIn(f'id="doc-{third_row["id"]}"', preview_html)
         self.assertIn("Kickoff thread for launch planning.", preview_html)
         self.assertIn("Follow-up from the same Teams space.", preview_html)
 

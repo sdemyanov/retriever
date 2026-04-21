@@ -3,12 +3,12 @@
 ## Template metadata
 
 - tool version: `0.17.1`
-- schema version: `19`
+- schema version: `20`
 - requirements version: `2026-04-20-phase10-conversations-and-export-previews`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `c3ec7753f2b0621c0ca21ce93663da4a85a0b6b0e25059647545fe9aae4cc707`
+- source checksum (SHA256): `1551c486d5b68ad831f7993963d047c0cd6d8e8072d56e3c3c8810b31451780a`
 
 ## Current command surface
 
@@ -19,6 +19,7 @@ The current template implements:
 - `schema-version`
 - `ingest`
 - `ingest-production`
+- `inspect-pst-properties`
 - `search`
 - `search-docs`
 - `catalog`

@@ -1266,6 +1266,60 @@ def replace_document_email_threading_row(
     )
 
 
+def replace_document_chat_threading_row(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    chat_threading: object,
+) -> None:
+    if not isinstance(chat_threading, dict):
+        connection.execute("DELETE FROM document_chat_threading WHERE document_id = ?", (document_id,))
+        return
+    participant_names = sorted_unique_display_names(normalize_string_list(chat_threading.get("participants")))
+    normalized_payload = {
+        "thread_id": normalize_pst_chat_thread_id(chat_threading.get("thread_id")),
+        "message_id": normalize_pst_identifier(chat_threading.get("message_id")),
+        "parent_message_id": normalize_pst_identifier(chat_threading.get("parent_message_id")),
+        "thread_type": normalize_whitespace(str(chat_threading.get("thread_type") or "")).lower() or None,
+        "participants_json": json.dumps(participant_names),
+        "updated_at": utc_now(),
+    }
+    if not any(
+        (
+            normalized_payload["thread_id"],
+            normalized_payload["message_id"],
+            normalized_payload["parent_message_id"],
+            normalized_payload["thread_type"],
+            participant_names,
+        )
+    ):
+        connection.execute("DELETE FROM document_chat_threading WHERE document_id = ?", (document_id,))
+        return
+    connection.execute(
+        """
+        INSERT INTO document_chat_threading (
+          document_id, thread_id, message_id, parent_message_id, thread_type, participants_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id) DO UPDATE SET
+          thread_id = excluded.thread_id,
+          message_id = excluded.message_id,
+          parent_message_id = excluded.parent_message_id,
+          thread_type = excluded.thread_type,
+          participants_json = excluded.participants_json,
+          updated_at = excluded.updated_at
+        """,
+        (
+            document_id,
+            normalized_payload["thread_id"],
+            normalized_payload["message_id"],
+            normalized_payload["parent_message_id"],
+            normalized_payload["thread_type"],
+            normalized_payload["participants_json"],
+            normalized_payload["updated_at"],
+        ),
+    )
+
+
 def document_row_has_email_threading(connection: sqlite3.Connection, row: sqlite3.Row | None) -> bool:
     if row is None:
         return False
@@ -1795,6 +1849,7 @@ def list_pst_chat_conversation_documents(connection: sqlite3.Connection) -> list
           d.control_number,
           d.conversation_id,
           d.conversation_assignment_mode,
+          d.manual_field_locks_json,
           d.source_kind,
           d.source_rel_path,
           d.source_item_id,
@@ -1803,8 +1858,12 @@ def list_pst_chat_conversation_documents(connection: sqlite3.Connection) -> list
           d.title,
           d.participants,
           d.date_created,
-          d.custodian
+          d.custodian,
+          dct.thread_id,
+          dct.thread_type,
+          dct.participants_json
         FROM documents d
+        LEFT JOIN document_chat_threading dct ON dct.document_id = d.id
         WHERE d.parent_document_id IS NULL
           AND d.source_kind = ?
           AND d.content_type = 'Chat'
@@ -1818,12 +1877,23 @@ def list_pst_chat_conversation_documents(connection: sqlite3.Connection) -> list
     ).fetchall()
     documents: list[dict[str, object]] = []
     for row in rows:
+        participant_names = sorted_unique_display_names(
+            [
+                *normalize_string_list(row["participants_json"]),
+                *[
+                    normalize_whitespace(part)
+                    for part in str(row["participants"] or "").split(",")
+                    if normalize_whitespace(part)
+                ],
+            ]
+        )
         documents.append(
             {
                 "id": int(row["id"]),
                 "control_number": row["control_number"],
                 "existing_conversation_id": int(row["conversation_id"]) if row["conversation_id"] is not None else None,
                 "assignment_mode": effective_conversation_assignment_mode(row["conversation_assignment_mode"]),
+                "locked_fields": set(normalize_string_list(row[MANUAL_FIELD_LOCKS_COLUMN])),
                 "source_kind": normalize_whitespace(str(row["source_kind"] or "")).lower(),
                 "source_rel_path": normalize_whitespace(str(row["source_rel_path"] or "")) or None,
                 "source_item_id": normalize_whitespace(str(row["source_item_id"] or "")) or None,
@@ -1831,8 +1901,11 @@ def list_pst_chat_conversation_documents(connection: sqlite3.Connection) -> list
                 "file_type": normalize_whitespace(str(row["file_type"] or "")).lower() or None,
                 "title": normalize_whitespace(str(row["title"] or "")) or None,
                 "participants": normalize_whitespace(str(row["participants"] or "")) or None,
+                "participant_names": participant_names,
                 "date_created": normalize_datetime(row["date_created"]),
                 "custodian": normalize_whitespace(str(row["custodian"] or "")) or None,
+                "thread_id": normalize_pst_chat_thread_id(row["thread_id"]),
+                "thread_type": normalize_whitespace(str(row["thread_type"] or "")).lower() or None,
             }
         )
     return documents
@@ -1844,6 +1917,9 @@ def create_pst_chat_conversation_cluster(*, manual_conversation_id: int | None =
         "manual_conversation_id": manual_conversation_id,
         "source_rel_paths": set(),
         "source_folder_paths": set(),
+        "thread_ids": set(),
+        "thread_types": set(),
+        "participant_names": set(),
         "titles": set(),
         "participants": set(),
     }
@@ -1857,6 +1933,15 @@ def add_document_to_pst_chat_cluster(cluster: dict[str, object], document: dict[
     source_folder_path = document.get("source_folder_path")
     if source_folder_path:
         cluster["source_folder_paths"].add(source_folder_path)
+    thread_id = document.get("thread_id")
+    if thread_id:
+        cluster["thread_ids"].add(thread_id)
+    thread_type = document.get("thread_type")
+    if thread_type:
+        cluster["thread_types"].add(thread_type)
+    for participant_name in list(document.get("participant_names") or []):
+        if normalize_whitespace(str(participant_name)):
+            cluster["participant_names"].add(str(participant_name))
     title = document.get("title")
     if title:
         cluster["titles"].add(title)
@@ -1867,6 +1952,9 @@ def add_document_to_pst_chat_cluster(cluster: dict[str, object], document: dict[
 
 def pst_chat_cluster_scope_key(document: dict[str, object]) -> tuple[str, str]:
     source_rel_path = normalize_whitespace(str(document.get("source_rel_path") or ""))
+    thread_id = normalize_pst_chat_thread_id(document.get("thread_id"))
+    if thread_id:
+        return (source_rel_path, f"thread:{thread_id.lower()}")
     source_folder_path = normalize_whitespace(str(document.get("source_folder_path") or ""))
     if source_folder_path:
         return (source_rel_path, f"folder:{source_folder_path.lower()}")
@@ -1877,6 +1965,13 @@ def pst_chat_cluster_scope_key(document: dict[str, object]) -> tuple[str, str]:
 
 
 def derive_pst_chat_conversation_key(cluster: dict[str, object]) -> str:
+    thread_ids = sorted(
+        normalize_pst_chat_thread_id(value).lower()
+        for value in cluster["thread_ids"]
+        if normalize_pst_chat_thread_id(value)
+    )
+    if thread_ids:
+        return f"thread:{thread_ids[0]}"
     source_folder_paths = sorted(
         str(value).lower()
         for value in cluster["source_folder_paths"]
@@ -1896,6 +1991,9 @@ def derive_pst_chat_conversation_key(cluster: dict[str, object]) -> str:
 
 def derive_pst_chat_conversation_display_name(cluster: dict[str, object]) -> str:
     generic_folder_names = {"conversation history", "teamsmessagesdata", "teamsmeetings"}
+    participant_summary = render_display_name_list(list(cluster["participant_names"]), max_names=4)
+    if "chat" in cluster["thread_types"] and participant_summary:
+        return participant_summary
     source_folder_paths = sorted(
         str(value)
         for value in cluster["source_folder_paths"]
@@ -1905,6 +2003,8 @@ def derive_pst_chat_conversation_display_name(cluster: dict[str, object]) -> str
         leaf_name = normalize_whitespace(str(folder_path).split("/")[-1])
         if leaf_name and leaf_name.lower() not in generic_folder_names:
             return leaf_name
+    if participant_summary:
+        return participant_summary
     for document in list(cluster["documents"]):
         title = normalize_whitespace(str(document.get("title") or ""))
         if title:
@@ -3361,6 +3461,11 @@ def ingest_container_source(
                 connection,
                 document_id=document_id,
                 email_threading=extracted.get("email_threading"),
+            )
+            replace_document_chat_threading_row(
+                connection,
+                document_id=document_id,
+                chat_threading=extracted.get("chat_threading"),
             )
             seed_source_text_revision_for_document(
                 connection,
