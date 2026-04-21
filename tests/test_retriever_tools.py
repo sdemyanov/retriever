@@ -13,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 import types
 import unittest
 import zipfile
@@ -4406,6 +4407,38 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 "Another ingest is already running in this workspace",
             ):
                 retriever_tools.acquire_workspace_ingest_lock(self.paths)
+
+    def test_iter_prepared_loose_file_items_preserves_input_order_with_multiple_workers(self) -> None:
+        items = [
+            {
+                "path": self.root / "alpha.txt",
+                "rel_path": "alpha.txt",
+                "file_type": "txt",
+                "file_hash": "alpha",
+            },
+            {
+                "path": self.root / "beta.txt",
+                "rel_path": "beta.txt",
+                "file_type": "txt",
+                "file_hash": "beta",
+            },
+        ]
+
+        def fake_prepare(item: dict[str, object]) -> dict[str, object]:
+            if item["rel_path"] == "alpha.txt":
+                time.sleep(0.05)
+            prepared = dict(item)
+            prepared["prepare_ms"] = 1.0
+            prepared["prepare_error"] = None
+            prepared["extracted_payload"] = {"text_content": item["rel_path"]}
+            prepared["attachments"] = []
+            return prepared
+
+        with mock.patch.dict(os.environ, {"RETRIEVER_INGEST_WORKERS": "2"}):
+            with mock.patch.object(retriever_tools, "prepare_loose_file_item", side_effect=fake_prepare):
+                prepared = list(retriever_tools.iter_prepared_loose_file_items(items))
+
+        self.assertEqual([item["rel_path"] for item, _ in prepared], ["alpha.txt", "beta.txt"])
 
     def test_bootstrap_recovers_zero_byte_sqlite_artifacts(self) -> None:
         self.paths["db_path"].touch()
