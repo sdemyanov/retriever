@@ -4440,6 +4440,79 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertEqual([item["rel_path"] for item, _ in prepared], ["alpha.txt", "beta.txt"])
 
+    def test_refresh_prepared_loose_file_item_if_stale_reprepares_with_new_contents(self) -> None:
+        path = self.root / "alpha.txt"
+        path.write_text("first version\n", encoding="utf-8")
+        item = retriever_tools.refresh_ingest_item_filesystem_facts(
+            {
+                "path": path,
+                "rel_path": "alpha.txt",
+                "file_type": "txt",
+            }
+        )
+        prepared = retriever_tools.prepare_loose_file_item(item)
+
+        time.sleep(0.02)
+        path.write_text("second version\nwith more text\n", encoding="utf-8")
+
+        refreshed, did_refresh = retriever_tools.refresh_prepared_loose_file_item_if_stale(prepared)
+
+        self.assertTrue(did_refresh)
+        self.assertNotEqual(prepared["file_hash"], refreshed["file_hash"])
+        self.assertIn("second version", refreshed["extracted_payload"]["text_content"])
+        self.assertTrue(refreshed["prepared_chunks"])
+        self.assertIn("second version", refreshed["prepared_chunks"][0]["text_content"])
+
+    def test_iter_prepared_loose_file_items_spills_large_payloads_to_temp_dir(self) -> None:
+        items = [
+            {
+                "path": self.root / "alpha.txt",
+                "rel_path": "alpha.txt",
+                "file_type": "txt",
+                "file_hash": "alpha",
+            }
+        ]
+        staging_root = self.paths["ingest_tmp_dir"] / "spill-test"
+
+        def fake_prepare(item: dict[str, object]) -> dict[str, object]:
+            prepared = dict(item)
+            prepared["prepare_ms"] = 1.0
+            prepared["prepare_chunk_ms"] = 0.1
+            prepared["prepare_error"] = None
+            prepared["extracted_payload"] = {
+                "text_content": "x" * 4096,
+                "preview_artifacts": [{"file_name": "preview.html", "preview_type": "html", "content": "x" * 4096}],
+            }
+            prepared["attachments"] = [
+                {
+                    "file_name": "payload.bin",
+                    "payload": b"x" * 4096,
+                    "file_hash": "payload-hash",
+                }
+            ]
+            prepared["prepared_chunks"] = [
+                {
+                    "chunk_index": 0,
+                    "char_start": 0,
+                    "char_end": 32,
+                    "token_estimate": 8,
+                    "text_content": "x" * 32,
+                }
+            ]
+            return prepared
+
+        with mock.patch.object(retriever_tools, "prepare_loose_file_item", side_effect=fake_prepare):
+            with mock.patch.object(retriever_tools, "ingest_prepare_worker_count", return_value=1):
+                with mock.patch.object(retriever_tools, "ingest_prepare_queue_capacity", return_value=1):
+                    with mock.patch.object(retriever_tools, "ingest_prepare_queue_max_bytes", return_value=1):
+                        with mock.patch.object(retriever_tools, "ingest_prepare_spill_threshold_bytes", return_value=1):
+                            prepared = list(retriever_tools.iter_prepared_loose_file_items(items, staging_root))
+
+        self.assertEqual(prepared[0][0]["rel_path"], "alpha.txt")
+        spill_dir = staging_root / "prepared-loose"
+        self.assertTrue(spill_dir.exists())
+        self.assertEqual(list(spill_dir.iterdir()), [])
+
     def test_bootstrap_recovers_zero_byte_sqlite_artifacts(self) -> None:
         self.paths["db_path"].touch()
         Path(f"{self.paths['db_path']}-journal").write_text("stale\n", encoding="utf-8")
