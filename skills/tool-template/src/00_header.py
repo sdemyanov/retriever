@@ -6,6 +6,7 @@ import argparse
 import base64
 import csv
 import difflib
+import errno
 import hashlib
 import html
 import io
@@ -16,7 +17,9 @@ import os
 import posixpath
 import platform
 import re
+import secrets
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -26,6 +29,7 @@ import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
@@ -78,6 +82,16 @@ try:
     import pypff
 except Exception:  # pragma: no cover - required PST backend probe
     pypff = None
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - platform-specific locking
+    fcntl = None
+
+try:
+    import msvcrt
+except Exception:  # pragma: no cover - platform-specific locking
+    msvcrt = None
 
 
 TOOL_VERSION = "0.18.0"

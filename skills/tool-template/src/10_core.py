@@ -701,6 +701,9 @@ def run_command(command: list[str]) -> tuple[bool, str]:
 
 def workspace_paths(root: Path) -> dict[str, Path]:
     state_dir = root / ".retriever"
+    tmp_dir = state_dir / "tmp"
+    ingest_tmp_dir = tmp_dir / "ingest"
+    locks_dir = state_dir / "locks"
     return {
         "root": root,
         "state_dir": state_dir,
@@ -715,13 +718,134 @@ def workspace_paths(root: Path) -> dict[str, Path]:
         "jobs_dir": state_dir / "jobs",
         "logs_dir": state_dir / "logs",
         "runtime_path": state_dir / "runtime.json",
+        "tmp_dir": tmp_dir,
+        "ingest_tmp_dir": ingest_tmp_dir,
+        "locks_dir": locks_dir,
+        "ingest_lock_path": locks_dir / "ingest.lock",
     }
 
 
 def ensure_layout(paths: dict[str, Path]) -> None:
     paths["state_dir"].mkdir(parents=True, exist_ok=True)
-    for key in ("previews_dir", "text_revisions_dir", "bin_dir", "backups_dir", "jobs_dir", "logs_dir"):
+    for key in (
+        "previews_dir",
+        "text_revisions_dir",
+        "bin_dir",
+        "backups_dir",
+        "jobs_dir",
+        "logs_dir",
+        "tmp_dir",
+        "ingest_tmp_dir",
+        "locks_dir",
+    ):
         paths[key].mkdir(parents=True, exist_ok=True)
+
+
+def remove_directory_tree(path: Path) -> bool:
+    try:
+        if not path.exists():
+            return False
+        shutil.rmtree(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def new_ingest_session_id(now: datetime | None = None) -> str:
+    timestamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}-{secrets.token_hex(4)}"
+
+
+def sweep_stale_ingest_tmp_dirs(paths: dict[str, Path]) -> int:
+    ingest_tmp_dir = paths["ingest_tmp_dir"]
+    if not ingest_tmp_dir.exists():
+        return 0
+    removed = 0
+    for child in sorted(ingest_tmp_dir.iterdir(), key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        if remove_directory_tree(child):
+            removed += 1
+    return removed
+
+
+def acquire_os_file_lock(handle) -> None:
+    if os.name == "nt":
+        if msvcrt is None:
+            raise RetrieverError("Windows file locking support is unavailable in this runtime.")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    if fcntl is None:
+        raise RetrieverError("POSIX file locking support is unavailable in this runtime.")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def release_os_file_lock(handle) -> None:
+    if os.name == "nt":
+        if msvcrt is None:
+            return
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    if fcntl is None:
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def acquire_workspace_ingest_lock(paths: dict[str, Path]):
+    lock_path = paths["ingest_lock_path"]
+    handle = lock_path.open("a+b")
+    try:
+        acquire_os_file_lock(handle)
+    except RetrieverError:
+        handle.close()
+        raise
+    except OSError as exc:
+        handle.close()
+        if exc.errno in {errno.EACCES, errno.EAGAIN} or isinstance(exc, PermissionError):
+            raise RetrieverError("Another ingest is already running in this workspace. Wait for it to finish and retry.") from exc
+        raise RetrieverError(
+            f"Unable to acquire workspace ingest lock at {lock_path}: {type(exc).__name__}: {exc}"
+        ) from exc
+    return handle
+
+
+def release_workspace_ingest_lock(handle) -> None:
+    try:
+        release_os_file_lock(handle)
+    finally:
+        handle.close()
+
+
+@contextmanager
+def workspace_ingest_session(paths: dict[str, Path], *, command_name: str):
+    ensure_layout(paths)
+    lock_handle = acquire_workspace_ingest_lock(paths)
+    benchmark_mark("workspace_ingest_lock_acquired", command=command_name)
+    session_id = new_ingest_session_id()
+    session_dir = paths["ingest_tmp_dir"] / session_id
+    try:
+        stale_tmp_dirs_removed = sweep_stale_ingest_tmp_dirs(paths)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        benchmark_mark(
+            "workspace_ingest_session_ready",
+            command=command_name,
+            session_id=session_id,
+            stale_tmp_dirs_removed=stale_tmp_dirs_removed,
+        )
+        yield {
+            "id": session_id,
+            "tmp_dir": session_dir,
+            "stale_tmp_dirs_removed": stale_tmp_dirs_removed,
+        }
+    finally:
+        remove_directory_tree(session_dir)
+        release_workspace_ingest_lock(lock_handle)
 
 
 def sqlite_artifact_paths(db_path: Path) -> list[Path]:
