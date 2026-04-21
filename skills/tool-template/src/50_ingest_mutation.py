@@ -141,6 +141,7 @@ def ingest_serial_special_sources(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
     root: Path,
+    ingest_tmp_dir: Path | None,
     allowed_types: set[str] | None,
     production_signatures: list[dict[str, object]],
     slack_export_descriptors: list[dict[str, object]],
@@ -240,6 +241,7 @@ def ingest_serial_special_sources(
                     paths,
                     root,
                     resolved_production_root,
+                    staging_root=ingest_tmp_dir,
                 )
                 ingested_production_roots.append(production_rel_root)
                 stats["new"] += int(production_result["created"])
@@ -368,11 +370,11 @@ def ingest_prepare_spill_threshold_bytes() -> int:
         return default_value
 
 
-def serialized_prepared_loose_file_item(prepared_item: dict[str, object]) -> bytes:
+def serialize_prepared_ingest_item(prepared_item: dict[str, object]) -> bytes:
     return pickle.dumps(prepared_item, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def stage_prepared_loose_file_item(
+def stage_prepared_ingest_item(
     spill_dir: Path,
     prepared_index: int,
     serialized_payload: bytes,
@@ -383,11 +385,128 @@ def stage_prepared_loose_file_item(
     return spill_path
 
 
-def hydrate_staged_prepared_loose_file_item(spill_path: Path) -> dict[str, object]:
+def hydrate_staged_prepared_ingest_item(spill_path: Path) -> dict[str, object]:
     try:
         return pickle.loads(spill_path.read_bytes())
     finally:
         remove_file_if_exists(spill_path)
+
+
+def iter_staged_prepared_items(
+    items: list[dict[str, object]],
+    *,
+    prepare_item,
+    config_benchmark_name: str,
+    queue_done_benchmark_name: str,
+    spill_subdir_name: str,
+    staging_root: Path | None = None,
+) -> Iterator[tuple[dict[str, object], float]]:
+    if not items:
+        return
+    prepare_workers = ingest_prepare_worker_count()
+    max_prepared_items = ingest_prepare_queue_capacity(prepare_workers)
+    queue_max_bytes = ingest_prepare_queue_max_bytes()
+    spill_threshold_bytes = ingest_prepare_spill_threshold_bytes()
+    benchmark_mark(
+        config_benchmark_name,
+        prepare_workers=prepare_workers,
+        max_prepared_items=max_prepared_items,
+        queue_max_bytes=queue_max_bytes,
+        spill_threshold_bytes=spill_threshold_bytes,
+    )
+    own_staging_dir = staging_root is None
+    spill_dir = (
+        Path(tempfile.mkdtemp(prefix="retriever-ingest-prepared-"))
+        if staging_root is None
+        else Path(staging_root) / spill_subdir_name
+    )
+    ready_entries_by_index: dict[int, dict[str, object]] = {}
+    ready_bytes_in_memory = 0
+    peak_ready_bytes_in_memory = 0
+    spilled_items = 0
+    spilled_bytes = 0
+    try:
+        with ThreadPoolExecutor(max_workers=prepare_workers) as executor:
+            pending_by_index: dict[int, object] = {}
+            future_to_index: dict[object, int] = {}
+            next_submit_index = 0
+            next_yield_index = 0
+
+            def submit_available() -> None:
+                nonlocal next_submit_index
+                while (
+                    next_submit_index < len(items)
+                    and len(pending_by_index) + len(ready_entries_by_index) < max_prepared_items
+                ):
+                    future = executor.submit(
+                        prepare_item,
+                        items[next_submit_index],
+                    )
+                    pending_by_index[next_submit_index] = future
+                    future_to_index[future] = next_submit_index
+                    next_submit_index += 1
+
+            def record_completed_future(future) -> None:
+                nonlocal ready_bytes_in_memory, peak_ready_bytes_in_memory, spilled_items, spilled_bytes
+                prepared_index = future_to_index.pop(future)
+                pending_by_index.pop(prepared_index, None)
+                prepared_item = future.result()
+                serialized_payload = serialize_prepared_ingest_item(prepared_item)
+                serialized_size = len(serialized_payload)
+                should_spill = (
+                    serialized_size >= spill_threshold_bytes
+                    or ready_bytes_in_memory + serialized_size > queue_max_bytes
+                )
+                if should_spill:
+                    spill_path = stage_prepared_ingest_item(spill_dir, prepared_index, serialized_payload)
+                    ready_entries_by_index[prepared_index] = {
+                        "storage": "spill",
+                        "spill_path": spill_path,
+                        "serialized_size": serialized_size,
+                    }
+                    spilled_items += 1
+                    spilled_bytes += serialized_size
+                    return
+                ready_entries_by_index[prepared_index] = {
+                    "storage": "memory",
+                    "prepared_item": prepared_item,
+                    "serialized_size": serialized_size,
+                }
+                ready_bytes_in_memory += serialized_size
+                peak_ready_bytes_in_memory = max(peak_ready_bytes_in_memory, ready_bytes_in_memory)
+
+            submit_available()
+            while next_yield_index < len(items):
+                wait_started = time.perf_counter()
+                while next_yield_index not in ready_entries_by_index:
+                    if not pending_by_index:
+                        raise RetrieverError(
+                            f"Prepared ingest queue drained before index {next_yield_index} was ready."
+                        )
+                    done, _ = wait(list(pending_by_index.values()), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        record_completed_future(future)
+                    submit_available()
+                wait_ms = (time.perf_counter() - wait_started) * 1000.0
+                entry = ready_entries_by_index.pop(next_yield_index)
+                if entry["storage"] == "spill":
+                    prepared_item = hydrate_staged_prepared_ingest_item(Path(entry["spill_path"]))
+                else:
+                    prepared_item = dict(entry["prepared_item"])
+                    ready_bytes_in_memory = max(0, ready_bytes_in_memory - int(entry["serialized_size"]))
+                yield prepared_item, wait_ms
+                next_yield_index += 1
+                submit_available()
+    finally:
+        benchmark_mark(
+            queue_done_benchmark_name,
+            spilled_items=spilled_items,
+            spilled_bytes=spilled_bytes,
+            peak_ready_bytes=peak_ready_bytes_in_memory,
+            spill_dir=str(spill_dir),
+        )
+        if own_staging_dir:
+            remove_directory_tree(spill_dir)
 
 
 def prepare_loose_file_item(item: dict[str, object]) -> dict[str, object]:
@@ -441,112 +560,14 @@ def iter_prepared_loose_file_items(
     loose_file_items: list[dict[str, object]],
     staging_root: Path | None = None,
 ) -> Iterator[tuple[dict[str, object], float]]:
-    if not loose_file_items:
-        return
-    prepare_workers = ingest_prepare_worker_count()
-    max_prepared_items = ingest_prepare_queue_capacity(prepare_workers)
-    queue_max_bytes = ingest_prepare_queue_max_bytes()
-    spill_threshold_bytes = ingest_prepare_spill_threshold_bytes()
-    benchmark_mark(
-        "ingest_loose_prepare_config",
-        prepare_workers=prepare_workers,
-        max_prepared_items=max_prepared_items,
-        queue_max_bytes=queue_max_bytes,
-        spill_threshold_bytes=spill_threshold_bytes,
+    yield from iter_staged_prepared_items(
+        loose_file_items,
+        prepare_item=prepare_loose_file_item,
+        config_benchmark_name="ingest_loose_prepare_config",
+        queue_done_benchmark_name="ingest_loose_prepare_queue_done",
+        spill_subdir_name="prepared-loose",
+        staging_root=staging_root,
     )
-    own_staging_dir = staging_root is None
-    spill_dir = (
-        Path(tempfile.mkdtemp(prefix="retriever-ingest-prepared-"))
-        if staging_root is None
-        else Path(staging_root) / "prepared-loose"
-    )
-    ready_entries_by_index: dict[int, dict[str, object]] = {}
-    ready_bytes_in_memory = 0
-    peak_ready_bytes_in_memory = 0
-    spilled_items = 0
-    spilled_bytes = 0
-    try:
-        with ThreadPoolExecutor(max_workers=prepare_workers) as executor:
-            pending_by_index: dict[int, object] = {}
-            future_to_index: dict[object, int] = {}
-            next_submit_index = 0
-            next_yield_index = 0
-
-            def submit_available() -> None:
-                nonlocal next_submit_index
-                while (
-                    next_submit_index < len(loose_file_items)
-                    and len(pending_by_index) + len(ready_entries_by_index) < max_prepared_items
-                ):
-                    future = executor.submit(
-                        prepare_loose_file_item,
-                        loose_file_items[next_submit_index],
-                    )
-                    pending_by_index[next_submit_index] = future
-                    future_to_index[future] = next_submit_index
-                    next_submit_index += 1
-
-            def record_completed_future(future) -> None:
-                nonlocal ready_bytes_in_memory, peak_ready_bytes_in_memory, spilled_items, spilled_bytes
-                prepared_index = future_to_index.pop(future)
-                pending_by_index.pop(prepared_index, None)
-                prepared_item = future.result()
-                serialized_payload = serialized_prepared_loose_file_item(prepared_item)
-                serialized_size = len(serialized_payload)
-                should_spill = (
-                    serialized_size >= spill_threshold_bytes
-                    or ready_bytes_in_memory + serialized_size > queue_max_bytes
-                )
-                if should_spill:
-                    spill_path = stage_prepared_loose_file_item(spill_dir, prepared_index, serialized_payload)
-                    ready_entries_by_index[prepared_index] = {
-                        "storage": "spill",
-                        "spill_path": spill_path,
-                        "serialized_size": serialized_size,
-                    }
-                    spilled_items += 1
-                    spilled_bytes += serialized_size
-                    return
-                ready_entries_by_index[prepared_index] = {
-                    "storage": "memory",
-                    "prepared_item": prepared_item,
-                    "serialized_size": serialized_size,
-                }
-                ready_bytes_in_memory += serialized_size
-                peak_ready_bytes_in_memory = max(peak_ready_bytes_in_memory, ready_bytes_in_memory)
-
-            submit_available()
-            while next_yield_index < len(loose_file_items):
-                wait_started = time.perf_counter()
-                while next_yield_index not in ready_entries_by_index:
-                    if not pending_by_index:
-                        raise RetrieverError(
-                            f"Prepared loose-file queue drained before index {next_yield_index} was ready."
-                        )
-                    done, _ = wait(list(pending_by_index.values()), return_when=FIRST_COMPLETED)
-                    for future in done:
-                        record_completed_future(future)
-                    submit_available()
-                wait_ms = (time.perf_counter() - wait_started) * 1000.0
-                entry = ready_entries_by_index.pop(next_yield_index)
-                if entry["storage"] == "spill":
-                    prepared_item = hydrate_staged_prepared_loose_file_item(Path(entry["spill_path"]))
-                else:
-                    prepared_item = dict(entry["prepared_item"])
-                    ready_bytes_in_memory = max(0, ready_bytes_in_memory - int(entry["serialized_size"]))
-                yield prepared_item, wait_ms
-                next_yield_index += 1
-                submit_available()
-    finally:
-        benchmark_mark(
-            "ingest_loose_prepare_queue_done",
-            spilled_items=spilled_items,
-            spilled_bytes=spilled_bytes,
-            peak_ready_bytes=peak_ready_bytes_in_memory,
-            spill_dir=str(spill_dir),
-        )
-        if own_staging_dir:
-            remove_directory_tree(spill_dir)
 
 
 def commit_prepared_loose_file(
@@ -846,7 +867,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
     ensure_layout(paths)
     total_started = time.perf_counter()
     benchmark_mark("ingest_production_begin")
-    with workspace_ingest_session(paths, command_name="ingest-production"):
+    with workspace_ingest_session(paths, command_name="ingest-production") as ingest_session:
         connection = connect_db(paths["db_path"])
         try:
             setup_started = time.perf_counter()
@@ -864,6 +885,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
                 paths,
                 root,
                 resolved_production_root,
+                staging_root=Path(ingest_session["tmp_dir"]),
             )
             benchmark_mark(
                 "ingest_production_done",
@@ -947,6 +969,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 connection,
                 paths,
                 root,
+                Path(ingest_session["tmp_dir"]),
                 allowed_types,
                 production_signatures,
                 slack_export_descriptors,
