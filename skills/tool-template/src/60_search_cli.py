@@ -834,6 +834,7 @@ def fetch_attachment_summaries(
                 "control_number": row["control_number"],
                 "file_name": row["file_name"],
                 "file_type": row["file_type"],
+                "content_type": row["content_type"],
                 **document_path_payload(paths, connection, row),
                 "source_kind": row["source_kind"],
                 "begin_bates": row["begin_bates"],
@@ -885,6 +886,7 @@ def fetch_child_document_summaries(
                 "control_number": row["control_number"],
                 "file_name": row["file_name"],
                 "file_type": row["file_type"],
+                "content_type": row["content_type"],
                 **document_path_payload(paths, connection, row),
                 "child_document_kind": row["child_document_kind"],
                 "title": row["title"],
@@ -2623,7 +2625,7 @@ def markdown_search_target(item: dict[str, object]) -> str | None:
 
 def summarize_child_content_type(item: dict[str, object], *, attachment: bool) -> str | None:
     if attachment:
-        return "Attachment"
+        return "Unrecognized"
     child_kind = normalize_inline_whitespace(str(item.get("child_document_kind") or ""))
     if child_kind:
         return child_kind.replace("_", " ").title()
@@ -2730,7 +2732,7 @@ def render_search_markdown(payload: dict[str, object], column_defs: list[dict[st
                                 attachment,
                                 column_defs,
                                 child_prefix="↳ ",
-                                child_content_type="Attachment",
+                                child_content_type=summarize_child_content_type(attachment, attachment=True),
                             )
                         )
             child_documents = raw_item.get("child_documents")
