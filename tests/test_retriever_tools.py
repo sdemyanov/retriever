@@ -6124,18 +6124,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(next_exit, 0)
         self.assertIsNotNone(next_payload)
         self.assertEqual(next_payload["page"], 2)
-        self.assertEqual(next_payload["offset"], 20)
-        self.assertEqual(next_payload["results"][0]["file_name"], "doc-20.txt")
+        self.assertEqual(next_payload["offset"], 10)
+        self.assertEqual(next_payload["results"][0]["file_name"], "doc-10.txt")
 
         self.assertEqual(page_exit, 0)
         self.assertIsNotNone(page_payload)
-        self.assertEqual(page_payload["page"], 2)
+        self.assertEqual(page_payload["page"], 3)
         self.assertEqual(page_payload["offset"], 20)
 
         self.assertEqual(previous_exit, 0)
         self.assertIsNotNone(previous_payload)
-        self.assertEqual(previous_payload["page"], 1)
-        self.assertEqual(previous_payload["offset"], 0)
+        self.assertEqual(previous_payload["page"], 2)
+        self.assertEqual(previous_payload["offset"], 10)
 
         self.assertEqual(default_exit, 0)
         self.assertIsNotNone(default_payload)
@@ -6316,26 +6316,26 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "--mode",
             "view",
             "--per-page",
-            "10",
+            "5",
         )
         next_exit, next_payload, _, _ = self.run_cli("slash", str(self.root), "/next")
 
         self.assertEqual(search_exit, 0)
         self.assertIsNotNone(search_payload)
         self.assertEqual(search_payload["page"], 1)
-        self.assertEqual(search_payload["per_page"], 10)
-        self.assertEqual(len(search_payload["results"]), 10)
+        self.assertEqual(search_payload["per_page"], 5)
+        self.assertEqual(len(search_payload["results"]), 5)
 
         session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertEqual(session_payload["display"]["page_size"], 10)
+        self.assertEqual(session_payload["display"]["page_size"], 5)
         self.assertEqual(session_payload["scope"]["keyword"], "document")
 
         self.assertEqual(next_exit, 0)
         self.assertIsNotNone(next_payload)
-        self.assertEqual(next_payload["offset"], 10)
-        self.assertEqual(next_payload["per_page"], 10)
+        self.assertEqual(next_payload["offset"], 5)
+        self.assertEqual(next_payload["per_page"], 5)
         self.assertEqual(next_payload["page"], 2)
-        self.assertEqual(len(next_payload["results"]), 10)
+        self.assertEqual(len(next_payload["results"]), 5)
 
     def test_slash_search_drops_stale_display_columns_with_warning(self) -> None:
         (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
@@ -8017,6 +8017,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("updated_at", compact_result["metadata"])
         self.assertNotIn("page_count", compact_result["metadata"])
         self.assertIn("preview_abs_path", compact_result)
+        self.assertNotIn("preview_rel_path", compact_result)
         self.assertIn("preview_targets", verbose_result)
         self.assertIn("manual_field_locks", verbose_result)
         self.assertIn("page_count", verbose_result["metadata"])

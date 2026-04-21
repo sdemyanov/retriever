@@ -191,7 +191,7 @@ When the user asks to inspect fields or columns:
 
 ## Paging
 
-- Default page size: 20
+- Default page size: 10
 - Show `Documents X-Y of Z`
 - Tell the user how to ask for the next page when there are more results
 
