@@ -15,6 +15,8 @@ Use this skill whenever a task changes or depends on document extraction behavio
 ## Required reference
 
 Read [parsing.md](parsing.md) before changing ingest logic or parser dependencies.
+For spreadsheet parser redesign work, also read [spreadsheet-parsing-plan.md](spreadsheet-parsing-plan.md).
+For ingest execution-model redesign, also read [PARALLEL_INGEST_PLAN.md](/Users/sergey/Projects/retriever-plugin/plans/parallel-ingest-plan.md).
 
 ## Rules
 
