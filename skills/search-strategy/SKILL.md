@@ -25,6 +25,9 @@ Read [search-strategy.md](search-strategy.md) before presenting search results o
 - Use `list` subcommands for discoverability: `/scope list`, `/dataset list`, `/sort list`, and `/columns list`.
 - Unless the user explicitly asks for a different layout, show document results using the active display column set. The default when no override is present is `content_type`, `title`, `author`, `date_created`, and `control_number`.
 - When the user asked to see the table itself, prefer `--mode view` and forward the tool's `rendered_markdown` as the entire reply. Do not add any text before or after the table.
+- In compose mode, keep summaries short by default. Use one short paragraph unless the user asked for a detailed write-up or the material genuinely needs a second paragraph for chronology or contrast.
+- In compose mode, anchor the main answer to the top matching documents instead of broad collection-wide storytelling. Name the most relevant `control_number` items when they support the conclusion.
+- Do not add side remarks about unrelated hits, dataset noise, or collection quality unless the user asked for that analysis or it materially changes the answer.
 - When the user asks to show files, documents, or attachment children, make every shown result clickable with its preview/open link.
 - The `Title` cell is always the clickable cell in the standard format; do not create a separate `Link` column.
 - Use the tool-returned preview path when one exists, and fall back to the source/native path when no generated preview exists.

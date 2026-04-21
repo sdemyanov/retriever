@@ -23,6 +23,14 @@
 - When `rendered_markdown` is present for a view request, forward it as the entire reply and nothing else: no preamble, no trailing commentary, no code fences, no reformatting, and no follow-up summary sentence.
 - The view-mode response must terminate immediately after the table footer. Any extra prose after `Documents X–Y of Z ...` is a contract violation, not a stylistic choice.
 
+## Compose-mode answer style
+
+- Default to a concise answer. Use one short paragraph for straightforward summaries; use two short paragraphs only when chronology, comparison, or uncertainty genuinely needs the extra space.
+- Ground the answer in the top matching documents rather than in a sweeping collection-wide narrative. When the main conclusion rests on a few documents, name or cite those `control_number` items directly.
+- Prefer "the top hits indicate ..." over definitive broad claims when the answer is based on a limited result page.
+- Do not add commentary about unrelated matches, corpus noise, or synthetic-dataset structure unless the user asked for noise analysis or that caveat materially changes the answer.
+- If there is real ambiguity or mixed evidence, say so briefly instead of smoothing it into a single confident storyline.
+
 Supported SQL-like filter operators:
 
 - `=`
