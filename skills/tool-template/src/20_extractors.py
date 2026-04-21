@@ -117,6 +117,22 @@ def preview_rows_use_conversation_navigation(preview_rows: list[sqlite3.Row]) ->
     return bool(preview_rows) and is_conversation_preview_rel_path(preview_rows[0]["rel_preview_path"])
 
 
+def ordered_preview_rows_for_document(
+    document_row: sqlite3.Row | None,
+    preview_rows: list[sqlite3.Row],
+) -> list[sqlite3.Row]:
+    if not preview_rows:
+        return []
+    if document_row is None or not preview_rows_use_conversation_navigation(preview_rows):
+        return list(preview_rows)
+    if normalize_whitespace(str(document_row["content_type"] or "")) == "Chat":
+        return list(preview_rows)
+    for preview_row in preview_rows:
+        if not is_conversation_preview_rel_path(preview_row["rel_preview_path"]):
+            return [preview_row, *[row for row in preview_rows if row is not preview_row]]
+    return list(preview_rows)
+
+
 def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection: sqlite3.Connection) -> dict[str, object]:
     preview_rows = connection.execute(
         """
@@ -127,10 +143,11 @@ def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection:
         """,
         (row["id"],),
     ).fetchall()
+    ordered_preview_rows = ordered_preview_rows_for_document(row, preview_rows)
     native_target = document_native_target(paths, row)
     if (
-        preview_rows
-        and not preview_rows_use_conversation_navigation(preview_rows)
+        ordered_preview_rows
+        and not preview_rows_use_conversation_navigation(ordered_preview_rows)
         and document_prefers_native_primary_preview(row)
         and native_target is not None
     ):
@@ -141,8 +158,8 @@ def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection:
             label=(str(native_target["label"]) if native_target["label"] is not None else None),
             ordinal=int(native_target["ordinal"]),
         )
-    if preview_rows:
-        return preview_target_payload_from_preview_row(paths, preview_rows[0])
+    if ordered_preview_rows:
+        return preview_target_payload_from_preview_row(paths, ordered_preview_rows[0])
     source_targets = production_source_part_targets(paths, connection, row)
     if source_targets:
         return build_preview_target_payload(
@@ -197,8 +214,13 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
             )
         ]
 
+    ordered_preview_rows = ordered_preview_rows_for_document(document_row, preview_rows)
     targets: list[dict[str, object]] = []
-    if preview_rows and not preview_rows_use_conversation_navigation(preview_rows) and document_prefers_native_primary_preview(document_row):
+    if (
+        ordered_preview_rows
+        and not preview_rows_use_conversation_navigation(ordered_preview_rows)
+        and document_prefers_native_primary_preview(document_row)
+    ):
         native_target = document_native_target(paths, document_row)
         if native_target is not None:
             targets.append(
@@ -210,7 +232,7 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
                     ordinal=int(native_target["ordinal"]),
                 )
             )
-    for preview_row in preview_rows:
+    for preview_row in ordered_preview_rows:
         targets.append(preview_target_payload_from_preview_row(paths, preview_row))
     source_targets = production_source_part_targets(paths, connection, document_row)
     for target in source_targets:

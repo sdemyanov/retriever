@@ -409,6 +409,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         *,
         subject: str,
         body_text: str,
+        body_html: str | None = None,
         author: str = "Alice Example <alice@example.com>",
         recipients: str = "Bob Example <bob@example.com>",
         cc: str | None = "Carol Example <carol@example.com>",
@@ -439,6 +440,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         if conversation_topic is not None:
             message["Conversation-Topic"] = conversation_topic
         message.set_content(body_text)
+        if body_html is not None:
+            message.add_alternative(body_html, subtype="html")
         if attachment_name is not None and attachment_text is not None:
             message.add_attachment(attachment_text, subtype="plain", filename=attachment_name)
         path.write_bytes(message.as_bytes(policy=policy.default))
@@ -4463,12 +4466,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-        parent_preview_path = Path(parent_preview_abs_path)
-        preview_html = self.preview_target_file_path(
+        segment_preview_path = self.preview_target_file_path(
             self.preview_target_by_label(parent_preview_targets, "segment")
-        ).read_text(encoding="utf-8")
+        )
+        preview_html = segment_preview_path.read_text(encoding="utf-8")
         expected_href = retriever_tools.urllib_request.pathname2url(
-            os.path.relpath(child_preview_abs_path, start=str(parent_preview_path.parent))
+            os.path.relpath(child_preview_abs_path, start=str(segment_preview_path.parent))
         )
 
         self.assertIn("<title>Energy Balance Revenue Summary - All messages</title>", preview_html)
@@ -5326,27 +5329,25 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.preview_target_file_path(self.preview_target_by_label(day_one_result["preview_targets"], "segment")),
             self.preview_target_file_path(self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "segment")),
         )
-        slack_entry_html = self.preview_target_file_path(day_one_result["preview_targets"][0]).read_text(encoding="utf-8")
-        self.assertIn(f"segment-2022-12.html#doc-{day_one_row['id']}", slack_entry_html)
+        slack_original_preview = self.preview_target_file_path(
+            self.preview_target_by_label(day_one_result["preview_targets"], "conversation")
+        )
+        reply_original_preview = self.preview_target_file_path(
+            self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "conversation")
+        )
+        slack_entry_path = self.preview_target_file_path(day_one_result["preview_targets"][0])
+        slack_entry_html = slack_entry_path.read_text(encoding="utf-8")
+        self.assertIn("Kickoff thread", slack_entry_html)
+        self.assertNotIn("Contents", slack_entry_html)
+        self.assertNotIn('class="conversation-nav-segment"', slack_entry_html)
+        self.assertNotIn("window.location.replace", slack_entry_html)
         slack_preview_html = self.preview_target_file_path(
             self.preview_target_by_label(day_one_result["preview_targets"], "segment")
         ).read_text(encoding="utf-8")
         self.assertIn("Kickoff thread", slack_preview_html)
         self.assertIn("Following up on kickoff", slack_preview_html)
-        self.assertFalse(
-            (
-                self.paths["state_dir"]
-                / retriever_tools.preview_base_path_for_rel_path("data/slack/general/2022-12-16.json")
-                / "2022-12-16.html"
-            ).exists()
-        )
-        self.assertFalse(
-            (
-                self.paths["state_dir"]
-                / retriever_tools.preview_base_path_for_rel_path(child_rel_path)
-                / f"{Path(child_rel_path).stem}.html"
-            ).exists()
-        )
+        self.assertTrue(slack_original_preview.exists())
+        self.assertTrue(reply_original_preview.exists())
 
         dataset_payload = retriever_tools.list_datasets(self.root)
         slack_dataset = next(
@@ -5390,6 +5391,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             reply_path,
             subject="Re: Status Update",
             body_text="Reply message body",
+            body_html=(
+                '<div class="reply-rich-email">'
+                "<p><strong>Reply message body</strong></p>"
+                '<table role="presentation"><tr><td>Rendered from the original HTML body.</td></tr></table>'
+                "</div>"
+            ),
             message_id="<reply@example.com>",
             in_reply_to="<root@example.com>",
             references="<root@example.com>",
@@ -5447,22 +5454,36 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         root_result = next(item for item in browse_result["results"] if item["id"] == root_row["id"])
         search_result = retriever_tools.search(self.root, "Reply message body", None, None, None, 1, 20)
         reply_result = next(item for item in search_result["results"] if item["id"] == reply_row["id"])
-        self.assertTrue(
-            reply_result["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
+        self.assertEqual(
+            reply_result["preview_rel_path"],
+            self.preview_target_by_label(reply_result["preview_targets"], "message")["rel_path"],
         )
-        self.assertTrue(reply_result["preview_rel_path"].endswith(f"doc-{reply_row['id']}.html"))
         self.assertIsNone(reply_result["preview_target_fragment"])
-        self.assertEqual(len(reply_result["preview_targets"]), 3)
+        self.assertEqual(len(reply_result["preview_targets"]), 4)
+        self.assertEqual(reply_result["preview_targets"][0]["label"], "message")
+        self.assertEqual(reply_result["preview_targets"][1]["label"], "entry")
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "segment")["target_fragment"], f"doc-{reply_row['id']}")
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "contents")["label"], "contents")
+        self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "message")["label"], "message")
         self.assertEqual(
             self.preview_target_file_path(self.preview_target_by_label(root_result["preview_targets"], "segment")),
             self.preview_target_file_path(self.preview_target_by_label(reply_result["preview_targets"], "segment")),
         )
-        entry_html = self.preview_target_file_path(reply_result["preview_targets"][0]).read_text(encoding="utf-8")
-        self.assertIn(f"segment-all.html#doc-{reply_row['id']}", entry_html)
+        message_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(reply_result["preview_targets"], "message")
+        ).read_text(encoding="utf-8")
+        entry_path = self.preview_target_file_path(
+            self.preview_target_by_label(reply_result["preview_targets"], "entry")
+        )
+        entry_html = entry_path.read_text(encoding="utf-8")
+        self.assertIn("Reply message body", entry_html)
+        self.assertIn('class="reply-rich-email"', entry_html)
+        self.assertIn('<table role="presentation">', entry_html)
+        self.assertNotIn("&lt;div class=&quot;reply-rich-email&quot;&gt;", entry_html)
+        self.assertNotIn("Contents", entry_html)
+        self.assertNotIn('class="conversation-nav-segment"', entry_html)
+        self.assertNotIn("window.location.replace", entry_html)
+        self.assertIn('class="reply-rich-email"', message_preview_html)
         segment_html = self.preview_target_file_path(
             self.preview_target_by_label(reply_result["preview_targets"], "segment")
         ).read_text(encoding="utf-8")
@@ -5473,13 +5494,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn(f'id="doc-{reply_row["id"]}"', segment_html)
         self.assertIn("Root message body", segment_html)
         self.assertIn("Reply message body", segment_html)
+        self.assertIn('class="reply-rich-email"', segment_html)
         self.assertIn("Status Update", toc_html)
-        self.assertIn(f"#doc-{reply_row['id']}", toc_html)
-        self.assertFalse(
-            (self.paths["state_dir"] / retriever_tools.preview_base_path_for_rel_path("root.eml") / "root.eml.html").exists()
+        self.assertNotIn("<a href=", toc_html)
+        self.assertTrue(
+            self.preview_target_file_path(self.preview_target_by_label(root_result["preview_targets"], "message")).exists()
         )
-        self.assertFalse(
-            (self.paths["state_dir"] / retriever_tools.preview_base_path_for_rel_path("reply.eml") / "reply.eml.html").exists()
+        self.assertTrue(
+            self.preview_target_file_path(self.preview_target_by_label(reply_result["preview_targets"], "message")).exists()
         )
 
     def test_manual_conversation_assignment_mode_prevents_root_overwrite_and_retargets_auto_reply(self) -> None:
@@ -7344,12 +7366,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_result["attachment_count"], 1)
         self.assertEqual(parent_result["source_rel_path"], "mailbox.mbox")
         self.assertEqual(parent_result["dataset_name"], "mailbox.mbox")
-        self.assertTrue(
-            parent_result["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
+        self.assertEqual(
+            parent_result["preview_rel_path"],
+            self.preview_target_by_label(parent_result["preview_targets"], "message")["rel_path"],
         )
-        self.assertTrue(parent_result["preview_rel_path"].endswith(f"doc-{parent_row['id']}.html"))
         parent_preview_html = self.preview_target_file_path(
             self.preview_target_by_label(parent_result["preview_targets"], "segment")
         ).read_text(encoding="utf-8")
@@ -7670,12 +7690,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_result["source_rel_path"], "mailbox.pst")
         self.assertEqual(parent_result["source_folder_path"], "Inbox")
         self.assertEqual(parent_result["dataset_name"], "mailbox.pst")
-        self.assertTrue(
-            parent_result["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
+        self.assertEqual(
+            parent_result["preview_rel_path"],
+            self.preview_target_by_label(parent_result["preview_targets"], "message")["rel_path"],
         )
-        self.assertTrue(parent_result["preview_rel_path"].endswith(f"doc-{parent_row['id']}.html"))
         parent_preview_html = self.preview_target_file_path(
             self.preview_target_by_label(parent_result["preview_targets"], "segment")
         ).read_text(encoding="utf-8")
@@ -8584,7 +8602,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
         expected_href = retriever_tools.urllib_request.pathname2url(
-            os.path.relpath(child_preview_abs_path, start=str(Path(html_result["preview_targets"][0]["abs_path"]).parent))
+            os.path.relpath(
+                child_preview_abs_path,
+                start=str(Path(html_result["preview_targets"][0]["abs_path"]).parent),
+            )
         )
         self.assertIn("<h2>Attachments</h2>", preview_html)
         self.assertIn(f'href="{expected_href}"', preview_html)
