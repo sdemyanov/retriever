@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import importlib.util
 import json
@@ -4375,6 +4376,36 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIs(connection, fake_connection)
         self.assertIn("PRAGMA journal_mode = WAL", fake_connection.commands)
         self.assertIn("PRAGMA journal_mode = DELETE", fake_connection.commands)
+
+    def test_workspace_paths_include_ingest_lock_and_tmp_dirs(self) -> None:
+        self.assertEqual(self.paths["tmp_dir"], self.root / ".retriever" / "tmp")
+        self.assertEqual(self.paths["ingest_tmp_dir"], self.root / ".retriever" / "tmp" / "ingest")
+        self.assertEqual(self.paths["locks_dir"], self.root / ".retriever" / "locks")
+        self.assertEqual(self.paths["ingest_lock_path"], self.root / ".retriever" / "locks" / "ingest.lock")
+
+    def test_workspace_ingest_session_sweeps_stale_tmp_dirs_and_cleans_current_dir(self) -> None:
+        stale_dir = self.paths["ingest_tmp_dir"] / "stale-session"
+        stale_dir.mkdir(parents=True, exist_ok=True)
+        (stale_dir / "payload.txt").write_text("stale\n", encoding="utf-8")
+
+        with retriever_tools.workspace_ingest_session(self.paths, command_name="ingest") as session:
+            self.assertEqual(session["stale_tmp_dirs_removed"], 1)
+            self.assertFalse(stale_dir.exists())
+            session_dir = Path(session["tmp_dir"])
+            self.assertTrue(session_dir.exists())
+            self.assertEqual(session_dir.parent, self.paths["ingest_tmp_dir"])
+            self.assertTrue(self.paths["ingest_lock_path"].exists())
+
+        self.assertFalse(session_dir.exists())
+
+    def test_acquire_workspace_ingest_lock_raises_clear_error_on_lock_conflict(self) -> None:
+        blocking_error = BlockingIOError(errno.EAGAIN, "already locked")
+        with mock.patch.object(retriever_tools, "acquire_os_file_lock", side_effect=blocking_error):
+            with self.assertRaisesRegex(
+                retriever_tools.RetrieverError,
+                "Another ingest is already running in this workspace",
+            ):
+                retriever_tools.acquire_workspace_ingest_lock(self.paths)
 
     def test_bootstrap_recovers_zero_byte_sqlite_artifacts(self) -> None:
         self.paths["db_path"].touch()
