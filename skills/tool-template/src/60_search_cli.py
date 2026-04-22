@@ -108,6 +108,40 @@ def build_virtual_filter_clause(
     operator: str,
     value: str | None,
 ) -> tuple[str, list[object]]:
+    if field_name == "custodian":
+        exists_expr = (
+            "EXISTS ("
+            "SELECT 1 "
+            "FROM document_occurrences o "
+            f"WHERE o.document_id = {alias}.id "
+            "AND o.lifecycle_status = 'active'"
+        )
+        filtered_exists_expr = (
+            "EXISTS ("
+            "SELECT 1 "
+            "FROM document_occurrences o "
+            f"WHERE o.document_id = {alias}.id "
+            "AND o.lifecycle_status = 'active' "
+        )
+        if operator == "is-null":
+            return f"NOT {filtered_exists_expr} AND COALESCE(o.custodian, '') != '')", []
+        if operator == "not-null":
+            return f"{filtered_exists_expr} AND COALESCE(o.custodian, '') != '')", []
+        if operator == "contains":
+            return (
+                f"{filtered_exists_expr} AND LOWER(COALESCE(o.custodian, '')) LIKE LOWER(?))",
+                [f"%{value}%"],
+            )
+        if operator == "neq":
+            return f"NOT ({filtered_exists_expr} AND COALESCE(o.custodian, '') = ?)", [value or ""]
+        occurrence_clause, occurrence_params = build_scalar_filter_clause(
+            "o.custodian",
+            field_type,
+            operator,
+            value,
+        )
+        return f"{exists_expr} AND {occurrence_clause})", occurrence_params
+
     if field_name in {"is_attachment", "has_attachments"}:
         if operator not in {"eq", "neq"}:
             raise RetrieverError(f"Virtual filter '{field_name}' only supports eq and neq.")
@@ -577,6 +611,45 @@ def build_dataset_name_sql_filter_clause(
     return f"EXISTS ({exists_sql} AND COALESCE(ds.dataset_name, '') {comparator} ?)", [value]
 
 
+def build_custodian_sql_filter_clause(
+    alias: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+    *,
+    occurrence_alias: str | None = None,
+) -> tuple[str, list[object]]:
+    ensure_sql_filter_operator_supported(field_def, operator)
+    if occurrence_alias is not None:
+        sql_expression = f"{occurrence_alias}.custodian"
+        if operator == "IS NULL":
+            return f"COALESCE({sql_expression}, '') = ''", []
+        if operator == "IS NOT NULL":
+            return f"COALESCE({sql_expression}, '') != ''", []
+        if operator in {"!=", "<>"}:
+            assert isinstance(operand, dict)
+            value = str(coerce_sql_literal("text", operand))
+            return f"COALESCE({sql_expression}, '') != ?", [value]
+        return build_scalar_sql_filter_clause(sql_expression, field_def, operator, operand)
+
+    exists_sql = (
+        "SELECT 1 "
+        "FROM document_occurrences o "
+        f"WHERE o.document_id = {alias}.id "
+        "AND o.lifecycle_status = 'active'"
+    )
+    if operator == "IS NULL":
+        return f"NOT EXISTS ({exists_sql} AND COALESCE(o.custodian, '') != '')", []
+    if operator == "IS NOT NULL":
+        return f"EXISTS ({exists_sql} AND COALESCE(o.custodian, '') != '')", []
+    if operator in {"!=", "<>"}:
+        assert isinstance(operand, dict)
+        value = str(coerce_sql_literal("text", operand))
+        return f"NOT EXISTS ({exists_sql} AND COALESCE(o.custodian, '') = ?)", [value]
+    clause, params = build_scalar_sql_filter_clause("o.custodian", field_def, operator, operand)
+    return f"EXISTS ({exists_sql} AND {clause})", params
+
+
 def virtual_field_sql_expression(alias: str, field_name: str) -> str:
     if field_name == "production_name":
         return (
@@ -601,13 +674,29 @@ def build_sql_filter_clause(
     field_def: dict[str, object],
     operator: str,
     operand: object | None,
+    *,
+    occurrence_alias: str | None = None,
 ) -> tuple[str, list[object]]:
     field_name = str(field_def["field_name"])
     if field_def.get("source") == "virtual":
+        if field_name == "custodian":
+            return build_custodian_sql_filter_clause(
+                alias,
+                field_def,
+                operator,
+                operand,
+                occurrence_alias=occurrence_alias,
+            )
         if field_name == "dataset_name":
             return build_dataset_name_sql_filter_clause(alias, field_def, operator, operand)
         return build_scalar_sql_filter_clause(virtual_field_sql_expression(alias, field_name), field_def, operator, operand)
-    return build_scalar_sql_filter_clause(f"{alias}.{quote_identifier(field_name)}", field_def, operator, operand)
+    target_alias = occurrence_alias if occurrence_alias is not None and field_name in OCCURRENCE_FILTER_FIELDS else alias
+    return build_scalar_sql_filter_clause(
+        f"{target_alias}.{quote_identifier(field_name)}",
+        field_def,
+        operator,
+        operand,
+    )
 
 
 def parse_sql_filter_literal(state: dict[str, object]) -> dict[str, object]:
@@ -621,13 +710,21 @@ def parse_sql_filter_predicate(state: dict[str, object]) -> tuple[str, list[obje
     identifier = expect_filter_token(state, "identifier", "Expected a field name")
     field_name = str(identifier["value"])
     field_def = resolve_sql_filter_field(state["connection"], field_name)
+    document_alias = str(state.get("document_alias", "d"))
+    occurrence_alias = state.get("occurrence_alias")
 
     if match_filter_keyword(state, "IS"):
         operator = "IS NOT NULL" if match_filter_keyword(state, "NOT") else "IS NULL"
         token = expect_filter_token(state, "literal", "Expected NULL after IS / IS NOT")
         if token["literal_kind"] != "null":
             raise_filter_syntax_error(str(state["expression"]), int(token["start"]), "Expected NULL after IS / IS NOT")
-        return build_sql_filter_clause("d", field_def, operator, None)
+        return build_sql_filter_clause(
+            document_alias,
+            field_def,
+            operator,
+            None,
+            occurrence_alias=(str(occurrence_alias) if occurrence_alias is not None else None),
+        )
 
     negated_operator = match_filter_keyword(state, "NOT")
     if match_filter_keyword(state, "IN"):
@@ -638,7 +735,13 @@ def parse_sql_filter_predicate(state: dict[str, object]) -> tuple[str, list[obje
             if match_filter_token_kind(state, "comma") is None:
                 break
         expect_filter_token(state, "rparen", "Expected ')' to close IN list")
-        clause, params = build_sql_filter_clause("d", field_def, "IN", values)
+        clause, params = build_sql_filter_clause(
+            document_alias,
+            field_def,
+            "IN",
+            values,
+            occurrence_alias=(str(occurrence_alias) if occurrence_alias is not None else None),
+        )
         return (f"NOT ({clause})", params) if negated_operator else (clause, params)
 
     if match_filter_keyword(state, "BETWEEN"):
@@ -647,12 +750,24 @@ def parse_sql_filter_predicate(state: dict[str, object]) -> tuple[str, list[obje
             token = peek_filter_token(state)
             raise_filter_syntax_error(str(state["expression"]), int(token["start"]), "Expected AND in BETWEEN expression")
         right_value = parse_sql_filter_literal(state)
-        clause, params = build_sql_filter_clause("d", field_def, "BETWEEN", (left_value, right_value))
+        clause, params = build_sql_filter_clause(
+            document_alias,
+            field_def,
+            "BETWEEN",
+            (left_value, right_value),
+            occurrence_alias=(str(occurrence_alias) if occurrence_alias is not None else None),
+        )
         return (f"NOT ({clause})", params) if negated_operator else (clause, params)
 
     if match_filter_keyword(state, "LIKE"):
         value = parse_sql_filter_literal(state)
-        clause, params = build_sql_filter_clause("d", field_def, "LIKE", value)
+        clause, params = build_sql_filter_clause(
+            document_alias,
+            field_def,
+            "LIKE",
+            value,
+            occurrence_alias=(str(occurrence_alias) if occurrence_alias is not None else None),
+        )
         return (f"NOT ({clause})", params) if negated_operator else (clause, params)
 
     if negated_operator:
@@ -661,7 +776,13 @@ def parse_sql_filter_predicate(state: dict[str, object]) -> tuple[str, list[obje
 
     operator_token = expect_filter_token(state, "operator", "Expected an operator after the field name")
     value = parse_sql_filter_literal(state)
-    return build_sql_filter_clause("d", field_def, str(operator_token["value"]).upper(), value)
+    return build_sql_filter_clause(
+        document_alias,
+        field_def,
+        str(operator_token["value"]).upper(),
+        value,
+        occurrence_alias=(str(occurrence_alias) if occurrence_alias is not None else None),
+    )
 
 
 def parse_sql_filter_primary(state: dict[str, object]) -> tuple[str, list[object]]:
@@ -700,6 +821,9 @@ def parse_sql_filter_or_expression(state: dict[str, object]) -> tuple[str, list[
 def compile_sql_filter_expression(
     connection: sqlite3.Connection,
     expression: str,
+    *,
+    document_alias: str = "d",
+    occurrence_alias: str | None = None,
 ) -> tuple[str, list[object]]:
     normalized_expression = expression.strip()
     if not normalized_expression:
@@ -709,6 +833,8 @@ def compile_sql_filter_expression(
         "expression": normalized_expression,
         "tokens": tokenize_sql_filter_expression(normalized_expression),
         "index": 0,
+        "document_alias": document_alias,
+        "occurrence_alias": occurrence_alias,
     }
     clause, params = parse_sql_filter_or_expression(state)
     trailing_token = peek_filter_token(state)
@@ -763,7 +889,7 @@ def metadata_snippet(row: sqlite3.Row) -> str:
         row["begin_bates"],
         row["end_bates"],
         row["content_type"],
-        row["custodian"],
+        document_custodian_display_text_from_row(row),
         row["source_rel_path"],
         row["source_folder_path"],
         row["title"],
@@ -818,10 +944,19 @@ def build_occurrence_scope_filters(
     clauses = ["o.lifecycle_status = 'active'"]
     params: list[object] = []
     if not uses_legacy_tuple_filters(raw_filters):
+        for expression in normalize_sql_filter_expressions(raw_filters):
+            clause, clause_params = compile_sql_filter_expression(
+                connection,
+                expression,
+                document_alias="d",
+                occurrence_alias="o",
+            )
+            clauses.append(f"({clause})")
+            params.extend(clause_params)
         return clauses, params
     for raw_filter in parse_filter_args(raw_filters):
         field_def = resolve_field_definition(connection, str(raw_filter["field_name"]))
-        if field_def.get("source") == "virtual":
+        if field_def.get("source") == "virtual" and field_def["field_name"] != "custodian":
             continue
         if field_def["field_name"] not in OCCURRENCE_FILTER_FIELDS:
             continue
@@ -844,8 +979,9 @@ def preferred_occurrence_for_document(
 ) -> sqlite3.Row | None:
     scoped_rows = connection.execute(
         f"""
-        SELECT *
+        SELECT o.*
         FROM document_occurrences o
+        JOIN documents d ON d.id = o.document_id
         WHERE o.document_id = ?
           AND {' AND '.join(occurrence_scope_clauses)}
         ORDER BY o.id ASC
@@ -1373,6 +1509,8 @@ def document_overview_payload(
     include_attachment_context: bool = True,
 ) -> dict[str, object]:
     source_row = occurrence_row or row
+    custodian_values = document_custodian_values_from_row(row)
+    custodian_text = ", ".join(custodian_values) if custodian_values else None
     payload: dict[str, object] = {
         "document_id": int(row["id"]),
         "control_number": row["control_number"],
@@ -1389,6 +1527,8 @@ def document_overview_payload(
         **document_path_payload(paths, connection, row, occurrence_row=occurrence_row),
         "file_name": source_row["file_name"],
         "file_type": source_row["file_type"],
+        "custodian": custodian_text,
+        "custodians": custodian_values,
         "metadata": {
             "author": row["author"],
             "begin_attachment": source_row["begin_attachment"],
@@ -1396,7 +1536,8 @@ def document_overview_payload(
             "child_document_kind": row["child_document_kind"],
             "content_type": row["content_type"],
             "conversation_id": row["conversation_id"],
-            "custodian": source_row["custodian"],
+            "custodian": custodian_text,
+            "custodians": custodian_values,
             "dataset_id": row["dataset_id"],
             "date_created": row["date_created"],
             "date_modified": row["date_modified"],
@@ -2285,7 +2426,8 @@ def search(
                             "child_document_kind": row["child_document_kind"],
                             "content_type": row["content_type"],
                             "conversation_id": row["conversation_id"],
-                            "custodian": row["custodian"],
+                            "custodian": document_custodian_display_text_from_row(row),
+                            "custodians": document_custodian_values_from_row(row),
                             "dataset_id": row["dataset_id"],
                             "date_created": row["date_created"],
                             "date_modified": row["date_modified"],
@@ -2348,6 +2490,8 @@ def search(
             row = item["row"]
             occurrence_row = preferred_occurrences.get(int(row["id"]))
             source_row = occurrence_row or row
+            custodian_values = document_custodian_values_from_row(row)
+            custodian_text = ", ".join(custodian_values) if custodian_values else None
             path_payload = document_path_payload(
                 paths,
                 connection,
@@ -2366,8 +2510,11 @@ def search(
                 item["preview_targets"] = path_payload["preview_targets"]
             item["file_name"] = source_row["file_name"]
             item["file_type"] = source_row["file_type"]
+            item["custodian"] = custodian_text
+            item["custodians"] = custodian_values
             if compact_mode:
-                item["metadata"]["custodian"] = source_row["custodian"]
+                item["metadata"]["custodian"] = custodian_text
+                item["metadata"]["custodians"] = custodian_values
             else:
                 item["source_kind"] = source_row["source_kind"]
                 item["source_rel_path"] = source_row["source_rel_path"]
@@ -2376,7 +2523,8 @@ def search(
                 item["production_id"] = source_row["production_id"]
                 item["metadata"]["begin_attachment"] = source_row["begin_attachment"]
                 item["metadata"]["begin_bates"] = source_row["begin_bates"]
-                item["metadata"]["custodian"] = source_row["custodian"]
+                item["metadata"]["custodian"] = custodian_text
+                item["metadata"]["custodians"] = custodian_values
                 item["metadata"]["end_attachment"] = source_row["end_attachment"]
                 item["metadata"]["end_bates"] = source_row["end_bates"]
                 item["metadata"]["source_kind"] = source_row["source_kind"]
@@ -2784,6 +2932,13 @@ def search_result_display_value(
 ) -> object:
     if field_name == "title":
         return best_result_title(row)
+    if field_name == "custodian":
+        custodians = item.get("custodians")
+        if isinstance(custodians, list):
+            normalized_values = [normalize_inline_whitespace(str(value)) for value in custodians if normalize_inline_whitespace(str(value))]
+            return ", ".join(normalized_values) or None
+        value = item.get("custodian")
+        return normalize_inline_whitespace(str(value)) or None
     if field_name == "dataset_name":
         dataset_names = item.get("dataset_names")
         if isinstance(dataset_names, list):
@@ -2844,6 +2999,12 @@ def best_summary_title(item: dict[str, object]) -> str | None:
 def summary_display_value(item: dict[str, object], field_name: str, field_type: str) -> object:
     if field_name == "title":
         return best_summary_title(item)
+    if field_name == "custodian":
+        custodians = item.get("custodians")
+        if isinstance(custodians, list):
+            normalized_values = [normalize_inline_whitespace(str(value)) for value in custodians if normalize_inline_whitespace(str(value))]
+            return ", ".join(normalized_values) or None
+        return normalize_inline_whitespace(str(item.get("custodian") or "")) or None
     if field_name == "dataset_name":
         dataset_names = item.get("dataset_names")
         if isinstance(dataset_names, list):
@@ -3536,7 +3697,8 @@ def search_with_scope(
                         "begin_attachment": row["begin_attachment"],
                         "begin_bates": row["begin_bates"],
                         "content_type": row["content_type"],
-                        "custodian": row["custodian"],
+                        "custodian": document_custodian_display_text_from_row(row),
+                        "custodians": document_custodian_values_from_row(row),
                         "dataset_id": row["dataset_id"],
                         "date_created": row["date_created"],
                         "date_modified": row["date_modified"],
@@ -3595,7 +3757,8 @@ def search_with_scope(
                             "begin_attachment": row["begin_attachment"],
                             "begin_bates": row["begin_bates"],
                             "content_type": row["content_type"],
-                            "custodian": row["custodian"],
+                            "custodian": document_custodian_display_text_from_row(row),
+                            "custodians": document_custodian_values_from_row(row),
                             "dataset_id": row["dataset_id"],
                             "date_created": row["date_created"],
                             "date_modified": row["date_modified"],
@@ -3633,6 +3796,12 @@ def search_with_scope(
         )
         for item in paged_results:
             row = item["row"]
+            custodian_values = document_custodian_values_from_row(row)
+            custodian_text = ", ".join(custodian_values) if custodian_values else None
+            item["custodian"] = custodian_text
+            item["custodians"] = custodian_values
+            item["metadata"]["custodian"] = custodian_text
+            item["metadata"]["custodians"] = custodian_values
             memberships = dataset_memberships.get(int(row["id"]), {"ids": [], "names": []})
             dataset_ids = [int(dataset_id) for dataset_id in memberships["ids"]]
             dataset_names = [str(dataset_name) for dataset_name in memberships["names"]]
@@ -5345,6 +5514,8 @@ def export_field_value(
 ) -> object:
     field_name = field_def["field_name"]
     document_id = int(row["id"])
+    if field_name == "custodian":
+        return document_custodian_display_text_from_row(row)
     if field_name == "dataset_name":
         dataset_membership = context["dataset_memberships"].get(document_id, {"names": []})
         return "; ".join(str(dataset_name) for dataset_name in dataset_membership["names"])
@@ -5593,10 +5764,13 @@ def build_synthetic_document_export_payload(
         "source_item_id": row["source_item_id"],
         "production_id": row["production_id"],
         "parent_document_id": row["parent_document_id"],
+        "custodian": document_custodian_display_text_from_row(row),
+        "custodians": document_custodian_values_from_row(row),
         "metadata": {
             "author": row["author"],
             "content_type": row["content_type"],
-            "custodian": row["custodian"],
+            "custodian": document_custodian_display_text_from_row(row),
+            "custodians": document_custodian_values_from_row(row),
             "date_created": row["date_created"],
             "date_modified": row["date_modified"],
             "participants": row["participants"],
@@ -6863,12 +7037,16 @@ def search_chunks(
             preview_abs_path = str(preview_target["abs_path"])
             snippet = make_snippet(str(row["text_content"] or ""), query)
             source_row = occurrence_row or row
+            custodian_values = document_custodian_values_from_row(row)
+            custodian_text = ", ".join(custodian_values) if custodian_values else None
             result = {
                 **document_path_payload(paths, connection, row, occurrence_row=occurrence_row),
                 "document_id": int(row["id"]),
                 "control_number": row["control_number"],
                 "file_name": source_row["file_name"],
                 "file_type": source_row["file_type"],
+                "custodian": custodian_text,
+                "custodians": custodian_values,
                 "chunk_index": int(row["chunk_index"]),
                 "char_start": int(row["char_start"]),
                 "char_end": int(row["char_end"]),
@@ -6879,7 +7057,8 @@ def search_chunks(
                 "metadata": {
                     "author": row["author"],
                     "content_type": row["content_type"],
-                    "custodian": source_row["custodian"],
+                    "custodian": custodian_text,
+                    "custodians": custodian_values,
                     "date_created": row["date_created"],
                     "date_modified": row["date_modified"],
                     "participants": row["participants"],

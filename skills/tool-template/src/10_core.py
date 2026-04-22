@@ -104,7 +104,7 @@ SCHEMA_STATEMENTS = [
       page_count INTEGER,
       author TEXT,
       content_type TEXT,
-      custodian TEXT,
+      custodians_json TEXT NOT NULL DEFAULT '[]',
       date_created TEXT,
       date_modified TEXT,
       title TEXT,
@@ -2643,6 +2643,68 @@ def occurrence_field_value(
     return None
 
 
+def normalize_custodian_values(values: list[object] | tuple[object, ...] | set[object]) -> list[str]:
+    normalized_values: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        normalized = normalize_whitespace(str(raw_value or ""))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_values.append(normalized)
+    return normalized_values
+
+
+def occurrence_rows_in_preferred_order(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            0 if row["lifecycle_status"] == ACTIVE_OCCURRENCE_STATUS else 1,
+            source_kind_priority(row["source_kind"]),
+            text_status_priority(row["text_status"]),
+            -occurrence_field_count(row),
+            0 if int(row["has_preview"] or 0) else 1,
+            parse_utc_timestamp(row["ingested_at"]) or datetime.max.replace(tzinfo=timezone.utc),
+            int(row["id"]),
+        ),
+    )
+
+
+def custodian_values_from_occurrence_rows(rows: list[sqlite3.Row]) -> list[str]:
+    return normalize_custodian_values([row["custodian"] for row in occurrence_rows_in_preferred_order(rows)])
+
+
+def parse_document_custodians_json(raw_value: object) -> list[str]:
+    if isinstance(raw_value, list):
+        return normalize_custodian_values(list(raw_value))
+    if not raw_value:
+        return []
+    try:
+        parsed = json.loads(str(raw_value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return normalize_custodian_values([raw_value])
+    if isinstance(parsed, list):
+        return normalize_custodian_values(parsed)
+    return normalize_custodian_values([parsed])
+
+
+def document_custodian_values_from_row(row: sqlite3.Row | dict[str, object] | None) -> list[str]:
+    if row is None:
+        return []
+    if "custodians_json" in row.keys():  # type: ignore[attr-defined]
+        return parse_document_custodians_json(row["custodians_json"])  # type: ignore[index]
+    if "custodian" in row.keys():  # type: ignore[attr-defined]
+        return normalize_custodian_values([row["custodian"]])  # type: ignore[index]
+    return []
+
+
+def document_custodian_display_text_from_row(row: sqlite3.Row | dict[str, object] | None) -> str | None:
+    values = document_custodian_values_from_row(row)
+    if not values:
+        return None
+    return ", ".join(values)
+
+
 def refresh_document_control_number_aliases(connection: sqlite3.Connection, document_id: int) -> None:
     now = utc_now()
     connection.execute(
@@ -2895,7 +2957,7 @@ def refresh_document_from_occurrences(connection: sqlite3.Connection, document_i
     locked_fields = set(normalize_string_list(document_row[MANUAL_FIELD_LOCKS_COLUMN]))
     resolved_author = occurrence_field_value(preferred_row, active_rows, "extracted_author")
     resolved_content_type = occurrence_field_value(preferred_row, active_rows, "extracted_content_type")
-    resolved_custodian = preferred_row["custodian"]
+    resolved_custodians = custodian_values_from_occurrence_rows(active_rows)
     resolved_date_created = occurrence_field_value(preferred_row, active_rows, "extracted_doc_authored_at")
     resolved_date_modified = occurrence_field_value(preferred_row, active_rows, "extracted_doc_modified_at")
     resolved_title = occurrence_field_value(preferred_row, active_rows, "extracted_title")
@@ -2906,8 +2968,6 @@ def refresh_document_from_occurrences(connection: sqlite3.Connection, document_i
         resolved_author = document_row["author"]
     if "content_type" in locked_fields:
         resolved_content_type = document_row["content_type"]
-    if "custodian" in locked_fields:
-        resolved_custodian = document_row["custodian"]
     if "date_created" in locked_fields:
         resolved_date_created = document_row["date_created"]
     if "date_modified" in locked_fields:
@@ -2961,7 +3021,7 @@ def refresh_document_from_occurrences(connection: sqlite3.Connection, document_i
         "file_size": preferred_row["file_size"],
         "author": resolved_author,
         "content_type": resolved_content_type,
-        "custodian": resolved_custodian,
+        "custodians_json": json.dumps(resolved_custodians),
         "date_created": resolved_date_created,
         "date_modified": resolved_date_modified,
         "title": resolved_title,
@@ -2988,7 +3048,7 @@ def refresh_document_from_occurrences(connection: sqlite3.Connection, document_i
         SET control_number = ?, canonical_kind = ?, canonical_status = ?, merged_into_document_id = ?,
             source_kind = ?, source_rel_path = ?, source_item_id = ?, source_folder_path = ?, production_id = ?,
             begin_bates = ?, end_bates = ?, begin_attachment = ?, end_attachment = ?, rel_path = ?, file_name = ?,
-            file_type = ?, file_size = ?, author = ?, content_type = ?, custodian = ?, date_created = ?, date_modified = ?,
+            file_type = ?, file_size = ?, author = ?, content_type = ?, custodians_json = ?, date_created = ?, date_modified = ?,
             title = ?, subject = ?, participants = ?, recipients = ?, file_hash = ?, text_status = ?,
             lifecycle_status = ?, ingested_at = ?, last_seen_at = ?, updated_at = ?
         WHERE id = ?
@@ -3013,7 +3073,7 @@ def refresh_document_from_occurrences(connection: sqlite3.Connection, document_i
             updated_values["file_size"],
             updated_values["author"],
             updated_values["content_type"],
-            updated_values["custodian"],
+            updated_values["custodians_json"],
             updated_values["date_created"],
             updated_values["date_modified"],
             updated_values["title"],
@@ -3233,6 +3293,8 @@ def sanitize_field_name(field_name: str) -> str:
         sanitized = f"field_{sanitized}"
     if sanitized in BUILTIN_FIELD_TYPES:
         raise RetrieverError(f"Field name '{sanitized}' conflicts with a built-in document column.")
+    if sanitized in INTERNAL_DOCUMENT_COLUMNS:
+        raise RetrieverError(f"Field name '{sanitized}' conflicts with a system-managed document column.")
     return sanitized
 
 
