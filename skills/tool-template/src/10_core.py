@@ -3363,8 +3363,9 @@ def decode_bytes(data: bytes, declared_encoding: str | None = None) -> tuple[str
     except UnicodeDecodeError:
         pass
 
-    if charset_normalizer is not None:
-        best = charset_normalizer.from_bytes(data).best()
+    charset_normalizer_module = load_dependency("charset_normalizer")
+    if charset_normalizer_module is not None:
+        best = charset_normalizer_module.from_bytes(data).best()
         if best is not None:
             text = str(best)
             status = "partial" if "\ufffd" in text else "ok"
@@ -3938,11 +3939,74 @@ def determine_content_type(
     )
 
 
-def dependency_guard(module: object | None, package_name: str, file_type: str) -> None:
+LAZY_DEPENDENCY_IMPORT_TARGETS = {
+    "charset_normalizer": ("charset_normalizer", None),
+    "extract_msg": ("extract_msg", None),
+    "openpyxl": ("openpyxl", None),
+    "xlrd": ("xlrd", None),
+    "pdfplumber": ("pdfplumber", None),
+    "DocxDocument": ("docx", "Document"),
+    "rtf_to_text": ("striprtf.striprtf", "rtf_to_text"),
+    "PilImage": ("PIL.Image", None),
+    "pypff": ("pypff", None),
+}
+
+
+def load_dependency(dependency_name: str) -> object | None:
+    current = globals().get(dependency_name, _UNLOADED_DEPENDENCY)
+    if current is not _UNLOADED_DEPENDENCY:
+        return None if current is None else current
+    import_target = LAZY_DEPENDENCY_IMPORT_TARGETS.get(dependency_name)
+    if import_target is None:
+        raise RetrieverError(f"Unknown dependency loader: {dependency_name}")
+    module_name, attribute_name = import_target
+    try:
+        imported = importlib.import_module(module_name)
+        value = imported if attribute_name is None else getattr(imported, attribute_name)
+    except Exception:
+        value = None
+    globals()[dependency_name] = value
+    return value
+
+
+def dependency_status(
+    dependency_name: str,
+    *,
+    package_name: str,
+    import_name: str | None = None,
+    detail_label: str | None = None,
+    probe_if_unloaded: bool = False,
+) -> dict[str, str]:
+    current = globals().get(dependency_name, _UNLOADED_DEPENDENCY)
+    if current is _UNLOADED_DEPENDENCY and probe_if_unloaded:
+        current = load_dependency(dependency_name)
+    detail_name = detail_label or import_name or dependency_name
+    import_label = import_name or dependency_name
+    if current is _UNLOADED_DEPENDENCY:
+        return {
+            "status": "deferred",
+            "detail": f"{detail_name} will load on demand when a matching file type is used.",
+        }
+    if current is None:
+        return {
+            "status": "fail",
+            "detail": f"Missing optional dependency import '{import_label}'. Install {package_name} before using the matching file type.",
+        }
+    return {"status": "pass", "detail": f"{detail_name} import succeeded"}
+
+
+def dependency_guard(module: object | str | None, package_name: str, file_type: str) -> object:
+    if isinstance(module, str):
+        module = load_dependency(module)
     if module is None:
         raise RetrieverError(
             f"Missing dependency for .{file_type} parsing: install {package_name} before ingesting this file type."
         )
+    if module is _UNLOADED_DEPENDENCY:
+        raise RetrieverError(
+            f"Dependency for .{file_type} parsing was not initialized correctly: {package_name}."
+        )
+    return module
 
 
 CID_REFERENCE_PATTERN = re.compile(
@@ -4468,9 +4532,10 @@ def image_path_data_url(path: Path) -> str | None:
     mime_type, _ = mimetypes.guess_type(path.name)
     normalized_suffix = path.suffix.lower()
     if normalized_suffix in {".tif", ".tiff"}:
-        if PilImage is None:
+        pil_image_module = load_dependency("PilImage")
+        if pil_image_module is None:
             return None
-        with PilImage.open(path) as image:
+        with pil_image_module.open(path) as image:
             converted = image.convert("RGB")
             buffer = io.BytesIO()
             converted.save(buffer, format="PNG")

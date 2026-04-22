@@ -825,7 +825,7 @@ python3 .retriever/bin/retriever_tools.py clear-conversation-assignment . --doc-
 
 - Retriever is workspace-local. Changing workspaces means changing the database, browse state, datasets, and saved scopes you are working against.
 - Re-ingest updates changed files in place, preserves stable document identity where possible, and marks missing items instead of silently forgetting them.
-- PST support depends on the required `pypff` backend being available. Use `doctor` if PST ingest is not ready.
+- PST support depends on the required `pypff` backend being available. `doctor` probes PST backend status separately, and missing PST support no longer blocks ordinary non-PST workflows.
 - Production ingest is not the same as loose-file ingest. Use `ingest-production` when you want to target a production root explicitly.
 - Manual field edits are protected from later automated overwrite.
 - Results stay grounded in the active scope. If something looks missing, check `/scope`, `/dataset`, `/from-run`, `/sort`, and `/page-size` before assuming the underlying data is gone.
