@@ -19,7 +19,10 @@
 ## View vs compose
 
 - `--mode compose` is the default. Use it when the user wants a summary, count, explanation, draft, comparison, or any answer that is about the documents rather than the listing itself.
-- `--mode view` is for table-shaped requests only. In view mode the tool returns a `rendered_markdown` field containing the complete pre-formatted result table.
+- `--mode view` is the default for document-listing requests, not just when the user literally says "table". Treat verbs like "show", "show me", "list", "display", "browse", "which documents", "what files", "show 10", and "show only" as view requests unless the user explicitly asks for a summary, explanation, or different layout.
+- For document listings in an active browse flow, prefer the slash/session surface over a fresh stateless search so saved state like `/page-size`, `/columns`, and `/sort` is preserved.
+- The standard `/search` rendered table is the default output contract for any answer that shows documents unless the user explicitly asks for another presentation.
+- In view mode the tool returns a `rendered_markdown` field containing the complete pre-formatted result table.
 - When `rendered_markdown` is present for a view request, forward it as the entire reply and nothing else: no preamble, no trailing commentary, no code fences, no reformatting, and no follow-up summary sentence.
 - The view-mode response must terminate immediately after the table footer. Any extra prose after `Documents X–Y of Z ...` is a contract violation, not a stylistic choice.
 
@@ -68,8 +71,11 @@ Production-aware query behavior:
 
 ## OUTPUT FORMAT (mandatory)
 
-When you are in compose mode and the user explicitly wants a rendered result set, every search result set MUST use a table driven by the active display column set.
-This is mandatory for all result types: keyword searches, filtered browses, ranked requests ("show 10 largest"), and any other document listing.
+Whenever your answer shows documents, every result set MUST use the standard `/search` table driven by the active display column set.
+This is mandatory for all result types: keyword searches, filtered browses, ranked requests ("show 10 largest"), and any other document listing, even when the answer also includes a short compose-mode summary.
+Prefer the tool-returned `rendered_markdown` instead of hand-building a custom list whenever it is available.
+Honor the active `/page-size` when deciding how many rows to show, unless the user explicitly asks for a different count or asks for all results.
+Never concatenate multiple pages into one reply unless the user explicitly asks for more than the current page.
 Always show the active search header immediately before the table:
 
 ```
@@ -170,7 +176,7 @@ When the user asks to inspect fields or columns:
 - Apply that same family presentation rule to processed-production attachments when `parent_document_id` is set from production family spans.
 - Prefix attachment title rows with `↳` and keep the attachment title itself clickable.
 - Matching attachments may still appear as standalone hits; when they do, render them with the same `↳` attachment marker and include parent email context when available.
-- If the user asks to "show" files or documents, every listed result should include a clickable link, not just the top result.
+- If the user asks to "show" files or documents, every listed result should include a clickable link, not just the top result, and the listing should stay in the standard `/search` schema unless they asked otherwise.
 - Retriever search commands now return compact JSON by default; rerun with `--verbose` when you need attachment child rows, alternate preview targets, or the full metadata/source payload.
 
 ## Parallel follow-ups

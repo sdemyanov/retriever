@@ -5,7 +5,7 @@ description: >
   or browse search results. It runs Retriever's search command with structured
   filters and presents results using the search-strategy contract.
 metadata:
-  version: "0.9.5"
+  version: "0.9.6"
 ---
 
 # Retriever Search
@@ -36,11 +36,14 @@ For the exact bare slash form `/search`:
 
 ## View vs compose
 
-- Use `--mode view` only when the user asked to see results as a table or is using the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, plus read-only `list` forms such as `/scope list`, `/dataset list`, `/sort list`, and `/columns list`).
+- Use `--mode view` whenever the user primarily wants to see a document listing, not just when they literally say "table". Treat verbs like "show", "show me", "list", "display", "browse", "which documents", "what files", "show 10", and "show only" as view requests unless the user explicitly asks for a summary, explanation, or a different layout.
+- Use `--mode view` for the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, plus read-only `list` forms such as `/scope list`, `/dataset list`, `/sort list`, and `/columns list`).
+- For document-listing requests inside an active investigation, prefer the slash/session browse surface over a fresh stateless search so the current `/page-size`, `/columns`, `/sort`, and related browse state apply automatically.
+- The standard `/search` rendered table is the default output contract for every document-listing request unless the user explicitly asks for a different presentation.
 - In `view` mode, the tool returns a `rendered_markdown` field containing the complete pre-formatted result table.
 - When `rendered_markdown` is present for a view request, your entire reply MUST be the exact contents of that field and nothing else: no preamble, no trailing commentary, no code fences, no reformatting, and no extra summary sentence. Treat any text before or after the markdown footer as a bug.
 - The reply must terminate immediately after the table footer, even if the results seem self-explanatory or worth summarizing.
-- Use `--mode compose` for everything else. Compose is the safe default for summaries, counts, explanations, drafting, comparison, or any answer that is about the documents rather than the table of results itself.
+- Use `--mode compose` only when the user wants a summary, count, explanation, drafting, comparison, or other prose answer that is about the documents rather than a document listing itself.
 
 ## Execution rules
 
@@ -57,12 +60,14 @@ For the exact bare slash form `/search`:
 - Bare slash commands are read-only state inspection when supported: `/scope` shows the active scope, `/dataset` the active dataset selector, `/sort` the active sort, `/page` the current page state, `/page-size` the active page size, and `/columns` the active display columns.
 - Use `list` subcommands for discoverability: `/scope list` lists saved scopes, `/dataset list` lists available datasets, `/sort list` lists sortable fields, and `/columns list` lists displayable fields.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
-- If the user asked to see a table, call search with `--mode view` and reply with only `rendered_markdown`. Never append an interpretive summary in the same turn.
+- If the user asked to show/list/display/browse documents, or asked to see a table, use the slash/session browse surface when practical, otherwise call search with `--mode view`, and reply with only `rendered_markdown`. Never append an interpretive summary in the same turn.
+- Honor the active `/page-size` for document listings unless the user explicitly asks for a different count, asks for all results, or changes `/page-size`.
+- Never manually concatenate multiple result pages or enumerate more rows than the active page size in one reply unless the user explicitly asks for more than the current page.
 - In compose mode, default to a concise answer: one short paragraph for straightforward summaries, or two short paragraphs when a timeline/contrast genuinely helps. Do not turn ordinary summaries into long narrative memos unless the user asked for depth.
 - In compose mode, ground the main claims in the top matching documents. Prefer naming or citing the most relevant `control_number` items instead of synthesizing a broad story from distant/low-signal hits.
 - Do not volunteer collection-noise commentary, unrelated matches, or corpus-quality caveats unless the user asked for noise analysis, asked what matched unexpectedly, or the noise materially changes the answer.
 - Always show the active scope/header before the result table so the user can see the selector, sort, and page state.
-- **Mandatory compose-mode output format** — when you called search with `--mode compose` (the default), render every result set as a table driven by the active display columns from search-strategy.md:
+- **Standard listing output format** — whenever your answer shows documents, whether from `--mode view` or embedded in a compose-mode answer, use the exact standard `/search` table schema driven by the active display columns from search-strategy.md. Prefer the tool-returned `rendered_markdown` whenever it is present instead of hand-building a list:
 
   ```
   Scope: ...

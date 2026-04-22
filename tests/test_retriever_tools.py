@@ -6270,6 +6270,32 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Documents 1–1 of 1.", rendered)
         self.assertNotIn("| # |", rendered)
 
+    def test_search_cli_compose_mode_also_returns_rendered_markdown_for_standard_listing_schema(self) -> None:
+        (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "sample",
+            "--columns",
+            "title,control_number",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertIn("rendered_markdown", search_payload)
+        rendered = str(search_payload["rendered_markdown"])
+        self.assertIn("Scope: keyword='sample'", rendered)
+        self.assertIn("| title | control_number |", rendered)
+        self.assertIn("](computer://", rendered)
+        self.assertIn("Documents 1–1 of 1.", rendered)
+        self.assertNotIn("| # |", rendered)
+
     def test_search_cli_view_mode_renders_attachment_rows_and_parent_context(self) -> None:
         email_path = self.root / "thread.eml"
         self.write_email_message(
@@ -6836,6 +6862,53 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(session_payload["display"]["page_size"], 5)
         self.assertEqual(session_payload["scope"]["keyword"], "document")
         self.assertEqual(session_payload["browsing"]["offset"], 5)
+
+    def test_view_search_uses_saved_page_size_when_per_page_is_omitted(self) -> None:
+        for index in range(25):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 25)
+
+        self.assertEqual(self.run_cli("slash", str(self.root), "/page-size 5")[0], 0)
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "document",
+            "--mode",
+            "view",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertEqual(search_payload["page"], 1)
+        self.assertEqual(search_payload["per_page"], 5)
+        self.assertEqual(len(search_payload["results"]), 5)
+        self.assertIn("Documents 1–5 of 25. Ask for the next page to see more.", str(search_payload["rendered_markdown"]))
+
+    def test_compose_search_uses_saved_page_size_when_per_page_is_omitted(self) -> None:
+        for index in range(12):
+            (self.root / f"doc-{index:02d}.txt").write_text(f"document {index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 12)
+
+        self.assertEqual(self.run_cli("slash", str(self.root), "/page-size 5")[0], 0)
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "document",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertEqual(search_payload["per_page"], 5)
+        self.assertEqual(len(search_payload["results"]), 5)
+        self.assertIn("Documents 1–5 of 12. Ask for the next page to see more.", str(search_payload["rendered_markdown"]))
 
     def test_slash_search_drops_stale_display_columns_with_warning(self) -> None:
         (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
