@@ -1096,9 +1096,24 @@ GMAIL_DRIVE_LINKS_REQUIRED_HEADERS = {
     "DriveUrl",
     "DriveItemId",
 }
+PST_EXPORT_STANDARD_RESULTS_REQUIRED_HEADERS = {
+    "Document ID",
+    "Item Identity",
+    "Target Path",
+}
+PST_EXPORT_ARCHIVE_RESULTS_REQUIRED_HEADERS = {
+    "Document ID",
+    "Export Item Id",
+    "Export Item Path",
+}
+PST_EXPORT_RESULTS_FILE_PATTERN = re.compile(r"^results\.csv$", re.IGNORECASE)
+PST_EXPORT_ARCHIVE_RESULTS_FILE_PATTERN = re.compile(r"^export_results.*\.csv$", re.IGNORECASE)
+PST_EXPORT_SUMMARY_FILE_PATTERN = re.compile(r"^export summary .+\.csv$", re.IGNORECASE)
+PST_EXPORT_MANIFEST_FILE_PATTERN = re.compile(r"^manifest\.xml$", re.IGNORECASE)
+PST_EXPORT_TRACE_LOG_FILE_PATTERN = re.compile(r"^trace\.log$", re.IGNORECASE)
 
 
-def load_gmail_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+def load_normalized_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     try:
         decoded, _, _ = decode_bytes(path.read_bytes())
     except OSError:
@@ -1123,9 +1138,17 @@ def load_gmail_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     return headers, rows
 
 
-def gmail_csv_has_required_headers(path: Path, required_headers: set[str]) -> bool:
-    headers, _ = load_gmail_csv_rows(path)
+def csv_has_required_headers(path: Path, required_headers: set[str]) -> bool:
+    headers, _ = load_normalized_csv_rows(path)
     return required_headers.issubset(set(headers))
+
+
+def load_gmail_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    return load_normalized_csv_rows(path)
+
+
+def gmail_csv_has_required_headers(path: Path, required_headers: set[str]) -> bool:
+    return csv_has_required_headers(path, required_headers)
 
 
 def gmail_metadata_csv_valid(path: Path) -> bool:
@@ -1361,7 +1384,7 @@ def gmail_drive_record_preference_key(record: dict[str, object]) -> tuple[int, i
     )
 
 
-def gmail_append_search_context(
+def append_extracted_search_context(
     extracted: dict[str, object],
     extra_sections: list[str],
 ) -> dict[str, object]:
@@ -1390,6 +1413,13 @@ def gmail_append_search_context(
     if merged.get("text_status") == "empty":
         merged["text_status"] = "ok"
     return merged
+
+
+def gmail_append_search_context(
+    extracted: dict[str, object],
+    extra_sections: list[str],
+) -> dict[str, object]:
+    return append_extracted_search_context(extracted, extra_sections)
 
 
 def gmail_email_metadata_search_text(
@@ -1570,6 +1600,635 @@ def gmail_drive_document_file_hash(path: Path, drive_record: dict[str, object]) 
             },
         }
     )
+
+
+def pst_export_results_csv_valid(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    if PST_EXPORT_RESULTS_FILE_PATTERN.match(path.name):
+        return csv_has_required_headers(path, PST_EXPORT_STANDARD_RESULTS_REQUIRED_HEADERS)
+    if PST_EXPORT_ARCHIVE_RESULTS_FILE_PATTERN.match(path.name):
+        return csv_has_required_headers(path, PST_EXPORT_ARCHIVE_RESULTS_REQUIRED_HEADERS)
+    return False
+
+
+def pst_export_summary_csv_valid(path: Path) -> bool:
+    return path.is_file() and PST_EXPORT_SUMMARY_FILE_PATTERN.match(path.name) is not None
+
+
+def pst_export_manifest_xml_valid(path: Path) -> bool:
+    return path.is_file() and PST_EXPORT_MANIFEST_FILE_PATTERN.match(path.name) is not None
+
+
+def pst_export_trace_log_valid(path: Path) -> bool:
+    return path.is_file() and PST_EXPORT_TRACE_LOG_FILE_PATTERN.match(path.name) is not None
+
+
+def pst_export_normalized_text(value: object) -> str | None:
+    normalized = normalize_whitespace(html.unescape(str(value or "")))
+    return normalized or None
+
+
+def pst_export_match_text_key(value: object) -> str | None:
+    normalized = normalize_generated_document_title(value) or pst_export_normalized_text(value)
+    return normalized.casefold() if normalized else None
+
+
+def pst_export_row_value(row: dict[str, object], *keys: str) -> str | None:
+    for key in keys:
+        if key not in row:
+            continue
+        normalized = pst_export_normalized_text(row.get(key))
+        if normalized:
+            return normalized
+    return None
+
+
+def pst_export_path_parts(value: object) -> list[str]:
+    normalized = pst_export_normalized_text(value)
+    if not normalized:
+        return []
+    return [part.strip() for part in re.split(r"[\\/]+", normalized) if part.strip()]
+
+
+def pst_export_folder_match_part(value: object) -> str | None:
+    normalized = pst_export_normalized_text(value)
+    if not normalized:
+        return None
+    normalized = normalize_whitespace(re.sub(r"[-_]+", " ", normalized.casefold()))
+    return normalized or None
+
+
+def pst_export_folder_match_parts(value: object) -> tuple[str, ...]:
+    parts = pst_export_path_parts(value)
+    if not parts:
+        return ()
+    pst_index = next((index for index, part in enumerate(parts) if part.lower().endswith(".pst")), None)
+    if pst_index is not None:
+        parts = parts[pst_index + 1 :]
+        if parts:
+            parts = parts[:-1]
+    normalized_parts = [
+        normalized_part
+        for normalized_part in (pst_export_folder_match_part(part) for part in parts)
+        if normalized_part
+    ]
+    return tuple(normalized_parts)
+
+
+def pst_export_folder_parts_match(
+    message_folder_parts: tuple[str, ...],
+    candidate_folder_parts: tuple[str, ...],
+) -> bool:
+    if not message_folder_parts or not candidate_folder_parts:
+        return False
+    if len(message_folder_parts) >= len(candidate_folder_parts):
+        return tuple(message_folder_parts[-len(candidate_folder_parts) :]) == tuple(candidate_folder_parts)
+    return tuple(candidate_folder_parts[-len(message_folder_parts) :]) == tuple(message_folder_parts)
+
+
+def pst_export_resolve_pst_path(
+    candidate_root: Path,
+    raw_path: object,
+) -> tuple[Path | None, bool]:
+    parts = pst_export_path_parts(raw_path)
+    pst_index = next((index for index, part in enumerate(parts) if part.lower().endswith(".pst")), None)
+    if pst_index is None:
+        return None, False
+    has_message_component = pst_index < len(parts) - 1
+    pst_name = parts[pst_index]
+    candidate_part_sets: list[list[str]] = []
+    if parts and parts[0].lower() == "exchange":
+        candidate_part_sets.append(parts[: pst_index + 1])
+    candidate_part_sets.extend((["Exchange", pst_name], [pst_name]))
+    seen: set[tuple[str, ...]] = set()
+    for rel_parts in candidate_part_sets:
+        marker = tuple(part.lower() for part in rel_parts)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        resolved = resolve_case_insensitive_relative_path(candidate_root, rel_parts)
+        if resolved is None or not resolved.exists() or resolved.is_dir():
+            continue
+        if normalize_extension(resolved) != PST_SOURCE_KIND:
+            continue
+        return resolved.resolve(), has_message_component
+    return None, has_message_component
+
+
+def pst_export_combined_recipients(row: dict[str, object]) -> str | None:
+    recipients: list[str] = []
+    for keys in (
+        ("To - Expanded", "To – Expanded", "Recipients in To line"),
+        ("CC - Expanded", "CC – Expanded", "Recipients in Cc line"),
+        ("BCC - Expanded", "BCC – Expanded", "Recipients in Bcc line"),
+    ):
+        value = pst_export_row_value(row, *keys)
+        if value:
+            recipients.append(value)
+    if not recipients:
+        return None
+    return ", ".join(recipients)
+
+
+def pst_export_manifest_recipients(tag_values: dict[str, str]) -> str | None:
+    recipients = [
+        value
+        for value in (
+            pst_export_normalized_text(tag_values.get("#To")),
+            pst_export_normalized_text(tag_values.get("#CC")),
+            pst_export_normalized_text(tag_values.get("#BCC")),
+        )
+        if value
+    ]
+    if not recipients:
+        return None
+    return ", ".join(recipients)
+
+
+def pst_export_merge_message_metadata(
+    existing: dict[str, object] | None,
+    updates: dict[str, object],
+) -> dict[str, object]:
+    merged = dict(existing or {})
+    for key, value in updates.items():
+        if value in (None, "", [], {}):
+            continue
+        current = merged.get(key)
+        if current in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def parse_pst_export_results_csv(
+    paths: list[Path],
+    *,
+    candidate_root: Path,
+) -> dict[str, dict[str, dict[str, object]]]:
+    metadata_by_pst_path: dict[str, dict[str, dict[str, object]]] = defaultdict(dict)
+    for path in paths:
+        headers, rows = load_normalized_csv_rows(path)
+        header_set = set(headers)
+        standard_format = PST_EXPORT_STANDARD_RESULTS_REQUIRED_HEADERS.issubset(header_set)
+        archive_format = PST_EXPORT_ARCHIVE_RESULTS_REQUIRED_HEADERS.issubset(header_set)
+        if not standard_format and not archive_format:
+            continue
+        for row in rows:
+            source_item_id = normalize_pst_identifier(
+                row.get("Export Item Id") if archive_format else row.get("Item Identity")
+            )
+            if not source_item_id:
+                continue
+            resolved_pst_path, has_message_component = pst_export_resolve_pst_path(
+                candidate_root,
+                row.get("Export Item Path") if archive_format else row.get("Target Path"),
+            )
+            if resolved_pst_path is None or not has_message_component:
+                continue
+            metadata_updates = {
+                "author": pst_export_row_value(row, "Sender or Created by"),
+                "compliance_tag": pst_export_row_value(row, "Compliance Tag"),
+                "custodian": pst_export_row_value(row, "Location Name"),
+                "date_created": normalize_datetime(
+                    pst_export_row_value(row, "Sent", "Received or Created")
+                ),
+                "date_modified": normalize_datetime(pst_export_row_value(row, "Modified Date")),
+                "decode_status": pst_export_row_value(row, "Decode Status"),
+                "document_path": pst_export_row_value(row, "Document Path"),
+                "export_document_id": pst_export_row_value(row, "Document ID"),
+                "export_item_id": pst_export_row_value(row, "Export Item Id", "ExportItem Id"),
+                "export_item_path": pst_export_row_value(row, "Export Item Path"),
+                "has_attachments": pst_export_row_value(row, "Has Attachments"),
+                "item_identity": pst_export_row_value(row, "Item Identity"),
+                "internet_message_id": pst_export_row_value(row, "Internet Message Id"),
+                "location": pst_export_row_value(row, "Location"),
+                "location_name": pst_export_row_value(row, "Location Name"),
+                "modern_attachment_embedded_urls": pst_export_row_value(row, "Modern Attachment Embedded Urls"),
+                "original_path": pst_export_row_value(row, "Original Path"),
+                "preservation_original_url": pst_export_row_value(row, "Preservation Original Url"),
+                "recipients": pst_export_combined_recipients(row),
+                "retention_url": pst_export_row_value(row, "Retention Url"),
+                "sidecar_source_item_id": source_item_id,
+                "subject": normalize_generated_document_title(pst_export_row_value(row, "Subject or Title")),
+                "target_path": pst_export_row_value(row, "Target Path"),
+                "teams_metadata": pst_export_row_value(row, "Teams Metadata"),
+            }
+            pst_key = resolved_pst_path.as_posix()
+            existing = metadata_by_pst_path[pst_key].get(source_item_id)
+            metadata_by_pst_path[pst_key][source_item_id] = pst_export_merge_message_metadata(existing, metadata_updates)
+    return {key: dict(value) for key, value in metadata_by_pst_path.items()}
+
+
+def parse_pst_export_manifest_xml(
+    paths: list[Path],
+    *,
+    candidate_root: Path,
+) -> dict[str, dict[str, dict[str, object]]]:
+    metadata_by_pst_path: dict[str, dict[str, dict[str, object]]] = defaultdict(dict)
+    for path in paths:
+        try:
+            root = parse_xml_document(path.read_bytes())
+        except (OSError, ET.ParseError):
+            continue
+        for document in root.iter():
+            if xml_local_name(document.tag) != "Document":
+                continue
+            source_item_id = normalize_pst_identifier(document.attrib.get("DocID"))
+            if not source_item_id:
+                continue
+            tag_values: dict[str, str] = {}
+            location_custodian = None
+            location_uri = None
+            for node in document.iter():
+                local_name = xml_local_name(node.tag)
+                if local_name == "Tag":
+                    tag_name = normalize_inline_whitespace(str(node.attrib.get("TagName") or ""))
+                    if not tag_name:
+                        continue
+                    normalized_value = pst_export_normalized_text(node.attrib.get("TagValue"))
+                    if normalized_value:
+                        tag_values[tag_name] = normalized_value
+                    continue
+                if local_name == "Custodian":
+                    location_custodian = pst_export_normalized_text(node.text)
+                    continue
+                if local_name == "LocationURI":
+                    location_uri = pst_export_normalized_text(node.text)
+            resolved_pst_path, has_message_component = pst_export_resolve_pst_path(
+                candidate_root,
+                tag_values.get("TargetPath"),
+            )
+            if resolved_pst_path is None or not has_message_component:
+                continue
+            metadata_updates = {
+                "author": pst_export_normalized_text(tag_values.get("#From")),
+                "custodian": pst_export_normalized_text(tag_values.get("#Source")) or location_custodian,
+                "date_created": normalize_datetime(
+                    tag_values.get("#DateSent")
+                    or tag_values.get("#DateReceived")
+                    or tag_values.get("#CreatedOn")
+                ),
+                "has_attachments": pst_export_normalized_text(tag_values.get("#HasAttachments")),
+                "location": location_custodian or location_uri,
+                "location_name": pst_export_normalized_text(tag_values.get("#Source")),
+                "manifest_doc_id": source_item_id,
+                "original_url": pst_export_normalized_text(tag_values.get("#OriginalUrl")),
+                "recipients": pst_export_manifest_recipients(tag_values),
+                "sidecar_source_item_id": source_item_id,
+                "subject": normalize_generated_document_title(tag_values.get("#Subject")),
+                "target_path": pst_export_normalized_text(tag_values.get("TargetPath")),
+            }
+            pst_key = resolved_pst_path.as_posix()
+            existing = metadata_by_pst_path[pst_key].get(source_item_id)
+            metadata_by_pst_path[pst_key][source_item_id] = pst_export_merge_message_metadata(existing, metadata_updates)
+    return {key: dict(value) for key, value in metadata_by_pst_path.items()}
+
+
+def build_pst_export_message_match_records(
+    message_metadata_by_pst_path: dict[str, dict[str, dict[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    records_by_pst_path: dict[str, list[dict[str, object]]] = {}
+    for pst_path, metadata_by_source_item in message_metadata_by_pst_path.items():
+        records: list[dict[str, object]] = []
+        for sidecar_source_item_id, message_metadata in sorted(metadata_by_source_item.items()):
+            exact_match_ids: list[str] = []
+            seen_exact_match_ids: set[str] = set()
+            for candidate in (
+                sidecar_source_item_id,
+                message_metadata.get("sidecar_source_item_id"),
+                message_metadata.get("item_identity"),
+                message_metadata.get("manifest_doc_id"),
+                message_metadata.get("export_item_id"),
+                message_metadata.get("export_document_id"),
+            ):
+                normalized_candidate = normalize_pst_identifier(candidate) or pst_export_normalized_text(candidate)
+                if not normalized_candidate or normalized_candidate in seen_exact_match_ids:
+                    continue
+                seen_exact_match_ids.add(normalized_candidate)
+                exact_match_ids.append(normalized_candidate)
+
+            folder_match_paths: list[tuple[str, ...]] = []
+            seen_folder_match_paths: set[tuple[str, ...]] = set()
+            for raw_path in (
+                message_metadata.get("target_path"),
+                message_metadata.get("original_path"),
+                message_metadata.get("document_path"),
+                message_metadata.get("export_item_path"),
+            ):
+                folder_match_parts = pst_export_folder_match_parts(raw_path)
+                if not folder_match_parts or folder_match_parts in seen_folder_match_paths:
+                    continue
+                seen_folder_match_paths.add(folder_match_parts)
+                folder_match_paths.append(folder_match_parts)
+
+            records.append(
+                {
+                    "date_created": normalize_datetime(message_metadata.get("date_created")),
+                    "exact_match_ids": exact_match_ids,
+                    "folder_match_paths": folder_match_paths,
+                    "internet_message_id": normalize_email_message_id(message_metadata.get("internet_message_id")),
+                    "message_metadata": dict(message_metadata),
+                    "subject_key": pst_export_match_text_key(message_metadata.get("subject")),
+                }
+            )
+        records_by_pst_path[pst_path] = records
+    return records_by_pst_path
+
+
+def pst_export_message_search_text(message_metadata: dict[str, object] | None) -> str | None:
+    if not message_metadata:
+        return None
+    lines = ["PST export metadata"]
+    for label, key in (
+        ("Sidecar source item ID", "sidecar_source_item_id"),
+        ("Export document ID", "export_document_id"),
+        ("Export item ID", "export_item_id"),
+        ("Item identity", "item_identity"),
+        ("Location name", "location_name"),
+        ("Location", "location"),
+        ("Export target path", "target_path"),
+        ("Export item path", "export_item_path"),
+        ("Document path", "document_path"),
+        ("Original path", "original_path"),
+        ("Original URL", "original_url"),
+        ("Preservation original URL", "preservation_original_url"),
+        ("Retention URL", "retention_url"),
+        ("Internet message ID", "internet_message_id"),
+        ("Modern attachment embedded URLs", "modern_attachment_embedded_urls"),
+        ("Teams metadata", "teams_metadata"),
+        ("Compliance tag", "compliance_tag"),
+        ("Decode status", "decode_status"),
+    ):
+        value = pst_export_normalized_text(message_metadata.get(key))
+        if value:
+            lines.append(f"{label}: {value}")
+    normalized = normalize_whitespace("\n".join(lines))
+    return normalized or None
+
+
+def pst_export_sidecar_custodian_candidate(message_metadata: dict[str, object] | None) -> str | None:
+    if not message_metadata:
+        return None
+    for key in ("custodian", "location_name"):
+        candidate = pst_export_normalized_text(message_metadata.get(key))
+        if candidate:
+            return candidate
+    return None
+
+
+def select_pst_export_message_metadata(
+    normalized_message: dict[str, object],
+    *,
+    exact_metadata_by_source_item: dict[str, dict[str, object]] | None = None,
+    message_match_records: list[dict[str, object]] | None = None,
+) -> dict[str, object] | None:
+    source_item_id = normalize_pst_identifier(normalized_message.get("source_item_id"))
+    if source_item_id:
+        exact_match = dict(exact_metadata_by_source_item or {}).get(source_item_id)
+        if exact_match:
+            return dict(exact_match)
+
+    records = list(message_match_records or [])
+    if not records:
+        return None
+
+    extracted = dict(normalized_message.get("extracted") or {})
+    email_threading = dict(extracted.get("email_threading") or {})
+    message_id = normalize_email_message_id(email_threading.get("message_id"))
+    folder_match_parts = pst_export_folder_match_parts(normalized_message.get("source_folder_path"))
+    date_created = normalize_datetime(extracted.get("date_created"))
+    subject_key = pst_export_match_text_key(extracted.get("subject") or extracted.get("title"))
+
+    candidates = records
+    if source_item_id:
+        exact_id_matches = [
+            record
+            for record in candidates
+            if source_item_id in list(record.get("exact_match_ids") or [])
+        ]
+        if len(exact_id_matches) == 1:
+            return dict(exact_id_matches[0]["message_metadata"])
+        if exact_id_matches:
+            candidates = exact_id_matches
+
+    if message_id:
+        message_id_matches = [
+            record
+            for record in candidates
+            if normalize_email_message_id(record.get("internet_message_id")) == message_id
+        ]
+        if len(message_id_matches) == 1:
+            return dict(message_id_matches[0]["message_metadata"])
+        if message_id_matches:
+            candidates = message_id_matches
+
+    if folder_match_parts:
+        folder_matches = [
+            record
+            for record in candidates
+            if any(
+                pst_export_folder_parts_match(folder_match_parts, tuple(candidate_parts))
+                for candidate_parts in list(record.get("folder_match_paths") or [])
+            )
+        ]
+        if len(folder_matches) == 1:
+            return dict(folder_matches[0]["message_metadata"])
+        if folder_matches:
+            candidates = folder_matches
+
+    if date_created:
+        date_matches = [
+            record
+            for record in candidates
+            if normalize_datetime(record.get("date_created")) == date_created
+        ]
+        if len(date_matches) == 1:
+            return dict(date_matches[0]["message_metadata"])
+        if date_matches:
+            candidates = date_matches
+
+    if subject_key:
+        subject_matches = [
+            record
+            for record in candidates
+            if pst_export_match_text_key(record.get("subject_key")) == subject_key
+            or pst_export_match_text_key(dict(record.get("message_metadata") or {}).get("subject")) == subject_key
+        ]
+        if len(subject_matches) == 1:
+            return dict(subject_matches[0]["message_metadata"])
+        if subject_matches:
+            candidates = subject_matches
+
+    if len(candidates) == 1:
+        return dict(candidates[0]["message_metadata"])
+    return None
+
+
+def apply_pst_export_message_metadata(
+    extracted: dict[str, object],
+    *,
+    message_metadata: dict[str, object] | None,
+) -> dict[str, object]:
+    if not message_metadata:
+        return dict(extracted)
+    enriched = dict(extracted)
+    if not normalize_whitespace(str(enriched.get("date_created") or "")) and message_metadata.get("date_created"):
+        enriched["date_created"] = message_metadata.get("date_created")
+    if not normalize_whitespace(str(enriched.get("date_modified") or "")) and message_metadata.get("date_modified"):
+        enriched["date_modified"] = message_metadata.get("date_modified")
+    subject = normalize_generated_document_title(message_metadata.get("subject"))
+    if subject and not normalize_whitespace(str(enriched.get("title") or "")):
+        enriched["title"] = subject
+    if subject and not normalize_whitespace(str(enriched.get("subject") or "")):
+        enriched["subject"] = subject
+    author = pst_export_normalized_text(message_metadata.get("author"))
+    if author and not normalize_whitespace(str(enriched.get("author") or "")):
+        enriched["author"] = author
+    recipients = pst_export_normalized_text(message_metadata.get("recipients"))
+    if recipients and not normalize_whitespace(str(enriched.get("recipients") or "")):
+        enriched["recipients"] = recipients
+    custodian_candidate = pst_export_sidecar_custodian_candidate(message_metadata)
+    current_custodian = normalize_whitespace(str(enriched.get("custodian") or ""))
+    if custodian_candidate and (not current_custodian or ("@" in custodian_candidate and "@" not in current_custodian)):
+        enriched["custodian"] = custodian_candidate
+    if normalize_whitespace(str(enriched.get("content_type") or "")).lower() == "email":
+        email_threading = dict(enriched.get("email_threading") or {})
+        if not normalize_email_message_id(email_threading.get("message_id")):
+            internet_message_id = pst_export_normalized_text(message_metadata.get("internet_message_id"))
+            if internet_message_id:
+                email_threading["message_id"] = internet_message_id
+        enriched["email_threading"] = email_threading
+    search_text = pst_export_message_search_text(message_metadata)
+    return append_extracted_search_context(enriched, [search_text] if search_text else [])
+
+
+def pst_export_enriched_message_file_hash(
+    base_hash: object,
+    *,
+    message_metadata: dict[str, object] | None,
+) -> str:
+    return sha256_json_value(
+        {
+            "base_hash": normalize_whitespace(str(base_hash or "")) or None,
+            "message_metadata": message_metadata or {},
+        }
+    )
+
+
+def detect_pst_export_root(candidate_root: Path) -> dict[str, object] | None:
+    if not candidate_root.is_dir() or ".retriever" in candidate_root.parts:
+        return None
+    try:
+        pst_paths = sorted(
+            path
+            for path in candidate_root.rglob("*.pst")
+            if ".retriever" not in path.parts
+        )
+        csv_paths = sorted(
+            path
+            for path in candidate_root.rglob("*.csv")
+            if ".retriever" not in path.parts
+        )
+        xml_paths = sorted(
+            path
+            for path in candidate_root.rglob("*.xml")
+            if ".retriever" not in path.parts
+        )
+        log_paths = sorted(
+            path
+            for path in candidate_root.rglob("*.log")
+            if ".retriever" not in path.parts
+        )
+    except OSError:
+        return None
+    if not pst_paths:
+        return None
+
+    results_csv_paths = [path for path in csv_paths if pst_export_results_csv_valid(path)]
+    summary_csv_paths = [path for path in csv_paths if pst_export_summary_csv_valid(path)]
+    manifest_paths = [path for path in xml_paths if pst_export_manifest_xml_valid(path)]
+    trace_log_paths = [path for path in log_paths if pst_export_trace_log_valid(path)]
+    if not (results_csv_paths or summary_csv_paths or manifest_paths or trace_log_paths):
+        return None
+
+    message_metadata_by_pst_path = parse_pst_export_results_csv(results_csv_paths, candidate_root=candidate_root)
+    manifest_metadata_by_pst_path = parse_pst_export_manifest_xml(manifest_paths, candidate_root=candidate_root)
+    for pst_path, records in manifest_metadata_by_pst_path.items():
+        target_records = message_metadata_by_pst_path.setdefault(pst_path, {})
+        for source_item_id, metadata in records.items():
+            target_records[source_item_id] = pst_export_merge_message_metadata(
+                target_records.get(source_item_id),
+                metadata,
+            )
+    message_match_records_by_pst_path = build_pst_export_message_match_records(message_metadata_by_pst_path)
+
+    owned_paths = {
+        *(path.resolve() for path in results_csv_paths),
+        *(path.resolve() for path in summary_csv_paths),
+        *(path.resolve() for path in manifest_paths),
+        *(path.resolve() for path in trace_log_paths),
+    }
+    message_sidecar_paths = [*results_csv_paths, *manifest_paths]
+    message_sidecar_hash = (
+        sha256_json_value(
+            {
+                "files": {
+                    path.resolve().as_posix(): sha256_file(path)
+                    for path in sorted(message_sidecar_paths, key=lambda item: item.resolve().as_posix())
+                }
+            }
+        )
+        if message_sidecar_paths
+        else None
+    )
+    return {
+        "message_metadata_by_pst_path": message_metadata_by_pst_path,
+        "message_match_records_by_pst_path": message_match_records_by_pst_path,
+        "message_sidecar_hash": message_sidecar_hash,
+        "owned_paths": owned_paths,
+        "pst_paths": [path.resolve() for path in pst_paths],
+        "root": candidate_root,
+    }
+
+
+def find_pst_export_roots(
+    root: Path,
+    recursive: bool,
+) -> list[dict[str, object]]:
+    candidates: set[Path] = set()
+    if recursive:
+        try:
+            for csv_path in root.rglob("*.csv"):
+                if ".retriever" in csv_path.parts:
+                    continue
+                if pst_export_results_csv_valid(csv_path) or pst_export_summary_csv_valid(csv_path):
+                    candidates.add(csv_path.parent)
+            for xml_path in root.rglob("*.xml"):
+                if ".retriever" in xml_path.parts:
+                    continue
+                if pst_export_manifest_xml_valid(xml_path):
+                    candidates.add(xml_path.parent)
+            for log_path in root.rglob("*.log"):
+                if ".retriever" in log_path.parts:
+                    continue
+                if pst_export_trace_log_valid(log_path):
+                    candidates.add(log_path.parent)
+        except OSError:
+            return []
+    else:
+        candidates.add(root)
+
+    descriptors: list[dict[str, object]] = []
+    accepted_roots: list[Path] = []
+    for candidate in sorted(candidates, key=lambda path: (len(path.parts), path.as_posix())):
+        if any(parent == candidate or parent in candidate.parents for parent in accepted_roots):
+            continue
+        descriptor = detect_pst_export_root(candidate)
+        if descriptor is None:
+            continue
+        descriptors.append(descriptor)
+        accepted_roots.append(candidate)
+    return descriptors
 
 
 def detect_gmail_export_root(candidate_root: Path) -> dict[str, object] | None:

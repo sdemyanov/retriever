@@ -3352,14 +3352,17 @@ def normalize_datetime(value: object) -> str | None:
 
 
 def decode_bytes(data: bytes, declared_encoding: str | None = None) -> tuple[str, str, str | None]:
+    def normalized_decoded_text(value: str) -> str:
+        return value.lstrip("\ufeff")
+
     if declared_encoding:
         try:
-            return data.decode(declared_encoding), "ok", declared_encoding
+            return normalized_decoded_text(data.decode(declared_encoding)), "ok", declared_encoding
         except Exception:
             pass
 
     try:
-        return data.decode("utf-8"), "ok", "utf-8"
+        return normalized_decoded_text(data.decode("utf-8-sig")), "ok", "utf-8"
     except UnicodeDecodeError:
         pass
 
@@ -3367,11 +3370,11 @@ def decode_bytes(data: bytes, declared_encoding: str | None = None) -> tuple[str
     if charset_normalizer_module is not None:
         best = charset_normalizer_module.from_bytes(data).best()
         if best is not None:
-            text = str(best)
+            text = normalized_decoded_text(str(best))
             status = "partial" if "\ufffd" in text else "ok"
             return text, status, best.encoding
 
-    text = data.decode("utf-8", errors="replace")
+    text = normalized_decoded_text(data.decode("utf-8", errors="replace"))
     status = "partial" if "\ufffd" in text else "ok"
     return text, status, None
 

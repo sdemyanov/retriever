@@ -436,6 +436,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def fetch_email_threading_row(self, document_id: int) -> sqlite3.Row | None:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            return connection.execute(
+                """
+                SELECT *
+                FROM document_email_threading
+                WHERE document_id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
     def count_rows(self, table_name: str) -> int:
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -723,6 +737,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         path = self.root / name
         path.write_bytes(content)
         return path
+
+    def write_csv_rows(
+        self,
+        path: Path,
+        *,
+        fieldnames: list[str],
+        rows: list[dict[str, object]],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
 
     def write_fake_mbox_file(self, messages: list[EmailMessage], name: str = "mailbox.mbox") -> Path:
         path = self.root / name
@@ -9681,6 +9709,211 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachment_search = retriever_tools.search(self.root, "pst attachment body", None, None, None, 1, 20)
         attachment_result = next(item for item in attachment_search["results"] if item["id"] == child_row["id"])
         self.assertEqual(attachment_result["parent"]["control_number"], parent_row["control_number"])
+
+    def test_ingest_pst_export_sidecars_augment_messages_and_stay_out_of_filesystem_docs(self) -> None:
+        (self.root / "Exchange").mkdir(parents=True, exist_ok=True)
+        self.write_fake_pst_file(name="Exchange/mailbox.pst")
+        self.write_csv_rows(
+            self.root / "Results.csv",
+            fieldnames=[
+                "Item Identity",
+                "Document ID",
+                "Target Path",
+                "Original Path",
+                "Location",
+                "Location Name",
+                "Subject or Title",
+                "Sender or Created by",
+                "Recipients in To line",
+                "Sent",
+            ],
+            rows=[
+                {
+                    "Item Identity": "pst-export-001",
+                    "Document ID": "101",
+                    "Target Path": r"Exchange\mailbox.pst\Top of Information Store\Inbox\Sidecar Welcome",
+                    "Original Path": (
+                        r"mailbox@example.com, Primary, abc-123\mailbox@example.com (Primary)"
+                        r"\Top of Information Store\Inbox"
+                    ),
+                    "Location": "mailbox@example.com, Primary, abc-123",
+                    "Location Name": "mailbox@example.com",
+                    "Subject or Title": "Sidecar Welcome",
+                    "Sender or Created by": "Mailbox Sender <sender@example.com>",
+                    "Recipients in To line": "Recipient Example <recipient@example.com>",
+                    "Sent": "4/24/2026 11:59:00 PM",
+                }
+            ],
+        )
+        (self.root / "Manifest.xml").write_text(
+            (
+                "<?xml version='1.0' encoding='utf-8'?>"
+                "<Root><Batch><Documents>"
+                "<Document DocID='pst-export-001'>"
+                "<Tags>"
+                "<Tag TagName='TargetPath' TagDataType='Text' "
+                "TagValue='Exchange\\mailbox.pst\\Top of Information Store\\Inbox\\Sidecar Welcome' />"
+                "<Tag TagName='#OriginalUrl' TagDataType='Text' TagValue='pst-export-original://abc-123' />"
+                "</Tags>"
+                "</Document>"
+                "</Documents></Batch></Root>"
+            ),
+            encoding="utf-8",
+        )
+        self.write_csv_rows(
+            self.root / "Export Summary 05.24.2024-1357PM.csv",
+            fieldnames=["Export Name", "Value"],
+            rows=[{"Export Name": "Example Export", "Value": "done"}],
+        )
+        (self.root / "trace.log").write_text("trace entry\n", encoding="utf-8")
+
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="2097188",
+                subject=None,
+                body_text="Body from PST",
+                folder_path="Top of Personal Folders/Top-of-Information-Store/Inbox",
+                author=None,
+                recipients=None,
+                date_created=None,
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 1)
+        rel_path = retriever_tools.pst_message_rel_path("Exchange/mailbox.pst", "2097188")
+        row = self.fetch_document_row(rel_path)
+        self.assertEqual(row["title"], "Sidecar Welcome")
+        self.assertEqual(row["subject"], "Sidecar Welcome")
+        self.assertEqual(row["author"], "Mailbox Sender <sender@example.com>")
+        self.assertEqual(row["recipients"], "Recipient Example <recipient@example.com>")
+        self.assertEqual(row["date_created"], "2026-04-24T23:59:00Z")
+        self.assertEqual(row["custodian"], "mailbox@example.com")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            sidecar_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM documents
+                    WHERE rel_path IN (?, ?, ?, ?)
+                    """,
+                    (
+                        "Results.csv",
+                        "Manifest.xml",
+                        "Export Summary 05.24.2024-1357PM.csv",
+                        "trace.log",
+                    ),
+                ).fetchone()["count"]
+            )
+            chunk_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM document_chunks
+                    WHERE document_id = ?
+                      AND text_content LIKE ?
+                    """,
+                    (row["id"], "%abc-123%"),
+                ).fetchone()["count"]
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(sidecar_count, 0)
+        self.assertGreaterEqual(chunk_count, 1)
+
+    def test_changed_pst_export_results_sidecar_reingests_unchanged_pst_source(self) -> None:
+        (self.root / "Exchange").mkdir(parents=True, exist_ok=True)
+        self.write_fake_pst_file(name="Exchange/mailbox.pst", content=b"pst-static")
+        export_results_path = self.root / "Export_Results_1_1.csv"
+        fieldnames = [
+            "Export Item Id",
+            "Export Item Path",
+            "Document ID",
+            "Location",
+            "Location Name",
+            "Target Path",
+            "Original Path",
+            "Subject or Title",
+            "Sender or Created by",
+            "Recipients in To line",
+            "Sent",
+            "Internet Message Id",
+        ]
+
+        def write_export_results(subject: str) -> None:
+            self.write_csv_rows(
+                export_results_path,
+                fieldnames=fieldnames,
+                rows=[
+                    {
+                        "Export Item Id": "pst-export-002",
+                        "Export Item Path": (
+                            r"First export_1.zip\mailbox.pst\Top-of-Information-Store\Inbox\Welcome"
+                        ),
+                        "Document ID": "17",
+                        "Location": "mailbox@example.com",
+                        "Location Name": "mailbox@example.com",
+                        "Target Path": "/Top of Information Store/Inbox",
+                        "Original Path": "/Top of Information Store/Inbox",
+                        "Subject or Title": subject,
+                        "Sender or Created by": "Sidecar Sender <sender@example.com>",
+                        "Recipients in To line": "Recipient Example <recipient@example.com>",
+                        "Sent": "4/24/2026 11:59:00 PM",
+                        "Internet Message Id": "<sidecar-message@example.com>",
+                    }
+                ],
+            )
+
+        write_export_results("First export subject")
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="2097220",
+                subject=None,
+                body_text="Body from PST",
+                folder_path="Top of Personal Folders/Top-of-Information-Store/Inbox",
+                author=None,
+                recipients=None,
+                date_created=None,
+                transport_headers=(
+                    "Message-ID: <sidecar-message@example.com>\n"
+                    "From: Sidecar Sender <sender@example.com>\n"
+                    "To: Recipient Example <recipient@example.com>\n"
+                ),
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["failed"], 0)
+        rel_path = retriever_tools.pst_message_rel_path("Exchange/mailbox.pst", "2097220")
+        first_row = self.fetch_document_row(rel_path)
+        first_threading_row = self.fetch_email_threading_row(first_row["id"])
+        self.assertEqual(first_row["title"], "First export subject")
+        self.assertEqual(first_row["custodian"], "mailbox@example.com")
+        self.assertIsNotNone(first_threading_row)
+        self.assertEqual(
+            first_threading_row["message_id"],
+            retriever_tools.normalize_email_message_id("<sidecar-message@example.com>"),
+        )
+
+        write_export_results("Second export subject")
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["updated"], 1)
+        self.assertEqual(second_ingest["pst_messages_updated"], 1)
+        updated_row = self.fetch_document_row(rel_path)
+        self.assertEqual(updated_row["title"], "Second export subject")
+        self.assertEqual(updated_row["subject"], "Second export subject")
 
     def test_pst_only_ingest_prunes_stale_empty_filesystem_dataset(self) -> None:
         self.write_fake_pst_file()

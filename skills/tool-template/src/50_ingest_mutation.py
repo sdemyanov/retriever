@@ -80,9 +80,15 @@ def plan_ingest_work(
     slack_export_descriptors = find_slack_export_roots(root, recursive, allowed_types)
     slack_export_root_paths = [Path(descriptor["root"]).resolve() for descriptor in slack_export_descriptors]
     gmail_export_descriptors = find_gmail_export_roots(root, recursive, allowed_types)
+    pst_export_descriptors = find_pst_export_roots(root, recursive) if allowed_types is None or PST_SOURCE_KIND in allowed_types else []
     gmail_owned_paths = {
         Path(path).resolve()
         for descriptor in gmail_export_descriptors
+        for path in list(descriptor.get("owned_paths") or [])
+    }
+    pst_export_owned_paths = {
+        Path(path).resolve()
+        for descriptor in pst_export_descriptors
         for path in list(descriptor.get("owned_paths") or [])
     }
     gmail_owned_rel_paths = {
@@ -90,12 +96,23 @@ def plan_ingest_work(
         for owned_path in gmail_owned_paths
         if root.resolve() == owned_path.resolve() or root.resolve() in owned_path.resolve().parents
     }
+    pst_export_owned_rel_paths = {
+        relative_document_path(root, owned_path)
+        for owned_path in pst_export_owned_paths
+        if root.resolve() == owned_path.resolve() or root.resolve() in owned_path.resolve().parents
+    }
+    pst_export_descriptors_by_pst_path = {
+        Path(path).resolve().as_posix(): descriptor
+        for descriptor in pst_export_descriptors
+        for path in list(descriptor.get("pst_paths") or [])
+    }
     scanned_files = [
         path
         for path in collect_files(root, recursive, allowed_types)
         if not any(production_root == path.resolve() or production_root in path.resolve().parents for production_root in production_root_paths)
         and not any(slack_root == path.resolve() or slack_root in path.resolve().parents for slack_root in slack_export_root_paths)
         and path.resolve() not in gmail_owned_paths
+        and path.resolve() not in pst_export_owned_paths
     ]
     scanned_rel_paths: set[str] = set()
     scanned_pst_source_rel_paths: set[str] = set()
@@ -126,7 +143,10 @@ def plan_ingest_work(
         "production_signatures": production_signatures,
         "slack_export_descriptors": slack_export_descriptors,
         "gmail_export_descriptors": gmail_export_descriptors,
+        "pst_export_descriptors": pst_export_descriptors,
         "gmail_owned_rel_paths": gmail_owned_rel_paths,
+        "pst_export_owned_rel_paths": pst_export_owned_rel_paths,
+        "pst_export_descriptors_by_pst_path": pst_export_descriptors_by_pst_path,
         "scanned_files": scanned_files,
         "scanned_items": scanned_items,
         "loose_file_items": loose_file_items,
@@ -305,6 +325,7 @@ def load_loose_file_commit_state(
     connection: sqlite3.Connection,
     scanned_rel_paths: set[str],
     gmail_owned_rel_paths: set[str],
+    pst_export_owned_rel_paths: set[str],
 ) -> tuple[dict[str, sqlite3.Row], dict[str, list[sqlite3.Row]]]:
     existing_occurrence_rows = connection.execute(
         """
@@ -317,7 +338,10 @@ def load_loose_file_commit_state(
         (FILESYSTEM_SOURCE_KIND,),
     ).fetchall()
     existing_occurrence_rows = [
-        row for row in existing_occurrence_rows if str(row["rel_path"]) not in gmail_owned_rel_paths
+        row
+        for row in existing_occurrence_rows
+        if str(row["rel_path"]) not in gmail_owned_rel_paths
+        and str(row["rel_path"]) not in pst_export_owned_rel_paths
     ]
     existing_by_rel = {str(row["rel_path"]): row for row in existing_occurrence_rows}
     unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
@@ -847,7 +871,20 @@ def finalize_ingest_postpass(
     scanned_mbox_source_rel_paths: set[str],
     slack_day_documents_missing: int,
     stats: dict[str, int],
+    pst_export_owned_rel_paths: set[str] | None = None,
 ) -> int:
+    if pst_export_owned_rel_paths:
+        connection.execute("BEGIN")
+        try:
+            retire_standalone_filesystem_documents_by_rel_paths(
+                connection,
+                paths,
+                rel_paths=pst_export_owned_rel_paths,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
     filesystem_missing = mark_missing_documents(connection, scanned_rel_paths)
     pst_sources_missing = 0
     pst_documents_missing = 0
@@ -972,12 +1009,15 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             production_signatures = list(ingest_plan["production_signatures"])
             slack_export_descriptors = list(ingest_plan["slack_export_descriptors"])
             gmail_export_descriptors = list(ingest_plan["gmail_export_descriptors"])
+            pst_export_descriptors = list(ingest_plan["pst_export_descriptors"])
             scanned_items = list(ingest_plan["scanned_items"])
             loose_file_items = list(ingest_plan["loose_file_items"])
             scanned_rel_paths = set(ingest_plan["scanned_rel_paths"])
             scanned_pst_source_rel_paths = set(ingest_plan["scanned_pst_source_rel_paths"])
             scanned_mbox_source_rel_paths = set(ingest_plan["scanned_mbox_source_rel_paths"])
             gmail_owned_rel_paths = set(ingest_plan["gmail_owned_rel_paths"])
+            pst_export_owned_rel_paths = set(ingest_plan["pst_export_owned_rel_paths"])
+            pst_export_descriptors_by_pst_path = dict(ingest_plan["pst_export_descriptors_by_pst_path"])
             benchmark_mark(
                 "ingest_scan_done",
                 scan_ms=round((time.perf_counter() - scan_started) * 1000.0, 3),
@@ -986,6 +1026,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 production_roots=len(production_signatures),
                 slack_export_roots=len(slack_export_descriptors),
                 gmail_export_roots=len(gmail_export_descriptors),
+                pst_export_roots=len(pst_export_descriptors),
             )
 
             stats = default_ingest_stats(len(slack_export_descriptors), len(gmail_export_descriptors))
@@ -1021,6 +1062,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 connection,
                 scanned_rel_paths,
                 gmail_owned_rel_paths,
+                pst_export_owned_rel_paths,
             )
 
             loop_started = time.perf_counter()
@@ -1046,11 +1088,28 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 item_started = time.perf_counter()
                 if file_type == PST_SOURCE_KIND:
                     try:
+                        pst_export_descriptor = pst_export_descriptors_by_pst_path.get(path.resolve().as_posix())
+                        pst_message_metadata_by_source_item = None
+                        pst_message_match_records = None
+                        pst_message_sidecar_hash = None
+                        if pst_export_descriptor is not None:
+                            pst_message_metadata_by_source_item = dict(
+                                dict(pst_export_descriptor.get("message_metadata_by_pst_path") or {}).get(path.resolve().as_posix()) or {}
+                            )
+                            pst_message_match_records = list(
+                                dict(pst_export_descriptor.get("message_match_records_by_pst_path") or {}).get(path.resolve().as_posix()) or []
+                            )
+                            pst_message_sidecar_hash = normalize_whitespace(
+                                str(pst_export_descriptor.get("message_sidecar_hash") or "")
+                            ) or None
                         pst_result = ingest_pst_source(
                             connection,
                             paths,
                             path,
                             rel_path,
+                            message_metadata_by_source_item=pst_message_metadata_by_source_item,
+                            message_match_records=pst_message_match_records,
+                            message_sidecar_hash=pst_message_sidecar_hash,
                             staging_root=Path(ingest_session["tmp_dir"]),
                         )
                         stats[str(pst_result["action"])] += 1
@@ -1149,6 +1208,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 scanned_mbox_source_rel_paths,
                 slack_day_documents_missing,
                 stats,
+                pst_export_owned_rel_paths=pst_export_owned_rel_paths,
             )
             benchmark_mark(
                 "ingest_postpass_done",
