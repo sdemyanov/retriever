@@ -9,6 +9,7 @@ import difflib
 import errno
 import hashlib
 import html
+import importlib
 import io
 import json
 import mailbox
@@ -41,50 +42,19 @@ from typing import Iterator
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-try:
-    import charset_normalizer
-except Exception:  # pragma: no cover - dependency probe
-    charset_normalizer = None
+_UNLOADED_DEPENDENCY = object()
 
-try:
-    import extract_msg
-except Exception:  # pragma: no cover - dependency probe
-    extract_msg = None
-
-try:
-    import openpyxl
-except Exception:  # pragma: no cover - dependency probe
-    openpyxl = None
-
-try:
-    import xlrd
-except Exception:  # pragma: no cover - dependency probe
-    xlrd = None
-
-try:
-    import pdfplumber
-except Exception:  # pragma: no cover - dependency probe
-    pdfplumber = None
-
-try:
-    from docx import Document as DocxDocument
-except Exception:  # pragma: no cover - dependency probe
-    DocxDocument = None
-
-try:
-    from striprtf.striprtf import rtf_to_text
-except Exception:  # pragma: no cover - dependency probe
-    rtf_to_text = None
-
-try:
-    from PIL import Image as PilImage
-except Exception:  # pragma: no cover - dependency probe
-    PilImage = None
-
-try:
-    import pypff
-except Exception:  # pragma: no cover - required PST backend probe
-    pypff = None
+# Third-party parsing dependencies load on demand so ordinary commands do not
+# depend on every parser being importable up front.
+charset_normalizer = _UNLOADED_DEPENDENCY
+extract_msg = _UNLOADED_DEPENDENCY
+openpyxl = _UNLOADED_DEPENDENCY
+xlrd = _UNLOADED_DEPENDENCY
+pdfplumber = _UNLOADED_DEPENDENCY
+DocxDocument = _UNLOADED_DEPENDENCY
+rtf_to_text = _UNLOADED_DEPENDENCY
+PilImage = _UNLOADED_DEPENDENCY
+pypff = _UNLOADED_DEPENDENCY
 
 try:
     import fcntl

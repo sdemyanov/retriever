@@ -51,4 +51,5 @@ Reply with a concise summary that includes:
 - Use the canonical plugin tool only as a fallback when the workspace-local tool is absent.
 - Do not silently swap in a generic environment-only probe.
 - If `matches_runtime` is `false` or the workspace is missing expected files, say so explicitly.
-- If `pst_backend.status` is not `pass`, say the runtime is not fully ready yet.
+- `doctor` should probe PST backend readiness under `pst_backend` even though ordinary non-PST commands stay lazy.
+- If `pst_backend.status` is `fail`, say PST ingest is not ready until the `libpff-python` / `pypff` backend is installed.

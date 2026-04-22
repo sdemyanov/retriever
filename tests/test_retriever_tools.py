@@ -4857,15 +4857,33 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(parents_with_attachments["total_hits"], 0)
 
-    def test_doctor_fails_when_required_pst_backend_is_missing(self) -> None:
+    def test_doctor_probes_pst_backend_when_unloaded(self) -> None:
         retriever_tools.bootstrap(self.root)
 
-        with mock.patch.object(retriever_tools, "pypff", None):
+        with (
+            mock.patch.object(retriever_tools, "pypff", retriever_tools._UNLOADED_DEPENDENCY),
+            mock.patch.object(retriever_tools, "load_dependency", return_value=object()) as load_dependency,
+        ):
             doctor_result = retriever_tools.doctor(self.root, quick=True)
 
-        self.assertEqual(doctor_result["overall"], "fail")
+        self.assertEqual(doctor_result["overall"], "pass")
+        self.assertEqual(doctor_result["pst_backend"]["status"], "pass")
+        self.assertIn("PST backend import succeeded", doctor_result["pst_backend"]["detail"])
+        load_dependency.assert_called_once_with("pypff")
+
+    def test_doctor_reports_optional_pst_backend_failure_without_failing_runtime(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        with (
+            mock.patch.object(retriever_tools, "pypff", retriever_tools._UNLOADED_DEPENDENCY),
+            mock.patch.object(retriever_tools, "load_dependency", return_value=None) as load_dependency,
+        ):
+            doctor_result = retriever_tools.doctor(self.root, quick=True)
+
+        self.assertEqual(doctor_result["overall"], "pass")
         self.assertEqual(doctor_result["pst_backend"]["status"], "fail")
         self.assertIn("libpff-python", doctor_result["pst_backend"]["detail"])
+        load_dependency.assert_called_once_with("pypff")
 
     def test_inspect_pst_properties_surfaces_chat_scope_candidates(self) -> None:
         pst_path = self.write_fake_pst_file()

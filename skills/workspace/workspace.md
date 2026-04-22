@@ -140,7 +140,7 @@ Notes:
 - `template_sha256` should reflect the materialized workspace copy
 - timestamps must be UTC ISO 8601 with `Z`
 - `schema_version` tracks the actual database schema, not the plugin version
-- a successful workspace bootstrap implies the pinned PST backend imports cleanly; `doctor` should fail until `pst_backend.status` is `pass`
+- a successful workspace bootstrap does not require loading optional parser backends up front; `doctor` should probe `pst_backend` explicitly while ordinary non-PST commands remain ready
 - for future schema changes with real migration vs. reindex tradeoffs, stop and ask the user before assuming migration is preferred
 - schema v7 renames `display_id` to `control_number`, renames the related helper columns and batch table, and keeps one-level email attachment families; existing workspaces should reindex parent emails to populate child attachment rows and preserve family numbering
 
