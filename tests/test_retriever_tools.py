@@ -9652,6 +9652,65 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         browse_results = retriever_tools.search(self.root, "", None, None, None, 1, 20)
         self.assertEqual(browse_results["total_hits"], 1)
 
+    def test_unchanged_pst_chat_source_reparses_when_chat_threading_rows_are_missing(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-chat-001",
+                subject=None,
+                body_text="Kickoff thread for launch planning.",
+                folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                author="Alice Example",
+                recipients=None,
+                date_created="2026-04-15T09:00:00Z",
+                chat_threading={
+                    "thread_id": "19:launch-thread@unq.gbl.spaces",
+                    "message_id": "1713882000000",
+                    "thread_type": "chat",
+                    "participants": ["Alice Example", "Bob Example"],
+                },
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["pst_messages_created"], 1)
+        parent_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-001"))
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                "DELETE FROM document_chat_threading WHERE document_id = ?",
+                (int(parent_row["id"]),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["failed"], 0)
+        self.assertEqual(second_ingest["pst_sources_skipped"], 0)
+        self.assertEqual(second_ingest["pst_messages_updated"], 1)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            threading_row = connection.execute(
+                """
+                SELECT thread_id, thread_type
+                FROM document_chat_threading
+                WHERE document_id = ?
+                """,
+                (int(parent_row["id"]),),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(threading_row)
+        assert threading_row is not None
+        self.assertEqual(threading_row["thread_id"], "19:launch-thread@unq.gbl.spaces")
+        self.assertEqual(threading_row["thread_type"], "chat")
+
     def test_changed_pst_reingest_preserves_control_numbers_and_retires_removed_messages(self) -> None:
         pst_path = self.write_fake_pst_file(content=b"pst-v1")
         first_messages = [
