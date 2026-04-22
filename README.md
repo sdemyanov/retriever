@@ -25,6 +25,8 @@ A few specific frustrations it's built to address.
 
 **Mixed file types, one place to look.** PDFs, Word documents, Excel, PowerPoint, loose emails, PST and MBOX archives, Slack exports, and processed productions all share the same browse surface. You do not have to bounce between three different programs to follow a single thread of evidence.
 
+**A document view and a conversation view of the same collection.** Ask for "documents" or "emails" and Retriever shows you one row per file or message. Ask for "threads," "conversations," "channels," or "DMs" and the same scope reshapes into one row per discussion — with participants, date range, and a message count — so you can see the shape of a thread before opening any one message. Filters, datasets, and saved scopes apply the same way in either view.
+
 **A big pile narrowed down to what actually matters.** Start broad with a keyword, then filter by date range, file type, custodian, or any custom field you have added. Each filter is additive. You watch the pile shrink until you have something reviewable.
 
 **Your place, saved.** Review work rarely happens in one sitting. Save a scope today, come back tomorrow, and pick up exactly where you left off. Build named review sets as you go. Re-run the same scope a month later when the next batch of documents lands.
@@ -62,7 +64,7 @@ Retriever uses a small vocabulary that shows up in every section that follows. E
 
 **Ingest.** The process of scanning the workspace, extracting text and metadata from each supported file, and registering one or more documents per file. Re-ingesting the same folder updates changed files, preserves identity where it can, and marks missing items rather than silently forgetting them.
 
-**Document (logical document).** The unit Retriever indexes. Usually one per file, but not always: an email with attachments becomes an email document plus one child per attachment, a PST file explodes into a message document per message plus attachment children, a Slack export becomes conversation-day documents with reply children, and a processed production creates one document per load-file row.
+**Document (logical document).** The unit Retriever indexes. Usually one per file, but not always: an email with attachments becomes an email document plus one child per attachment, a PST file explodes into a message document per message plus attachment children, a Slack export becomes conversation-day documents with reply children, and a processed production creates one document per load-file row. When the same file shows up in more than one place — for example, the same PDF appears in two custodian collections — Retriever treats those as separate occurrences of a single logical document. The document's metadata (title, dates, author, custodians) is the union across active occurrences, and custodian in particular is kept as a list so a document can legitimately belong to multiple custodians.
 
 **Control number.** The stable identifier assigned to each document. It survives re-ingest, it's what exports use to reference a row, and for production documents it is the produced Bates value.
 
@@ -95,6 +97,8 @@ Retriever uses a small vocabulary that shows up in every section that follows. E
 **Skill.** A prewritten recipe Claude can follow for a specific Retriever operation. Skills are what make natural-language requests map reliably to the right command with the right arguments — once Claude matches your request to a skill, the skill spells out exactly how to execute.
 
 **Slash command.** A deterministic control like `/search`, `/filter`, `/bates`, `/columns`. No reasoning required — you type it, it executes exactly as written.
+
+**Browse mode (documents vs conversations).** A session-level toggle between the per-document view and the per-conversation view. Documents mode shows one row per file, email, message, or attachment. Conversations mode groups those documents back into their parent thread (an email chain, a Slack channel-day, a chat thread) and shows one row per conversation. Each mode carries its own default columns, default sort, and page size, and your current scope (keyword, filter, dataset, Bates, from-run) applies in both. Natural-language verbs like "show threads," "list email chains," "browse channels" switch to conversation mode; "show documents," "list emails," "files" switch back to documents mode.
 
 **Export.** Pulling documents out of a scope into a shareable form. Retriever supports CSV (for downstream review or QC), HTML preview bundles (for sharing previews outside the workspace), and zip archives that can include source files, previews, and an optional portable workspace subset.
 
@@ -310,20 +314,43 @@ Scope changes reset paging. Display settings and browse preferences persist unti
 
 ### Result format
 
-Document listings use a standard table:
+Document listings use a standard table.
 
-- A header showing `Scope`, `Sort`, and `Page`.
-- A table whose `title` cell is the clickable preview link.
-- A footer like `Documents 1-10 of 85. Ask for the next page to see more.`
+The header above the table shows the active scope split across one line per selector, so it is obvious at a glance what is narrowing the current page:
+
+- `Keyword: ...` (only when a keyword is active)
+- `Bates: ...` (only when a Bates selector is active)
+- `Active filters: ...` (only when a filter expression is active; truncated if very long)
+- `Datasets: ...` (only when one or more datasets are selected)
+- `From run: ...` (only when a `/from-run` selector is active)
+- `Sort: ...`
+- `Page: N of M  (docs X-Y of Z)` — or `(conversations X-Y of Z)` in conversation mode
+
+When no selector is set, the header collapses to a single `Scope: (none)` line plus the sort and page lines.
+
+Between the header and the table, an `Overview:` line summarizes the current page — how many datasets, custodians, rows with attachments, and rows flagged as `text_status=empty` are represented. It is there to give you a quick sense of whether the page is homogeneous or spans a lot of different buckets.
+
+The table itself:
+
+- One row per document in documents mode, or one row per conversation in conversation mode.
+- The `title` cell (when shown) is a clickable preview link.
+
+Below the table, a footer suggests next steps:
+
+- A `Navigate:` line hints at `/retriever:next` for the next page and `/retriever:previous` to go back when those are available.
+- A `Narrow:` line appears when the page spans multiple datasets, processing runs, or custodians and the active scope does not already narrow by them — it proposes a concrete `/filter` or `/from-run` you can paste to focus further.
 
 Default behavior:
 
 - Default page size: `10`.
 - Maximum page size: `100`.
-- Default columns: `content_type`, `title`, `author`, `date_created`, `control_number`.
+- Default columns in documents mode: `content_type`, `title`, `author`, `date_created`, `control_number`.
+- Default columns in conversation mode: `conversation_type`, `title`, `participants`, `last_activity`, `document_count`.
 - Default sort for keyword search: `relevance asc`.
 - Default sort for Bates lookup: `bates asc`.
-- Default sort for filter-only browse: `date_created desc`.
+- Default sort for filter-only browse in documents mode: `date_created desc`.
+- Default sort in conversation mode: `last_activity desc`.
+- Each browse mode keeps its own `/columns`, `/sort`, and `/page-size` — switching modes does not clobber the other mode's preferences.
 
 ## Supported content
 
@@ -563,7 +590,7 @@ Retriever's persistent browse surface consists of these commands.
 | `/search` | Show or set the current keyword/Bates search slot | `/search`, `/search contract`, `/search --within renewal`, `/search clear`, `/search --fts ABC000123` |
 | `/filter` | Show, add, or clear the current SQL-like filter expression | `/filter`, `/filter content_type = 'Email'`, `/filter clear` |
 | `/bates` | Show, set, or clear the current Bates selector | `/bates`, `/bates ABC000123-ABC000150`, `/bates clear` |
-| `/dataset` | Show, list, set, clear, or rename dataset selectors | `/dataset`, `/dataset list`, `/dataset "Review Set"`, `/dataset clear`, `/dataset rename "Old Set" "New Set"` |
+| `/dataset` | Show, list, set, clear, or rename dataset selectors | `/dataset`, `/dataset list`, `/dataset "Review Set"`, `/dataset "Review Set", production`, `/dataset clear`, `/dataset rename "Old Set" "New Set"` |
 | `/scope` | Show, list, save, load, or clear the whole current scope | `/scope`, `/scope list`, `/scope save hotdocs`, `/scope load hotdocs`, `/scope clear` |
 | `/sort` | Show, list, set, or reset browse sorting | `/sort`, `/sort list`, `/sort file_name asc`, `/sort date_created desc, file_name asc`, `/sort default` |
 | `/page` | Show current page state or jump to another page | `/page`, `/page 3`, `/page first`, `/page last`, `/page next`, `/page previous` |
@@ -578,6 +605,7 @@ Notes:
 - Bare forms such as `/scope`, `/dataset`, `/sort`, `/page`, `/page-size`, and `/columns` are read-only state inspection.
 - `/next` is equivalent to `/page next`.
 - `/previous` is equivalent to `/page previous`.
+- Retriever also has internal browse-mode toggles for document and conversation views. Agents or app integrations may use those on your behalf, but they are intentionally omitted from the public slash-command surface.
 - Values with spaces should be quoted.
 - Comma-separated lists are supported for commands such as `/dataset`, `/columns set`, and `/sort`.
 
@@ -702,6 +730,8 @@ You can filter on:
 - Virtual fields such as `dataset_name`, `production_name`, `is_attachment`, and `has_attachments`.
 
 Prefer canonical field names such as `date_created` instead of ad hoc variants.
+
+A note on `custodian`. Because the same logical document can appear under more than one custodian, `custodian` filters match against the document's active occurrences rather than a single stored value. `custodian = 'Smith'` returns a document if any of its active occurrences have `Smith` as custodian, and `custodian LIKE '%Garcia%'` / `IN (...)` follow the same any-occurrence rule. Displayed custodian cells show the full list, joined by commas, so it is clear when a document spans multiple collections.
 
 ### Filter examples
 

@@ -6,7 +6,7 @@ description: >
   search and slash browse commands with structured filters and returns the
   standard rendered table output.
 metadata:
-  version: "0.9.7"
+  version: "0.9.8"
 ---
 
 # Retriever Search
@@ -18,15 +18,21 @@ Use this skill when the user says things like:
 - "search for Latin emails"
 - "filter to NDA contracts"
 - "show me conversations in gmail-max"
+- "/search clear"
+- "/search --within indemnification"
+- "/search --fts ABC000123"
 
-## Exact /search fast path
+## Exact /search fast paths
 
-For the exact bare slash form `/search`:
+For exact slash forms that begin with `/search`:
 
 - Do not read [../search-strategy/search-strategy.md](../search-strategy/search-strategy.md).
 - Do not read schema docs.
-- Run exactly one Bash command from the workspace root:
+- Run exactly one Bash command from the workspace root that passes the slash command through unchanged. Common examples:
   - `/search`: `python3 .retriever/bin/retriever_tools.py slash . /search`
+  - `/search clear`: `python3 .retriever/bin/retriever_tools.py slash . '/search clear'`
+  - `/search --within indemnification`: `python3 .retriever/bin/retriever_tools.py slash . '/search --within indemnification'`
+  - `/search --fts ABC000123`: `python3 .retriever/bin/retriever_tools.py slash . '/search --fts ABC000123'`
 - If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
 - Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
 
