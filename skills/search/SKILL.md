@@ -1,11 +1,12 @@
 ---
 name: search
 description: >
-  Use this skill when the user wants to find documents, filter the collection,
-  or browse search results. It runs Retriever's search command with structured
-  filters and presents results using the search-strategy contract.
+  Use this skill when the user wants to find documents or conversations,
+  filter the collection, or browse linked search results. It runs Retriever's
+  search and slash browse commands with structured filters and returns the
+  standard rendered table output.
 metadata:
-  version: "0.9.6"
+  version: "0.9.7"
 ---
 
 # Retriever Search
@@ -60,6 +61,7 @@ For the exact bare slash form `/search`:
 - Use browse mode when the user is mostly filtering, and keyword search when they provide terms.
 - For a single Bates/control token or a Bates range expression, prefer the Bates-aware search path over plain keyword FTS.
 - For persistent investigation flows, prefer the slash surface: `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, plus the internal mode toggles `/documents` and `/conversations` when the request changes between per-document and per-conversation browsing.
+- If a dataset, scope, or similar browse selector is unknown or only loosely specified (for example `gmail-max` instead of the full dataset name), resolve it through Retriever's own browse surface first, such as `/dataset list` plus the closest matching dataset, rather than bypassing Retriever with raw SQL.
 - Bare slash commands are read-only state inspection when supported: `/scope` shows the active scope, `/dataset` the active dataset selector, `/sort` the active sort, `/page` the current page state, `/page-size` the active page size, and `/columns` the active display columns.
 - Use `list` subcommands for discoverability: `/scope list` lists saved scopes, `/dataset list` lists available datasets, `/sort list` lists sortable fields, and `/columns list` lists displayable fields.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
