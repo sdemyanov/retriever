@@ -4975,8 +4975,59 @@ def ingest_pst_source(
     paths: dict[str, Path],
     path: Path,
     source_rel_path: str,
+    *,
+    message_metadata_by_source_item: dict[str, dict[str, object]] | None = None,
+    message_match_records: list[dict[str, object]] | None = None,
+    message_sidecar_hash: str | None = None,
     staging_root: Path | None = None,
 ) -> dict[str, object]:
+    normalized_message_metadata = {
+        str(key): dict(value)
+        for key, value in dict(message_metadata_by_source_item or {}).items()
+    }
+    normalized_message_match_records = [
+        dict(record)
+        for record in list(message_match_records or [])
+        if isinstance(record, dict)
+    ]
+
+    def normalize_enriched_pst_message(
+        source_rel_path_for_message: str,
+        message_dict: dict[str, object],
+    ) -> dict[str, object] | None:
+        normalized = normalize_pst_message(source_rel_path_for_message, message_dict)
+        if normalized is None:
+            return None
+        message_metadata = select_pst_export_message_metadata(
+            normalized,
+            exact_metadata_by_source_item=normalized_message_metadata,
+            message_match_records=normalized_message_match_records,
+        )
+        if not message_metadata:
+            return normalized
+        enriched = dict(normalized)
+        enriched["extracted"] = apply_pst_export_message_metadata(
+            dict(normalized["extracted"]),
+            message_metadata=message_metadata,
+        )
+        enriched["file_hash"] = pst_export_enriched_message_file_hash(
+            normalized.get("file_hash"),
+            message_metadata=message_metadata,
+        )
+        return enriched
+
+    pst_scan_hash_override = (
+        sha256_json_value(
+            {
+                "pst_hash": sha256_file(path),
+                "message_sidecar_hash": message_sidecar_hash,
+                "sidecar_match_version": "pst-export-sidecar-v2",
+                "source_rel_path": source_rel_path,
+            }
+        )
+        if normalize_whitespace(str(message_sidecar_hash or ""))
+        else None
+    )
     # Salt the scan fingerprint so unchanged PSTs get one corrective reparse when
     # container-routing rules change (for example, when Teams/system folders are reclassified
     # or attachment naming/type inference improves for unnamed blobs).
@@ -4989,8 +5040,9 @@ def ingest_pst_source(
         scan_hash_salt="pst-ingest-v4",
         dataset_name=pst_dataset_name(source_rel_path),
         iter_messages=iter_pst_messages,
-        normalize_message=normalize_pst_message,
+        normalize_message=normalize_enriched_pst_message,
         file_type_override=PST_SOURCE_KIND,
+        source_scan_hash_override=pst_scan_hash_override,
         staging_root=staging_root,
     )
     return {
