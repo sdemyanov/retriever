@@ -4642,6 +4642,57 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parents_with_attachments["total_hits"], 1)
         self.assertEqual(parents_with_attachments["results"][0]["id"], parent_row["id"])
 
+    def test_ingest_email_inline_html_image_stays_in_preview_without_attachment_child(self) -> None:
+        email_path = self.root / "inline.eml"
+        png_pixel = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9mQAAAAASUVORK5CYII="
+        )
+        encoded_png = base64.b64encode(png_pixel).decode("ascii")
+        boundary = "boundary-inline-ingest"
+        email_path.write_bytes(
+            (
+                "From: Alice Example <alice@example.com>\r\n"
+                "To: Bob Example <bob@example.com>\r\n"
+                "Subject: Inline icon test\r\n"
+                "Date: Tue, 14 Apr 2026 10:00:00 +0000\r\n"
+                "MIME-Version: 1.0\r\n"
+                f'Content-Type: multipart/related; boundary="{boundary}"\r\n'
+                "\r\n"
+                f"--{boundary}\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "\r\n"
+                '<html><body><p>Hello team.</p><img src="cid:logo-icon" alt="logo"/></body></html>\r\n'
+                f"--{boundary}\r\n"
+                "Content-Type: image/png\r\n"
+                "Content-Transfer-Encoding: base64\r\n"
+                "Content-ID: <logo-icon>\r\n"
+                'Content-Disposition: inline; filename="logo.png"\r\n'
+                "\r\n"
+                f"{encoded_png}\r\n"
+                f"--{boundary}--\r\n"
+            ).encode("ascii")
+        )
+
+        retriever_tools.bootstrap(self.root)
+        result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(result["new"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["workspace_parent_documents"], 1)
+        self.assertEqual(result["workspace_attachment_children"], 0)
+        self.assertEqual(result["workspace_documents_total"], 1)
+
+        parent_row = self.fetch_document_row("inline.eml")
+        self.assertEqual(len(self.fetch_child_rows(parent_row["id"])), 0)
+
+        browse_results = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        parent_result = next(item for item in browse_results["results"] if item["id"] == parent_row["id"])
+        self.assertEqual(parent_result["attachment_count"], 0)
+
+        preview_html = Path(parent_result["preview_abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("data:image/png;base64,", preview_html)
+        self.assertNotIn('src="cid:logo-icon"', preview_html)
+
     def test_ingest_email_preview_moves_attachment_lists_out_of_titles_and_into_links(self) -> None:
         email_path = self.root / "thread.eml"
         self.write_email_message(
@@ -11944,7 +11995,15 @@ class CidInliningTests(unittest.TestCase):
                 "payload": self.PNG_PIXEL,
                 "file_hash": "deadbeef",
                 "content_id": "icon",
-            }
+                "content_type": "image/png",
+            },
+            {
+                "file_name": "notes.txt",
+                "ordinal": 2,
+                "payload": b"notes",
+                "file_hash": "feedbead",
+                "content_type": "text/plain",
+            },
         ]
         payload = retriever_tools.build_email_extracted_payload(
             subject="Test",
@@ -11959,6 +12018,7 @@ class CidInliningTests(unittest.TestCase):
         preview_content = payload["preview_artifacts"][0]["content"]
         self.assertIn("data:image/png;base64,", preview_content)
         self.assertNotIn('src="cid:icon"', preview_content)
+        self.assertEqual([attachment["file_name"] for attachment in payload["attachments"]], ["notes.txt"])
 
     def test_build_email_extracted_payload_uses_subject_for_preview_title_and_heading(self) -> None:
         payload = retriever_tools.build_email_extracted_payload(

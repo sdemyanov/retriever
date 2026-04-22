@@ -246,6 +246,7 @@ For EML and MSG parents, Retriever may create one level of child attachment docu
 
 - Parent emails keep `parent_document_id = NULL`.
 - Extracted attachments become child rows with `parent_document_id` pointing to the parent email row.
+- CID-backed image parts that are rendered inline in the HTML preview are not materialized as child attachment rows.
 - Child attachment rows are derived documents backed by extracted blobs under `.retriever/previews/<parent>/attachments/`.
 - Child attachment rows are reconciled only through parent-email ingest, not the top-level filesystem scan.
 - If a parent email is re-ingested, matched unchanged child attachments keep their `control_number`, locked built-in values, and custom-field values.

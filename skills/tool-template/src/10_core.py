@@ -4096,6 +4096,28 @@ def normalize_content_id(raw: object) -> str | None:
     return value or None
 
 
+def attachment_image_mime_type(attachment: object) -> str | None:
+    if not isinstance(attachment, dict):
+        return None
+    payload = attachment.get("payload")
+    payload_bytes = bytes(payload) if isinstance(payload, (bytes, bytearray)) else None
+    file_name = str(attachment.get("file_name") or "")
+    mime_type = normalize_mime_type(attachment.get("content_type"))
+    if mime_type is not None and mime_type.startswith("image/"):
+        return mime_type
+    ooxml_mime_type = ooxml_image_mime_type(file_name)
+    if ooxml_mime_type:
+        return ooxml_mime_type
+    if payload_bytes is not None:
+        sniffed = sniff_image_mime_type(payload_bytes)
+        if sniffed:
+            return sniffed
+    guessed, _ = mimetypes.guess_type(file_name)
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return None
+
+
 def build_cid_data_uri_map(attachments: list[dict[str, object]] | None) -> dict[str, str]:
     if not attachments:
         return {}
@@ -4110,16 +4132,7 @@ def build_cid_data_uri_map(attachments: list[dict[str, object]] | None) -> dict[
         if not isinstance(payload, (bytes, bytearray)):
             continue
         payload_bytes = bytes(payload)
-        file_name = str(attachment.get("file_name") or "")
-        mime_type = normalize_mime_type(attachment.get("content_type"))
-        if mime_type is not None and not mime_type.startswith("image/"):
-            mime_type = None
-        if not mime_type:
-            mime_type = ooxml_image_mime_type(file_name) or sniff_image_mime_type(payload_bytes)
-        if not mime_type:
-            guessed, _ = mimetypes.guess_type(file_name)
-            if guessed and guessed.startswith("image/"):
-                mime_type = guessed
+        mime_type = attachment_image_mime_type(attachment)
         if not mime_type:
             mime_type = "application/octet-stream"
         encoded = base64.b64encode(payload_bytes).decode("ascii")
@@ -4149,6 +4162,35 @@ def inline_cid_references_in_html(
         return f"{prefix}{quote}{replacement}{quote}"
 
     return CID_REFERENCE_PATTERN.sub(_replace, html_body)
+
+
+def referenced_cids_in_html(html_body: str | None) -> set[str]:
+    if not html_body:
+        return set()
+    referenced: set[str] = set()
+    for match in CID_REFERENCE_PATTERN.finditer(html_body):
+        cid = normalize_content_id(match.group(3))
+        if cid:
+            referenced.add(cid.lower())
+    return referenced
+
+
+def filter_html_preview_embedded_image_attachments(
+    html_body: str | None,
+    attachments: list[dict[str, object]] | None,
+) -> list[dict[str, object]]:
+    if not attachments:
+        return []
+    referenced_cids = referenced_cids_in_html(html_body)
+    if not referenced_cids:
+        return list(attachments)
+    filtered: list[dict[str, object]] = []
+    for attachment in attachments:
+        content_id = normalize_content_id(attachment.get("content_id"))
+        if content_id and content_id.lower() in referenced_cids and attachment_image_mime_type(attachment):
+            continue
+        filtered.append(attachment)
+    return filtered
 
 
 def render_html_preview_attachment_links(links: list[dict[str, str]]) -> str:
