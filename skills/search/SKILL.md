@@ -60,14 +60,14 @@ For the exact bare slash form `/search`:
 - Bare slash commands are read-only state inspection when supported: `/scope` shows the active scope, `/dataset` the active dataset selector, `/sort` the active sort, `/page` the current page state, `/page-size` the active page size, and `/columns` the active display columns.
 - Use `list` subcommands for discoverability: `/scope list` lists saved scopes, `/dataset list` lists available datasets, `/sort list` lists sortable fields, and `/columns list` lists displayable fields.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
-- If the user asked to show/list/display/browse documents, or asked to see a table, use the slash/session browse surface when practical, otherwise call search with `--mode view`, and reply with only `rendered_markdown`. Never append an interpretive summary in the same turn.
+- If the user asked to show/list/display/browse documents, or asked to see a table, use the slash/session browse surface when practical, otherwise call search with `--mode view`, and reply with only `rendered_markdown` unless the user explicitly asks for a different layout or a non-standard summary. Never append an interpretive summary in the same turn.
 - Honor the active `/page-size` for document listings unless the user explicitly asks for a different count, asks for all results, or changes `/page-size`.
 - Never manually concatenate multiple result pages or enumerate more rows than the active page size in one reply unless the user explicitly asks for more than the current page.
 - In compose mode, default to a concise answer: one short paragraph for straightforward summaries, or two short paragraphs when a timeline/contrast genuinely helps. Do not turn ordinary summaries into long narrative memos unless the user asked for depth.
 - In compose mode, ground the main claims in the top matching documents. Prefer naming or citing the most relevant `control_number` items instead of synthesizing a broad story from distant/low-signal hits.
 - Do not volunteer collection-noise commentary, unrelated matches, or corpus-quality caveats unless the user asked for noise analysis, asked what matched unexpectedly, or the noise materially changes the answer.
 - Always show the active scope/header before the result table so the user can see the selector, sort, and page state.
-- **Standard listing output format** — whenever your answer shows documents, whether from `--mode view` or embedded in a compose-mode answer, use the exact standard `/search` table schema driven by the active display columns from search-strategy.md. Prefer the tool-returned `rendered_markdown` whenever it is present instead of hand-building a list:
+- **Standard listing output format** — unless the user specifically asks otherwise, whenever your answer shows documents, whether from `--mode view` or embedded in a compose-mode answer, use the exact standard `/search` table schema driven by the active display columns from search-strategy.md. Prefer the tool-returned `rendered_markdown` whenever it is present instead of hand-building a list:
 
   ```
   Scope: ...
