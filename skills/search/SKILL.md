@@ -16,6 +16,7 @@ Use this skill when the user says things like:
 - "show only PDFs from 2023"
 - "search for Latin emails"
 - "filter to NDA contracts"
+- "show me conversations in gmail-max"
 
 ## Exact /search fast path
 
@@ -39,6 +40,7 @@ For the exact bare slash form `/search`:
 - Use `--mode view` whenever the user primarily wants to see a document listing, not just when they literally say "table". Treat verbs like "show", "show me", "list", "display", "browse", "which documents", "what files", "show 10", and "show only" as view requests unless the user explicitly asks for a summary, explanation, or a different layout.
 - Use `--mode view` for the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, plus read-only `list` forms such as `/scope list`, `/dataset list`, `/sort list`, and `/columns list`).
 - For document-listing requests inside an active investigation, prefer the slash/session browse surface over a fresh stateless search so the current `/page-size`, `/columns`, `/sort`, and related browse state apply automatically.
+- If the user asks to show, list, browse, or display **conversations**, **threads**, **email threads**, **chat threads**, **channels**, **DMs**, or similar grouped discussion units, treat that as a conversation-browse request and switch the slash/session browse surface to `/conversations` before rendering results. If the user instead asks for individual documents, emails, messages, files, attachments, or per-item details, switch or stay in `/documents` mode before rendering results.
 - The standard `/search` rendered table is the default output contract for every document-listing request unless the user explicitly asks for a different presentation.
 - In `view` mode, the tool returns a `rendered_markdown` field containing the complete pre-formatted result table.
 - When `rendered_markdown` is present for a view request, your entire reply MUST be the exact contents of that field and nothing else: no preamble, no trailing commentary, no code fences, no reformatting, and no extra summary sentence. Treat any text before or after the markdown footer as a bug.
@@ -61,6 +63,9 @@ For the exact bare slash form `/search`:
 - Use `list` subcommands for discoverability: `/scope list` lists saved scopes, `/dataset list` lists available datasets, `/sort list` lists sortable fields, and `/columns list` lists displayable fields.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
 - If the user asked to show/list/display/browse documents, or asked to see a table, use the slash/session browse surface when practical, otherwise call search with `--mode view`, and reply with only `rendered_markdown` unless the user explicitly asks for a different layout or a non-standard summary. Never append an interpretive summary in the same turn.
+- For ordinary browse/list/show requests, do not inspect SQLite tables or write ad hoc SQL if Retriever already has a browse/search command for the task. Raw database inspection is for debugging schema/data issues, not for user-facing result rendering.
+- For conversation-listing requests, prefer this sequence when practical: apply dataset/scope/filter commands first, then run `/conversations`, and return the rendered conversation table exactly as produced.
+- For document- or message-listing requests that arrive while conversation mode is active, switch back to `/documents` before rendering so the result shape, columns, and title links match the user's request.
 - Honor the active `/page-size` for document listings unless the user explicitly asks for a different count, asks for all results, or changes `/page-size`.
 - Never manually concatenate multiple result pages or enumerate more rows than the active page size in one reply unless the user explicitly asks for more than the current page.
 - In compose mode, default to a concise answer: one short paragraph for straightforward summaries, or two short paragraphs when a timeline/contrast genuinely helps. Do not turn ordinary summaries into long narrative memos unless the user asked for depth.
