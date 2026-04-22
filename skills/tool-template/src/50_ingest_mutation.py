@@ -352,16 +352,17 @@ def load_loose_file_commit_state(
 
 
 def ingest_prepare_worker_count() -> int:
+    default_workers = min(8, os.cpu_count() or 4)
     raw_value = os.environ.get("RETRIEVER_INGEST_WORKERS")
     if raw_value is None:
-        return 1
+        return default_workers
     raw_value = raw_value.strip()
     if not raw_value:
-        return 1
+        return default_workers
     try:
         return max(1, int(raw_value))
     except ValueError:
-        return 1
+        return default_workers
 
 
 def ingest_container_prepare_worker_count() -> int:
