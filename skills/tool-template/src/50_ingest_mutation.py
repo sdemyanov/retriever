@@ -167,6 +167,7 @@ def ingest_serial_special_sources(
                 root,
                 descriptor,
                 allowed_file_types=allowed_types,
+                staging_root=ingest_tmp_dir,
             )
             stats["new"] += int(gmail_result["new"])
             stats["updated"] += int(gmail_result["updated"])
@@ -339,6 +340,19 @@ def ingest_prepare_worker_count() -> int:
         return 1
 
 
+def ingest_container_prepare_worker_count() -> int:
+    raw_value = os.environ.get("RETRIEVER_INGEST_CONTAINER_WORKERS")
+    if raw_value is None:
+        return 1
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return 1
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return 1
+
+
 def ingest_prepare_queue_capacity(prepare_workers: int) -> int:
     return max(2, prepare_workers * 2)
 
@@ -394,23 +408,22 @@ def hydrate_staged_prepared_ingest_item(spill_path: Path) -> dict[str, object]:
 
 
 def iter_staged_prepared_items(
-    items: list[dict[str, object]],
+    items: list[dict[str, object]] | Iterator[dict[str, object]],
     *,
     prepare_item,
     config_benchmark_name: str,
     queue_done_benchmark_name: str,
     spill_subdir_name: str,
     staging_root: Path | None = None,
+    prepare_workers: int | None = None,
 ) -> Iterator[tuple[dict[str, object], float]]:
-    if not items:
-        return
-    prepare_workers = ingest_prepare_worker_count()
-    max_prepared_items = ingest_prepare_queue_capacity(prepare_workers)
+    effective_prepare_workers = prepare_workers if prepare_workers is not None else ingest_prepare_worker_count()
+    max_prepared_items = ingest_prepare_queue_capacity(effective_prepare_workers)
     queue_max_bytes = ingest_prepare_queue_max_bytes()
     spill_threshold_bytes = ingest_prepare_spill_threshold_bytes()
     benchmark_mark(
         config_benchmark_name,
-        prepare_workers=prepare_workers,
+        prepare_workers=effective_prepare_workers,
         max_prepared_items=max_prepared_items,
         queue_max_bytes=queue_max_bytes,
         spill_threshold_bytes=spill_threshold_bytes,
@@ -427,25 +440,30 @@ def iter_staged_prepared_items(
     spilled_items = 0
     spilled_bytes = 0
     try:
-        with ThreadPoolExecutor(max_workers=prepare_workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_prepare_workers) as executor:
             pending_by_index: dict[int, object] = {}
             future_to_index: dict[object, int] = {}
-            next_submit_index = 0
             next_yield_index = 0
+            item_iterator = enumerate(items)
+            input_exhausted = False
 
             def submit_available() -> None:
-                nonlocal next_submit_index
+                nonlocal input_exhausted
                 while (
-                    next_submit_index < len(items)
+                    not input_exhausted
                     and len(pending_by_index) + len(ready_entries_by_index) < max_prepared_items
                 ):
+                    try:
+                        prepared_index, item = next(item_iterator)
+                    except StopIteration:
+                        input_exhausted = True
+                        break
                     future = executor.submit(
                         prepare_item,
-                        items[next_submit_index],
+                        item,
                     )
-                    pending_by_index[next_submit_index] = future
-                    future_to_index[future] = next_submit_index
-                    next_submit_index += 1
+                    pending_by_index[prepared_index] = future
+                    future_to_index[future] = prepared_index
 
             def record_completed_future(future) -> None:
                 nonlocal ready_bytes_in_memory, peak_ready_bytes_in_memory, spilled_items, spilled_bytes
@@ -477,13 +495,19 @@ def iter_staged_prepared_items(
                 peak_ready_bytes_in_memory = max(peak_ready_bytes_in_memory, ready_bytes_in_memory)
 
             submit_available()
-            while next_yield_index < len(items):
+            while next_yield_index in ready_entries_by_index or pending_by_index or not input_exhausted:
                 wait_started = time.perf_counter()
                 while next_yield_index not in ready_entries_by_index:
+                    if not pending_by_index and input_exhausted:
+                        return
                     if not pending_by_index:
-                        raise RetrieverError(
-                            f"Prepared ingest queue drained before index {next_yield_index} was ready."
-                        )
+                        submit_available()
+                        if not pending_by_index and input_exhausted:
+                            return
+                        if not pending_by_index:
+                            raise RetrieverError(
+                                f"Prepared ingest queue drained before index {next_yield_index} was ready."
+                            )
                     done, _ = wait(list(pending_by_index.values()), return_when=FIRST_COMPLETED)
                     for future in done:
                         record_completed_future(future)
@@ -1001,6 +1025,10 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
 
             loop_started = time.perf_counter()
             container_source_ms = 0.0
+            container_prepare_ms = 0.0
+            container_chunk_ms = 0.0
+            container_prepare_wait_ms = 0.0
+            container_commit_ms = 0.0
             loose_file_ms = 0.0
             loose_extract_ms = 0.0
             loose_chunk_ms = 0.0
@@ -1018,12 +1046,22 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 item_started = time.perf_counter()
                 if file_type == PST_SOURCE_KIND:
                     try:
-                        pst_result = ingest_pst_source(connection, paths, path, rel_path)
+                        pst_result = ingest_pst_source(
+                            connection,
+                            paths,
+                            path,
+                            rel_path,
+                            staging_root=Path(ingest_session["tmp_dir"]),
+                        )
                         stats[str(pst_result["action"])] += 1
                         stats["pst_sources_skipped"] += int(pst_result["pst_sources_skipped"])
                         stats["pst_messages_created"] += int(pst_result["pst_messages_created"])
                         stats["pst_messages_updated"] += int(pst_result["pst_messages_updated"])
                         stats["pst_messages_deleted"] += int(pst_result["pst_messages_deleted"])
+                        container_prepare_ms += float(pst_result.get("pst_prepare_ms") or 0.0)
+                        container_chunk_ms += float(pst_result.get("pst_chunk_ms") or 0.0)
+                        container_prepare_wait_ms += float(pst_result.get("pst_prepare_wait_ms") or 0.0)
+                        container_commit_ms += float(pst_result.get("pst_commit_ms") or 0.0)
                     except Exception as exc:
                         stats["failed"] += 1
                         failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
@@ -1032,12 +1070,22 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     continue
                 if file_type == MBOX_SOURCE_KIND:
                     try:
-                        mbox_result = ingest_mbox_source(connection, paths, path, rel_path)
+                        mbox_result = ingest_mbox_source(
+                            connection,
+                            paths,
+                            path,
+                            rel_path,
+                            staging_root=Path(ingest_session["tmp_dir"]),
+                        )
                         stats[str(mbox_result["action"])] += 1
                         stats["mbox_sources_skipped"] += int(mbox_result["mbox_sources_skipped"])
                         stats["mbox_messages_created"] += int(mbox_result["mbox_messages_created"])
                         stats["mbox_messages_updated"] += int(mbox_result["mbox_messages_updated"])
                         stats["mbox_messages_deleted"] += int(mbox_result["mbox_messages_deleted"])
+                        container_prepare_ms += float(mbox_result.get("mbox_prepare_ms") or 0.0)
+                        container_chunk_ms += float(mbox_result.get("mbox_chunk_ms") or 0.0)
+                        container_prepare_wait_ms += float(mbox_result.get("mbox_prepare_wait_ms") or 0.0)
+                        container_commit_ms += float(mbox_result.get("mbox_commit_ms") or 0.0)
                     except Exception as exc:
                         stats["failed"] += 1
                         failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
@@ -1085,6 +1133,10 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 loose_commit_ms=round(loose_commit_ms, 3),
                 loose_freshness_fallbacks=loose_freshness_fallbacks,
                 container_source_ms=round(container_source_ms, 3),
+                container_prepare_ms=round(container_prepare_ms, 3),
+                container_chunk_ms=round(container_chunk_ms, 3),
+                container_prepare_wait_ms=round(container_prepare_wait_ms, 3),
+                container_commit_ms=round(container_commit_ms, 3),
             )
 
             postpass_started = time.perf_counter()

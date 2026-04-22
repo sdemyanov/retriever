@@ -4446,6 +4446,192 @@ def mark_missing_container_documents(
     return sources_missing, documents_missing
 
 
+def prepare_container_message_item(
+    source_rel_path: str,
+    raw_message: dict[str, object],
+    normalize_message,
+) -> dict[str, object]:
+    prepare_started = time.perf_counter()
+    normalized = normalize_message(source_rel_path, raw_message)
+    if normalized is None:
+        return {
+            "skip": True,
+            "source_item_id": normalize_source_item_id(raw_message.get("source_item_id")),
+            "prepare_ms": (time.perf_counter() - prepare_started) * 1000.0,
+            "prepare_chunk_ms": 0.0,
+        }
+    extracted_payload = dict(normalized["extracted"])
+    attachments = list(extracted_payload.get("attachments", []))
+    extracted_payload.pop("attachments", None)
+    chunk_started = time.perf_counter()
+    prepared_chunks = extracted_search_chunks(extracted_payload)
+    return {
+        "skip": False,
+        "rel_path": str(normalized["rel_path"]),
+        "file_name": str(normalized["file_name"]),
+        "file_hash": normalized.get("file_hash"),
+        "source_item_id": str(normalized["source_item_id"]),
+        "source_folder_path": (
+            str(normalized["source_folder_path"])
+            if normalized.get("source_folder_path") is not None
+            else None
+        ),
+        "extracted_payload": extracted_payload,
+        "attachments": attachments,
+        "prepared_chunks": prepared_chunks,
+        "prepare_ms": (time.perf_counter() - prepare_started) * 1000.0,
+        "prepare_chunk_ms": (time.perf_counter() - chunk_started) * 1000.0,
+    }
+
+
+def iter_prepared_container_message_items(
+    *,
+    source_kind: str,
+    source_rel_path: str,
+    raw_messages: Iterator[dict[str, object]],
+    normalize_message,
+    staging_root: Path | None = None,
+) -> Iterator[tuple[dict[str, object], float]]:
+    effective_staging_root = staging_root
+    if staging_root is not None:
+        effective_staging_root = (
+            Path(staging_root)
+            / "container"
+            / sanitize_storage_filename(source_kind)
+            / sanitize_storage_filename(source_rel_path)
+        )
+    yield from iter_staged_prepared_items(
+        raw_messages,
+        prepare_item=lambda raw_message: prepare_container_message_item(
+            source_rel_path,
+            raw_message,
+            normalize_message,
+        ),
+        config_benchmark_name="ingest_container_prepare_config",
+        queue_done_benchmark_name="ingest_container_prepare_queue_done",
+        spill_subdir_name="prepared-container",
+        staging_root=effective_staging_root,
+        prepare_workers=ingest_container_prepare_worker_count(),
+    )
+
+
+def commit_prepared_container_message(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    prepared_item: dict[str, object],
+    existing_row: sqlite3.Row | None,
+    *,
+    current_ingestion_batch: int | None,
+    dataset_id: int,
+    dataset_source_id: int | None,
+    source_kind: str,
+    source_rel_path: str,
+    file_type_override: str,
+    scan_started_at: str,
+) -> dict[str, object]:
+    connection.execute("BEGIN")
+    try:
+        extracted = apply_manual_locks(existing_row, dict(prepared_item["extracted_payload"] or {}))
+        attachments = list(prepared_item.get("attachments") or [])
+        if existing_row is None:
+            if current_ingestion_batch is None:
+                current_ingestion_batch = allocate_ingestion_batch_number(connection)
+            control_number_batch = current_ingestion_batch
+            control_number_family_sequence = reserve_control_number_family_sequence(connection, control_number_batch)
+            control_number = format_control_number(control_number_batch, control_number_family_sequence)
+            control_number_attachment_sequence = None
+        else:
+            control_number_batch = int(existing_row["control_number_batch"])
+            control_number_family_sequence = int(existing_row["control_number_family_sequence"])
+            control_number = str(existing_row["control_number"])
+            control_number_attachment_sequence = existing_row["control_number_attachment_sequence"]
+            cleanup_document_artifacts(paths, connection, existing_row)
+
+        document_id = upsert_document_row(
+            connection,
+            str(prepared_item["rel_path"]),
+            None,
+            existing_row,
+            extracted,
+            file_name=str(prepared_item["file_name"]),
+            parent_document_id=None,
+            control_number=control_number,
+            dataset_id=dataset_id,
+            control_number_batch=control_number_batch,
+            control_number_family_sequence=control_number_family_sequence,
+            control_number_attachment_sequence=control_number_attachment_sequence,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+            source_item_id=str(prepared_item["source_item_id"]),
+            source_folder_path=prepared_item.get("source_folder_path"),
+            file_type_override=file_type_override,
+            file_size_override=None,
+            file_hash_override=(
+                str(prepared_item["file_hash"])
+                if prepared_item.get("file_hash") is not None
+                else None
+            ),
+            ingested_at_override=scan_started_at,
+            last_seen_at_override=scan_started_at,
+            updated_at_override=scan_started_at,
+        )
+        replace_document_email_threading_row(
+            connection,
+            document_id=document_id,
+            email_threading=extracted.get("email_threading"),
+        )
+        replace_document_chat_threading_row(
+            connection,
+            document_id=document_id,
+            chat_threading=extracted.get("chat_threading"),
+        )
+        seed_source_text_revision_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+            extracted=extracted,
+            existing_row=existing_row,
+            created_at=scan_started_at,
+        )
+        preview_rows = write_preview_artifacts(
+            paths,
+            str(prepared_item["rel_path"]),
+            list(extracted.get("preview_artifacts", [])),
+        )
+        replace_document_related_rows(
+            connection,
+            document_id,
+            extracted | {"file_name": str(prepared_item["file_name"])},
+            list(prepared_item.get("prepared_chunks") or []),
+            preview_rows,
+        )
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            dataset_source_id=dataset_source_id,
+        )
+        reconcile_attachment_documents(
+            connection,
+            paths,
+            document_id,
+            str(prepared_item["rel_path"]),
+            control_number_batch,
+            control_number_family_sequence,
+            attachments,
+            [(dataset_id, dataset_source_id)],
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+    return {
+        "action": "new" if existing_row is None else "updated",
+        "current_ingestion_batch": current_ingestion_batch,
+    }
+
+
 def ingest_container_source(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
@@ -4459,6 +4645,7 @@ def ingest_container_source(
     normalize_message,
     file_type_override: str,
     source_scan_hash_override: str | None = None,
+    staging_root: Path | None = None,
 ) -> dict[str, object]:
     source_scan_hash = normalize_whitespace(str(source_scan_hash_override or "")) or sha256_text(
         f"{scan_hash_salt}:{sha256_file(path) or ''}"
@@ -4552,6 +4739,10 @@ def ingest_container_source(
                 "container_messages_created": 0,
                 "container_messages_updated": 0,
                 "container_messages_deleted": 0,
+                "container_prepare_ms": 0.0,
+                "container_chunk_ms": 0.0,
+                "container_prepare_wait_ms": 0.0,
+                "container_commit_ms": 0.0,
             }
         if (
             same_size
@@ -4601,6 +4792,10 @@ def ingest_container_source(
                 "container_messages_created": 0,
                 "container_messages_updated": 0,
                 "container_messages_deleted": 0,
+                "container_prepare_ms": 0.0,
+                "container_chunk_ms": 0.0,
+                "container_prepare_wait_ms": 0.0,
+                "container_commit_ms": 0.0,
             }
     else:
         file_hash = source_scan_hash
@@ -4626,114 +4821,45 @@ def ingest_container_source(
     container_messages_created = 0
     container_messages_updated = 0
     message_count = 0
+    container_prepare_ms = 0.0
+    container_chunk_ms = 0.0
+    container_prepare_wait_ms = 0.0
+    container_commit_ms = 0.0
 
-    for raw_message in iter_messages(path):
-        normalized = normalize_message(source_rel_path, raw_message)
-        if normalized is None:
+    for prepared_item, wait_ms in iter_prepared_container_message_items(
+        source_kind=source_kind,
+        source_rel_path=source_rel_path,
+        raw_messages=iter_messages(path),
+        normalize_message=normalize_message,
+        staging_root=staging_root,
+    ):
+        container_prepare_wait_ms += wait_ms
+        container_prepare_ms += float(prepared_item["prepare_ms"])
+        container_chunk_ms += float(prepared_item.get("prepare_chunk_ms") or 0.0)
+        if prepared_item.get("skip"):
             continue
         message_count += 1
-        existing_row = existing_rows_by_source_item.get(str(normalized["source_item_id"]))
-        connection.execute("BEGIN")
-        try:
-            extracted = apply_manual_locks(existing_row, dict(normalized["extracted"]))
-            attachments = list(extracted.get("attachments", []))
-            if existing_row is None:
-                if current_ingestion_batch is None:
-                    current_ingestion_batch = allocate_ingestion_batch_number(connection)
-                control_number_batch = current_ingestion_batch
-                control_number_family_sequence = reserve_control_number_family_sequence(connection, control_number_batch)
-                control_number = format_control_number(control_number_batch, control_number_family_sequence)
-                control_number_attachment_sequence = None
-            else:
-                control_number_batch = int(existing_row["control_number_batch"])
-                control_number_family_sequence = int(existing_row["control_number_family_sequence"])
-                control_number = str(existing_row["control_number"])
-                control_number_attachment_sequence = existing_row["control_number_attachment_sequence"]
-                cleanup_document_artifacts(paths, connection, existing_row)
-
-            document_id = upsert_document_row(
-                connection,
-                str(normalized["rel_path"]),
-                None,
-                existing_row,
-                extracted,
-                file_name=str(normalized["file_name"]),
-                parent_document_id=None,
-                control_number=control_number,
-                dataset_id=dataset_id,
-                control_number_batch=control_number_batch,
-                control_number_family_sequence=control_number_family_sequence,
-                control_number_attachment_sequence=control_number_attachment_sequence,
-                source_kind=source_kind,
-                source_rel_path=source_rel_path,
-                source_item_id=str(normalized["source_item_id"]),
-                source_folder_path=(
-                    str(normalized["source_folder_path"])
-                    if normalized.get("source_folder_path") is not None
-                    else None
-                ),
-                file_type_override=file_type_override,
-                file_size_override=None,
-                file_hash_override=(
-                    str(normalized["file_hash"])
-                    if normalized.get("file_hash") is not None
-                    else None
-                ),
-                ingested_at_override=scan_started_at,
-                last_seen_at_override=scan_started_at,
-                updated_at_override=scan_started_at,
-            )
-            replace_document_email_threading_row(
-                connection,
-                document_id=document_id,
-                email_threading=extracted.get("email_threading"),
-            )
-            replace_document_chat_threading_row(
-                connection,
-                document_id=document_id,
-                chat_threading=extracted.get("chat_threading"),
-            )
-            seed_source_text_revision_for_document(
-                connection,
-                paths,
-                document_id=document_id,
-                extracted=extracted,
-                existing_row=existing_row,
-                created_at=scan_started_at,
-            )
-            preview_rows = write_preview_artifacts(paths, str(normalized["rel_path"]), list(extracted.get("preview_artifacts", [])))
-            chunks = extracted_search_chunks(extracted)
-            replace_document_related_rows(
-                connection,
-                document_id,
-                extracted | {"file_name": str(normalized["file_name"])},
-                chunks,
-                preview_rows,
-            )
-            ensure_dataset_document_membership(
-                connection,
-                dataset_id=dataset_id,
-                document_id=document_id,
-                dataset_source_id=dataset_source_id,
-            )
-            reconcile_attachment_documents(
-                connection,
-                paths,
-                document_id,
-                str(normalized["rel_path"]),
-                control_number_batch,
-                control_number_family_sequence,
-                attachments,
-                [(dataset_id, dataset_source_id)],
-            )
-            connection.commit()
-            if existing_row is None:
-                container_messages_created += 1
-            else:
-                container_messages_updated += 1
-        except Exception:
-            connection.rollback()
-            raise
+        existing_row = existing_rows_by_source_item.get(str(prepared_item["source_item_id"]))
+        commit_started = time.perf_counter()
+        commit_result = commit_prepared_container_message(
+            connection,
+            paths,
+            prepared_item,
+            existing_row,
+            current_ingestion_batch=current_ingestion_batch,
+            dataset_id=dataset_id,
+            dataset_source_id=dataset_source_id,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+            file_type_override=file_type_override,
+            scan_started_at=scan_started_at,
+        )
+        container_commit_ms += (time.perf_counter() - commit_started) * 1000.0
+        current_ingestion_batch = commit_result["current_ingestion_batch"]
+        if str(commit_result["action"]) == "new":
+            container_messages_created += 1
+        else:
+            container_messages_updated += 1
 
     connection.execute("BEGIN")
     try:
@@ -4768,6 +4894,10 @@ def ingest_container_source(
         "container_messages_created": container_messages_created,
         "container_messages_updated": container_messages_updated,
         "container_messages_deleted": container_messages_deleted,
+        "container_prepare_ms": container_prepare_ms,
+        "container_chunk_ms": container_chunk_ms,
+        "container_prepare_wait_ms": container_prepare_wait_ms,
+        "container_commit_ms": container_commit_ms,
     }
 
 
@@ -4798,6 +4928,7 @@ def ingest_pst_source(
     paths: dict[str, Path],
     path: Path,
     source_rel_path: str,
+    staging_root: Path | None = None,
 ) -> dict[str, object]:
     # Salt the scan fingerprint so unchanged PSTs get one corrective reparse when
     # container-routing rules change (for example, when Teams/system folders are reclassified
@@ -4813,6 +4944,7 @@ def ingest_pst_source(
         iter_messages=iter_pst_messages,
         normalize_message=normalize_pst_message,
         file_type_override=PST_SOURCE_KIND,
+        staging_root=staging_root,
     )
     return {
         "action": result["action"],
@@ -4820,6 +4952,10 @@ def ingest_pst_source(
         "pst_messages_created": result["container_messages_created"],
         "pst_messages_updated": result["container_messages_updated"],
         "pst_messages_deleted": result["container_messages_deleted"],
+        "pst_prepare_ms": result["container_prepare_ms"],
+        "pst_chunk_ms": result["container_chunk_ms"],
+        "pst_prepare_wait_ms": result["container_prepare_wait_ms"],
+        "pst_commit_ms": result["container_commit_ms"],
     }
 
 
@@ -4828,6 +4964,7 @@ def ingest_mbox_source(
     paths: dict[str, Path],
     path: Path,
     source_rel_path: str,
+    staging_root: Path | None = None,
 ) -> dict[str, object]:
     result = ingest_container_source(
         connection,
@@ -4840,6 +4977,7 @@ def ingest_mbox_source(
         iter_messages=iter_mbox_messages,
         normalize_message=normalize_mbox_message,
         file_type_override=MBOX_SOURCE_KIND,
+        staging_root=staging_root,
     )
     return {
         "action": result["action"],
@@ -4847,6 +4985,10 @@ def ingest_mbox_source(
         "mbox_messages_created": result["container_messages_created"],
         "mbox_messages_updated": result["container_messages_updated"],
         "mbox_messages_deleted": result["container_messages_deleted"],
+        "mbox_prepare_ms": result["container_prepare_ms"],
+        "mbox_chunk_ms": result["container_chunk_ms"],
+        "mbox_prepare_wait_ms": result["container_prepare_wait_ms"],
+        "mbox_commit_ms": result["container_commit_ms"],
     }
 
 
@@ -4937,6 +5079,7 @@ def ingest_gmail_export_root(
     root: Path,
     descriptor: dict[str, object],
     allowed_file_types: set[str] | None = None,
+    staging_root: Path | None = None,
 ) -> dict[str, object]:
     all_mbox_paths = [Path(path) for path in list(descriptor.get("mbox_paths") or [])]
     if not all_mbox_paths:
@@ -5032,6 +5175,13 @@ def ingest_gmail_export_root(
     scanned_filesystem_rel_paths: set[str] = set()
     scanned_mbox_source_rel_paths: set[str] = set()
     current_ingestion_batch: int | None = None
+    gmail_staging_root = None
+    if staging_root is not None:
+        gmail_staging_root = (
+            Path(staging_root)
+            / "gmail"
+            / sanitize_storage_filename(relative_document_path(root, Path(descriptor["root"])))
+        )
 
     for mbox_path in mbox_paths:
         source_rel_path = relative_document_path(root, mbox_path)
@@ -5095,6 +5245,7 @@ def ingest_gmail_export_root(
             normalize_message=normalize_gmail_message,
             file_type_override=MBOX_SOURCE_KIND,
             source_scan_hash_override=mbox_scan_hash_override,
+            staging_root=gmail_staging_root,
         )
         if result["action"] == "new":
             stats["new"] += 1
