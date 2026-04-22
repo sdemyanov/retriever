@@ -1624,6 +1624,72 @@ def coerce_sort_value(value: object) -> tuple[int, object]:
     return (0, value)
 
 
+LISTING_QUERY_PREFIXES = (
+    "show ",
+    "show me ",
+    "list ",
+    "display ",
+    "browse ",
+    "open ",
+    "get ",
+    "get me ",
+    "give me ",
+)
+LISTING_QUERY_NOUNS = {
+    "attachment",
+    "attachments",
+    "conversation",
+    "conversations",
+    "document",
+    "documents",
+    "email",
+    "emails",
+    "file",
+    "files",
+    "message",
+    "messages",
+    "result",
+    "results",
+    "thread",
+    "threads",
+}
+LISTING_QUERY_SCOPE_TERMS = {
+    "about",
+    "for",
+    "from",
+    "in",
+    "where",
+    "with",
+    "within",
+}
+THREAD_QUERY_TERMS = {"thread", "threads", "conversation", "conversations"}
+
+
+def keyword_query_uses_relevance_scoring(query: str) -> bool:
+    normalized_query = normalize_inline_whitespace(query)
+    if not normalized_query:
+        return False
+
+    lowered_query = normalized_query.lower()
+    tokens = lowered_query.split()
+    if not tokens:
+        return False
+
+    if any(lowered_query.startswith(prefix) for prefix in LISTING_QUERY_PREFIXES):
+        return False
+    if " -- " in normalized_query:
+        return False
+    if tokens[-1] in THREAD_QUERY_TERMS and len(tokens) > 1:
+        return False
+    if any(noun in tokens for noun in LISTING_QUERY_NOUNS) and any(
+        scope_term in tokens for scope_term in LISTING_QUERY_SCOPE_TERMS
+    ):
+        return False
+    if any(term in tokens for term in THREAD_QUERY_TERMS) and len(tokens) > 1:
+        return False
+    return True
+
+
 def sort_search_results(
     results: list[dict[str, object]],
     sort_field: str | None,
@@ -1634,8 +1700,10 @@ def sort_search_results(
     stable_results = sorted(results, key=lambda item: item["id"])
 
     if query_present and (sort_field is None or sort_field == "relevance"):
-        stable_results = stable_sort_results_by_field(stable_results, "date_created", "desc")
-        return sorted(stable_results, key=lambda item: (item["rank"] is None, item["rank"]))
+        if keyword_query_uses_relevance_scoring(query):
+            stable_results = stable_sort_results_by_field(stable_results, "date_created", "desc")
+            return sorted(stable_results, key=lambda item: (item["rank"] is None, item["rank"]))
+        return stable_sort_results_by_field(stable_results, "date_created", "desc")
 
     field_name = sort_field or "date_created"
     normalized_order = (order or "desc").lower()
@@ -1651,6 +1719,7 @@ def resolve_document_search(
 ) -> dict[str, object]:
     filter_summary, clauses, params = build_search_filters(connection, raw_filters)
     normalized_sort_field = sort_field
+    uses_relevance_scoring = keyword_query_uses_relevance_scoring(query)
     bates_query_begin, bates_query_end = parse_bates_query(query)
     is_bates_query = bates_query_begin is not None and bates_query_end is not None
     if sort_field == "relevance" and not query.strip():
@@ -1688,13 +1757,21 @@ def resolve_document_search(
         )
     else:
         sorted_results = sort_search_results(results, normalized_sort_field, order, query)
+
+    default_sort = "date_created"
+    default_order = "desc"
+    if is_bates_query and query.strip():
+        default_sort = "bates"
+        default_order = "asc"
+    elif query.strip() and uses_relevance_scoring:
+        default_sort = "relevance"
+        default_order = "asc"
     return {
         "query": query,
         "filters": filter_summary,
-        "sort": normalized_sort_field or ("bates" if is_bates_query and query.strip() else ("relevance" if query.strip() else "date_created")),
-        "order": (order or ("asc" if (is_bates_query or (query.strip() and (sort_field in (None, "relevance")))) else "desc")).lower(),
-        "sort_spec": f"{normalized_sort_field or ('bates' if is_bates_query and query.strip() else ('relevance' if query.strip() else 'date_created'))} "
-        f"{(order or ('asc' if (is_bates_query or (query.strip() and (sort_field in (None, 'relevance')))) else 'desc')).lower()}",
+        "sort": normalized_sort_field or default_sort,
+        "order": (order or default_order).lower(),
+        "sort_spec": f"{normalized_sort_field or default_sort} {(order or default_order).lower()}",
         "results": sorted_results,
     }
 
@@ -2004,6 +2081,7 @@ def resolve_paged_document_search(
 ) -> dict[str, object]:
     filter_summary, clauses, params = build_search_filters(connection, raw_filters)
     normalized_sort_field = sort_field
+    uses_relevance_scoring = keyword_query_uses_relevance_scoring(query)
     bates_query_begin, bates_query_end = parse_bates_query(query)
     is_bates_query = bates_query_begin is not None and bates_query_end is not None
     if sort_field == "relevance" and not query.strip():
@@ -2053,7 +2131,10 @@ def resolve_paged_document_search(
             )
     elif query.strip():
         if normalized_sort_field is None or normalized_sort_field == "relevance":
-            order_by_sql = sql_relevance_order_by(connection, row_alias="d", rank_expr="bm.rank")
+            if uses_relevance_scoring:
+                order_by_sql = sql_relevance_order_by(connection, row_alias="d", rank_expr="bm.rank")
+            else:
+                order_by_sql = sql_order_by_for_sort_specs(connection, [("date_created", "desc")], alias="d")
         else:
             order_by_sql = sql_order_by_for_sort_specs(
                 connection,
@@ -2083,13 +2164,21 @@ def resolve_paged_document_search(
             ),
         )
 
+    default_sort = "date_created"
+    default_order = "desc"
+    if is_bates_query and query.strip():
+        default_sort = "bates"
+        default_order = "asc"
+    elif query.strip() and uses_relevance_scoring:
+        default_sort = "relevance"
+        default_order = "asc"
+
     return {
         "query": query,
         "filters": filter_summary,
-        "sort": normalized_sort_field or ("bates" if is_bates_query and query.strip() else ("relevance" if query.strip() else "date_created")),
-        "order": (order or ("asc" if (is_bates_query or (query.strip() and (sort_field in (None, "relevance")))) else "desc")).lower(),
-        "sort_spec": f"{normalized_sort_field or ('bates' if is_bates_query and query.strip() else ('relevance' if query.strip() else 'date_created'))} "
-        f"{(order or ('asc' if (is_bates_query or (query.strip() and (sort_field in (None, 'relevance')))) else 'desc')).lower()}",
+        "sort": normalized_sort_field or default_sort,
+        "order": (order or default_order).lower(),
+        "sort_spec": f"{normalized_sort_field or default_sort} {(order or default_order).lower()}",
         "results": selection_page["results"],
         "total_hits": int(selection_page["total_hits"]),
     }
@@ -2792,6 +2881,50 @@ def markdown_table_cell_text(value: object) -> str:
     return normalized.replace("\\", "\\\\").replace("|", "\\|")
 
 
+MARKDOWN_EMAIL_ADDRESS_PATTERN = re.compile(r"^[^\s<>;,]+@[^\s<>;,]+$")
+
+
+def strip_wrapping_quotes(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+        return stripped[1:-1].strip()
+    return stripped
+
+
+def split_markdown_person_email(value: object) -> tuple[str | None, str | None]:
+    normalized = normalize_inline_whitespace(str(value or ""))
+    if not normalized:
+        return None, None
+    if MARKDOWN_EMAIL_ADDRESS_PATTERN.fullmatch(normalized):
+        return None, normalized
+
+    bracket_match = re.fullmatch(
+        r"(?P<name>.+?)\s*<(?P<email>[^\s<>;,]+@[^\s<>;,]+)>\s*",
+        normalized,
+    )
+    if bracket_match:
+        name = strip_wrapping_quotes(normalize_inline_whitespace(bracket_match.group("name")))
+        email = normalize_inline_whitespace(bracket_match.group("email"))
+        return (name or None), (email or None)
+
+    trailing_match = re.fullmatch(
+        r"(?P<name>.+?)\s+(?P<email>[^\s<>;,]+@[^\s<>;,]+)\s*",
+        normalized,
+    )
+    if trailing_match:
+        name = strip_wrapping_quotes(normalize_inline_whitespace(trailing_match.group("name")))
+        email = normalize_inline_whitespace(trailing_match.group("email"))
+        return (name or None), (email or None)
+    return normalized, None
+
+
+def markdown_author_cell_text(value: object) -> str:
+    name, email = split_markdown_person_email(value)
+    if email and name and name != email:
+        return f"{markdown_table_cell_text(name)}<br>{markdown_table_cell_text(email)}"
+    return markdown_table_cell_text(name or email)
+
+
 def markdown_link_text(value: str) -> str:
     return value.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
@@ -2852,6 +2985,8 @@ def render_search_markdown_cell(
         if target:
             return f"[{markdown_link_text(title_text)}]({target})"
         return markdown_table_cell_text(title_text)
+    if column_name == "author":
+        return markdown_author_cell_text(value)
     return markdown_table_cell_text(value)
 
 
@@ -3144,6 +3279,7 @@ def resolve_scope_document_search(
 ) -> dict[str, object]:
     scope, clauses, params, filter_summary = build_scope_search_filters(connection, raw_scope)
     keyword_query = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    uses_relevance_scoring = keyword_query_uses_relevance_scoring(keyword_query)
     bates_scope = scope.get("bates")
     bates_query = format_scope_bates_value(bates_scope)
     bates_begin = normalize_inline_whitespace(str(bates_scope.get("begin") or "")) if isinstance(bates_scope, dict) else ""
@@ -3199,7 +3335,7 @@ def resolve_scope_document_search(
         sort_name = "bates"
         order_name = "asc"
         sort_spec = "bates asc"
-    elif keyword_query:
+    elif keyword_query and uses_relevance_scoring:
         sorted_results = stable_sort_results_by_field(stable_results, "date_created", "desc")
         sorted_results = sorted(
             sorted_results,
@@ -3236,6 +3372,7 @@ def resolve_paged_scope_document_search(
 ) -> dict[str, object]:
     scope, clauses, params, filter_summary = build_scope_search_filters(connection, raw_scope)
     keyword_query = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    uses_relevance_scoring = keyword_query_uses_relevance_scoring(keyword_query)
     bates_scope = scope.get("bates")
     bates_query = format_scope_bates_value(bates_scope)
     bates_begin = normalize_inline_whitespace(str(bates_scope.get("begin") or "")) if isinstance(bates_scope, dict) else ""
@@ -3264,7 +3401,7 @@ def resolve_paged_scope_document_search(
         sort_name = "bates"
         order_name = "asc"
         sort_spec = "bates asc"
-    elif keyword_query:
+    elif keyword_query and uses_relevance_scoring:
         sort_name = "relevance"
         order_name = "asc"
         sort_spec = "relevance asc"
@@ -3300,7 +3437,10 @@ def resolve_paged_scope_document_search(
         if sort_specs:
             order_by_sql = sql_order_by_for_sort_specs(connection, sort_specs, alias="d")
         else:
-            order_by_sql = sql_relevance_order_by(connection, row_alias="d", rank_expr="bm.rank")
+            if uses_relevance_scoring:
+                order_by_sql = sql_relevance_order_by(connection, row_alias="d", rank_expr="bm.rank")
+            else:
+                order_by_sql = sql_order_by_for_sort_specs(connection, [("date_created", "desc")], alias="d")
         selection_page = search_fts_page(
             connection,
             keyword_query,
@@ -3641,7 +3781,8 @@ def active_sort_payload(scope: dict[str, object], session_state: dict[str, objec
             "sort_source": "default",
         }
 
-    if normalize_inline_whitespace(str(scope.get("keyword") or "")):
+    keyword_query = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    if keyword_query and keyword_query_uses_relevance_scoring(keyword_query):
         return {
             "sort": "relevance",
             "order": "asc",

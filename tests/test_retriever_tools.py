@@ -6570,6 +6570,78 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(search_result["results"][0]["file_name"], "chat-newer.txt")
         self.assertEqual(search_result["results"][1]["file_name"], "chat-older.txt")
 
+    def test_search_cli_view_mode_defaults_thread_listing_queries_to_newest_first(self) -> None:
+        self.write_email_message(
+            self.root / "older.eml",
+            subject="Beagle Feature -- Auto Tagging",
+            body_text="Beagle Feature -- Auto Tagging thread update from the older message.",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            self.root / "middle.eml",
+            subject="Beagle Feature -- Auto Tagging",
+            body_text="Beagle Feature -- Auto Tagging thread update from the middle message.",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+        self.write_email_message(
+            self.root / "newer.eml",
+            subject="Beagle Feature -- Auto Tagging",
+            body_text="Beagle Feature -- Auto Tagging thread update from the newest message.",
+            date_created="Tue, 14 Apr 2026 12:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 3)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "Beagle Feature -- Auto Tagging thread",
+            "--mode",
+            "view",
+            "--per-page",
+            "2",
+        )
+        next_exit, next_stdout, next_stderr = self.run_cli_raw("slash", str(self.root), "/next")
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertEqual(search_payload["sort"], "date_created")
+        self.assertEqual(search_payload["order"], "desc")
+        self.assertEqual(
+            [item["file_name"] for item in search_payload["results"]],
+            ["newer.eml", "middle.eml"],
+        )
+
+        self.assertEqual(next_exit, 0)
+        self.assertEqual(next_stderr, "")
+        self.assertIn("Page: 2 of 2  (docs 3-3 of 3)", next_stdout)
+        self.assertIn("older.eml", next_stdout)
+
+    def test_search_cli_view_mode_keeps_relevance_for_plain_content_queries(self) -> None:
+        (self.root / "alpha.txt").write_text("needle\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("needle needle needle\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "needle",
+            "--mode",
+            "view",
+        )
+
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        self.assertEqual(search_payload["sort"], "relevance")
+        self.assertEqual(search_payload["order"], "asc")
+
     def test_dataset_cli_commands_manage_manual_dataset_membership(self) -> None:
         document_path = self.root / "sample.txt"
         document_path.write_text("sample dataset body\n", encoding="utf-8")
@@ -6965,6 +7037,19 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("| Unrecognized | [↳ attachment-001.bin](computer://", rendered)
         self.assertNotIn("| ↳ Unrecognized |", rendered)
         self.assertNotIn("| Attachment | [↳ attachment-001.bin](computer://", rendered)
+
+    def test_search_cli_view_mode_renders_author_email_on_new_line(self) -> None:
+        rendered = retriever_tools.render_search_markdown_cell(
+            {
+                "author": '"Sood, Udit" usood@cov.com',
+                "display_values": {
+                    "author": '"Sood, Udit" usood@cov.com',
+                },
+            },
+            {"name": "author", "type": "text"},
+        )
+
+        self.assertEqual(rendered, "Sood, Udit<br>usood@cov.com")
 
     def test_ingest_eml_attachment_without_filename_uses_detected_extension(self) -> None:
         email_path = self.root / "thread.eml"
