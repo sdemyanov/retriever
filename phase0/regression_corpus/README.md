@@ -1,6 +1,6 @@
 # Regression Corpus
 
-This directory contains Phase 0 sample files used by [runtime_probe.py](/Users/sergey/Projects/retriever-plugin/phase0/runtime_probe.py).
+This directory contains Phase 0 sample files used by [runtime_probe.py](../runtime_probe.py).
 
 ## Files
 
@@ -47,3 +47,25 @@ Additional conversation-fixture gaps still open:
 
 - one malformed or incomplete Slack export fixture stored on disk
 - one ZIP-wrapped Slack export fixture stored on disk
+
+## Corpus Diff
+
+Use [ingest_corpus_diff.py](../ingest_corpus_diff.py) to run two `retriever_tools.py` builds against the same fixed corpus and compare normalized ingest state.
+
+Example:
+
+```bash
+python3 phase0/ingest_corpus_diff.py \
+  --baseline-tool /path/to/baseline/skills/tool-template/retriever_tools.py \
+  --candidate-tool /path/to/candidate/skills/tool-template/retriever_tools.py
+```
+
+By default the script:
+
+- copies this corpus into two fresh `workspace/` roots
+- adds tiny synthetic Slack export and processed-production fixtures
+- runs `bootstrap` and recursive `ingest` on both tools
+- writes normalized snapshots, a unified diff, and a summary under a temporary artifacts directory
+- exits `1` if a semantic diff is found
+
+Pass `--output-dir <path>` to keep artifacts in a stable location, `--no-synthetic-extras` to diff only the static corpus, or `--allow-diff` to exit `0` even when semantic differences are found.
