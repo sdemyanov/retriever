@@ -4440,6 +4440,45 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertEqual([item["rel_path"] for item, _ in prepared], ["alpha.txt", "beta.txt"])
 
+    def test_iter_prepared_container_message_items_preserves_input_order_with_multiple_workers(self) -> None:
+        def raw_messages():
+            yield {"source_item_id": "first"}
+            yield {"source_item_id": "second"}
+
+        def fake_normalize(source_rel_path: str, raw_message: dict[str, object]) -> dict[str, object]:
+            self.assertEqual(source_rel_path, "mailbox.mbox")
+            if raw_message["source_item_id"] == "first":
+                time.sleep(0.05)
+            return {
+                "rel_path": f"_retriever/logical/mbox/{raw_message['source_item_id']}.eml",
+                "file_name": f"{raw_message['source_item_id']}.eml",
+                "file_hash": str(raw_message["source_item_id"]),
+                "source_item_id": str(raw_message["source_item_id"]),
+                "source_folder_path": None,
+                "extracted": {
+                    "text_content": str(raw_message["source_item_id"]),
+                    "preview_artifacts": [],
+                    "attachments": [],
+                },
+            }
+
+        with mock.patch.object(retriever_tools, "ingest_container_prepare_worker_count", return_value=2):
+            prepared = list(
+                retriever_tools.iter_prepared_container_message_items(
+                    source_kind=retriever_tools.MBOX_SOURCE_KIND,
+                    source_rel_path="mailbox.mbox",
+                    raw_messages=raw_messages(),
+                    normalize_message=fake_normalize,
+                )
+            )
+
+        self.assertEqual(
+            [item["source_item_id"] for item, _ in prepared],
+            ["first", "second"],
+        )
+        self.assertFalse(prepared[0][0]["skip"])
+        self.assertTrue(prepared[0][0]["prepared_chunks"])
+
     def test_refresh_prepared_loose_file_item_if_stale_reprepares_with_new_contents(self) -> None:
         path = self.root / "alpha.txt"
         path.write_text("first version\n", encoding="utf-8")
