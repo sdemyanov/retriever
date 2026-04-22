@@ -1640,12 +1640,15 @@ def container_email_documents_missing_threading(
         SELECT 1
         FROM documents d
         LEFT JOIN document_email_threading det ON det.document_id = d.id
+        LEFT JOIN document_chat_threading dct ON dct.document_id = d.id
         WHERE d.source_kind = ?
           AND d.source_rel_path = ?
           AND d.parent_document_id IS NULL
-          AND d.content_type = 'Email'
           AND d.lifecycle_status != 'deleted'
-          AND det.document_id IS NULL
+          AND (
+            (d.content_type = 'Email' AND det.document_id IS NULL)
+            OR (d.content_type = 'Chat' AND dct.document_id IS NULL)
+          )
         LIMIT 1
         """,
         (source_kind, source_rel_path),
