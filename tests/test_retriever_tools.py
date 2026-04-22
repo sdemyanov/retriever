@@ -5795,26 +5795,44 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.preview_target_file_path(self.preview_target_by_label(root_result["preview_targets"], "segment")),
             self.preview_target_file_path(self.preview_target_by_label(reply_result["preview_targets"], "segment")),
         )
-        message_preview_html = self.preview_target_file_path(
+        root_message_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(root_result["preview_targets"], "message")
+        )
+        root_message_preview_html = root_message_preview_path.read_text(encoding="utf-8")
+        message_preview_path = self.preview_target_file_path(
             self.preview_target_by_label(reply_result["preview_targets"], "message")
-        ).read_text(encoding="utf-8")
+        )
+        message_preview_html = message_preview_path.read_text(encoding="utf-8")
+        segment_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(reply_result["preview_targets"], "segment")
+        )
+        expected_thread_href = retriever_tools.urllib_request.pathname2url(
+            os.path.relpath(str(segment_preview_path), start=str(message_preview_path.parent))
+        )
         expected_entry_path = (
             self.paths["state_dir"]
             / retriever_tools.conversation_preview_entry_rel_path(root_row["conversation_id"], reply_row["id"])
         )
         self.assertFalse(expected_entry_path.exists())
-        self.assertIn('class="gmail-thread-title">Status Update</h1>', message_preview_html)
+        self.assertIn("<title>Status Update (2/2 in thread)</title>", message_preview_html)
+        self.assertIn('class="gmail-thread-title-link"', message_preview_html)
+        self.assertIn('class="gmail-thread-title-meta">(2/2 in thread)</span>', message_preview_html)
+        self.assertIn(f'href="{expected_thread_href}"', message_preview_html)
         self.assertIn("2 messages", message_preview_html)
         self.assertIn("Created Apr 14, 2026 10:00 AM UTC", message_preview_html)
         self.assertIn("Last modified Apr 14, 2026 11:00 AM UTC", message_preview_html)
         self.assertIn("Viewing message 2 of 2", message_preview_html)
+        self.assertIn("<title>Status Update (1/2 in thread)</title>", root_message_preview_html)
+        self.assertIn("Viewing message 1 of 2", root_message_preview_html)
+        self.assertIn("Root message body", root_message_preview_html)
+        self.assertNotIn("Reply message body", root_message_preview_html)
+        self.assertEqual(root_message_preview_html.count('class="gmail-message-card'), 1)
         self.assertIn("Root message body", message_preview_html)
         self.assertIn("Reply message body", message_preview_html)
+        self.assertEqual(message_preview_html.count('class="gmail-message-card'), 2)
         self.assertIn('class="gmail-message-card gmail-message-card--selected"', message_preview_html)
         self.assertIn('class="reply-rich-email"', message_preview_html)
-        segment_html = self.preview_target_file_path(
-            self.preview_target_by_label(reply_result["preview_targets"], "segment")
-        ).read_text(encoding="utf-8")
+        segment_html = segment_preview_path.read_text(encoding="utf-8")
         toc_html = self.preview_target_file_path(
             self.preview_target_by_label(reply_result["preview_targets"], "contents")
         ).read_text(encoding="utf-8")
@@ -5837,6 +5855,187 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(
             self.preview_target_file_path(self.preview_target_by_label(reply_result["preview_targets"], "message")).exists()
         )
+
+    def test_email_message_preview_renders_thread_up_to_selected_message_only(self) -> None:
+        self.write_email_message(
+            self.root / "root.eml",
+            subject="Design Review",
+            body_text="Root thread message",
+            message_id="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 09:00:00 +0000",
+        )
+        self.write_email_message(
+            self.root / "middle.eml",
+            subject="Re: Design Review",
+            body_text="Middle thread message",
+            message_id="<middle@example.com>",
+            in_reply_to="<root@example.com>",
+            references="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            self.root / "final.eml",
+            subject="Re: Design Review",
+            body_text="Final thread message",
+            message_id="<final@example.com>",
+            in_reply_to="<middle@example.com>",
+            references="<root@example.com> <middle@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["email_conversations"], 1)
+
+        search_result = retriever_tools.search(self.root, "Middle thread message", None, None, None, 1, 20)
+        middle_result = next(item for item in search_result["results"] if item["rel_path"] == "middle.eml")
+        middle_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(middle_result["preview_targets"], "message")
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("<title>Design Review (2/3 in thread)</title>", middle_preview_html)
+        self.assertIn("Viewing message 2 of 3", middle_preview_html)
+        self.assertIn("Root thread message", middle_preview_html)
+        self.assertIn("Middle thread message", middle_preview_html)
+        self.assertNotIn("Final thread message", middle_preview_html)
+        self.assertEqual(middle_preview_html.count('class="gmail-message-card'), 2)
+
+    def test_thread_preview_omits_repeated_quoted_history_from_rich_reply_bodies(self) -> None:
+        root_path = self.root / "root.eml"
+        reply_path = self.root / "reply.eml"
+        self.write_email_message(
+            root_path,
+            subject="Status Update",
+            body_text="Root message body",
+            message_id="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            reply_path,
+            subject="Re: Status Update",
+            body_text=(
+                "Fresh reply body\n\n"
+                "On Tue, 14 Apr 2026 at 10:00 AM Root Sender <root@example.com> wrote:\n"
+                "> Root message body"
+            ),
+            body_html=(
+                '<div class="reply-rich-email">'
+                "<p><strong>Fresh reply body</strong></p>"
+                '<div class="gmail_quote">'
+                '<div class="gmail_attr">On Tue, 14 Apr 2026 at 10:00 AM Root Sender &lt;root@example.com&gt; wrote:</div>'
+                "<blockquote>Root message body</blockquote>"
+                "</div>"
+                "</div>"
+            ),
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        search_result = retriever_tools.search(self.root, "Fresh reply body", None, None, None, 1, 20)
+        reply_result = next(item for item in search_result["results"] if item["rel_path"] == "reply.eml")
+
+        message_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(reply_result["preview_targets"], "message")
+        ).read_text(encoding="utf-8")
+        segment_html = self.preview_target_file_path(
+            self.preview_target_by_label(reply_result["preview_targets"], "segment")
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Fresh reply body", message_preview_html)
+        self.assertIn("Root message body", message_preview_html)
+        self.assertEqual(message_preview_html.count('class="gmail-message-card'), 2)
+        self.assertIn("Fresh reply body", segment_html)
+        self.assertEqual(segment_html.count("Root message body"), 1)
+        self.assertNotIn('class="gmail_quote"', segment_html)
+
+    def test_refresh_conversation_previews_backfills_missing_email_message_preview(self) -> None:
+        root_path = self.root / "root.eml"
+        reply_path = self.root / "reply.eml"
+        self.write_email_message(
+            root_path,
+            subject="Status Update",
+            body_text="Root message body",
+            message_id="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            reply_path,
+            subject="Re: Status Update",
+            body_text="Reply message body",
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        root_row = self.fetch_document_row("root.eml")
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            message_preview_row = connection.execute(
+                """
+                SELECT rel_preview_path
+                FROM document_previews
+                WHERE document_id = ? AND label = 'message'
+                ORDER BY ordinal ASC, id ASC
+                LIMIT 1
+                """,
+                (root_row["id"],),
+            ).fetchone()
+            self.assertIsNotNone(message_preview_row)
+            legacy_message_preview_path = self.paths["state_dir"] / str(message_preview_row["rel_preview_path"])
+            if legacy_message_preview_path.exists():
+                legacy_message_preview_path.unlink()
+            connection.execute(
+                "DELETE FROM document_previews WHERE document_id = ? AND label = 'message'",
+                (root_row["id"],),
+            )
+            connection.commit()
+
+            legacy_search = retriever_tools.search(self.root, "Root message body", None, None, None, 1, 20)
+            legacy_result = next(item for item in legacy_search["results"] if item["id"] == root_row["id"])
+            self.assertEqual(
+                legacy_result["preview_rel_path"],
+                self.preview_target_by_label(legacy_result["preview_targets"], "segment")["rel_path"],
+            )
+            self.assertFalse(any(target.get("label") == "message" for target in legacy_result["preview_targets"]))
+
+            refreshed = retriever_tools.refresh_conversation_previews(
+                connection,
+                self.paths,
+                [root_row["conversation_id"]],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertEqual(refreshed, 1)
+        refreshed_search = retriever_tools.search(self.root, "Root message body", None, None, None, 1, 20)
+        refreshed_result = next(item for item in refreshed_search["results"] if item["id"] == root_row["id"])
+        self.assertEqual(
+            refreshed_result["preview_rel_path"],
+            self.preview_target_by_label(refreshed_result["preview_targets"], "message")["rel_path"],
+        )
+        self.assertEqual(refreshed_result["preview_targets"][0]["label"], "message")
+        refreshed_message_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(refreshed_result["preview_targets"], "message")
+        )
+        self.assertTrue(refreshed_message_preview_path.exists())
+        refreshed_message_preview_html = refreshed_message_preview_path.read_text(encoding="utf-8")
+        self.assertIn("Root message body", refreshed_message_preview_html)
+        self.assertIn('class="gmail-thread-title-link"', refreshed_message_preview_html)
 
     def test_ingest_groups_loose_eml_messages_without_thread_headers_using_heuristics(self) -> None:
         first_path = self.root / "first.eml"
@@ -9006,6 +9205,40 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         browse_results = retriever_tools.search(self.root, "", None, None, None, 1, 20)
         self.assertEqual(browse_results["total_hits"], 1)
 
+    def test_refresh_generated_previews_regenerates_mbox_message_previews_by_dataset_name(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Gmail Max Refresh",
+                    body_text="Refresh this generated preview body",
+                    message_id="<mbox-refresh-001@example.com>",
+                )
+            ],
+            name="gmail-max.mbox",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        message_rel_path = retriever_tools.mbox_message_rel_path("gmail-max.mbox", "<mbox-refresh-001@example.com>")
+        search_result = retriever_tools.search(self.root, "Refresh this generated preview body", None, None, None, 1, 20)
+        message_result = next(item for item in search_result["results"] if item["rel_path"] == message_rel_path)
+        message_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(message_result["preview_targets"], "message")
+        )
+        message_preview_path.write_text("stale preview html", encoding="utf-8")
+
+        refresh_result = retriever_tools.refresh_generated_previews(self.root, dataset_name="gmail-max.mbox")
+
+        self.assertEqual(refresh_result["status"], "ok")
+        self.assertEqual(refresh_result["dataset"]["dataset_name"], "gmail-max.mbox")
+        self.assertEqual(refresh_result["refreshed_conversations"], 1)
+        refreshed_html = message_preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale preview html", refreshed_html)
+        self.assertIn("Refresh this generated preview body", refreshed_html)
+        self.assertIn('class="gmail-thread-title"', refreshed_html)
+
     def test_changed_mbox_reingest_preserves_control_numbers_and_retires_removed_messages(self) -> None:
         self.write_fake_mbox_file(
             [
@@ -10695,31 +10928,43 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(len(payload["document_targets"]), 1)
         self.assertEqual(payload["document_targets"][0]["document_id"], reply_row["id"])
         self.assertEqual(payload["document_targets"][0]["target_fragment"], f"doc-{reply_row['id']}")
+        self.assertEqual(payload["document_targets"][0]["unit_output_rel_path"], payload["units"][0]["output_rel_path"])
 
         unit = payload["units"][0]
         self.assertEqual(unit["unit_kind"], "email_conversation")
         self.assertEqual(unit["selected_document_ids"], [reply_row["id"]])
         self.assertEqual(unit["document_ids"], [root_row["id"], reply_row["id"]])
-        self.assertEqual(unit["output_rel_path"], payload["document_targets"][0]["output_rel_path"])
+        self.assertNotEqual(unit["output_rel_path"], payload["document_targets"][0]["output_rel_path"])
 
         unit_path = Path(unit["output_path"])
+        document_path = Path(payload["document_targets"][0]["output_path"])
         index_path = Path(payload["index_path"])
         manifest_path = Path(payload["manifest_path"])
         self.assertTrue(unit_path.exists())
+        self.assertTrue(document_path.exists())
         self.assertTrue(index_path.exists())
         self.assertTrue(manifest_path.exists())
 
         unit_html = unit_path.read_text(encoding="utf-8")
+        document_html = document_path.read_text(encoding="utf-8")
         index_html = index_path.read_text(encoding="utf-8")
         self.assertIn("Root message body", unit_html)
         self.assertIn("Reply message body", unit_html)
         self.assertIn(f'id="doc-{root_row["id"]}"', unit_html)
         self.assertIn(f'id="doc-{reply_row["id"]}"', unit_html)
+        self.assertIn("Root message body", document_html)
+        self.assertIn("Reply message body", document_html)
+        self.assertEqual(document_html.count('class="gmail-message-card'), 2)
+        self.assertIn('class="gmail-thread-title-link"', document_html)
+        self.assertIn(f'href="../{unit["output_rel_path"]}"', document_html)
         self.assertIn("units/", index_html)
-        self.assertIn(f"#doc-{reply_row['id']}", index_html)
+        self.assertIn(payload["document_targets"][0]["output_rel_path"], index_html)
+        self.assertNotIn(f"#doc-{reply_row['id']}", index_html)
 
         units_dir = unit_path.parent
+        documents_dir = document_path.parent
         self.assertEqual(sorted(path.name for path in units_dir.glob("*.html")), [unit_path.name])
+        self.assertEqual(sorted(path.name for path in documents_dir.glob("*.html")), [document_path.name])
 
     def test_export_previews_merges_contiguous_slack_documents_and_splits_gaps(self) -> None:
         export_root = self.root / "data" / "slack"

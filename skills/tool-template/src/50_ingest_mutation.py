@@ -3997,6 +3997,124 @@ def reassign_conversations_and_refresh_previews(
     return assignment
 
 
+def resolve_conversation_preview_refresh_ids(
+    connection: sqlite3.Connection,
+    *,
+    conversation_ids: list[int] | None = None,
+    document_ids: list[int] | None = None,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+) -> tuple[list[int], dict[str, object] | None]:
+    target_conversation_ids: set[int] = set()
+    dataset_summary: dict[str, object] | None = None
+
+    if conversation_ids:
+        requested_conversation_ids = sorted(dict.fromkeys(int(conversation_id) for conversation_id in conversation_ids))
+        rows = connection.execute(
+            f"""
+            SELECT id
+            FROM conversations
+            WHERE id IN ({", ".join("?" for _ in requested_conversation_ids)})
+            """,
+            tuple(requested_conversation_ids),
+        ).fetchall()
+        found_conversation_ids = {int(row["id"]) for row in rows}
+        missing_conversation_ids = [
+            conversation_id
+            for conversation_id in requested_conversation_ids
+            if conversation_id not in found_conversation_ids
+        ]
+        if missing_conversation_ids:
+            missing_text = ", ".join(str(conversation_id) for conversation_id in missing_conversation_ids)
+            raise RetrieverError(f"Unknown conversation id(s): {missing_text}")
+        target_conversation_ids.update(requested_conversation_ids)
+
+    if document_ids:
+        for document_id in sorted(dict.fromkeys(int(document_id) for document_id in document_ids)):
+            root_row = get_document_family_root_row_for_assignment(connection, document_id)
+            conversation_id = root_row["conversation_id"]
+            if conversation_id is None:
+                raise RetrieverError(
+                    f"Document {document_id} does not belong to a conversation, so there are no conversation previews to refresh."
+                )
+            target_conversation_ids.add(int(conversation_id))
+
+    if dataset_id is not None or dataset_name is not None:
+        dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
+        dataset_summary = dataset_summary_by_id(connection, int(dataset_row["id"]))
+        rows = connection.execute(
+            """
+            SELECT DISTINCT documents.conversation_id AS conversation_id
+            FROM dataset_documents
+            JOIN documents ON documents.id = dataset_documents.document_id
+            WHERE dataset_documents.dataset_id = ?
+              AND documents.conversation_id IS NOT NULL
+              AND documents.lifecycle_status NOT IN ('missing', 'deleted')
+            ORDER BY documents.conversation_id ASC
+            """,
+            (int(dataset_row["id"]),),
+        ).fetchall()
+        target_conversation_ids.update(
+            int(row["conversation_id"])
+            for row in rows
+            if row["conversation_id"] is not None
+        )
+
+    if not target_conversation_ids and conversation_ids is None and document_ids is None and dataset_id is None and dataset_name is None:
+        target_conversation_ids.update(list_active_conversation_ids(connection))
+
+    return sorted(target_conversation_ids), dataset_summary
+
+
+def refresh_generated_previews(
+    root: Path,
+    *,
+    conversation_ids: list[int] | None = None,
+    document_ids: list[int] | None = None,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        target_conversation_ids, dataset_summary = resolve_conversation_preview_refresh_ids(
+            connection,
+            conversation_ids=conversation_ids,
+            document_ids=document_ids,
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+        )
+        connection.execute("BEGIN")
+        try:
+            refreshed = refresh_conversation_previews(connection, paths, target_conversation_ids)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        result: dict[str, object] = {
+            "status": "ok",
+            "refreshed_conversations": int(refreshed),
+        }
+        if conversation_ids is None and document_ids is None and dataset_id is None and dataset_name is None:
+            result["target_scope"] = "all_active_conversations"
+        else:
+            result["target_conversation_ids"] = target_conversation_ids
+        if document_ids:
+            result["requested_document_ids"] = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+        if conversation_ids:
+            result["requested_conversation_ids"] = sorted(
+                dict.fromkeys(int(conversation_id) for conversation_id in conversation_ids)
+            )
+        if dataset_summary is not None:
+            result["dataset"] = dataset_summary
+        return result
+    finally:
+        connection.close()
+
+
 def merge_into_conversation(root: Path, document_id: int, target_document_id: int) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
