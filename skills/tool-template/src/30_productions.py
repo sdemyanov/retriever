@@ -4675,14 +4675,15 @@ def ingest_pst_source(
     source_rel_path: str,
 ) -> dict[str, object]:
     # Salt the scan fingerprint so unchanged PSTs get one corrective reparse when
-    # container-routing rules change (for example, when Teams/system folders are reclassified).
+    # container-routing rules change (for example, when Teams/system folders are reclassified
+    # or attachment naming/type inference improves for unnamed blobs).
     result = ingest_container_source(
         connection,
         paths,
         path,
         source_rel_path,
         source_kind=PST_SOURCE_KIND,
-        scan_hash_salt="pst-ingest-v3",
+        scan_hash_salt="pst-ingest-v4",
         dataset_name=pst_dataset_name(source_rel_path),
         iter_messages=iter_pst_messages,
         normalize_message=normalize_pst_message,

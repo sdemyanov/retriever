@@ -6422,6 +6422,32 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertNotIn("| ↳ Unrecognized |", rendered)
         self.assertNotIn("| Attachment | [↳ attachment-001.bin](computer://", rendered)
 
+    def test_ingest_eml_attachment_without_filename_uses_detected_extension(self) -> None:
+        email_path = self.root / "thread.eml"
+        attachment_path = self.root / "attachment-source.pdf"
+        self.write_minimal_pdf(attachment_path, "Detected attachment")
+        attachment_bytes = attachment_path.read_bytes()
+        attachment_path.unlink()
+
+        message = EmailMessage()
+        message["From"] = "Alice Example <alice@example.com>"
+        message["To"] = "Bob Example <bob@example.com>"
+        message["Subject"] = "Detected attachment type"
+        message["Date"] = "Tue, 14 Apr 2026 10:00:00 +0000"
+        message.set_content("Hello team,\nThis carries a nameless PDF attachment.")
+        message.add_attachment(attachment_bytes, maintype="application", subtype="pdf")
+        email_path.write_bytes(message.as_bytes(policy=policy.default))
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        parent_row = self.fetch_document_row("thread.eml")
+        child_rows = self.fetch_child_rows(parent_row["id"])
+        self.assertEqual(len(child_rows), 1)
+        self.assertEqual(child_rows[0]["file_name"], "attachment-001.pdf")
+        self.assertEqual(child_rows[0]["file_type"], "pdf")
+
     def test_slash_search_persists_scope_and_search_within_keyword(self) -> None:
         (self.root / "alpha.txt").write_text("alpha beta body\n", encoding="utf-8")
         (self.root / "second.txt").write_text("alpha only body\n", encoding="utf-8")
@@ -11352,6 +11378,87 @@ class CidInliningTests(unittest.TestCase):
         self.assertIn("<title>Legalweek 2023 Mobile App Now Available</title>", preview_content)
         self.assertIn('class="gmail-thread-title">Legalweek 2023 Mobile App Now Available</h1>', preview_content)
         self.assertNotIn("Attachments: agenda.pdf", preview_content)
+
+
+class AttachmentResolutionTests(unittest.TestCase):
+    def test_sniff_attachment_file_type_detects_pdf_and_docx(self) -> None:
+        self.assertEqual(retriever_tools.sniff_attachment_file_type(b"%PDF-1.4\n1 0 obj\n"), "pdf")
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "[Content_Types].xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>
+""",
+            )
+            archive.writestr(
+                "word/document.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>
+""",
+            )
+        self.assertEqual(retriever_tools.sniff_attachment_file_type(buffer.getvalue()), "docx")
+
+    def test_pst_attachment_file_name_recovers_record_set_metadata(self) -> None:
+        class FakeRecordEntry:
+            def __init__(self, *, entry_type: int, value_type: int, data: bytes):
+                self.entry_type = entry_type
+                self.value_type = value_type
+                self.data = data
+
+        class FakeRecordSet:
+            def __init__(self, entries: list[object]):
+                self.entries = entries
+
+        class FakeAttachment:
+            def __init__(self, *, payload: bytes, record_sets: list[object]):
+                self.data = payload
+                self.record_sets = record_sets
+                self.name = None
+                self.filename = None
+                self.long_filename = None
+                self.display_name = None
+                self.mime_tag = None
+
+        payload = b"%PDF-1.7\n1 0 obj\n"
+        attachment = FakeAttachment(
+            payload=payload,
+            record_sets=[
+                FakeRecordSet(
+                    [
+                        FakeRecordEntry(
+                            entry_type=retriever_tools.PST_PROP_ATTACH_EXTENSION,
+                            value_type=0x001F,
+                            data=".pdf\x00".encode("utf-16-le"),
+                        ),
+                        FakeRecordEntry(
+                            entry_type=retriever_tools.PST_PROP_ATTACH_FILENAME,
+                            value_type=0x001F,
+                            data="Mcneil~1.pdf\x00".encode("utf-16-le"),
+                        ),
+                        FakeRecordEntry(
+                            entry_type=retriever_tools.PST_PROP_ATTACH_LONG_FILENAME,
+                            value_type=0x001F,
+                            data="Mcneill, Walter.pdf\x00".encode("utf-16-le"),
+                        ),
+                        FakeRecordEntry(
+                            entry_type=retriever_tools.PST_PROP_ATTACH_MIME_TAG,
+                            value_type=0x001F,
+                            data="application/pdf\x00".encode("utf-16-le"),
+                        ),
+                    ]
+                )
+            ],
+        )
+
+        self.assertEqual(
+            retriever_tools.pst_attachment_file_name(attachment, 1, payload=payload),
+            "Mcneill, Walter.pdf",
+        )
+        self.assertEqual(retriever_tools.pst_attachment_content_type(attachment), "application/pdf")
 
 
 if __name__ == "__main__":
