@@ -10,17 +10,22 @@ metadata:
 
 # Retriever /page-size
 
-This skill is a thin visible alias for Retriever's internal slash-command browse surface.
+Use this skill for `/page-size` and `/page-size <N>`.
 
-## Load order
+## Read-only fast path
+
+For the exact read-only form `/page-size`:
+
+- Do not read [../search/SKILL.md](../search/SKILL.md).
+- Run exactly one Bash command from the workspace root:
+  - `/page-size`: `python3 .retriever/bin/retriever_tools.py slash . /page-size`
+- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+- Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
+
+## Other forms
+
+For `/page-size <N>`:
 
 1. Read [../search/SKILL.md](../search/SKILL.md).
-
-## Behavior
-
-- Treat this skill as the slash command `/page-size`.
-- Supported forms:
-  - `/page-size` shows the active page size.
-  - `/page-size <N>` changes the page size.
-- Keep bare `/page-size` read-only and use an argument to change it.
-- Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion around the slash-command result.
+2. Treat this skill as the slash command `/page-size`.
+3. Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.

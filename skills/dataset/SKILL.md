@@ -10,20 +10,24 @@ metadata:
 
 # Retriever /dataset
 
-This skill is a thin visible alias for Retriever's internal slash-command browse surface.
+Use this skill for `/dataset`, `/dataset list`, `/dataset <name>`, and `/dataset clear`.
 
-## Load order
+## Read-only fast path
+
+For the exact read-only forms `/dataset` and `/dataset list`:
+
+- Do not read [../search/SKILL.md](../search/SKILL.md).
+- Do not read schema docs.
+- Run exactly one Bash command from the workspace root:
+  - `/dataset`: `python3 .retriever/bin/retriever_tools.py slash . /dataset`
+  - `/dataset list`: `python3 .retriever/bin/retriever_tools.py slash . /dataset list`
+- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+- Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
+
+## Other forms
+
+For `/dataset <name>` and `/dataset clear`:
 
 1. Read [../search/SKILL.md](../search/SKILL.md).
-2. Read [../schema/schema.md](../schema/schema.md) if field names are unclear.
-
-## Behavior
-
-- Treat this skill as the slash command `/dataset`.
-- Supported forms:
-  - `/dataset` shows the active dataset selector.
-  - `/dataset list` lists available datasets.
-  - `/dataset <name>` scopes the browse surface to a dataset.
-  - `/dataset clear` clears the active dataset selector.
-- Keep bare `/dataset` read-only and use `list` for available options.
-- Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion around the slash-command result.
+2. Treat this skill as the slash command `/dataset`.
+3. Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.

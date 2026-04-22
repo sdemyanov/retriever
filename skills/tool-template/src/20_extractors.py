@@ -2035,17 +2035,18 @@ def build_email_extracted_payload(
         [author, recipients or None],
     )
     preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
-    preview_title = resolved_subject or "Retriever Email Preview"
-    preview = build_html_preview(
+    preview = build_email_message_preview_html(
         {
-            "From": author or "",
-            "To": recipients or "",
-            "Date": format_chat_preview_timestamp(date_created) or date_created or "",
-            "Subject": resolved_subject or "",
+            "id": 0,
+            "author": author,
+            "recipients": recipients or None,
+            "date_created": date_created,
+            "subject": resolved_subject,
+            "title": resolved_subject,
+            "text_content": normalized_text,
+            "standalone_preview_body_html": preview_html_body,
         },
         body_html=preview_html_body,
-        body_text=normalized_text,
-        document_title=preview_title,
     )
     return {
         "page_count": 1,
@@ -2095,6 +2096,24 @@ def email_header_value(header_mapping: object, key: str) -> str | None:
             normalized = normalize_whitespace(str(raw_value or ""))
             return normalized or None
     return None
+
+
+def extract_email_recipients_from_headers(header_text: object) -> str | None:
+    parsed_headers = parse_email_headers_only(header_text)
+    if parsed_headers is None:
+        return None
+    recipients: list[str] = []
+    seen: set[str] = set()
+    append_unique_participants(
+        recipients,
+        seen,
+        [
+            normalize_whitespace(str(parsed_headers.get("To") or "")) or None,
+            normalize_whitespace(str(parsed_headers.get("Cc") or "")) or None,
+            normalize_whitespace(str(parsed_headers.get("Bcc") or "")) or None,
+        ],
+    )
+    return ", ".join(recipients) or None
 
 
 def build_email_threading_payload(
@@ -2838,14 +2857,16 @@ def pst_message_author(message: object) -> str | None:
     return sender or sender_email or None
 
 
-def pst_message_recipients(message: object) -> str | None:
+def pst_message_recipients(message: object, transport_headers: object = None) -> str | None:
     parts = [
         normalize_whitespace(str(getattr(message, "display_to", "") or "")),
         normalize_whitespace(str(getattr(message, "display_cc", "") or "")),
         normalize_whitespace(str(getattr(message, "display_bcc", "") or "")),
     ]
     recipients = ", ".join(part for part in parts if part)
-    return recipients or None
+    if recipients:
+        return recipients
+    return extract_email_recipients_from_headers(transport_headers)
 
 
 def pst_attachment_file_name(attachment: object, ordinal: int) -> str:
@@ -3155,15 +3176,17 @@ def iter_pst_raw_messages(
                     max_record_entries=max_record_entries,
                 )
 
+            transport_headers = pst_message_transport_headers(message)
+
             yield {
                 "source_item_id": source_item_id,
                 "folder_path": folder_path,
                 "message_class": message_class,
                 "subject": normalize_whitespace(str(getattr(message, "subject", "") or "")) or None,
                 "conversation_topic": pst_message_conversation_topic(message),
-                "transport_headers": pst_message_transport_headers(message),
+                "transport_headers": transport_headers,
                 "author": pst_message_author(message),
-                "recipients": pst_message_recipients(message),
+                "recipients": pst_message_recipients(message, transport_headers),
                 "date_created": normalize_datetime(
                     getattr(message, "delivery_time", None)
                     or getattr(message, "client_submit_time", None)
@@ -3382,6 +3405,8 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
     normalized_subject = normalize_whitespace(str(message_dict.get("subject") or "")) or None
     normalized_author = normalize_whitespace(str(message_dict.get("author") or "")) or None
     normalized_recipients = normalize_whitespace(str(message_dict.get("recipients") or "")) or None
+    if normalized_recipients is None:
+        normalized_recipients = extract_email_recipients_from_headers(message_dict.get("transport_headers"))
     normalized_date_created = normalize_datetime(message_dict.get("date_created"))
     normalized_text_body = None if message_dict.get("text_body") is None else str(message_dict.get("text_body") or "")
     normalized_html_body = None if html_body is None else str(html_body)
