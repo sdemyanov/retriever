@@ -2,15 +2,16 @@
 name: dataset
 description: >
   This skill should be used when the user types "/dataset", "/dataset list",
-  "/dataset production", or "/dataset clear". It exposes Retriever's visible slash-command
-  surface for dataset scoping and discovery.
+  "/dataset production", "/dataset production, priority", or "/dataset clear".
+  It exposes Retriever's visible slash-command surface for dataset scoping and
+  discovery.
 metadata:
-  version: "0.17.2"
+  version: "0.17.3"
 ---
 
 # Retriever /dataset
 
-Use this skill for `/dataset`, `/dataset list`, `/dataset <name>`, and `/dataset clear`.
+Use this skill for `/dataset`, `/dataset list`, `/dataset <name>`, `/dataset <name>, <name>`, `/dataset clear`, and `/dataset rename <old-name> <new-name>`.
 
 ## Read-only fast path
 
@@ -26,8 +27,9 @@ For the exact read-only forms `/dataset` and `/dataset list`:
 
 ## Other forms
 
-For `/dataset <name>` and `/dataset clear`:
+For `/dataset <name>`, comma-separated dataset selection, `/dataset clear`, and `/dataset rename <old-name> <new-name>`:
 
 1. Read [../search/SKILL.md](../search/SKILL.md).
-2. Treat this skill as the slash command `/dataset`.
-3. Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.
+2. Preserve comma-separated dataset selectors exactly as written; quote names with spaces when needed.
+3. Treat this skill as the slash command `/dataset`.
+4. Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.

@@ -2,15 +2,16 @@
 name: sort
 description: >
   This skill should be used when the user types "/sort", "/sort list",
-  "/sort date_created desc", or "/sort default". It exposes Retriever's visible
-  slash-command surface for sort inspection and changes.
+  "/sort date_created desc", "/sort date_created desc, file_name asc",
+  or "/sort default". It exposes Retriever's visible slash-command surface for
+  sort inspection and changes.
 metadata:
-  version: "0.17.2"
+  version: "0.17.3"
 ---
 
 # Retriever /sort
 
-Use this skill for `/sort`, `/sort list`, `/sort <field> <asc|desc>`, and `/sort default`.
+Use this skill for `/sort`, `/sort list`, `/sort <field> <asc|desc>`, `/sort <field> <asc|desc>, <field> <asc|desc>`, and `/sort default`.
 
 ## Read-only fast path
 
@@ -26,9 +27,10 @@ For the exact read-only forms `/sort` and `/sort list`:
 
 ## Other forms
 
-For `/sort <field> <asc|desc>` and `/sort default`:
+For `/sort <field> <asc|desc>`, comma-separated multi-column sort specs, and `/sort default`:
 
 1. Read [../search/SKILL.md](../search/SKILL.md).
 2. Read [../schema/schema.md](../schema/schema.md) only if sortable field names are unclear.
 3. Treat this skill as the slash command `/sort`.
-4. Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.
+4. Preserve comma-separated sort specs exactly as written; do not collapse them to a single column.
+5. Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.
