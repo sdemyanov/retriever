@@ -1970,7 +1970,7 @@ def search(
     sort_field: str | None,
     order: str | None,
     page: int,
-    per_page: int,
+    per_page: int | None,
     raw_columns: str | None = None,
     mode: str = "compose",
     *,
@@ -1978,14 +1978,16 @@ def search(
 ) -> dict[str, object]:
     if page < 1:
         raise RetrieverError("Page must be >= 1.")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    if per_page is None:
+        per_page = session_page_size(read_session_state(paths))
     if per_page < 1:
         raise RetrieverError("per-page must be >= 1.")
     per_page = min(per_page, MAX_PAGE_SIZE)
     normalized_mode = normalize_search_mode(mode)
     compact_mode = bool(compact_mode) and normalized_mode == "compose"
 
-    paths = workspace_paths(root)
-    ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         benchmark_mark("schema_begin")
@@ -2182,8 +2184,8 @@ def search(
         }
         if display_warnings:
             payload["warnings"] = display_warnings
+        payload["rendered_markdown"] = render_search_markdown(payload, display_column_defs)
         if normalized_mode == "view":
-            payload["rendered_markdown"] = render_search_markdown(payload, display_column_defs)
             explicit_sort_specs = None
             if sort_field:
                 explicit_sort_specs = [(str(selection["sort"]), str(selection["order"]))]
@@ -2205,7 +2207,7 @@ def search_docs(
     sort_field: str | None,
     order: str | None,
     page: int,
-    per_page: int,
+    per_page: int | None,
     raw_columns: str | None = None,
     mode: str = "compose",
     *,
@@ -6681,8 +6683,8 @@ def add_search_arguments(parser: argparse.ArgumentParser) -> None:
         "--limit",
         dest="per_page",
         type=int,
-        default=DEFAULT_PAGE_SIZE,
-        help="Results per page",
+        default=None,
+        help="Results per page (defaults to saved /page-size or 10)",
     )
     parser.add_argument("--columns", help="Comma-separated result columns")
     parser.add_argument("--mode", choices=("compose", "view"), default="compose", help="Search response mode")
