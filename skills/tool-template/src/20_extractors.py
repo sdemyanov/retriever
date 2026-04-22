@@ -713,9 +713,9 @@ def extract_native_preview_only_file(path: Path, explicit_content_type: str | No
 
 
 def extract_rtf_file(path: Path) -> dict[str, object]:
-    dependency_guard(rtf_to_text, "striprtf", "rtf")
+    rtf_to_text_fn = dependency_guard("rtf_to_text", "striprtf", "rtf")
     decoded, text_status, _ = decode_bytes(path.read_bytes())
-    text_content = normalize_whitespace(rtf_to_text(decoded))
+    text_content = normalize_whitespace(rtf_to_text_fn(decoded))
     email_headers = extract_email_like_headers(text_content)
     chat_metadata = extract_chat_transcript_metadata(text_content)
     participants = extract_email_chain_participants(
@@ -777,8 +777,8 @@ def extract_rtf_file(path: Path) -> dict[str, object]:
 
 
 def extract_pdf_file(path: Path) -> dict[str, object]:
-    dependency_guard(pdfplumber, "pdfplumber", "pdf")
-    with pdfplumber.open(path) as pdf:  # type: ignore[union-attr]
+    pdfplumber_module = dependency_guard("pdfplumber", "pdfplumber", "pdf")
+    with pdfplumber_module.open(path) as pdf:  # type: ignore[union-attr]
         metadata = pdf.metadata or {}
         texts = [(page.extract_text() or "").strip() for page in pdf.pages]
         text_content = normalize_whitespace("\n\n".join(part for part in texts if part))
@@ -840,8 +840,8 @@ def extract_pdf_file(path: Path) -> dict[str, object]:
 
 
 def extract_docx_file(path: Path) -> dict[str, object]:
-    dependency_guard(DocxDocument, "python-docx", "docx")
-    document = DocxDocument(path)  # type: ignore[operator]
+    docx_document_cls = dependency_guard("DocxDocument", "python-docx", "docx")
+    document = docx_document_cls(path)  # type: ignore[operator]
     text_content = normalize_whitespace("\n\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text))
     props = document.core_properties
     email_headers = extract_email_like_headers(text_content)
@@ -1573,9 +1573,9 @@ def scan_xls_sheet_surface(
 
 
 def extract_xlsx_file(path: Path) -> dict[str, object]:
-    dependency_guard(openpyxl, "openpyxl", "xlsx")
+    openpyxl_module = dependency_guard("openpyxl", "openpyxl", "xlsx")
     read_only = path.stat().st_size > SPREADSHEET_XLSX_READ_ONLY_FALLBACK_BYTES
-    workbook = openpyxl.load_workbook(path, read_only=read_only, data_only=True)  # type: ignore[union-attr]
+    workbook = openpyxl_module.load_workbook(path, read_only=read_only, data_only=True)  # type: ignore[union-attr]
     preview_artifacts: list[dict[str, object]] = []
     sections: list[str] = []
     workbook_hyperlinks_seen: set[str] = set()
@@ -1681,8 +1681,8 @@ def extract_xlsx_file(path: Path) -> dict[str, object]:
 
 
 def extract_xls_file(path: Path) -> dict[str, object]:
-    dependency_guard(xlrd, "xlrd", "xls")
-    workbook = xlrd.open_workbook(path, formatting_info=True)  # type: ignore[union-attr]
+    xlrd_module = dependency_guard("xlrd", "xlrd", "xls")
+    workbook = xlrd_module.open_workbook(path, formatting_info=True)  # type: ignore[union-attr]
     preview_artifacts: list[dict[str, object]] = []
     sections: list[str] = []
     workbook_hyperlinks_seen: set[str] = set()
@@ -2572,8 +2572,8 @@ def extract_eml_file(path: Path, include_attachments: bool = True) -> dict[str, 
 
 
 def extract_msg_file(path: Path, include_attachments: bool = True) -> dict[str, object]:
-    dependency_guard(extract_msg, "extract-msg", "msg")
-    message = extract_msg.Message(str(path))  # type: ignore[union-attr]
+    extract_msg_module = dependency_guard("extract_msg", "extract-msg", "msg")
+    message = extract_msg_module.Message(str(path))  # type: ignore[union-attr]
     try:
         subject = message.subject or None
         author = message.sender or None
@@ -3244,7 +3244,7 @@ def iter_pst_raw_messages(
     include_debug_record_sets: bool = False,
     max_record_entries: int = 128,
 ):
-    dependency_guard(pypff, "libpff-python", "pst")
+    pypff_module = dependency_guard("pypff", "libpff-python", "pst")
 
     def _iter_folder(folder: object, ancestors: list[str]):
         folder_name = normalize_whitespace(str(getattr(folder, "name", "") or ""))
@@ -3348,7 +3348,7 @@ def iter_pst_raw_messages(
         ):
             yield from _iter_folder(child_folder, current_ancestors)
 
-    pst_file = pypff.file()  # type: ignore[union-attr]
+    pst_file = pypff_module.file()  # type: ignore[union-attr]
     pst_file.open(str(path))
     try:
         root_folder = pst_file.get_root_folder()

@@ -1534,14 +1534,13 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
     paths = workspace_paths(root)
     fts5 = probe_fts5()
     pip_ok, pip_version = run_command([sys.executable, "-m", "pip", "--version"])
-    pst_backend = {
-        "status": "pass" if pypff is not None else "fail",
-        "detail": (
-            "pypff import succeeded"
-            if pypff is not None
-            else "Missing required PST backend import 'pypff'. Install the pinned libpff-python dependency and rerun doctor."
-        ),
-    }
+    pst_backend = dependency_status(
+        "pypff",
+        package_name="libpff-python",
+        import_name="pypff",
+        detail_label="PST backend",
+        probe_if_unloaded=True,
+    )
     runtime = read_runtime(paths["runtime_path"])
     current_sha = sha256_file(paths["tool_path"])
     stored_sha = None if runtime is None else runtime.get("template_sha256")
@@ -1569,8 +1568,6 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
 
     overall = "pass"
     if fts5["status"] != "pass":
-        overall = "fail"
-    elif pst_backend["status"] != "pass":
         overall = "fail"
     elif db_error is not None:
         overall = "fail"

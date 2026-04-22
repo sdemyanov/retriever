@@ -582,7 +582,7 @@ Expected JSON shape:
   },
   "pst_backend": {
     "status": "pass",
-    "detail": "pypff import succeeded"
+    "detail": "PST backend import succeeded"
   },
   "workspace": {
     "root": "/path/to/workspace",
