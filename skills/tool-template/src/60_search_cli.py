@@ -2848,11 +2848,38 @@ def build_search_header_payload(scope: dict[str, object], payload: dict[str, obj
     sort_summary = str(payload.get("sort_spec") or f"{payload.get('sort')} {payload.get('order')}")
     browse_mode = normalize_browse_mode(payload.get("browse_mode"))
     result_label = "conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "docs"
-    return {
-        "scope": format_scope_header(scope),
-        "sort": f"Sort: {sort_summary}",
-        "page": f"Page: {page} of {payload.get('total_pages')}  ({result_label} {start_index}-{end_index} of {total_hits})",
-    }
+
+    header: dict[str, str] = {}
+
+    keyword = scope.get("keyword") if isinstance(scope.get("keyword"), str) else None
+    if keyword and keyword.strip():
+        header["keyword"] = f"Keyword: {keyword!r}"
+
+    bates_value = format_scope_bates_value(scope.get("bates"))
+    if bates_value:
+        header["bates"] = f"Bates: {bates_value}"
+
+    filter_value = scope.get("filter")
+    if isinstance(filter_value, str) and filter_value.strip():
+        header["filters"] = f"Active filters: {truncate_scope_header_value(filter_value)}"
+
+    dataset_entries = coerce_scope_dataset_entries(scope.get("dataset"))
+    if dataset_entries:
+        dataset_names = ", ".join(entry["name"] for entry in dataset_entries)
+        header["datasets"] = f"Datasets: {truncate_scope_header_value(dataset_names)}"
+
+    if scope.get("from_run_id") is not None:
+        header["from_run_id"] = f"From run: {scope['from_run_id']}"
+
+    if not any(key in header for key in ("keyword", "bates", "filters", "datasets", "from_run_id")):
+        header["scope"] = "Scope: (none)"
+
+    header["sort"] = f"Sort: {sort_summary}"
+    header["page"] = (
+        f"Page: {page} of {payload.get('total_pages')}"
+        f"  ({result_label} {start_index}-{end_index} of {total_hits})"
+    )
+    return header
 
 
 CONVERSATION_FIELD_DEFINITIONS = {
@@ -3464,15 +3491,198 @@ def render_search_markdown_row(
     return "| " + " | ".join(cells) + " |"
 
 
+SEARCH_HEADER_KEY_ORDER = (
+    "keyword",
+    "bates",
+    "filters",
+    "custodians",
+    "datasets",
+    "from_run_id",
+    "scope",
+    "sort",
+    "page",
+)
+
+
+def compute_search_overview_line(
+    results: object,
+    *,
+    browse_mode: str,
+) -> str | None:
+    if not isinstance(results, list) or not results:
+        return None
+    datasets: set[str] = set()
+    custodians: set[str] = set()
+    with_attachments = 0
+    flagged_empty = 0
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        dataset_names_value = item.get("dataset_names")
+        if isinstance(dataset_names_value, list):
+            for name in dataset_names_value:
+                if name is None:
+                    continue
+                text = str(name).strip()
+                if text:
+                    datasets.add(text)
+        else:
+            dataset_name_value = item.get("dataset_name")
+            if dataset_name_value:
+                for part in str(dataset_name_value).split(","):
+                    part = part.strip()
+                    if part:
+                        datasets.add(part)
+        custodian_values = item.get("custodians")
+        if isinstance(custodian_values, list) and custodian_values:
+            for value in custodian_values:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    custodians.add(text)
+        else:
+            custodian_value = item.get("custodian")
+            if custodian_value:
+                for part in str(custodian_value).split(","):
+                    part = part.strip()
+                    if part:
+                        custodians.add(part)
+        attachments = item.get("attachments")
+        attachment_count = 0
+        try:
+            attachment_count = int(item.get("attachment_count") or 0)
+        except (TypeError, ValueError):
+            attachment_count = 0
+        if attachment_count > 0 or (isinstance(attachments, list) and attachments):
+            with_attachments += 1
+        text_status = item.get("text_status")
+        if text_status in {"empty", "no_text", "unavailable"}:
+            flagged_empty += 1
+    parts: list[str] = []
+    if datasets:
+        parts.append(f"{len(datasets)} dataset{'s' if len(datasets) != 1 else ''}")
+    if custodians:
+        parts.append(f"{len(custodians)} custodian{'s' if len(custodians) != 1 else ''}")
+    if with_attachments:
+        parts.append(f"{with_attachments} with attachments")
+    if flagged_empty:
+        parts.append(f"{flagged_empty} flagged (text_status=empty)")
+    if not parts:
+        return None
+    label = "conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "docs"
+    parts.insert(0, f"{len(results)} {label} on this page")
+    return "Overview: " + " \u00b7 ".join(parts)
+
+
+def build_search_footer_hints(
+    payload: dict[str, object],
+    results: object,
+    *,
+    page: int,
+    total_pages: int,
+) -> list[str]:
+    hints: list[str] = []
+    nav: list[str] = []
+    if page < max(total_pages, 1):
+        nav.append("`/retriever:next` for the next page")
+    if page > 1:
+        nav.append("`/retriever:previous` to go back")
+    if nav:
+        hints.append("Navigate: " + ", ".join(nav) + ".")
+
+    if not isinstance(results, list) or not results:
+        return hints
+
+    dataset_counts: dict[str, int] = {}
+    run_ids: set[str] = set()
+    custodian_counts: dict[str, int] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        dataset_names_value = item.get("dataset_names")
+        if isinstance(dataset_names_value, list):
+            for name in dataset_names_value:
+                if name is None:
+                    continue
+                text = str(name).strip()
+                if text:
+                    dataset_counts[text] = dataset_counts.get(text, 0) + 1
+        else:
+            dataset_name_value = item.get("dataset_name")
+            if dataset_name_value:
+                for part in str(dataset_name_value).split(","):
+                    part = part.strip()
+                    if part:
+                        dataset_counts[part] = dataset_counts.get(part, 0) + 1
+        run_value = item.get("processing_run_id") or item.get("run_id")
+        if run_value is not None and str(run_value).strip():
+            run_ids.add(str(run_value).strip())
+        custodian_values = item.get("custodians")
+        if isinstance(custodian_values, list) and custodian_values:
+            for value in custodian_values:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    custodian_counts[text] = custodian_counts.get(text, 0) + 1
+        else:
+            custodian_value = item.get("custodian")
+            if custodian_value:
+                for part in str(custodian_value).split(","):
+                    part = part.strip()
+                    if part:
+                        custodian_counts[part] = custodian_counts.get(part, 0) + 1
+
+    scope_value = payload.get("scope")
+    active_scope = scope_value if isinstance(scope_value, dict) else {}
+    has_dataset_scope = bool(coerce_scope_dataset_entries(active_scope.get("dataset")))
+    has_run_scope = active_scope.get("from_run_id") is not None
+    existing_filter = str(active_scope.get("filter") or "")
+
+    narrow: list[str] = []
+    if len(dataset_counts) > 1 and not has_dataset_scope:
+        dominant_dataset = max(dataset_counts.items(), key=lambda item: item[1])
+        narrow.append(
+            f"`/filter dataset_name = '{dominant_dataset[0]}'` to focus on one dataset"
+        )
+    if len(run_ids) > 1 and not has_run_scope:
+        narrow.append("`/from-run <id>` to focus on a specific processing run")
+    if (
+        len(custodian_counts) > 1
+        and "custodian" not in existing_filter.lower()
+    ):
+        dominant_custodian = max(custodian_counts.items(), key=lambda item: item[1])
+        narrow.append(
+            f"`/filter custodian = '{dominant_custodian[0]}'` to focus on one custodian"
+        )
+
+    if narrow:
+        hints.append("Narrow: " + "; ".join(narrow) + ".")
+    return hints
+
+
 def render_search_markdown(payload: dict[str, object], column_defs: list[dict[str, str]]) -> str:
     lines: list[str] = []
     browse_mode = normalize_browse_mode(payload.get("browse_mode"))
     header = payload.get("header")
     if isinstance(header, dict):
-        for key in ("scope", "sort", "page"):
+        for key in SEARCH_HEADER_KEY_ORDER:
             value = header.get(key)
             if payload_has_meaningful_value(value):
                 lines.append(str(value))
+        for key, value in header.items():
+            if key in SEARCH_HEADER_KEY_ORDER:
+                continue
+            if payload_has_meaningful_value(value):
+                lines.append(str(value))
+
+    overview_line = compute_search_overview_line(
+        payload.get("results"),
+        browse_mode=browse_mode,
+    )
+    if overview_line:
+        lines.append(overview_line)
 
     column_names = [str(column_def["name"]) for column_def in column_defs]
     lines.append("")
@@ -3531,13 +3741,21 @@ def render_search_markdown(payload: dict[str, object], column_defs: list[dict[st
     total_hits = int(payload.get("total_hits") or 0)
     page = int(payload.get("page") or 1)
     per_page = int(payload.get("per_page") or DEFAULT_PAGE_SIZE)
+    total_pages = int(payload.get("total_pages") or 1)
     start_index = 0 if total_hits == 0 else ((page - 1) * per_page) + 1
     end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
     result_label = "Conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "Documents"
-    footer = f"{result_label} {start_index}\u2013{end_index} of {total_hits}."
-    if page < int(payload.get("total_pages") or 1):
-        footer += " Ask for the next page to see more."
-    lines.extend(["", footer])
+    footer_lines = [f"{result_label} {start_index}\u2013{end_index} of {total_hits}."]
+    footer_lines.extend(
+        build_search_footer_hints(
+            payload,
+            payload.get("results"),
+            page=page,
+            total_pages=total_pages,
+        )
+    )
+    lines.append("")
+    lines.extend(footer_lines)
     return "\n".join(lines)
 
 
