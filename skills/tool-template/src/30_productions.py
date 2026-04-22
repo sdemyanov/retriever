@@ -2588,6 +2588,17 @@ EMAIL_QUOTED_REPLY_HEADER_PATTERN = re.compile(
     r"^(?:From|Sent|To|Cc|Bcc|Subject|Date):\s+",
     flags=re.IGNORECASE,
 )
+EMAIL_HTML_QUOTED_REPLY_START_PATTERNS = (
+    re.compile(
+        r'(?is)<(?:div|section|table|blockquote)\b[^>]*class\s*=\s*(["\'])[^"\']*\bgmail_(?:quote|attr)\b[^"\']*\1'
+    ),
+    re.compile(r'(?is)<blockquote\b[^>]*type\s*=\s*(["\'])cite\1[^>]*>'),
+    re.compile(
+        r"(?is)<(?:div|p|span|font|td)\b[^>]*>\s*"
+        r"(?:On .+ wrote:|Begin forwarded message:|-{2,}\s*(?:Original|Forwarded) Message\s*-{2,})"
+    ),
+    re.compile(r"(?is)<blockquote\b"),
+)
 
 
 def build_email_preview_head_html() -> str:
@@ -2709,6 +2720,28 @@ def split_email_preview_text_content(text_content: str) -> tuple[str, str | None
                     return visible_text, quoted_text
         has_visible_content = True
     return normalized_text, None
+
+
+def email_html_has_visible_content(html_content: str | None) -> bool:
+    return bool(normalize_whitespace(strip_html_tags(str(html_content or ""))))
+
+
+def strip_email_reply_history_html(html_content: str | None) -> str | None:
+    normalized_html = str(html_content or "").strip()
+    if not normalized_html:
+        return None
+    split_index = min(
+        (
+            match.start()
+            for pattern in EMAIL_HTML_QUOTED_REPLY_START_PATTERNS
+            if (match := pattern.search(normalized_html)) is not None
+        ),
+        default=None,
+    )
+    if split_index is None:
+        return normalized_html
+    candidate = re.sub(r"(?is)(?:<br\s*/?>|\s|&nbsp;)+$", "", normalized_html[:split_index]).strip()
+    return candidate if email_html_has_visible_content(candidate) else None
 
 
 def build_email_message_body_content_html(
@@ -3445,6 +3478,7 @@ def build_conversation_segment_html(
             segment_label=segment_label,
             segment_count=segment_count,
             attachment_links_by_document_id=attachment_links_by_document_id,
+            strip_quoted_history=True,
         )
     headers = {
         "Conversation": normalize_whitespace(str(conversation_row["display_name"] or "")) or f"Conversation {int(conversation_row['id'])}",
@@ -3768,6 +3802,7 @@ def refresh_conversation_previews(
                             if len(documents) > 1
                             else None
                         ),
+                        thread_rel_path=str(segment["segment_rel_path"]),
                     )
                 preview_rows: list[dict[str, object]] = []
                 if conversation_document_uses_entry_preview(document):
