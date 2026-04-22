@@ -914,6 +914,55 @@ def document_path_payload(
     return payload
 
 
+def resolve_conversation_preview_rel_path(paths: dict[str, Path], conversation_id: int) -> str:
+    preferred_rel_path = conversation_preview_full_rel_path(conversation_id)
+    preferred_abs_path = paths["state_dir"] / preferred_rel_path
+    if preferred_abs_path.exists():
+        return preferred_rel_path
+    preview_dir = paths["state_dir"] / conversation_preview_base_path(conversation_id)
+    if preview_dir.exists():
+        segment_paths = sorted(
+            path.relative_to(paths["state_dir"]).as_posix()
+            for path in preview_dir.glob("segment-*.html")
+            if path.is_file()
+        )
+        if segment_paths:
+            return segment_paths[0]
+    toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
+    if (paths["state_dir"] / toc_rel_path).exists():
+        return toc_rel_path
+    return preferred_rel_path
+
+
+def conversation_path_payload(
+    paths: dict[str, Path],
+    conversation_id: int,
+    *,
+    include_preview_targets: bool = True,
+) -> dict[str, object]:
+    rel_preview_path = resolve_conversation_preview_rel_path(paths, conversation_id)
+    abs_preview_path = str(paths["state_dir"] / rel_preview_path)
+    preview_target = build_preview_target_payload(
+        rel_path=str(Path(INTERNAL_REL_PATH_PREFIX) / rel_preview_path),
+        abs_path=abs_preview_path,
+        preview_type="html",
+        label="conversation",
+        ordinal=0,
+    )
+    payload = {
+        "rel_path": preview_target["rel_path"],
+        "abs_path": preview_target["abs_path"],
+        "preview_rel_path": preview_target["rel_path"],
+        "preview_abs_path": preview_target["abs_path"],
+        "preview_file_rel_path": preview_target["file_rel_path"],
+        "preview_file_abs_path": preview_target["file_abs_path"],
+        "preview_target_fragment": preview_target["target_fragment"],
+    }
+    if include_preview_targets:
+        payload["preview_targets"] = [preview_target]
+    return payload
+
+
 def fetch_attachment_counts(
     connection: sqlite3.Connection,
     parent_ids: list[int],
@@ -1098,14 +1147,14 @@ def fetch_production_names(connection: sqlite3.Connection, rows: list[sqlite3.Ro
     return {int(row["id"]): str(row["production_name"]) for row in result_rows}
 
 
-def fetch_document_dataset_memberships(
+def fetch_dataset_memberships_for_document_ids(
     connection: sqlite3.Connection,
-    rows: list[sqlite3.Row],
+    document_ids: list[int],
 ) -> dict[int, dict[str, list[object]]]:
-    document_ids = sorted({int(row["id"]) for row in rows})
-    if not document_ids:
+    normalized_document_ids = sorted({int(document_id) for document_id in document_ids})
+    if not normalized_document_ids:
         return {}
-    placeholders = ", ".join("?" for _ in document_ids)
+    placeholders = ", ".join("?" for _ in normalized_document_ids)
     result_rows = connection.execute(
         f"""
         SELECT dd.document_id, ds.id AS dataset_id, ds.dataset_name
@@ -1114,7 +1163,7 @@ def fetch_document_dataset_memberships(
         WHERE dd.document_id IN ({placeholders})
         ORDER BY dd.document_id ASC, LOWER(ds.dataset_name) ASC, ds.id ASC
         """,
-        document_ids,
+        normalized_document_ids,
     ).fetchall()
     memberships: dict[int, dict[str, list[object]]] = defaultdict(lambda: {"ids": [], "names": []})
     for row in result_rows:
@@ -1126,6 +1175,64 @@ def fetch_document_dataset_memberships(
         if dataset_name not in payload["names"]:
             payload["names"].append(dataset_name)
     return memberships
+
+
+def fetch_document_dataset_memberships(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+) -> dict[int, dict[str, list[object]]]:
+    return fetch_dataset_memberships_for_document_ids(
+        connection,
+        [int(row["id"]) for row in rows],
+    )
+
+
+def load_conversation_summary_documents(
+    connection: sqlite3.Connection,
+    conversation_ids: list[int],
+) -> dict[int, list[dict[str, object]]]:
+    normalized_conversation_ids = sorted({int(conversation_id) for conversation_id in conversation_ids})
+    if not normalized_conversation_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in normalized_conversation_ids)
+    rows = connection.execute(
+        f"""
+        SELECT
+          id,
+          conversation_id,
+          parent_document_id,
+          author,
+          participants,
+          recipients,
+          date_created,
+          date_modified,
+          source_rel_path,
+          rel_path
+        FROM documents
+        WHERE conversation_id IN ({placeholders})
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+          AND COALESCE(child_document_kind, '') != ?
+        ORDER BY conversation_id ASC, id ASC
+        """,
+        [*normalized_conversation_ids, CHILD_DOCUMENT_KIND_ATTACHMENT],
+    ).fetchall()
+    grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[int(row["conversation_id"])].append(
+            {
+                "id": int(row["id"]),
+                "conversation_id": int(row["conversation_id"]),
+                "parent_document_id": row["parent_document_id"],
+                "author": row["author"],
+                "participants": row["participants"],
+                "recipients": row["recipients"],
+                "date_created": row["date_created"],
+                "date_modified": row["date_modified"],
+                "source_rel_path": row["source_rel_path"],
+                "rel_path": row["rel_path"],
+            }
+        )
+    return dict(grouped)
 
 
 def chunk_preview_text(text: object, *, max_chars: int = 220) -> str:
@@ -1166,6 +1273,19 @@ def compact_metadata_payload(metadata: object) -> dict[str, object]:
 def compact_search_result_payload(item: dict[str, object]) -> dict[str, object]:
     compact: dict[str, object] = {"id": item["id"]}
     for key in ("control_number", "file_name", "file_type", "preview_abs_path", "snippet", "rank"):
+        if key in item and payload_has_meaningful_value(item[key]):
+            compact[key] = item[key]
+    for key in (
+        "conversation_id",
+        "conversation_type",
+        "title",
+        "participants",
+        "first_activity",
+        "last_activity",
+        "document_count",
+        "matching_document_count",
+        "source_kind",
+    ):
         if key in item and payload_has_meaningful_value(item[key]):
             compact[key] = item[key]
 
@@ -1221,6 +1341,7 @@ def compact_search_payload(payload: dict[str, object]) -> dict[str, object]:
         "filters": payload["filters"],
         "sort": payload["sort"],
         "order": payload["order"],
+        "browse_mode": normalize_browse_mode(payload.get("browse_mode")),
         "page": payload["page"],
         "per_page": payload["per_page"],
         "total_hits": payload["total_hits"],
@@ -2202,7 +2323,7 @@ def search(
     paths = workspace_paths(root)
     ensure_layout(paths)
     if per_page is None:
-        per_page = session_page_size(read_session_state(paths))
+        per_page = session_page_size(read_session_state(paths), browse_mode=BROWSE_MODE_DOCUMENTS)
     if per_page < 1:
         raise RetrieverError("per-page must be >= 1.")
     per_page = min(per_page, MAX_PAGE_SIZE)
@@ -2430,6 +2551,7 @@ def search(
             "sort": selection["sort"],
             "order": selection["order"],
             "sort_spec": selection["sort_spec"],
+            "browse_mode": BROWSE_MODE_DOCUMENTS,
             "page": page,
             "per_page": per_page,
             "total_hits": total_hits,
@@ -2459,6 +2581,7 @@ def search(
                 payload,
                 display_column_defs,
                 sort_specs=explicit_sort_specs,
+                browse_mode=BROWSE_MODE_DOCUMENTS,
             )
         return payload
     finally:
@@ -2575,15 +2698,86 @@ def build_search_header_payload(scope: dict[str, object], payload: dict[str, obj
     start_index = 0 if total_hits == 0 else ((page - 1) * per_page) + 1
     end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
     sort_summary = str(payload.get("sort_spec") or f"{payload.get('sort')} {payload.get('order')}")
+    browse_mode = normalize_browse_mode(payload.get("browse_mode"))
+    result_label = "conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "docs"
     return {
         "scope": format_scope_header(scope),
         "sort": f"Sort: {sort_summary}",
-        "page": f"Page: {page} of {payload.get('total_pages')}  (docs {start_index}-{end_index} of {total_hits})",
+        "page": f"Page: {page} of {payload.get('total_pages')}  ({result_label} {start_index}-{end_index} of {total_hits})",
     }
 
 
-def default_display_columns() -> list[str]:
-    return list(DEFAULT_DISPLAY_COLUMNS)
+CONVERSATION_FIELD_DEFINITIONS = {
+    "conversation_type": {
+        "field_name": "conversation_type",
+        "field_type": "text",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "title": {
+        "field_name": "title",
+        "field_type": "text",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "participants": {
+        "field_name": "participants",
+        "field_type": "text",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "false",
+    },
+    "first_activity": {
+        "field_name": "first_activity",
+        "field_type": "date",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "last_activity": {
+        "field_name": "last_activity",
+        "field_type": "date",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "document_count": {
+        "field_name": "document_count",
+        "field_type": "integer",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "matching_document_count": {
+        "field_name": "matching_document_count",
+        "field_type": "integer",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "source_kind": {
+        "field_name": "source_kind",
+        "field_type": "text",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "dataset_name": {
+        "field_name": "dataset_name",
+        "field_type": "text",
+        "source": "conversation",
+        "displayable": "true",
+        "sortable": "false",
+    },
+}
+
+
+def default_display_columns(browse_mode: str = BROWSE_MODE_DOCUMENTS) -> list[str]:
+    if normalize_browse_mode(browse_mode) == BROWSE_MODE_CONVERSATIONS:
+        return list(DEFAULT_CONVERSATION_DISPLAY_COLUMNS)
+    return list(DEFAULT_DOCUMENT_DISPLAY_COLUMNS)
 
 
 def normalize_search_mode(mode: object | None) -> str:
@@ -2595,32 +2789,93 @@ def normalize_search_mode(mode: object | None) -> str:
     return normalized
 
 
-def session_display_state(session_state: dict[str, object]) -> dict[str, object]:
+def session_browse_mode(session_state: dict[str, object]) -> str:
+    return normalize_browse_mode(session_state.get("browse_mode"))
+
+
+def session_display_state(
+    session_state: dict[str, object],
+    *,
+    browse_mode: str | None = None,
+) -> dict[str, object]:
+    effective_browse_mode = normalize_browse_mode(browse_mode or session_browse_mode(session_state))
     display = session_state.get("display")
-    return display if isinstance(display, dict) else {}
+    if not isinstance(display, dict):
+        return {}
+    branch = display.get(effective_browse_mode)
+    return branch if isinstance(branch, dict) else {}
 
 
-def displayable_field_names(connection: sqlite3.Connection) -> list[str]:
+def conversation_field_definition(field_name: str) -> dict[str, str]:
+    canonical_name = FIELD_NAME_ALIASES.get(field_name, field_name)
+    field_def = CONVERSATION_FIELD_DEFINITIONS.get(canonical_name)
+    if field_def is None:
+        raise RetrieverError(f"Unknown field: {field_name}")
+    return dict(field_def)
+
+
+def resolve_browse_field_definition(
+    connection: sqlite3.Connection,
+    field_name: str,
+    *,
+    browse_mode: str,
+) -> dict[str, str]:
+    effective_browse_mode = normalize_browse_mode(browse_mode)
+    if effective_browse_mode == BROWSE_MODE_CONVERSATIONS:
+        return conversation_field_definition(field_name)
+    return resolve_field_definition(connection, field_name)
+
+
+def known_browse_field_names(connection: sqlite3.Connection, *, browse_mode: str) -> list[str]:
+    if normalize_browse_mode(browse_mode) == BROWSE_MODE_CONVERSATIONS:
+        return sorted(CONVERSATION_FIELD_DEFINITIONS)
+    return known_logical_field_names(connection)
+
+
+def displayable_field_names(
+    connection: sqlite3.Connection,
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+) -> list[str]:
     names: set[str] = set()
-    for field_name in known_logical_field_names(connection):
-        field_def = resolve_field_definition(connection, field_name)
+    for field_name in known_browse_field_names(connection, browse_mode=browse_mode):
+        field_def = resolve_browse_field_definition(connection, field_name, browse_mode=browse_mode)
         if str(field_def.get("displayable") or "").lower() == "true":
             names.add(str(field_def["field_name"]))
     return sorted(names)
 
 
-def display_field_suggestions(connection: sqlite3.Connection, field_name: str) -> list[str]:
-    return difflib.get_close_matches(field_name, displayable_field_names(connection), n=3, cutoff=0.45)
+def display_field_suggestions(
+    connection: sqlite3.Connection,
+    field_name: str,
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+) -> list[str]:
+    return difflib.get_close_matches(
+        field_name,
+        displayable_field_names(connection, browse_mode=browse_mode),
+        n=3,
+        cutoff=0.45,
+    )
 
 
-def displayable_field_examples(connection: sqlite3.Connection, *, limit: int = 12) -> str:
-    return ", ".join(displayable_field_names(connection)[:limit])
+def displayable_field_examples(
+    connection: sqlite3.Connection,
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+    limit: int = 12,
+) -> str:
+    return ", ".join(displayable_field_names(connection, browse_mode=browse_mode)[:limit])
 
 
-def default_display_column_definitions(connection: sqlite3.Connection) -> list[dict[str, str]]:
+def default_display_column_definitions(
+    connection: sqlite3.Connection,
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+) -> list[dict[str, str]]:
     definitions: list[dict[str, str]] = []
-    for column_name in default_display_columns():
-        field_def = resolve_field_definition(connection, column_name)
+    for column_name in default_display_columns(browse_mode):
+        field_def = resolve_browse_field_definition(connection, column_name, browse_mode=browse_mode)
         definitions.append(
             {
                 "name": str(field_def["field_name"]),
@@ -2636,8 +2891,9 @@ def resolve_display_column_definitions(
     raw_columns: object,
     *,
     drop_missing: bool,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
 ) -> tuple[list[dict[str, str]], list[str], bool]:
-    raw_values = raw_columns if isinstance(raw_columns, list) and raw_columns else default_display_columns()
+    raw_values = raw_columns if isinstance(raw_columns, list) and raw_columns else default_display_columns(browse_mode)
     warnings: list[str] = []
     changed = False
     resolved_columns: list[dict[str, str]] = []
@@ -2648,7 +2904,11 @@ def resolve_display_column_definitions(
             changed = True
             continue
         try:
-            field_def = resolve_field_definition(connection, normalized_name)
+            field_def = resolve_browse_field_definition(
+                connection,
+                normalized_name,
+                browse_mode=browse_mode,
+            )
         except RetrieverError as exc:
             if drop_missing:
                 warnings.append(
@@ -2656,7 +2916,7 @@ def resolve_display_column_definitions(
                 )
                 changed = True
                 continue
-            suggestions = display_field_suggestions(connection, normalized_name)
+            suggestions = display_field_suggestions(connection, normalized_name, browse_mode=browse_mode)
             suggestion_text = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
             raise RetrieverError(f"Unknown column: {normalized_name}.{suggestion_text}") from exc
         canonical_name = str(field_def["field_name"])
@@ -2669,7 +2929,7 @@ def resolve_display_column_definitions(
                 continue
             raise RetrieverError(
                 f"Field '{canonical_name}' is filter-only and cannot be displayed. "
-                f"Displayable fields include: {displayable_field_examples(connection)}."
+                f"Displayable fields include: {displayable_field_examples(connection, browse_mode=browse_mode)}."
             )
         if canonical_name in seen_names:
             changed = True
@@ -2685,7 +2945,7 @@ def resolve_display_column_definitions(
             }
         )
     if not resolved_columns:
-        return default_display_column_definitions(connection), warnings, True
+        return default_display_column_definitions(connection, browse_mode=browse_mode), warnings, True
     return resolved_columns, warnings, changed
 
 
@@ -2704,14 +2964,21 @@ def persist_display_columns(
     paths: dict[str, Path],
     session_state: dict[str, object],
     column_defs: list[dict[str, str]],
+    *,
+    browse_mode: str,
 ) -> dict[str, object]:
-    display_state = session_display_state(session_state)
+    effective_browse_mode = normalize_browse_mode(browse_mode)
+    display_root = session_state.get("display")
+    if not isinstance(display_root, dict):
+        display_root = {}
+    display_state = session_display_state(session_state, browse_mode=effective_browse_mode)
     column_names = display_column_names(column_defs)
-    if column_names == default_display_columns():
+    if column_names == default_display_columns(effective_browse_mode):
         display_state.pop("columns", None)
     else:
         display_state["columns"] = column_names
-    session_state["display"] = coerce_display_payload(display_state)
+    display_root[effective_browse_mode] = coerce_display_payload(display_state)
+    session_state["display"] = coerce_mode_payloads(display_root, coerce_display_payload)
     return persist_session_state(paths, session_state)
 
 
@@ -2720,10 +2987,16 @@ def persist_display_preferences(
     session_state: dict[str, object],
     column_defs: list[dict[str, str]],
     page_size: int,
+    *,
+    browse_mode: str,
 ) -> dict[str, object]:
-    display_state = session_display_state(session_state)
+    effective_browse_mode = normalize_browse_mode(browse_mode)
+    display_root = session_state.get("display")
+    if not isinstance(display_root, dict):
+        display_root = {}
+    display_state = session_display_state(session_state, browse_mode=effective_browse_mode)
     column_names = display_column_names(column_defs)
-    if column_names == default_display_columns():
+    if column_names == default_display_columns(effective_browse_mode):
         display_state.pop("columns", None)
     else:
         display_state["columns"] = column_names
@@ -2731,7 +3004,8 @@ def persist_display_preferences(
         display_state.pop("page_size", None)
     else:
         display_state["page_size"] = page_size
-    session_state["display"] = coerce_display_payload(display_state)
+    display_root[effective_browse_mode] = coerce_display_payload(display_state)
+    session_state["display"] = coerce_mode_payloads(display_root, coerce_display_payload)
     return persist_session_state(paths, session_state)
 
 
@@ -2739,15 +3013,23 @@ def resolve_session_display_columns(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
     session_state: dict[str, object],
+    *,
+    browse_mode: str,
 ) -> tuple[list[dict[str, str]], list[str], dict[str, object]]:
-    configured_columns = session_display_state(session_state).get("columns")
+    configured_columns = session_display_state(session_state, browse_mode=browse_mode).get("columns")
     column_defs, warnings, changed = resolve_display_column_definitions(
         connection,
         configured_columns,
         drop_missing=True,
+        browse_mode=browse_mode,
     )
     if changed:
-        session_state = persist_display_columns(paths, session_state, column_defs)
+        session_state = persist_display_columns(
+            paths,
+            session_state,
+            column_defs,
+            browse_mode=browse_mode,
+        )
     return column_defs, warnings, session_state
 
 
@@ -2824,6 +3106,16 @@ def build_search_result_display_values(
 ) -> dict[str, object]:
     return {
         column_def["name"]: search_result_display_value(row, item, column_def["name"], column_def["type"])
+        for column_def in column_defs
+    }
+
+
+def build_summary_display_values(
+    item: dict[str, object],
+    column_defs: list[dict[str, str]],
+) -> dict[str, object]:
+    return {
+        column_def["name"]: summary_display_value(item, column_def["name"], column_def["type"])
         for column_def in column_defs
     }
 
@@ -2973,7 +3265,7 @@ def render_search_markdown_cell(
         value = summary_display_value(item, column_name, field_type)
     if column_name == "content_type" and child_content_type and not value:
         value = child_content_type
-    if column_name in {"date_created", "date_modified"}:
+    if field_type == "date":
         return format_search_markdown_date(value)
     if column_name == "title":
         title_text = normalize_inline_whitespace(str(value or best_summary_title(item) or "Untitled"))
@@ -3013,6 +3305,7 @@ def render_search_markdown_row(
 
 def render_search_markdown(payload: dict[str, object], column_defs: list[dict[str, str]]) -> str:
     lines: list[str] = []
+    browse_mode = normalize_browse_mode(payload.get("browse_mode"))
     header = payload.get("header")
     if isinstance(header, dict):
         for key in ("scope", "sort", "page"):
@@ -3079,7 +3372,8 @@ def render_search_markdown(payload: dict[str, object], column_defs: list[dict[st
     per_page = int(payload.get("per_page") or DEFAULT_PAGE_SIZE)
     start_index = 0 if total_hits == 0 else ((page - 1) * per_page) + 1
     end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
-    footer = f"Documents {start_index}\u2013{end_index} of {total_hits}."
+    result_label = "Conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "Documents"
+    footer = f"{result_label} {start_index}\u2013{end_index} of {total_hits}."
     if page < int(payload.get("total_pages") or 1):
         footer += " Ask for the next page to see more."
     lines.extend(["", footer])
@@ -3223,14 +3517,26 @@ def sort_specs_text(sort_specs: list[tuple[str, str]] | None) -> str | None:
     return ", ".join(f"{field_name} {direction}" for field_name, direction in sort_specs)
 
 
-def resolve_sort_field_name(connection: sqlite3.Connection, raw_field_name: str) -> str:
-    field_def = resolve_field_definition(connection, raw_field_name)
+def resolve_sort_field_name(
+    connection: sqlite3.Connection,
+    raw_field_name: str,
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+) -> str:
+    field_def = resolve_browse_field_definition(connection, raw_field_name, browse_mode=browse_mode)
     if field_def.get("source") == "virtual":
         raise RetrieverError(f"Cannot sort by virtual filter field: {raw_field_name}")
+    if str(field_def.get("sortable") or "true").lower() != "true":
+        raise RetrieverError(f"Field '{field_def['field_name']}' cannot be used for sorting.")
     return str(field_def["field_name"])
 
 
-def parse_slash_sort_specs(connection: sqlite3.Connection, raw_text: str) -> list[tuple[str, str]]:
+def parse_slash_sort_specs(
+    connection: sqlite3.Connection,
+    raw_text: str,
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+) -> list[tuple[str, str]]:
     if not normalize_inline_whitespace(raw_text):
         raise RetrieverError("Usage: /sort <column asc|desc[, column asc|desc...]>")
     parts = split_quoted_comma_values(raw_text)
@@ -3241,7 +3547,7 @@ def parse_slash_sort_specs(connection: sqlite3.Connection, raw_text: str) -> lis
         tokens = shlex_split_slash_tail(part)
         if len(tokens) != 2:
             raise RetrieverError("Each sort entry must be exactly '<column> <asc|desc>'.")
-        field_name = resolve_sort_field_name(connection, tokens[0])
+        field_name = resolve_sort_field_name(connection, tokens[0], browse_mode=browse_mode)
         direction = normalize_inline_whitespace(tokens[1]).lower()
         if direction not in {"asc", "desc"}:
             raise RetrieverError("Sort direction must be 'asc' or 'desc'.")
@@ -3268,6 +3574,75 @@ def apply_sort_specs(
             )
             continue
         sorted_results = stable_sort_results_by_field(sorted_results, field_name, direction)
+    return sorted_results
+
+
+def stable_sort_summary_results_by_field(
+    results: list[dict[str, object]],
+    field_name: str,
+    order: str,
+    *,
+    field_type: str,
+) -> list[dict[str, object]]:
+    reverse = order.lower() == "desc"
+    non_null_items: list[tuple[object, dict[str, object]]] = []
+    null_items: list[dict[str, object]] = []
+    for item in results:
+        raw_value = item.get(field_name)
+        if raw_value in (None, ""):
+            null_items.append(item)
+            continue
+        normalized_value: object = raw_value
+        if field_type == "date":
+            parsed_value = parse_utc_timestamp(raw_value)
+            if parsed_value is None:
+                null_items.append(item)
+                continue
+            normalized_value = parsed_value
+        elif field_type == "integer":
+            try:
+                normalized_value = int(raw_value)
+            except (TypeError, ValueError):
+                null_items.append(item)
+                continue
+        elif field_type == "real":
+            try:
+                normalized_value = float(raw_value)
+            except (TypeError, ValueError):
+                null_items.append(item)
+                continue
+        elif isinstance(raw_value, str):
+            normalized_value = raw_value.lower()
+        non_null_items.append((normalized_value, item))
+    non_null_items.sort(key=lambda pair: pair[0], reverse=reverse)
+    return [item for _, item in non_null_items] + null_items
+
+
+def apply_conversation_sort_specs(
+    results: list[dict[str, object]],
+    sort_specs: list[tuple[str, str]] | None,
+) -> list[dict[str, object]]:
+    if not sort_specs:
+        return results
+    effective_specs = list(sort_specs)
+    if not any(field_name == "id" for field_name, _ in effective_specs):
+        effective_specs.append(("id", "asc"))
+    sorted_results = list(results)
+    for field_name, direction in reversed(effective_specs):
+        if field_name == "id":
+            sorted_results = sorted(
+                sorted_results,
+                key=lambda item: int(item["id"]),
+                reverse=direction == "desc",
+            )
+            continue
+        field_type = str(conversation_field_definition(field_name)["field_type"])
+        sorted_results = stable_sort_summary_results_by_field(
+            sorted_results,
+            field_name,
+            direction,
+            field_type=field_type,
+        )
     return sorted_results
 
 
@@ -3477,6 +3852,201 @@ def resolve_paged_scope_document_search(
     }
 
 
+def resolve_paged_scope_conversation_search(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    raw_scope: object,
+    *,
+    sort_specs: list[tuple[str, str]] | None = None,
+    offset: int,
+    per_page: int,
+) -> dict[str, object]:
+    selection = resolve_scope_document_search(connection, raw_scope)
+    scope = coerce_scope_payload(selection.get("scope"))
+    keyword_query = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    uses_relevance_scoring = keyword_query_uses_relevance_scoring(keyword_query)
+    bates_query = format_scope_bates_value(scope.get("bates"))
+
+    grouped_matches: dict[int, dict[str, object]] = {}
+    for match in selection["results"]:
+        row = match["row"]
+        if row["conversation_id"] is None:
+            continue
+        if normalize_inline_whitespace(str(row["child_document_kind"] or "")) == CHILD_DOCUMENT_KIND_ATTACHMENT:
+            continue
+        conversation_id = int(row["conversation_id"])
+        payload = grouped_matches.setdefault(
+            conversation_id,
+            {
+                "matching_document_ids": set(),
+                "snippet": "",
+                "rank": None,
+                "bates_sort_key": None,
+            },
+        )
+        matching_document_ids = payload["matching_document_ids"]
+        assert isinstance(matching_document_ids, set)
+        matching_document_ids.add(int(match["id"]))
+        snippet = normalize_inline_whitespace(str(match.get("snippet") or ""))
+        rank = match.get("rank")
+        if rank is not None and (payload["rank"] is None or rank < payload["rank"]):
+            payload["rank"] = rank
+            if snippet:
+                payload["snippet"] = snippet
+        elif not payload["snippet"] and snippet:
+            payload["snippet"] = snippet
+        bates_sort_key = match.get("bates_sort_key")
+        if bates_sort_key is not None and (
+            payload["bates_sort_key"] is None or bates_sort_key < payload["bates_sort_key"]
+        ):
+            payload["bates_sort_key"] = bates_sort_key
+            if not payload["snippet"] and snippet:
+                payload["snippet"] = snippet
+
+    conversation_ids = sorted(grouped_matches)
+    if not conversation_ids:
+        return {
+            "scope": scope,
+            "query": selection["query"],
+            "filters": selection["filters"],
+            "sort": "last_activity",
+            "order": "desc",
+            "sort_spec": "last_activity desc",
+            "results": [],
+            "total_hits": 0,
+        }
+
+    placeholders = ", ".join("?" for _ in conversation_ids)
+    conversation_rows = connection.execute(
+        f"""
+        SELECT id, source_kind, conversation_type, display_name
+        FROM conversations
+        WHERE id IN ({placeholders})
+        """,
+        conversation_ids,
+    ).fetchall()
+    conversation_rows_by_id = {int(row["id"]): row for row in conversation_rows}
+    summary_documents_by_conversation = load_conversation_summary_documents(connection, conversation_ids)
+
+    summary_results: list[dict[str, object]] = []
+    for conversation_id in conversation_ids:
+        conversation_row = conversation_rows_by_id.get(conversation_id)
+        documents = summary_documents_by_conversation.get(conversation_id, [])
+        if conversation_row is None or not documents:
+            continue
+        first_activity, last_activity = conversation_preview_bounds(documents)
+        matching_document_ids = grouped_matches[conversation_id]["matching_document_ids"]
+        assert isinstance(matching_document_ids, set)
+        summary_results.append(
+            {
+                "id": conversation_id,
+                "conversation_id": conversation_id,
+                "conversation_type": normalize_inline_whitespace(str(conversation_row["conversation_type"] or "")),
+                "title": normalize_inline_whitespace(str(conversation_row["display_name"] or "")) or f"Conversation {conversation_id}",
+                "participants": conversation_preview_participants(documents),
+                "first_activity": first_activity,
+                "last_activity": last_activity,
+                "document_count": len(documents),
+                "matching_document_count": len(matching_document_ids),
+                "source_kind": normalize_inline_whitespace(str(conversation_row["source_kind"] or "")) or None,
+                "snippet": str(grouped_matches[conversation_id]["snippet"] or ""),
+                "rank": grouped_matches[conversation_id]["rank"],
+                "_bates_sort_key": grouped_matches[conversation_id]["bates_sort_key"],
+                "_document_ids": [int(document["id"]) for document in documents],
+            }
+        )
+
+    stable_results = sorted(summary_results, key=lambda item: int(item["id"]))
+    if sort_specs:
+        sorted_results = apply_conversation_sort_specs(stable_results, sort_specs)
+        sort_name = sort_specs[0][0]
+        order_name = sort_specs[0][1]
+        sort_spec = sort_specs_text(sort_specs) or f"{sort_name} {order_name}"
+    elif bates_query:
+        sorted_results = sorted(
+            stable_results,
+            key=lambda item: item.get("_bates_sort_key") or (1, "", 0, ""),
+        )
+        sort_name = "bates"
+        order_name = "asc"
+        sort_spec = "bates asc"
+    elif keyword_query and uses_relevance_scoring:
+        sorted_results = stable_sort_summary_results_by_field(
+            stable_results,
+            "last_activity",
+            "desc",
+            field_type="date",
+        )
+        sorted_results = stable_sort_summary_results_by_field(
+            sorted_results,
+            "rank",
+            "asc",
+            field_type="real",
+        )
+        sort_name = "relevance"
+        order_name = "asc"
+        sort_spec = "relevance asc"
+    else:
+        sorted_results = stable_sort_summary_results_by_field(
+            stable_results,
+            "last_activity",
+            "desc",
+            field_type="date",
+        )
+        sort_name = "last_activity"
+        order_name = "desc"
+        sort_spec = "last_activity desc"
+
+    total_hits = len(sorted_results)
+    paged_results = [dict(item) for item in sorted_results[offset: offset + per_page]]
+    paged_document_ids = [
+        document_id
+        for item in paged_results
+        for document_id in item.get("_document_ids", [])
+        if isinstance(document_id, int)
+    ]
+    dataset_memberships = fetch_dataset_memberships_for_document_ids(connection, paged_document_ids)
+    for item in paged_results:
+        dataset_ids: list[int] = []
+        dataset_names: list[str] = []
+        for document_id in item.pop("_document_ids", []):
+            memberships = dataset_memberships.get(int(document_id), {"ids": [], "names": []})
+            for dataset_id in memberships["ids"]:
+                normalized_dataset_id = int(dataset_id)
+                if normalized_dataset_id not in dataset_ids:
+                    dataset_ids.append(normalized_dataset_id)
+            for dataset_name in memberships["names"]:
+                normalized_dataset_name = str(dataset_name)
+                if normalized_dataset_name not in dataset_names:
+                    dataset_names.append(normalized_dataset_name)
+        item["dataset_ids"] = dataset_ids
+        item["dataset_names"] = dataset_names
+        if len(dataset_names) == 1:
+            item["dataset_name"] = dataset_names[0]
+        item["metadata"] = {
+            "conversation_type": item.get("conversation_type"),
+            "title": item.get("title"),
+            "participants": item.get("participants"),
+            "first_activity": item.get("first_activity"),
+            "last_activity": item.get("last_activity"),
+            "document_count": item.get("document_count"),
+            "source_kind": item.get("source_kind"),
+        }
+        item.update(conversation_path_payload(paths, int(item["id"])))
+        item.pop("_bates_sort_key", None)
+
+    return {
+        "scope": scope,
+        "query": selection["query"],
+        "filters": selection["filters"],
+        "sort": sort_name,
+        "order": order_name,
+        "sort_spec": sort_spec,
+        "results": paged_results,
+        "total_hits": total_hits,
+    }
+
+
 def search_with_scope(
     root: Path,
     raw_scope: object,
@@ -3487,6 +4057,7 @@ def search_with_scope(
     sort_specs: list[tuple[str, str]] | None = None,
     display_column_defs: list[dict[str, str]] | None = None,
     warnings: list[str] | None = None,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
 ) -> dict[str, object]:
     if page < 1:
         raise RetrieverError("Page must be >= 1.")
@@ -3501,7 +4072,64 @@ def search_with_scope(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        effective_browse_mode = normalize_browse_mode(browse_mode)
         requested_offset = (page - 1) * per_page if offset is None else offset
+        effective_display_column_defs = display_column_defs or default_display_column_definitions(
+            connection,
+            browse_mode=effective_browse_mode,
+        )
+
+        if effective_browse_mode == BROWSE_MODE_CONVERSATIONS:
+            selection = resolve_paged_scope_conversation_search(
+                connection,
+                paths,
+                raw_scope,
+                sort_specs=sort_specs,
+                offset=requested_offset,
+                per_page=per_page,
+            )
+            total_hits = int(selection["total_hits"])
+            total_pages = max(1, (total_hits + per_page - 1) // per_page)
+            start = requested_offset
+            if total_hits > 0 and start >= total_hits:
+                start = (total_pages - 1) * per_page
+                selection = resolve_paged_scope_conversation_search(
+                    connection,
+                    paths,
+                    raw_scope,
+                    sort_specs=sort_specs,
+                    offset=start,
+                    per_page=per_page,
+                )
+            start = max(0, start)
+            page = (start // per_page) + 1
+            paged_results = [dict(item) for item in selection["results"]]
+            for item in paged_results:
+                item["display_values"] = build_summary_display_values(item, effective_display_column_defs)
+
+            payload = {
+                "query": selection["query"],
+                "filters": selection["filters"],
+                "sort": selection["sort"],
+                "order": selection["order"],
+                "sort_spec": selection["sort_spec"],
+                "browse_mode": effective_browse_mode,
+                "page": page,
+                "per_page": per_page,
+                "offset": start,
+                "total_hits": total_hits,
+                "total_pages": total_pages,
+                "results": paged_results,
+                "scope": selection["scope"],
+                "display": build_display_payload(effective_display_column_defs, per_page),
+            }
+            payload["header"] = build_search_header_payload(selection["scope"], payload)
+            if warnings:
+                payload["warnings"] = warnings
+            payload["rendered_markdown"] = render_search_markdown(payload, effective_display_column_defs)
+            return payload
+
+        results: list[dict[str, object]] = []
         selection = resolve_paged_scope_document_search(
             connection,
             raw_scope,
@@ -3509,9 +4137,6 @@ def search_with_scope(
             offset=requested_offset,
             per_page=per_page,
         )
-        effective_display_column_defs = display_column_defs or default_display_column_definitions(connection)
-
-        results: list[dict[str, object]] = []
         for match in selection["results"]:
             row = match["row"]
             results.append(
@@ -3668,6 +4293,7 @@ def search_with_scope(
             "sort": selection["sort"],
             "order": selection["order"],
             "sort_spec": selection["sort_spec"],
+            "browse_mode": effective_browse_mode,
             "page": page,
             "per_page": per_page,
             "offset": start,
@@ -3686,8 +4312,12 @@ def search_with_scope(
         connection.close()
 
 
-def session_page_size(session_state: dict[str, object]) -> int:
-    display = session_display_state(session_state)
+def session_page_size(
+    session_state: dict[str, object],
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+) -> int:
+    display = session_display_state(session_state, browse_mode=browse_mode)
     if not display:
         return DEFAULT_PAGE_SIZE
     page_size = display.get("page_size")
@@ -3696,13 +4326,25 @@ def session_page_size(session_state: dict[str, object]) -> int:
     return min(page_size, MAX_PAGE_SIZE)
 
 
-def session_browsing_state(session_state: dict[str, object]) -> dict[str, object]:
+def session_browsing_state(
+    session_state: dict[str, object],
+    *,
+    browse_mode: str | None = None,
+) -> dict[str, object]:
+    effective_browse_mode = normalize_browse_mode(browse_mode or session_browse_mode(session_state))
     browsing = session_state.get("browsing")
-    return browsing if isinstance(browsing, dict) else {}
+    if not isinstance(browsing, dict):
+        return {}
+    branch = browsing.get(effective_browse_mode)
+    return branch if isinstance(branch, dict) else {}
 
 
-def session_sort_specs(session_state: dict[str, object]) -> list[tuple[str, str]]:
-    return coerce_sort_specs(session_browsing_state(session_state).get("sort"))
+def session_sort_specs(
+    session_state: dict[str, object],
+    *,
+    browse_mode: str | None = None,
+) -> list[tuple[str, str]]:
+    return coerce_sort_specs(session_browsing_state(session_state, browse_mode=browse_mode).get("sort"))
 
 
 def saved_scope_summaries(paths: dict[str, Path]) -> list[dict[str, object]]:
@@ -3722,12 +4364,18 @@ def saved_scope_summaries(paths: dict[str, Path]) -> list[dict[str, object]]:
     ]
 
 
-def sortable_field_entries(connection: sqlite3.Connection) -> list[dict[str, object]]:
+def sortable_field_entries(
+    connection: sqlite3.Connection,
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+) -> list[dict[str, object]]:
     seen_names: set[str] = set()
     entries: list[dict[str, object]] = []
-    for raw_field_name in known_logical_field_names(connection):
-        field_def = resolve_field_definition(connection, raw_field_name)
+    for raw_field_name in known_browse_field_names(connection, browse_mode=browse_mode):
+        field_def = resolve_browse_field_definition(connection, raw_field_name, browse_mode=browse_mode)
         if field_def.get("source") == "virtual":
+            continue
+        if str(field_def.get("sortable") or "true").lower() != "true":
             continue
         canonical_name = str(field_def["field_name"])
         if canonical_name in seen_names:
@@ -3745,10 +4393,14 @@ def sortable_field_entries(connection: sqlite3.Connection) -> list[dict[str, obj
     return sorted(entries, key=lambda item: (str(item["name"]).lower(), str(item["name"])))
 
 
-def displayable_field_entries(connection: sqlite3.Connection) -> list[dict[str, object]]:
+def displayable_field_entries(
+    connection: sqlite3.Connection,
+    *,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
+) -> list[dict[str, object]]:
     entries: list[dict[str, object]] = []
-    for field_name in displayable_field_names(connection):
-        field_def = resolve_field_definition(connection, field_name)
+    for field_name in displayable_field_names(connection, browse_mode=browse_mode):
+        field_def = resolve_browse_field_definition(connection, field_name, browse_mode=browse_mode)
         entries.append(
             catalog_field_entry(
                 str(field_def["field_name"]),
@@ -3761,8 +4413,14 @@ def displayable_field_entries(connection: sqlite3.Connection) -> list[dict[str, 
     return entries
 
 
-def active_sort_payload(scope: dict[str, object], session_state: dict[str, object]) -> dict[str, object]:
-    sort_specs = session_sort_specs(session_state)
+def active_sort_payload(
+    scope: dict[str, object],
+    session_state: dict[str, object],
+    *,
+    browse_mode: str | None = None,
+) -> dict[str, object]:
+    effective_browse_mode = normalize_browse_mode(browse_mode or session_browse_mode(session_state))
+    sort_specs = session_sort_specs(session_state, browse_mode=effective_browse_mode)
     if sort_specs:
         field_name, direction = sort_specs[0]
         return {
@@ -3790,6 +4448,14 @@ def active_sort_payload(scope: dict[str, object], session_state: dict[str, objec
             "sort_source": "default",
         }
 
+    if effective_browse_mode == BROWSE_MODE_CONVERSATIONS:
+        return {
+            "sort": "last_activity",
+            "order": "desc",
+            "sort_spec": "last_activity desc",
+            "sort_source": "default",
+        }
+
     return {
         "sort": "date_created",
         "order": "desc",
@@ -3798,15 +4464,21 @@ def active_sort_payload(scope: dict[str, object], session_state: dict[str, objec
     }
 
 
-def active_page_payload(session_state: dict[str, object]) -> dict[str, int]:
-    per_page = session_page_size(session_state)
-    browsing = session_browsing_state(session_state)
+def active_page_payload(
+    session_state: dict[str, object],
+    *,
+    browse_mode: str | None = None,
+) -> dict[str, int | str]:
+    effective_browse_mode = normalize_browse_mode(browse_mode or session_browse_mode(session_state))
+    per_page = session_page_size(session_state, browse_mode=effective_browse_mode)
+    browsing = session_browsing_state(session_state, browse_mode=effective_browse_mode)
     offset = int(browsing.get("offset") or 0)
     total_known = int(browsing.get("total_known") or 0)
     total_pages = max(1, (total_known + per_page - 1) // per_page)
     if total_known > 0 and offset >= total_known:
         offset = max(0, (total_pages - 1) * per_page)
     return {
+        "browse_mode": effective_browse_mode,
         "page": (offset // per_page) + 1,
         "per_page": per_page,
         "offset": offset,
@@ -3859,8 +4531,10 @@ def summarize_scope_inline(scope: dict[str, object]) -> str:
 
 def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) -> str | None:
     command_name, normalized_tail = parse_slash_command_text(raw_command)
+    browse_mode = normalize_browse_mode(payload.get("browse_mode"))
+    result_label = "conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "docs"
 
-    if command_name in {"next", "previous"}:
+    if command_name in {"next", "previous", "documents", "conversations"}:
         rendered_markdown = payload.get("rendered_markdown")
         if payload_has_meaningful_value(rendered_markdown):
             return str(rendered_markdown)
@@ -4020,13 +4694,13 @@ def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) 
         else:
             first_doc = 0
             last_doc = 0
-        return f"Page: {page} of {total_pages} (docs {first_doc}-{last_doc} of {total_known})"
+        return f"Page: {page} of {total_pages} ({result_label} {first_doc}-{last_doc} of {total_known})"
 
     return None
 
 
 def clear_session_browsing(session_state: dict[str, object]) -> dict[str, object]:
-    session_state["browsing"] = {}
+    session_state["browsing"] = coerce_mode_payloads({}, coerce_browsing_payload)
     return session_state
 
 
@@ -4383,8 +5057,17 @@ def persist_browsing_search_result(
     session_state: dict[str, object],
     payload: dict[str, object],
     sort_specs: list[tuple[str, str]] | None,
+    *,
+    browse_mode: str | None = None,
 ) -> dict[str, object]:
+    effective_browse_mode = normalize_browse_mode(
+        browse_mode or payload.get("browse_mode") or session_browse_mode(session_state)
+    )
     session_state["scope"] = coerce_scope_payload(payload.get("scope"))
+    session_state["browse_mode"] = effective_browse_mode
+    browsing_root = session_state.get("browsing")
+    if not isinstance(browsing_root, dict):
+        browsing_root = {}
     browsing_payload: dict[str, object] = {
         "offset": int(payload.get("offset") or 0),
         "total_known": int(payload.get("total_hits") or 0),
@@ -4392,7 +5075,8 @@ def persist_browsing_search_result(
     }
     if sort_specs:
         browsing_payload["sort"] = serialize_sort_specs(sort_specs)
-    session_state["browsing"] = browsing_payload
+    browsing_root[effective_browse_mode] = coerce_browsing_payload(browsing_payload)
+    session_state["browsing"] = coerce_mode_payloads(browsing_root, coerce_browsing_payload)
     persist_session_state(paths, session_state)
     return payload
 
@@ -4403,6 +5087,7 @@ def persist_direct_view_search_result(
     column_defs: list[dict[str, str]],
     *,
     sort_specs: list[tuple[str, str]] | None,
+    browse_mode: str = BROWSE_MODE_DOCUMENTS,
 ) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -4412,8 +5097,15 @@ def persist_direct_view_search_result(
         session_state,
         column_defs,
         int(payload.get("per_page") or DEFAULT_PAGE_SIZE),
+        browse_mode=browse_mode,
     )
-    persist_browsing_search_result(paths, persisted_session_state, payload, sort_specs)
+    persist_browsing_search_result(
+        paths,
+        persisted_session_state,
+        payload,
+        sort_specs,
+        browse_mode=browse_mode,
+    )
     return payload
 
 
@@ -4424,29 +5116,46 @@ def run_browsing_search_from_session(
     *,
     offset: int | None = None,
     sort_specs: list[tuple[str, str]] | None = None,
+    browse_mode: str | None = None,
 ) -> dict[str, object]:
     normalized_session_state = read_session_state(paths) if session_state is None else session_state
-    effective_sort_specs = sort_specs if sort_specs is not None else session_sort_specs(normalized_session_state)
-    current_offset = int(session_browsing_state(normalized_session_state).get("offset") or 0)
+    effective_browse_mode = normalize_browse_mode(browse_mode or session_browse_mode(normalized_session_state))
+    normalized_session_state["browse_mode"] = effective_browse_mode
+    effective_sort_specs = (
+        sort_specs
+        if sort_specs is not None
+        else session_sort_specs(normalized_session_state, browse_mode=effective_browse_mode)
+    )
+    current_offset = int(
+        session_browsing_state(normalized_session_state, browse_mode=effective_browse_mode).get("offset") or 0
+    )
     connection = connect_db(paths["db_path"])
     try:
         display_column_defs, display_warnings, normalized_session_state = resolve_session_display_columns(
             connection,
             paths,
             normalized_session_state,
+            browse_mode=effective_browse_mode,
         )
     finally:
         connection.close()
     payload = search_with_scope(
         root,
         normalized_session_state.get("scope", {}),
-        per_page=session_page_size(normalized_session_state),
+        per_page=session_page_size(normalized_session_state, browse_mode=effective_browse_mode),
         offset=current_offset if offset is None else offset,
         sort_specs=effective_sort_specs or None,
         display_column_defs=display_column_defs,
         warnings=display_warnings,
+        browse_mode=effective_browse_mode,
     )
-    return persist_browsing_search_result(paths, normalized_session_state, payload, effective_sort_specs or None)
+    return persist_browsing_search_result(
+        paths,
+        normalized_session_state,
+        payload,
+        effective_sort_specs or None,
+        browse_mode=effective_browse_mode,
+    )
 
 
 def run_scope_search_from_session(root: Path, paths: dict[str, Path], scope: dict[str, object]) -> dict[str, object]:
@@ -4464,6 +5173,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
         apply_schema(connection, root)
         session_state = read_session_state(paths)
         scope = coerce_scope_payload(session_state.get("scope"))
+        active_browse_mode = session_browse_mode(session_state)
 
         if command_name == "scope":
             scope_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
@@ -4492,23 +5202,65 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
                 return run_scope_search_from_session(root, paths, loaded_scope)
             raise RetrieverError(f"Unknown /scope command: {subcommand}")
 
+        if command_name in {"documents", "conversations"}:
+            if normalized_tail:
+                raise RetrieverError(f"Usage: /{command_name}")
+            target_browse_mode = (
+                BROWSE_MODE_CONVERSATIONS
+                if command_name == "conversations"
+                else BROWSE_MODE_DOCUMENTS
+            )
+            updated_session_state = read_session_state(paths)
+            updated_session_state["browse_mode"] = target_browse_mode
+            updated_session_state = persist_session_state(paths, updated_session_state)
+            return run_browsing_search_from_session(
+                root,
+                paths,
+                updated_session_state,
+                browse_mode=target_browse_mode,
+            )
+
         if command_name == "page-size":
             if not normalized_tail:
-                return {"status": "ok", "page_size": session_page_size(session_state)}
+                return {
+                    "status": "ok",
+                    "browse_mode": active_browse_mode,
+                    "page_size": session_page_size(session_state, browse_mode=active_browse_mode),
+                }
             updated_session_state = read_session_state(paths)
-            display_state = session_display_state(updated_session_state)
+            effective_browse_mode = session_browse_mode(updated_session_state)
+            display_root = updated_session_state.get("display")
+            if not isinstance(display_root, dict):
+                display_root = {}
+            display_state = session_display_state(updated_session_state, browse_mode=effective_browse_mode)
             display_state["page_size"] = parse_page_size_value(normalized_tail)
-            updated_session_state["display"] = coerce_display_payload(display_state)
+            display_root[effective_browse_mode] = coerce_display_payload(display_state)
+            updated_session_state["display"] = coerce_mode_payloads(display_root, coerce_display_payload)
             updated_session_state = persist_session_state(paths, updated_session_state)
-            return run_browsing_search_from_session(root, paths, updated_session_state)
+            return run_browsing_search_from_session(
+                root,
+                paths,
+                updated_session_state,
+                browse_mode=effective_browse_mode,
+            )
 
         if command_name == "columns":
             updated_session_state = read_session_state(paths)
+            effective_browse_mode = session_browse_mode(updated_session_state)
             if not normalized_tail:
-                column_defs, warnings, updated_session_state = resolve_session_display_columns(connection, paths, updated_session_state)
+                column_defs, warnings, updated_session_state = resolve_session_display_columns(
+                    connection,
+                    paths,
+                    updated_session_state,
+                    browse_mode=effective_browse_mode,
+                )
                 payload: dict[str, object] = {
                     "status": "ok",
-                    "display": build_display_payload(column_defs, session_page_size(updated_session_state)),
+                    "browse_mode": effective_browse_mode,
+                    "display": build_display_payload(
+                        column_defs,
+                        session_page_size(updated_session_state, browse_mode=effective_browse_mode),
+                    ),
                 }
                 if warnings:
                     payload["warnings"] = warnings
@@ -4517,15 +5269,25 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
             if normalized_tail == "list":
                 return {
                     "status": "ok",
-                    "columns": displayable_field_entries(connection),
+                    "browse_mode": effective_browse_mode,
+                    "columns": displayable_field_entries(connection, browse_mode=effective_browse_mode),
                 }
 
             if normalized_tail == "default":
-                display_state = session_display_state(updated_session_state)
+                display_root = updated_session_state.get("display")
+                if not isinstance(display_root, dict):
+                    display_root = {}
+                display_state = session_display_state(updated_session_state, browse_mode=effective_browse_mode)
                 display_state.pop("columns", None)
-                updated_session_state["display"] = coerce_display_payload(display_state)
+                display_root[effective_browse_mode] = coerce_display_payload(display_state)
+                updated_session_state["display"] = coerce_mode_payloads(display_root, coerce_display_payload)
                 updated_session_state = persist_session_state(paths, updated_session_state)
-                return run_browsing_search_from_session(root, paths, updated_session_state)
+                return run_browsing_search_from_session(
+                    root,
+                    paths,
+                    updated_session_state,
+                    browse_mode=effective_browse_mode,
+                )
 
             subcommand, _, remainder = normalized_tail.partition(" ")
             if subcommand not in {"set", "add", "remove"}:
@@ -4533,57 +5295,121 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
             if not remainder.strip():
                 raise RetrieverError("Column selection cannot be empty.")
 
-            current_column_defs, _, updated_session_state = resolve_session_display_columns(connection, paths, updated_session_state)
+            current_column_defs, _, updated_session_state = resolve_session_display_columns(
+                connection,
+                paths,
+                updated_session_state,
+                browse_mode=effective_browse_mode,
+            )
             current_columns = display_column_names(current_column_defs)
 
             if subcommand == "set":
                 requested_columns = parse_display_columns_argument(remainder.strip())
-                next_column_defs, _, _ = resolve_display_column_definitions(connection, requested_columns, drop_missing=False)
+                next_column_defs, _, _ = resolve_display_column_definitions(
+                    connection,
+                    requested_columns,
+                    drop_missing=False,
+                    browse_mode=effective_browse_mode,
+                )
             elif subcommand == "add":
                 field_name = normalize_inline_whitespace(remainder.strip())
                 next_column_defs, _, _ = resolve_display_column_definitions(
                     connection,
                     current_columns + [field_name],
                     drop_missing=False,
+                    browse_mode=effective_browse_mode,
                 )
             else:
                 field_name = normalize_inline_whitespace(remainder.strip())
-                field_def = resolve_field_definition(connection, field_name)
+                field_def = resolve_browse_field_definition(connection, field_name, browse_mode=effective_browse_mode)
                 canonical_name = str(field_def["field_name"])
                 if canonical_name not in current_columns:
                     raise RetrieverError(f"Column '{canonical_name}' is not in the current display set.")
                 remaining_columns = [column_name for column_name in current_columns if column_name != canonical_name]
                 if not remaining_columns:
                     raise RetrieverError("Display must include at least one column. Use /columns default to reset.")
-                next_column_defs, _, _ = resolve_display_column_definitions(connection, remaining_columns, drop_missing=False)
+                next_column_defs, _, _ = resolve_display_column_definitions(
+                    connection,
+                    remaining_columns,
+                    drop_missing=False,
+                    browse_mode=effective_browse_mode,
+                )
 
-            updated_session_state = persist_display_columns(paths, updated_session_state, next_column_defs)
-            return run_browsing_search_from_session(root, paths, updated_session_state)
+            updated_session_state = persist_display_columns(
+                paths,
+                updated_session_state,
+                next_column_defs,
+                browse_mode=effective_browse_mode,
+            )
+            return run_browsing_search_from_session(
+                root,
+                paths,
+                updated_session_state,
+                browse_mode=effective_browse_mode,
+            )
 
         if command_name == "sort":
             updated_session_state = read_session_state(paths)
+            effective_browse_mode = session_browse_mode(updated_session_state)
             if not normalized_tail:
-                return {"status": "ok", **active_sort_payload(scope, updated_session_state)}
+                return {
+                    "status": "ok",
+                    "browse_mode": effective_browse_mode,
+                    **active_sort_payload(scope, updated_session_state, browse_mode=effective_browse_mode),
+                }
             if normalized_tail == "list":
-                return {"status": "ok", "sortable_fields": sortable_field_entries(connection)}
+                return {
+                    "status": "ok",
+                    "browse_mode": effective_browse_mode,
+                    "sortable_fields": sortable_field_entries(connection, browse_mode=effective_browse_mode),
+                }
             if normalized_tail == "default":
-                return run_browsing_search_from_session(root, paths, updated_session_state, offset=0, sort_specs=[])
-            sort_specs = parse_slash_sort_specs(connection, normalized_tail)
-            return run_browsing_search_from_session(root, paths, updated_session_state, offset=0, sort_specs=sort_specs)
+                return run_browsing_search_from_session(
+                    root,
+                    paths,
+                    updated_session_state,
+                    offset=0,
+                    sort_specs=[],
+                    browse_mode=effective_browse_mode,
+                )
+            sort_specs = parse_slash_sort_specs(connection, normalized_tail, browse_mode=effective_browse_mode)
+            return run_browsing_search_from_session(
+                root,
+                paths,
+                updated_session_state,
+                offset=0,
+                sort_specs=sort_specs,
+                browse_mode=effective_browse_mode,
+            )
 
         if command_name in {"next", "previous"}:
             updated_session_state = read_session_state(paths)
-            per_page = session_page_size(updated_session_state)
-            current_offset = int(session_browsing_state(updated_session_state).get("offset") or 0)
+            effective_browse_mode = session_browse_mode(updated_session_state)
+            per_page = session_page_size(updated_session_state, browse_mode=effective_browse_mode)
+            current_offset = int(
+                session_browsing_state(updated_session_state, browse_mode=effective_browse_mode).get("offset") or 0
+            )
             target_offset = current_offset + per_page if command_name == "next" else max(0, current_offset - per_page)
-            return run_browsing_search_from_session(root, paths, updated_session_state, offset=target_offset)
+            return run_browsing_search_from_session(
+                root,
+                paths,
+                updated_session_state,
+                offset=target_offset,
+                browse_mode=effective_browse_mode,
+            )
 
         if command_name == "page":
             updated_session_state = read_session_state(paths)
+            effective_browse_mode = session_browse_mode(updated_session_state)
             if not normalized_tail:
-                return {"status": "ok", **active_page_payload(updated_session_state)}
-            per_page = session_page_size(updated_session_state)
-            current_offset = int(session_browsing_state(updated_session_state).get("offset") or 0)
+                return {
+                    "status": "ok",
+                    **active_page_payload(updated_session_state, browse_mode=effective_browse_mode),
+                }
+            per_page = session_page_size(updated_session_state, browse_mode=effective_browse_mode)
+            current_offset = int(
+                session_browsing_state(updated_session_state, browse_mode=effective_browse_mode).get("offset") or 0
+            )
             page_token = normalize_inline_whitespace(normalized_tail).lower()
             if page_token == "first":
                 target_offset = 0
@@ -4601,7 +5427,13 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
                 if page_number < 1:
                     raise RetrieverError("Page number must be >= 1.")
                 target_offset = (page_number - 1) * per_page
-            return run_browsing_search_from_session(root, paths, updated_session_state, offset=target_offset)
+            return run_browsing_search_from_session(
+                root,
+                paths,
+                updated_session_state,
+                offset=target_offset,
+                browse_mode=effective_browse_mode,
+            )
 
         if command_name == "search":
             if not normalized_tail:

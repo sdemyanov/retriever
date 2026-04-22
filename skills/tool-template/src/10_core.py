@@ -1192,12 +1192,26 @@ def normalize_saved_scope_name(scope_name: str) -> str:
     return normalize_dataset_name_for_compare(scope_name)
 
 
+def normalize_browse_mode(raw_value: object | None) -> str:
+    normalized = normalize_inline_whitespace(str(raw_value or DEFAULT_BROWSE_MODE)).lower()
+    if normalized not in {BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS}:
+        return DEFAULT_BROWSE_MODE
+    return normalized
+
+
 def default_session_state() -> dict[str, object]:
     return {
         "schema_version": SESSION_SCHEMA_VERSION,
         "scope": {},
-        "browsing": {},
-        "display": {},
+        "browse_mode": DEFAULT_BROWSE_MODE,
+        "browsing": {
+            BROWSE_MODE_DOCUMENTS: {},
+            BROWSE_MODE_CONVERSATIONS: {},
+        },
+        "display": {
+            BROWSE_MODE_DOCUMENTS: {},
+            BROWSE_MODE_CONVERSATIONS: {},
+        },
     }
 
 
@@ -1317,6 +1331,24 @@ def coerce_display_payload(raw_display: object) -> dict[str, object]:
     return display
 
 
+def coerce_mode_payloads(raw_value: object, payload_coercer) -> dict[str, object]:
+    normalized_payloads = {
+        BROWSE_MODE_DOCUMENTS: {},
+        BROWSE_MODE_CONVERSATIONS: {},
+    }
+    if not isinstance(raw_value, dict):
+        return normalized_payloads
+    if any(
+        key in raw_value
+        for key in ("columns", "page_size", "sort", "offset", "total_known", "run_at")
+    ):
+        normalized_payloads[BROWSE_MODE_DOCUMENTS] = payload_coercer(raw_value)
+        return normalized_payloads
+    for browse_mode in (BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS):
+        normalized_payloads[browse_mode] = payload_coercer(raw_value.get(browse_mode))
+    return normalized_payloads
+
+
 def coerce_session_state(raw_value: object) -> dict[str, object]:
     session = default_session_state()
     if not isinstance(raw_value, dict):
@@ -1325,8 +1357,9 @@ def coerce_session_state(raw_value: object) -> dict[str, object]:
     if isinstance(schema_version, int):
         session["schema_version"] = schema_version
     session["scope"] = coerce_scope_payload(raw_value.get("scope"))
-    session["browsing"] = coerce_browsing_payload(raw_value.get("browsing"))
-    session["display"] = coerce_display_payload(raw_value.get("display"))
+    session["browse_mode"] = normalize_browse_mode(raw_value.get("browse_mode"))
+    session["browsing"] = coerce_mode_payloads(raw_value.get("browsing"), coerce_browsing_payload)
+    session["display"] = coerce_mode_payloads(raw_value.get("display"), coerce_display_payload)
     return session
 
 
@@ -4412,6 +4445,10 @@ def conversation_preview_anchor(document_id: int) -> str:
 
 def conversation_preview_base_path(conversation_id: int) -> Path:
     return Path("previews") / "conversations" / f"conversation-{int(conversation_id):08d}"
+
+
+def conversation_preview_full_rel_path(conversation_id: int) -> str:
+    return (conversation_preview_base_path(conversation_id) / "conversation.html").as_posix()
 
 
 def conversation_preview_toc_rel_path(conversation_id: int) -> str:
