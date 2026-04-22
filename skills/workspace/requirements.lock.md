@@ -51,5 +51,5 @@ python3 -c "import pdfplumber, docx, openpyxl, xlrd, extract_msg, charset_normal
 - Exact transitive dependency hashes are deferred until packaging needs become stricter.
 - If pip is present but install is blocked by network or policy, stop and report that clearly.
 - PST ingest is part of the pinned runtime through `libpff-python` (import name `pypff`).
-- If the PST backend cannot be installed or imported on the target platform, stop bootstrap clearly instead of treating PST as optional.
+- If the PST backend cannot be installed or imported on the target platform, report that clearly when PST ingest is attempted.
 - OCR and semantic-search dependencies are not part of the current pinned runtime.

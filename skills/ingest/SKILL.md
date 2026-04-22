@@ -39,7 +39,7 @@ Use this skill when the user says things like:
 - Never run `ingest` against a stale workspace tool after reinstall. Schema and tool upgrades happen before reindexing.
 - Run `bootstrap` before the first ingest or after any schema/tool upgrade.
 - For `.pst` sources, use regular `ingest`, not `ingest-production`.
-- If `doctor` reports `pst_backend.status != pass`, explain that the workspace is not fully bootstrapped until the required `libpff-python` / `pypff` backend is installed.
+- If `doctor` reports `pst_backend.status == fail`, explain that PST ingest needs the required `libpff-python` / `pypff` backend installed.
 - If the user target is a processed production root, or the user explicitly asks for production ingest, run `ingest-production` instead of plain `ingest`.
 - Keep `ingest-production` as the precise entrypoint for targeted reruns, scripts, or one-off production-only ingest.
 - Treat `DAT` + companion `TEXT/`, `IMAGES/`, and optional `NATIVES/` folders as a production signature, not as loose files.

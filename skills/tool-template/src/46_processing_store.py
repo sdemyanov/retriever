@@ -1518,11 +1518,11 @@ def render_pdf_pages_for_ocr(
     document_id: int,
     resolution: int,
 ) -> list[dict[str, object]]:
-    dependency_guard(pdfplumber, "pdfplumber", "pdf")
+    pdfplumber_module = dependency_guard("pdfplumber", "pdfplumber", "pdf")
     output_dir = paths["jobs_dir"] / "ocr" / f"run-{run_id}" / f"doc-{document_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     page_specs: list[dict[str, object]] = []
-    with pdfplumber.open(source_path) as pdf:  # type: ignore[union-attr]
+    with pdfplumber_module.open(source_path) as pdf:  # type: ignore[union-attr]
         for page_number, page in enumerate(pdf.pages, start=1):
             output_path = output_dir / f"page-{page_number:04d}.png"
             if not output_path.exists():

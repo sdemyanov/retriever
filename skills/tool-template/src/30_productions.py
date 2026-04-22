@@ -2763,13 +2763,10 @@ def build_email_message_body_content_html(
     if preferred_body_html:
         normalized_html = preferred_body_html.strip()
         if strip_quoted_history:
-            original_html = normalized_html
             stripped_html = strip_email_reply_history_html(normalized_html)
             if stripped_html is not None:
                 normalized_html = stripped_html
-            elif visible_text:
-                normalized_html = ""
-            if quoted_text and normalized_html == original_html and visible_text:
+            elif quoted_text and visible_text:
                 normalized_html = ""
         if normalized_html and any(
             token in normalized_html

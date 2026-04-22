@@ -42,7 +42,7 @@ With the current Phase 2 tool surface, Claude should be able to:
 - initialize schema v9
 - write a stable `runtime.json`
 - ingest supported documents into `.retriever/retriever.db`
-- verify the required PST backend is present before calling the runtime ready
+- report PST backend readiness separately while keeping ordinary non-PST commands free of eager parser loading
 - populate built-in `participants` for email and chat-like documents during ingest
 - ingest supported PST container sources through the same regular `ingest` surface
 - materialize one-level EML/MSG attachment families with stable `control_number` values during ingest
