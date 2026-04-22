@@ -3818,6 +3818,297 @@ def get_custom_field_registry_row(connection: sqlite3.Connection, field_name: st
     ).fetchone()
 
 
+def require_custom_field_registry_row(connection: sqlite3.Connection, field_name: str) -> sqlite3.Row:
+    registry_row = get_custom_field_registry_row(connection, field_name)
+    if registry_row is None:
+        raise RetrieverError(f"Unknown custom field: {field_name}")
+    return registry_row
+
+
+def count_documents_with_non_null_field_value(connection: sqlite3.Connection, field_name: str) -> int:
+    row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS value_count
+        FROM documents
+        WHERE {quote_identifier(field_name)} IS NOT NULL
+        """,
+    ).fetchone()
+    return int(row["value_count"]) if row is not None else 0
+
+
+def list_fields(root: Path) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        reconcile_custom_fields_registry(connection, repair=True)
+        columns = table_columns(connection, "documents")
+        fields: list[dict[str, object]] = []
+        rows = connection.execute(
+            """
+            SELECT field_name, field_type, instruction, created_at
+            FROM custom_fields_registry
+            ORDER BY field_name ASC
+            """
+        ).fetchall()
+        for row in rows:
+            field_name = str(row["field_name"])
+            if field_name not in columns:
+                continue
+            fields.append(
+                {
+                    "field_name": field_name,
+                    "field_type": str(row["field_type"]),
+                    "instruction": row["instruction"],
+                    "created_at": row["created_at"],
+                    "documents_with_values": count_documents_with_non_null_field_value(connection, field_name),
+                }
+            )
+        return {"status": "ok", "fields": fields}
+    finally:
+        connection.close()
+
+
+def describe_field(
+    root: Path,
+    raw_field_name: str,
+    *,
+    text: str | None = None,
+    clear: bool = False,
+) -> dict[str, object]:
+    if clear and text is not None:
+        raise RetrieverError("Choose either --text or --clear, not both.")
+    if not clear and text is None:
+        raise RetrieverError("Provide --text or --clear.")
+
+    normalized_field_name = sanitize_field_name(raw_field_name)
+    next_instruction = None if clear else text
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        reconcile_custom_fields_registry(connection, repair=True)
+        require_custom_field_registry_row(connection, normalized_field_name)
+        connection.execute(
+            """
+            UPDATE custom_fields_registry
+            SET instruction = ?
+            WHERE field_name = ?
+            """,
+            (next_instruction, normalized_field_name),
+        )
+        connection.commit()
+        updated_row = require_custom_field_registry_row(connection, normalized_field_name)
+        return {
+            "status": "ok",
+            "field_name": normalized_field_name,
+            "field_type": str(updated_row["field_type"]),
+            "instruction": updated_row["instruction"],
+        }
+    finally:
+        connection.close()
+
+
+def ensure_fill_target_field_definition(connection: sqlite3.Connection, field_name: str) -> dict[str, str]:
+    try:
+        field_def = resolve_field_definition(connection, field_name)
+    except RetrieverError as exc:
+        suggestions = field_name_suggestions(connection, field_name)
+        suggestion_text = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise RetrieverError(f"Unknown field '{field_name}'.{suggestion_text}") from exc
+    canonical_name = str(field_def["field_name"])
+    source = str(field_def.get("source") or "")
+    if source == "virtual":
+        raise RetrieverError(f"Field '{canonical_name}' is derived and cannot be filled manually.")
+    if canonical_name in SYSTEM_MANAGED_FIELDS:
+        raise RetrieverError(f"Field '{canonical_name}' is system-managed and cannot be filled manually.")
+    if source == "builtin":
+        if canonical_name not in EDITABLE_BUILTIN_FIELDS:
+            raise RetrieverError(f"Field '{canonical_name}' is not an editable built-in field.")
+        return field_def
+    if source == "custom":
+        return field_def
+    raise RetrieverError(
+        f"Field '{canonical_name}' is not a registered custom field or editable built-in field."
+    )
+
+
+def replace_document_field_locks(
+    connection: sqlite3.Connection,
+    old_field_name: str,
+    new_field_name: str,
+) -> int:
+    rows = connection.execute(
+        f"""
+        SELECT id, {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} AS locks_json
+        FROM documents
+        WHERE {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} LIKE ?
+        """,
+        (f'%"{old_field_name}"%',),
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        locks = normalize_string_list(row["locks_json"])
+        if old_field_name not in locks:
+            continue
+        next_locks: list[str] = []
+        for lock_name in locks:
+            target_name = new_field_name if lock_name == old_field_name else lock_name
+            if target_name not in next_locks:
+                next_locks.append(target_name)
+        connection.execute(
+            f"""
+            UPDATE documents
+            SET {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} = ?
+            WHERE id = ?
+            """,
+            (json.dumps(next_locks), int(row["id"])),
+        )
+        updated += 1
+    return updated
+
+
+def sample_documents_for_fill(
+    connection: sqlite3.Connection,
+    document_ids: list[int],
+    field_name: str,
+    *,
+    limit: int = 5,
+) -> list[dict[str, object]]:
+    normalized_ids = list(dict.fromkeys(int(document_id) for document_id in document_ids))[:limit]
+    if not normalized_ids:
+        return []
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    rows = connection.execute(
+        f"""
+        SELECT
+          id,
+          control_number,
+          file_name,
+          title,
+          {quote_identifier(field_name)} AS field_value
+        FROM documents
+        WHERE id IN ({placeholders})
+        """,
+        tuple(normalized_ids),
+    ).fetchall()
+    rows_by_id = {int(row["id"]): row for row in rows}
+    sample_rows: list[dict[str, object]] = []
+    for document_id in normalized_ids:
+        row = rows_by_id.get(document_id)
+        if row is None:
+            continue
+        sample_rows.append(
+            {
+                "document_id": int(row["id"]),
+                "control_number": row["control_number"],
+                "file_name": row["file_name"],
+                "title": row["title"],
+                "value": row["field_value"],
+            }
+        )
+    return sample_rows
+
+
+def round_half_away_from_zero(raw_value: float) -> int:
+    if raw_value >= 0:
+        return int(raw_value + 0.5)
+    return -int(abs(raw_value) + 0.5)
+
+
+def convert_field_value_for_type_change(
+    raw_value: object,
+    from_type: str,
+    to_type: str,
+) -> tuple[object, bool]:
+    if raw_value is None:
+        return None, False
+    normalized_from_type = from_type.strip().lower()
+    normalized_to_type = to_type.strip().lower()
+    if normalized_from_type == normalized_to_type:
+        return raw_value, False
+
+    if normalized_from_type == "text":
+        raw_text = str(raw_value)
+        if not raw_text.strip():
+            return None, True
+        if normalized_to_type == "text":
+            return raw_text, False
+        converted_value = value_from_type(normalized_to_type, raw_text)
+        return converted_value, raw_text != str(converted_value)
+
+    if normalized_from_type == "date":
+        if normalized_to_type != "text":
+            raise RetrieverError(f"Cannot convert {normalized_from_type} to {normalized_to_type}.")
+        return str(raw_value), False
+
+    if normalized_from_type == "boolean":
+        int_value = int(raw_value)
+        if normalized_to_type == "integer":
+            return int_value, False
+        if normalized_to_type == "real":
+            return float(int_value), True
+        if normalized_to_type == "text":
+            return ("true" if int_value else "false"), True
+        raise RetrieverError(f"Cannot convert {normalized_from_type} to {normalized_to_type}.")
+
+    if normalized_from_type == "integer":
+        int_value = int(raw_value)
+        if normalized_to_type == "boolean":
+            if int_value not in {0, 1}:
+                raise RetrieverError(f"Expected 0 or 1 for boolean conversion, got {int_value!r}")
+            return int_value, False
+        if normalized_to_type == "real":
+            return float(int_value), True
+        if normalized_to_type == "text":
+            return str(int_value), True
+        raise RetrieverError(f"Cannot convert {normalized_from_type} to {normalized_to_type}.")
+
+    if normalized_from_type == "real":
+        float_value = float(raw_value)
+        if normalized_to_type == "integer":
+            rounded_value = round_half_away_from_zero(float_value)
+            return rounded_value, rounded_value != float_value
+        if normalized_to_type == "text":
+            return str(float_value), True
+        raise RetrieverError(f"Cannot convert {normalized_from_type} to {normalized_to_type}.")
+
+    raise RetrieverError(f"Unsupported field type conversion: {normalized_from_type} -> {normalized_to_type}")
+
+
+def field_type_conversion_allowed(from_type: str, to_type: str) -> bool:
+    normalized_from = from_type.strip().lower()
+    normalized_to = to_type.strip().lower()
+    if normalized_from == normalized_to:
+        return True
+    allowed_pairs = {
+        ("boolean", "integer"),
+        ("boolean", "real"),
+        ("boolean", "text"),
+        ("date", "text"),
+        ("integer", "boolean"),
+        ("integer", "real"),
+        ("integer", "text"),
+        ("real", "integer"),
+        ("real", "text"),
+        ("text", "boolean"),
+        ("text", "date"),
+        ("text", "integer"),
+        ("text", "real"),
+    }
+    return (normalized_from, normalized_to) in allowed_pairs
+
+
+def build_no_document_selection_error() -> str:
+    return (
+        "No document selection active. Provide 'on <doc-ref[,...]>', narrow the current browse state "
+        "with /dataset / /filter / /search / /bates / /from-run, or use fill-field with explicit selectors."
+    )
+
+
 def add_field(root: Path, raw_field_name: str, field_type: str, instruction: str | None) -> dict[str, object]:
     normalized_field_name = sanitize_field_name(raw_field_name)
     normalized_field_type = field_type.strip().lower()
@@ -3868,11 +4159,9 @@ def add_field(root: Path, raw_field_name: str, field_type: str, instruction: str
         connection.close()
 
 
-def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) -> dict[str, object]:
-    normalized_field_name = sanitize_field_name(raw_field_name)
-    normalized_target_type = target_field_type.strip().lower()
-    if normalized_target_type != "date":
-        raise RetrieverError("Only text -> date field promotion is supported right now.")
+def rename_field(root: Path, old_name: str, new_name: str) -> dict[str, object]:
+    normalized_old_name = sanitize_field_name(old_name)
+    normalized_new_name = sanitize_field_name(new_name)
 
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -3880,9 +4169,147 @@ def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) 
     try:
         apply_schema(connection, root)
         reconcile_custom_fields_registry(connection, repair=True)
-        registry_row = get_custom_field_registry_row(connection, normalized_field_name)
-        if registry_row is None:
-            raise RetrieverError(f"Unknown custom field: {normalized_field_name}")
+        require_custom_field_registry_row(connection, normalized_old_name)
+        if normalized_old_name not in table_columns(connection, "documents"):
+            raise RetrieverError(f"Field column '{normalized_old_name}' does not exist on documents.")
+        if normalized_old_name == normalized_new_name:
+            return {
+                "status": "ok",
+                "renamed_from": normalized_old_name,
+                "field_name": normalized_new_name,
+                "locks_updated": 0,
+                "state_updates": {},
+            }
+        if normalized_new_name in table_columns(connection, "documents") or get_custom_field_registry_row(
+            connection,
+            normalized_new_name,
+        ) is not None:
+            raise RetrieverError(f"Field '{normalized_new_name}' already exists.")
+
+        state_plan = plan_field_rename_state_changes(paths, normalized_old_name, normalized_new_name)
+        blockers = state_plan.get("blockers")
+        if isinstance(blockers, list) and blockers:
+            return {
+                "status": "blocked",
+                "renamed_from": normalized_old_name,
+                "field_name": normalized_new_name,
+                "blockers": blockers,
+            }
+
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                f"""
+                ALTER TABLE documents
+                RENAME COLUMN {quote_identifier(normalized_old_name)} TO {quote_identifier(normalized_new_name)}
+                """
+            )
+            connection.execute(
+                """
+                UPDATE custom_fields_registry
+                SET field_name = ?
+                WHERE field_name = ?
+                """,
+                (normalized_new_name, normalized_old_name),
+            )
+            locks_updated = replace_document_field_locks(connection, normalized_old_name, normalized_new_name)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        apply_field_state_change_plan(paths, state_plan)
+        return {
+            "status": "ok",
+            "renamed_from": normalized_old_name,
+            "field_name": normalized_new_name,
+            "locks_updated": locks_updated,
+            "state_updates": state_plan.get("changes") or {},
+        }
+    finally:
+        connection.close()
+
+
+def delete_field(root: Path, raw_field_name: str, *, confirm: bool = False) -> dict[str, object]:
+    normalized_field_name = sanitize_field_name(raw_field_name)
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        reconcile_custom_fields_registry(connection, repair=True)
+        require_custom_field_registry_row(connection, normalized_field_name)
+        if normalized_field_name not in table_columns(connection, "documents"):
+            raise RetrieverError(f"Field column '{normalized_field_name}' does not exist on documents.")
+
+        non_null_values_removed = count_documents_with_non_null_field_value(connection, normalized_field_name)
+        preview_payload = {
+            "field_name": normalized_field_name,
+            "non_null_values_removed": non_null_values_removed,
+            "documents_affected": non_null_values_removed,
+        }
+
+        state_plan = plan_field_delete_state_changes(paths, normalized_field_name)
+        blockers = state_plan.get("blockers")
+        if isinstance(blockers, list) and blockers:
+            result = {"status": "blocked", **preview_payload, "blockers": blockers}
+            pending_changes = state_plan.get("changes")
+            if pending_changes:
+                result["state_updates"] = pending_changes
+            return result
+
+        if not confirm:
+            return {
+                "status": "confirm_required",
+                **preview_payload,
+                "state_updates": state_plan.get("changes") or {},
+            }
+
+        connection.execute("BEGIN")
+        try:
+            locks_removed = drop_document_field_locks(connection, normalized_field_name)
+            connection.execute(
+                f"ALTER TABLE documents DROP COLUMN {quote_identifier(normalized_field_name)}"
+            )
+            connection.execute(
+                """
+                DELETE FROM custom_fields_registry
+                WHERE field_name = ?
+                """,
+                (normalized_field_name,),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        apply_field_state_change_plan(paths, state_plan)
+        return {
+            "status": "ok",
+            "deleted": normalized_field_name,
+            "non_null_values_removed": non_null_values_removed,
+            "documents_affected": non_null_values_removed,
+            "locks_removed": locks_removed,
+            "state_updates": state_plan.get("changes") or {},
+        }
+    finally:
+        connection.close()
+
+
+def change_field_type(root: Path, raw_field_name: str, target_field_type: str) -> dict[str, object]:
+    normalized_field_name = sanitize_field_name(raw_field_name)
+    normalized_target_type = target_field_type.strip().lower()
+    if normalized_target_type not in REGISTRY_FIELD_TYPES:
+        raise RetrieverError(f"Unsupported field type: {target_field_type}")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        reconcile_custom_fields_registry(connection, repair=True)
+        registry_row = require_custom_field_registry_row(connection, normalized_field_name)
         current_type = str(registry_row["field_type"])
         if current_type == normalized_target_type:
             return {
@@ -3893,12 +4320,11 @@ def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) 
                 "normalized_values_updated": 0,
                 "documents_checked": 0,
                 "documents_with_values": 0,
+                "conversion_applied": False,
                 "promotion_applied": False,
             }
-        if current_type != "text":
-            raise RetrieverError(
-                f"Field '{normalized_field_name}' has type {current_type!r}; only text -> date promotion is supported."
-            )
+        if not field_type_conversion_allowed(current_type, normalized_target_type):
+            raise RetrieverError(f"Field '{normalized_field_name}' cannot convert from {current_type!r} to {normalized_target_type!r}.")
         if normalized_field_name not in table_columns(connection, "documents"):
             raise RetrieverError(f"Field column '{normalized_field_name}' does not exist on documents.")
 
@@ -3907,21 +4333,30 @@ def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) 
             SELECT id, {quote_identifier(normalized_field_name)} AS value
             FROM documents
             WHERE {quote_identifier(normalized_field_name)} IS NOT NULL
-              AND TRIM(CAST({quote_identifier(normalized_field_name)} AS TEXT)) != ''
             ORDER BY id ASC
             """
         ).fetchall()
 
         invalid_values: list[dict[str, object]] = []
-        normalized_updates: list[tuple[str, int]] = []
+        normalized_updates: list[tuple[object, int]] = []
+        warnings: list[str] = (
+            ["real -> integer rounds values to the nearest integer (half away from zero)."]
+            if current_type == "real" and normalized_target_type == "integer"
+            else []
+        )
         for row in value_rows:
-            raw_value = str(row["value"])
-            normalized_value = normalize_date_field_value(raw_value)
-            if normalized_value is None:
+            raw_value = row["value"]
+            try:
+                normalized_value, changed = convert_field_value_for_type_change(
+                    raw_value,
+                    current_type,
+                    normalized_target_type,
+                )
+            except RetrieverError:
                 if len(invalid_values) < 10:
                     invalid_values.append({"document_id": int(row["id"]), "value": raw_value})
                 continue
-            if normalized_value != raw_value:
+            if changed or normalized_value != raw_value:
                 normalized_updates.append((normalized_value, int(row["id"])))
 
         if invalid_values:
@@ -3933,20 +4368,59 @@ def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) 
                 "documents_checked": len(value_rows),
                 "documents_with_values": len(value_rows),
                 "invalid_value_samples": invalid_values,
+                "conversion_applied": False,
                 "promotion_applied": False,
             }
 
+        source_sql_type = REGISTRY_FIELD_TYPES[current_type]
+        target_sql_type = REGISTRY_FIELD_TYPES[normalized_target_type]
+        conversion_requires_column_rebuild = source_sql_type != target_sql_type
+        temp_column_name = f"{normalized_field_name}__tmp_{normalized_target_type}"
+
         connection.execute("BEGIN")
         try:
-            for normalized_value, document_id in normalized_updates:
+            if conversion_requires_column_rebuild:
+                if temp_column_name in table_columns(connection, "documents"):
+                    raise RetrieverError(f"Temporary field column '{temp_column_name}' already exists.")
+                connection.execute(
+                    f"ALTER TABLE documents ADD COLUMN {quote_identifier(temp_column_name)} {target_sql_type}"
+                )
+                if value_rows:
+                    for row in value_rows:
+                        document_id = int(row["id"])
+                        raw_value = row["value"]
+                        converted_value, _ = convert_field_value_for_type_change(
+                            raw_value,
+                            current_type,
+                            normalized_target_type,
+                        )
+                        connection.execute(
+                            f"""
+                            UPDATE documents
+                            SET {quote_identifier(temp_column_name)} = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (converted_value, utc_now(), document_id),
+                        )
+                connection.execute(
+                    f"ALTER TABLE documents DROP COLUMN {quote_identifier(normalized_field_name)}"
+                )
                 connection.execute(
                     f"""
-                    UPDATE documents
-                    SET {quote_identifier(normalized_field_name)} = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (normalized_value, utc_now(), document_id),
+                    ALTER TABLE documents
+                    RENAME COLUMN {quote_identifier(temp_column_name)} TO {quote_identifier(normalized_field_name)}
+                    """
                 )
+            else:
+                for normalized_value, document_id in normalized_updates:
+                    connection.execute(
+                        f"""
+                        UPDATE documents
+                        SET {quote_identifier(normalized_field_name)} = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (normalized_value, utc_now(), document_id),
+                    )
             connection.execute(
                 """
                 UPDATE custom_fields_registry
@@ -3968,10 +4442,21 @@ def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) 
             "documents_checked": len(value_rows),
             "documents_with_values": len(value_rows),
             "normalized_values_updated": len(normalized_updates),
+            "conversion_applied": True,
             "promotion_applied": True,
+            "column_rebuilt": conversion_requires_column_rebuild,
+            "warnings": warnings,
         }
     finally:
         connection.close()
+
+
+def promote_field_type(root: Path, raw_field_name: str, target_field_type: str) -> dict[str, object]:
+    if target_field_type.strip().lower() != "date":
+        raise RetrieverError("Only text -> date field promotion is supported via promote-field-type.")
+    payload = change_field_type(root, raw_field_name, target_field_type)
+    payload.setdefault("promotion_applied", bool(payload.get("conversion_applied")))
+    return payload
 
 
 def get_document_row_for_conversation_assignment(connection: sqlite3.Connection, document_id: int) -> sqlite3.Row:
@@ -4375,42 +4860,198 @@ def clear_conversation_assignment(root: Path, document_id: int) -> dict[str, obj
         connection.close()
 
 
-def set_field(root: Path, document_id: int, field_name: str, value: str | None) -> dict[str, object]:
+def fill_field(
+    root: Path,
+    *,
+    field_name: str,
+    value: str | None = None,
+    clear: bool = False,
+    document_ids: list[int] | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    dataset_names: list[str] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
+    dry_run: bool = False,
+    confirm: bool = False,
+) -> dict[str, object]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+    selector_inputs_present = bool(query.strip() or raw_bates or raw_filters or dataset_names or from_run_id is not None)
+    if normalized_document_ids and (selector_inputs_present or select_from_scope):
+        raise RetrieverError("fill-field accepts either --doc-id selectors or query/filter/scope selectors, not both.")
+    if clear and value is not None:
+        raise RetrieverError("Choose either --value or --clear, not both.")
+    if not clear and value is None:
+        raise RetrieverError("Provide --value or --clear.")
+
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        field_def = resolve_field_definition(connection, field_name)
-        column_name = field_def["field_name"]
-        if field_def.get("source") == "virtual":
-            raise RetrieverError(f"Field '{column_name}' is derived and cannot be manually set.")
-        if column_name in SYSTEM_MANAGED_FIELDS:
-            raise RetrieverError(f"Field '{column_name}' is system-managed and cannot be manually set.")
-        typed_value = value_from_type(field_def["field_type"], value)
+        field_def = ensure_fill_target_field_definition(connection, field_name)
+        column_name = str(field_def["field_name"])
+        typed_value = None if clear else value_from_type(str(field_def["field_type"]), value)
+
+        if normalized_document_ids:
+            target_rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
+            target_document_ids = [int(row["id"]) for row in target_rows]
+            selector_payload: dict[str, object] = {
+                "mode": "document_ids",
+                "document_ids": target_document_ids,
+            }
+            selected_from_scope = False
+        else:
+            selector = build_effective_scope_selector(
+                connection,
+                paths,
+                query=query,
+                raw_bates=raw_bates,
+                raw_filters=raw_filters,
+                dataset_names=dataset_names,
+                from_run_id=from_run_id,
+                select_from_scope=select_from_scope,
+            )
+            if not scope_run_selector_has_inputs(selector):
+                raise RetrieverError(build_no_document_selection_error())
+            target_document_ids, _, _ = resolve_seed_documents_for_scope_selector(connection, selector)
+            selector_payload = {
+                "mode": "scope_search",
+                "scope": selector,
+            }
+            selected_from_scope = bool(select_from_scope)
+
+        single_explicit_document = bool(normalized_document_ids) and len(target_document_ids) == 1
+        preview_payload = {
+            "field_name": column_name,
+            "field_type": str(field_def["field_type"]),
+            "value": typed_value,
+            "clear": clear,
+            "selector": selector_payload,
+            "selected_from_scope": selected_from_scope,
+            "would_write": len(target_document_ids),
+            "document_ids": target_document_ids,
+            "sample": sample_documents_for_fill(connection, target_document_ids, column_name),
+        }
+
+        if dry_run:
+            return {"status": "ok", "dry_run": True, **preview_payload}
+        if target_document_ids and not single_explicit_document and not confirm:
+            return {"status": "confirm_required", **preview_payload}
+        if not target_document_ids:
+            return {
+                "status": "ok",
+                "field_name": column_name,
+                "field_type": str(field_def["field_type"]),
+                "value": typed_value,
+                "selector": selector_payload,
+                "selected_from_scope": selected_from_scope,
+                "written": 0,
+                "skipped": 0,
+                "failed": 0,
+                "document_ids": [],
+                "sample": [],
+            }
+
+        placeholders = ", ".join("?" for _ in target_document_ids)
+        rows = connection.execute(
+            f"""
+            SELECT
+              id,
+              {quote_identifier(column_name)} AS field_value,
+              {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} AS locks_json
+            FROM documents
+            WHERE id IN ({placeholders})
+            """,
+            tuple(target_document_ids),
+        ).fetchall()
+        rows_by_id = {int(row["id"]): row for row in rows}
+
         connection.execute("BEGIN")
         try:
-            row = connection.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone()
-            if row is None:
-                raise RetrieverError(f"Unknown document id: {document_id}")
-            connection.execute(
-                f"UPDATE documents SET {quote_identifier(column_name)} = ?, updated_at = ? WHERE id = ?",
-                (typed_value, utc_now(), document_id),
-            )
+            written = 0
+            skipped = 0
+            updated_document_ids: list[int] = []
+            for document_id in target_document_ids:
+                row = rows_by_id.get(document_id)
+                if row is None:
+                    raise RetrieverError(f"Unknown document id: {document_id}")
+                locks = normalize_string_list(row["locks_json"])
+                next_locks = list(locks)
+                if column_name not in next_locks:
+                    next_locks.append(column_name)
+                if row["field_value"] == typed_value and next_locks == locks:
+                    skipped += 1
+                    continue
+                connection.execute(
+                    f"""
+                    UPDATE documents
+                    SET
+                      {quote_identifier(column_name)} = ?,
+                      {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} = ?,
+                      updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (typed_value, json.dumps(next_locks), utc_now(), document_id),
+                )
+                updated_document_ids.append(document_id)
+                written += 1
             if column_name in {"author", "participants", "recipients", "subject", "title"}:
-                refresh_documents_fts_row(connection, document_id)
-            locks = lock_field(connection, document_id, column_name)
+                for document_id in updated_document_ids:
+                    refresh_documents_fts_row(connection, document_id)
             connection.commit()
             return {
                 "status": "ok",
-                "document_id": document_id,
                 "field_name": column_name,
-                "field_type": field_def["field_type"],
+                "field_type": str(field_def["field_type"]),
                 "value": typed_value,
-                "manual_field_locks": locks,
+                "selector": selector_payload,
+                "selected_from_scope": selected_from_scope,
+                "written": written,
+                "skipped": skipped,
+                "failed": 0,
+                "document_ids": target_document_ids,
+                "sample": sample_documents_for_fill(connection, target_document_ids, column_name),
             }
         except Exception:
             connection.rollback()
             raise
+    finally:
+        connection.close()
+
+
+def set_field(root: Path, document_id: int, field_name: str, value: str | None) -> dict[str, object]:
+    payload = fill_field(
+        root,
+        field_name=field_name,
+        value=value,
+        clear=value is None,
+        document_ids=[document_id],
+        confirm=True,
+    )
+    paths = workspace_paths(root)
+    connection = connect_db(paths["db_path"])
+    try:
+        field_def = ensure_fill_target_field_definition(connection, field_name)
+        row = connection.execute(
+            f"""
+            SELECT
+              {quote_identifier(field_def['field_name'])} AS field_value,
+              {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} AS locks_json
+            FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+        locks = normalize_string_list(row["locks_json"] if row is not None else None)
+        return {
+            "status": str(payload.get("status") or "ok"),
+            "document_id": document_id,
+            "field_name": str(field_def["field_name"]),
+            "field_type": str(field_def["field_type"]),
+            "value": row["field_value"] if row is not None else None,
+            "manual_field_locks": locks,
+        }
     finally:
         connection.close()

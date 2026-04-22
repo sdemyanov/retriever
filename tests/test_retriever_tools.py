@@ -415,6 +415,19 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def fetch_custom_field_registry_row(self, field_name: str) -> sqlite3.Row:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            row = connection.execute(
+                "SELECT * FROM custom_fields_registry WHERE field_name = ?",
+                (field_name,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            return row
+        finally:
+            connection.close()
+
     def fetch_child_rows(self, parent_document_id: int) -> list[dict[str, object]]:
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -12174,6 +12187,326 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(payload["selected_from_scope"])
         self.assertEqual(payload["scope"]["keyword"], "alpha")
         self.assertEqual([item["file_name"] for item in payload["results"]], ["alpha-scope.txt"])
+
+    def test_list_fields_and_describe_field_report_custom_field_metadata(self) -> None:
+        (self.root / "sample.txt").write_text("field metadata body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        add_exit, add_payload, _, _ = self.run_cli(
+            "add-field",
+            str(self.root),
+            "review_status",
+            "text",
+            "--instruction",
+            "Initial review label",
+        )
+        self.assertEqual(add_exit, 0)
+        self.assertIsNotNone(add_payload)
+
+        fill_exit, fill_payload, _, _ = self.run_cli(
+            "fill-field",
+            str(self.root),
+            "--field",
+            "review_status",
+            "--value",
+            "hot",
+            "--doc-id",
+            str(row["id"]),
+        )
+        self.assertEqual(fill_exit, 0)
+        self.assertIsNotNone(fill_payload)
+        self.assertEqual(fill_payload["written"], 1)
+
+        list_exit, list_payload, _, _ = self.run_cli("list-fields", str(self.root))
+        self.assertEqual(list_exit, 0)
+        self.assertIsNotNone(list_payload)
+        review_status_entry = {
+            item["field_name"]: item for item in list_payload["fields"]
+        }["review_status"]
+        self.assertEqual(review_status_entry["field_type"], "text")
+        self.assertEqual(review_status_entry["documents_with_values"], 1)
+        self.assertEqual(review_status_entry["instruction"], "Initial review label")
+
+        describe_exit, describe_payload, _, _ = self.run_cli(
+            "describe-field",
+            str(self.root),
+            "review_status",
+            "--text",
+            "Normalized review label",
+        )
+        self.assertEqual(describe_exit, 0)
+        self.assertIsNotNone(describe_payload)
+        self.assertEqual(describe_payload["instruction"], "Normalized review label")
+        self.assertEqual(
+            self.fetch_custom_field_registry_row("review_status")["instruction"],
+            "Normalized review label",
+        )
+
+        table_exit, table_stdout, table_stderr = self.run_cli_raw(
+            "list-fields",
+            str(self.root),
+            "--format",
+            "table",
+        )
+        self.assertEqual(table_exit, 0)
+        self.assertEqual(table_stderr, "")
+        self.assertIn("review_status | text | 1 | Normalized review label", table_stdout)
+
+    def test_fill_field_bulk_scope_requires_confirm_and_locks_documents(self) -> None:
+        (self.root / "alpha-one.txt").write_text("alpha body one\n", encoding="utf-8")
+        (self.root / "alpha-two.txt").write_text("alpha body two\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 3)
+
+        self.assertEqual(self.run_cli("add-field", str(self.root), "review_status", "text")[0], 0)
+        scope_payload = retriever_tools.run_slash_command(self.root, "/search alpha")
+        self.assertEqual(scope_payload["total_hits"], 2)
+
+        preview_payload = retriever_tools.run_slash_command(self.root, "/fill review_status responsive")
+        self.assertEqual(preview_payload["status"], "confirm_required")
+        self.assertEqual(preview_payload["would_write"], 2)
+
+        apply_exit, apply_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/fill",
+            "review_status",
+            "responsive",
+            "--confirm",
+        )
+        self.assertEqual(apply_exit, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["written"], 2)
+        self.assertEqual(apply_payload["skipped"], 0)
+
+        for rel_path in ("alpha-one.txt", "alpha-two.txt"):
+            row = self.fetch_document_row(rel_path)
+            self.assertEqual(row["review_status"], "responsive")
+            self.assertIn("review_status", retriever_tools.normalize_string_list(row["manual_field_locks_json"]))
+        self.assertIsNone(self.fetch_document_row("beta.txt").get("review_status"))
+
+    def test_slash_fill_accepts_control_number_for_single_document(self) -> None:
+        (self.root / "single.txt").write_text("single fill body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("single.txt")
+        self.assertEqual(self.run_cli("add-field", str(self.root), "review_status", "text")[0], 0)
+
+        payload = retriever_tools.run_slash_command(
+            self.root,
+            f"/fill review_status hot on {row['control_number']}",
+        )
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["written"], 1)
+        self.assertEqual(payload["document_ids"], [row["id"]])
+
+        updated_row = self.fetch_document_row("single.txt")
+        self.assertEqual(updated_row["review_status"], "hot")
+        self.assertIn("review_status", retriever_tools.normalize_string_list(updated_row["manual_field_locks_json"]))
+
+    def test_rename_field_updates_session_and_saved_scope_refs(self) -> None:
+        (self.root / "sample.txt").write_text("rename field body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        self.assertEqual(self.run_cli("add-field", str(self.root), "review_score", "integer")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "fill-field",
+                str(self.root),
+                "--field",
+                "review_score",
+                "--value",
+                "7",
+                "--doc-id",
+                str(row["id"]),
+            )[0],
+            0,
+        )
+        self.assertEqual(self.run_cli("slash", str(self.root), "/columns set title, review_score, control_number")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/filter review_score >= 5")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/sort review_score asc")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/scope save review")[0], 0)
+
+        rename_exit, rename_payload, _, _ = self.run_cli(
+            "rename-field",
+            str(self.root),
+            "review_score",
+            "responsiveness_score",
+        )
+        self.assertEqual(rename_exit, 0)
+        self.assertIsNotNone(rename_payload)
+        self.assertEqual(rename_payload["status"], "ok")
+        self.assertEqual(rename_payload["field_name"], "responsiveness_score")
+
+        updated_row = self.fetch_document_row("sample.txt")
+        self.assertEqual(updated_row["responsiveness_score"], 7)
+        self.assertNotIn("review_score", updated_row)
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(
+            session_payload["display"]["documents"]["columns"],
+            ["title", "responsiveness_score", "control_number"],
+        )
+        self.assertEqual(
+            session_payload["browsing"]["documents"]["sort"],
+            [["responsiveness_score", "asc"]],
+        )
+        self.assertIn("responsiveness_score", session_payload["scope"]["filter"])
+        self.assertNotIn("review_score", session_payload["scope"]["filter"])
+
+        saved_scopes_payload = json.loads(self.paths["saved_scopes_path"].read_text(encoding="utf-8"))
+        self.assertIn("responsiveness_score", saved_scopes_payload["scopes"]["review"]["filter"])
+        self.assertNotIn("review_score", saved_scopes_payload["scopes"]["review"]["filter"])
+
+        load_exit, load_payload, _, _ = self.run_cli("slash", str(self.root), "/scope", "load", "review")
+        self.assertEqual(load_exit, 0)
+        self.assertIsNotNone(load_payload)
+        self.assertIn("responsiveness_score", load_payload["scope"]["filter"])
+        self.assertEqual(load_payload["total_hits"], 1)
+
+    def test_delete_field_blocks_on_scope_filters_and_scrubs_session_state(self) -> None:
+        (self.root / "sample.txt").write_text("delete field body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        row = self.fetch_document_row("sample.txt")
+        self.assertEqual(self.run_cli("add-field", str(self.root), "review_score", "integer")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "fill-field",
+                str(self.root),
+                "--field",
+                "review_score",
+                "--value",
+                "7",
+                "--doc-id",
+                str(row["id"]),
+            )[0],
+            0,
+        )
+        self.assertEqual(self.run_cli("slash", str(self.root), "/columns set title, review_score, control_number")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/sort review_score asc")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/filter review_score >= 5")[0], 0)
+        self.assertEqual(self.run_cli("slash", str(self.root), "/scope save review")[0], 0)
+
+        blocked_exit, blocked_payload, _, _ = self.run_cli(
+            "delete-field",
+            str(self.root),
+            "review_score",
+            "--confirm",
+        )
+        self.assertEqual(blocked_exit, 0)
+        self.assertIsNotNone(blocked_payload)
+        self.assertEqual(blocked_payload["status"], "blocked")
+        self.assertEqual(len(blocked_payload["blockers"]), 2)
+
+        self.assertEqual(self.run_cli("slash", str(self.root), "/filter clear")[0], 0)
+        saved_scopes_payload = json.loads(self.paths["saved_scopes_path"].read_text(encoding="utf-8"))
+        saved_scopes_payload["scopes"]["review"].pop("filter", None)
+        self.paths["saved_scopes_path"].write_text(
+            json.dumps(saved_scopes_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        preview_exit, preview_payload, _, _ = self.run_cli("delete-field", str(self.root), "review_score")
+        self.assertEqual(preview_exit, 0)
+        self.assertIsNotNone(preview_payload)
+        self.assertEqual(preview_payload["status"], "confirm_required")
+
+        delete_exit, delete_payload, _, _ = self.run_cli(
+            "delete-field",
+            str(self.root),
+            "review_score",
+            "--confirm",
+        )
+        self.assertEqual(delete_exit, 0)
+        self.assertIsNotNone(delete_payload)
+        self.assertEqual(delete_payload["status"], "ok")
+        self.assertEqual(delete_payload["deleted"], "review_score")
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["display"]["documents"]["columns"], ["title", "control_number"])
+        self.assertNotIn("sort", session_payload["browsing"]["documents"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(documents)")
+            }
+        finally:
+            connection.close()
+        self.assertNotIn("review_score", columns)
+        list_fields_payload = retriever_tools.list_fields(self.root)
+        self.assertEqual(list_fields_payload["fields"], [])
+
+    def test_change_field_type_supports_integer_to_boolean(self) -> None:
+        (self.root / "flag-a.txt").write_text("flag a\n", encoding="utf-8")
+        (self.root / "flag-b.txt").write_text("flag b\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_row = self.fetch_document_row("flag-a.txt")
+        second_row = self.fetch_document_row("flag-b.txt")
+        self.assertEqual(self.run_cli("add-field", str(self.root), "review_flag", "integer")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "fill-field",
+                str(self.root),
+                "--field",
+                "review_flag",
+                "--value",
+                "1",
+                "--doc-id",
+                str(first_row["id"]),
+            )[0],
+            0,
+        )
+        self.assertEqual(
+            self.run_cli(
+                "fill-field",
+                str(self.root),
+                "--field",
+                "review_flag",
+                "--value",
+                "0",
+                "--doc-id",
+                str(second_row["id"]),
+            )[0],
+            0,
+        )
+
+        exit_code, payload, _, _ = self.run_cli(
+            "change-field-type",
+            str(self.root),
+            "review_flag",
+            "boolean",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["conversion_applied"])
+        self.assertEqual(self.fetch_custom_field_registry_row("review_flag")["field_type"], "boolean")
+        self.assertEqual(self.fetch_document_row("flag-a.txt")["review_flag"], 1)
+        self.assertEqual(self.fetch_document_row("flag-b.txt")["review_flag"], 0)
 
     def test_set_field_validates_custom_date_fields(self) -> None:
         document_path = self.root / "sample.txt"
