@@ -13,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 import types
 import unittest
 import zipfile
@@ -4407,6 +4408,111 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ):
                 retriever_tools.acquire_workspace_ingest_lock(self.paths)
 
+    def test_iter_prepared_loose_file_items_preserves_input_order_with_multiple_workers(self) -> None:
+        items = [
+            {
+                "path": self.root / "alpha.txt",
+                "rel_path": "alpha.txt",
+                "file_type": "txt",
+                "file_hash": "alpha",
+            },
+            {
+                "path": self.root / "beta.txt",
+                "rel_path": "beta.txt",
+                "file_type": "txt",
+                "file_hash": "beta",
+            },
+        ]
+
+        def fake_prepare(item: dict[str, object]) -> dict[str, object]:
+            if item["rel_path"] == "alpha.txt":
+                time.sleep(0.05)
+            prepared = dict(item)
+            prepared["prepare_ms"] = 1.0
+            prepared["prepare_error"] = None
+            prepared["extracted_payload"] = {"text_content": item["rel_path"]}
+            prepared["attachments"] = []
+            return prepared
+
+        with mock.patch.dict(os.environ, {"RETRIEVER_INGEST_WORKERS": "2"}):
+            with mock.patch.object(retriever_tools, "prepare_loose_file_item", side_effect=fake_prepare):
+                prepared = list(retriever_tools.iter_prepared_loose_file_items(items))
+
+        self.assertEqual([item["rel_path"] for item, _ in prepared], ["alpha.txt", "beta.txt"])
+
+    def test_refresh_prepared_loose_file_item_if_stale_reprepares_with_new_contents(self) -> None:
+        path = self.root / "alpha.txt"
+        path.write_text("first version\n", encoding="utf-8")
+        item = retriever_tools.refresh_ingest_item_filesystem_facts(
+            {
+                "path": path,
+                "rel_path": "alpha.txt",
+                "file_type": "txt",
+            }
+        )
+        prepared = retriever_tools.prepare_loose_file_item(item)
+
+        time.sleep(0.02)
+        path.write_text("second version\nwith more text\n", encoding="utf-8")
+
+        refreshed, did_refresh = retriever_tools.refresh_prepared_loose_file_item_if_stale(prepared)
+
+        self.assertTrue(did_refresh)
+        self.assertNotEqual(prepared["file_hash"], refreshed["file_hash"])
+        self.assertIn("second version", refreshed["extracted_payload"]["text_content"])
+        self.assertTrue(refreshed["prepared_chunks"])
+        self.assertIn("second version", refreshed["prepared_chunks"][0]["text_content"])
+
+    def test_iter_prepared_loose_file_items_spills_large_payloads_to_temp_dir(self) -> None:
+        items = [
+            {
+                "path": self.root / "alpha.txt",
+                "rel_path": "alpha.txt",
+                "file_type": "txt",
+                "file_hash": "alpha",
+            }
+        ]
+        staging_root = self.paths["ingest_tmp_dir"] / "spill-test"
+
+        def fake_prepare(item: dict[str, object]) -> dict[str, object]:
+            prepared = dict(item)
+            prepared["prepare_ms"] = 1.0
+            prepared["prepare_chunk_ms"] = 0.1
+            prepared["prepare_error"] = None
+            prepared["extracted_payload"] = {
+                "text_content": "x" * 4096,
+                "preview_artifacts": [{"file_name": "preview.html", "preview_type": "html", "content": "x" * 4096}],
+            }
+            prepared["attachments"] = [
+                {
+                    "file_name": "payload.bin",
+                    "payload": b"x" * 4096,
+                    "file_hash": "payload-hash",
+                }
+            ]
+            prepared["prepared_chunks"] = [
+                {
+                    "chunk_index": 0,
+                    "char_start": 0,
+                    "char_end": 32,
+                    "token_estimate": 8,
+                    "text_content": "x" * 32,
+                }
+            ]
+            return prepared
+
+        with mock.patch.object(retriever_tools, "prepare_loose_file_item", side_effect=fake_prepare):
+            with mock.patch.object(retriever_tools, "ingest_prepare_worker_count", return_value=1):
+                with mock.patch.object(retriever_tools, "ingest_prepare_queue_capacity", return_value=1):
+                    with mock.patch.object(retriever_tools, "ingest_prepare_queue_max_bytes", return_value=1):
+                        with mock.patch.object(retriever_tools, "ingest_prepare_spill_threshold_bytes", return_value=1):
+                            prepared = list(retriever_tools.iter_prepared_loose_file_items(items, staging_root))
+
+        self.assertEqual(prepared[0][0]["rel_path"], "alpha.txt")
+        spill_dir = staging_root / "prepared-loose"
+        self.assertTrue(spill_dir.exists())
+        self.assertEqual(list(spill_dir.iterdir()), [])
+
     def test_bootstrap_recovers_zero_byte_sqlite_artifacts(self) -> None:
         self.paths["db_path"].touch()
         Path(f"{self.paths['db_path']}-journal").write_text("stale\n", encoding="utf-8")
@@ -5435,6 +5541,155 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 ORDER BY ordinal ASC, id ASC
                 """,
                 (child_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            [(row["part_kind"], row["rel_source_path"]) for row in source_parts],
+            [
+                ("slack_thread_root_day", "data/slack/general/2022-12-16.json"),
+                ("slack_thread_reply_day", "data/slack/general/2022-12-17.json"),
+            ],
+        )
+
+    def test_ingest_slack_rerun_adds_late_day_file_to_existing_conversation(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        thread_ts = "1671235434.237949"
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Kickoff thread",
+                        "user": "U04SERGEY1",
+                        "ts": thread_ts,
+                        "thread_ts": thread_ts,
+                        "reply_count": 1,
+                    },
+                    {
+                        "type": "message",
+                        "text": "Standalone channel update",
+                        "user": "U04MAX0001",
+                        "ts": "1671235834.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        first_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_result["new"], 2)
+        self.assertEqual(first_result["failed"], 0)
+        self.assertEqual(first_result["slack_documents_created"], 2)
+
+        day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        child_rel_path = retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
+        child_row = self.fetch_document_row(child_rel_path)
+        first_child_id = child_row["id"]
+        first_child_control_number = child_row["control_number"]
+
+        (channel_dir / "2022-12-17.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Following up on kickoff",
+                        "user": "U04MAX0001",
+                        "ts": "1671321834.237949",
+                        "thread_ts": thread_ts,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        second_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(second_result["new"], 1)
+        self.assertEqual(second_result["updated"], 2)
+        self.assertEqual(second_result["failed"], 0)
+        self.assertEqual(second_result["slack_exports_detected"], 1)
+        self.assertEqual(second_result["slack_day_documents_scanned"], 2)
+        self.assertEqual(second_result["slack_documents_created"], 1)
+        self.assertEqual(second_result["slack_documents_updated"], 2)
+
+        updated_day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        updated_child_row = self.fetch_document_row(child_rel_path)
+
+        self.assertEqual(updated_day_one_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(day_two_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(updated_child_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(updated_child_row["id"], first_child_id)
+        self.assertEqual(updated_child_row["control_number"], first_child_control_number)
+        self.assertEqual(updated_child_row["parent_document_id"], updated_day_one_row["id"])
+        self.assertEqual(day_two_row["text_status"], "empty")
+
+        reply_search = retriever_tools.search(self.root, "Following up on kickoff", None, None, None, 1, 20)
+        self.assertEqual(reply_search["total_hits"], 1)
+        self.assertEqual(reply_search["results"][0]["id"], updated_child_row["id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            source_parts = connection.execute(
+                """
+                SELECT part_kind, rel_source_path, ordinal
+                FROM document_source_parts
+                WHERE document_id = ?
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (updated_child_row["id"],),
             ).fetchall()
         finally:
             connection.close()
@@ -9396,6 +9651,65 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(second_ingest["failed"], 0)
         browse_results = retriever_tools.search(self.root, "", None, None, None, 1, 20)
         self.assertEqual(browse_results["total_hits"], 1)
+
+    def test_unchanged_pst_chat_source_reparses_when_chat_threading_rows_are_missing(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-chat-001",
+                subject=None,
+                body_text="Kickoff thread for launch planning.",
+                folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                author="Alice Example",
+                recipients=None,
+                date_created="2026-04-15T09:00:00Z",
+                chat_threading={
+                    "thread_id": "19:launch-thread@unq.gbl.spaces",
+                    "message_id": "1713882000000",
+                    "thread_type": "chat",
+                    "participants": ["Alice Example", "Bob Example"],
+                },
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["pst_messages_created"], 1)
+        parent_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-chat-001"))
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                "DELETE FROM document_chat_threading WHERE document_id = ?",
+                (int(parent_row["id"]),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["failed"], 0)
+        self.assertEqual(second_ingest["pst_sources_skipped"], 0)
+        self.assertEqual(second_ingest["pst_messages_updated"], 1)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            threading_row = connection.execute(
+                """
+                SELECT thread_id, thread_type
+                FROM document_chat_threading
+                WHERE document_id = ?
+                """,
+                (int(parent_row["id"]),),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(threading_row)
+        assert threading_row is not None
+        self.assertEqual(threading_row["thread_id"], "19:launch-thread@unq.gbl.spaces")
+        self.assertEqual(threading_row["thread_type"], "chat")
 
     def test_changed_pst_reingest_preserves_control_numbers_and_retires_removed_messages(self) -> None:
         pst_path = self.write_fake_pst_file(content=b"pst-v1")

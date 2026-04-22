@@ -1,559 +1,1142 @@
+CONTAINER_SOURCE_FILE_TYPES = frozenset({PST_SOURCE_KIND, MBOX_SOURCE_KIND})
+
+
+def default_ingest_stats(slack_export_count: int, gmail_export_count: int) -> dict[str, int]:
+    return {
+        "new": 0,
+        "updated": 0,
+        "renamed": 0,
+        "missing": 0,
+        "skipped": 0,
+        "failed": 0,
+        "pst_sources_skipped": 0,
+        "pst_messages_created": 0,
+        "pst_messages_updated": 0,
+        "pst_messages_deleted": 0,
+        "pst_sources_missing": 0,
+        "pst_documents_missing": 0,
+        "mbox_sources_skipped": 0,
+        "mbox_messages_created": 0,
+        "mbox_messages_updated": 0,
+        "mbox_messages_deleted": 0,
+        "mbox_sources_missing": 0,
+        "mbox_documents_missing": 0,
+        "gmail_exports_detected": gmail_export_count,
+        "gmail_linked_documents_created": 0,
+        "gmail_linked_documents_updated": 0,
+        "gmail_documents_scanned": 0,
+        "slack_exports_detected": slack_export_count,
+        "slack_day_documents_scanned": 0,
+        "slack_documents_created": 0,
+        "slack_documents_updated": 0,
+        "slack_documents_missing": 0,
+        "slack_conversations": 0,
+        "email_conversations": 0,
+        "email_documents_reassigned": 0,
+        "email_child_documents_updated": 0,
+        "pst_chat_conversations": 0,
+        "pst_chat_documents_reassigned": 0,
+        "pst_chat_child_documents_updated": 0,
+        "production_documents_created": 0,
+        "production_documents_updated": 0,
+        "production_documents_unchanged": 0,
+        "production_documents_retired": 0,
+        "production_families_reconstructed": 0,
+        "production_docs_missing_linked_text": 0,
+        "production_docs_missing_linked_images": 0,
+        "production_docs_missing_linked_natives": 0,
+    }
+
+
+def source_file_snapshot(path: Path) -> tuple[int | None, int | None]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None, None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def refresh_ingest_item_filesystem_facts(item: dict[str, object]) -> dict[str, object]:
+    refreshed_item = dict(item)
+    path = Path(refreshed_item["path"])
+    file_size, file_mtime_ns = source_file_snapshot(path)
+    refreshed_item["source_file_size"] = file_size
+    refreshed_item["source_file_mtime_ns"] = file_mtime_ns
+    refreshed_item["file_hash"] = (
+        None if str(refreshed_item["file_type"]) in CONTAINER_SOURCE_FILE_TYPES else sha256_file(path)
+    )
+    return refreshed_item
+
+
+def plan_ingest_work(
+    root: Path,
+    recursive: bool,
+    allowed_types: set[str] | None,
+    connection: sqlite3.Connection,
+) -> dict[str, object]:
+    scan_hash_ms = 0.0
+    production_signatures = find_production_root_signatures(root, recursive, connection)
+    production_root_paths = [Path(signature["root"]).resolve() for signature in production_signatures]
+    slack_export_descriptors = find_slack_export_roots(root, recursive, allowed_types)
+    slack_export_root_paths = [Path(descriptor["root"]).resolve() for descriptor in slack_export_descriptors]
+    gmail_export_descriptors = find_gmail_export_roots(root, recursive, allowed_types)
+    gmail_owned_paths = {
+        Path(path).resolve()
+        for descriptor in gmail_export_descriptors
+        for path in list(descriptor.get("owned_paths") or [])
+    }
+    gmail_owned_rel_paths = {
+        relative_document_path(root, owned_path)
+        for owned_path in gmail_owned_paths
+        if root.resolve() == owned_path.resolve() or root.resolve() in owned_path.resolve().parents
+    }
+    scanned_files = [
+        path
+        for path in collect_files(root, recursive, allowed_types)
+        if not any(production_root == path.resolve() or production_root in path.resolve().parents for production_root in production_root_paths)
+        and not any(slack_root == path.resolve() or slack_root in path.resolve().parents for slack_root in slack_export_root_paths)
+        and path.resolve() not in gmail_owned_paths
+    ]
+    scanned_rel_paths: set[str] = set()
+    scanned_pst_source_rel_paths: set[str] = set()
+    scanned_mbox_source_rel_paths: set[str] = set()
+    scanned_items: list[dict[str, object]] = []
+    loose_file_items: list[dict[str, object]] = []
+    for path in scanned_files:
+        item_started = time.perf_counter()
+        rel_path = relative_document_path(root, path)
+        file_type = normalize_extension(path)
+        scanned_rel_paths.add(rel_path)
+        if file_type == PST_SOURCE_KIND:
+            scanned_pst_source_rel_paths.add(rel_path)
+        if file_type == MBOX_SOURCE_KIND:
+            scanned_mbox_source_rel_paths.add(rel_path)
+        item = refresh_ingest_item_filesystem_facts(
+            {
+                "path": path,
+                "rel_path": rel_path,
+                "file_type": file_type,
+            }
+        )
+        scanned_items.append(item)
+        if file_type not in CONTAINER_SOURCE_FILE_TYPES:
+            loose_file_items.append(item)
+        scan_hash_ms += (time.perf_counter() - item_started) * 1000.0
+    return {
+        "production_signatures": production_signatures,
+        "slack_export_descriptors": slack_export_descriptors,
+        "gmail_export_descriptors": gmail_export_descriptors,
+        "gmail_owned_rel_paths": gmail_owned_rel_paths,
+        "scanned_files": scanned_files,
+        "scanned_items": scanned_items,
+        "loose_file_items": loose_file_items,
+        "scanned_rel_paths": scanned_rel_paths,
+        "scanned_pst_source_rel_paths": scanned_pst_source_rel_paths,
+        "scanned_mbox_source_rel_paths": scanned_mbox_source_rel_paths,
+        "scan_hash_ms": scan_hash_ms,
+    }
+
+
+def ingest_serial_special_sources(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    root: Path,
+    ingest_tmp_dir: Path | None,
+    allowed_types: set[str] | None,
+    production_signatures: list[dict[str, object]],
+    slack_export_descriptors: list[dict[str, object]],
+    gmail_export_descriptors: list[dict[str, object]],
+    scanned_rel_paths: set[str],
+    scanned_mbox_source_rel_paths: set[str],
+    stats: dict[str, int],
+    failures: list[dict[str, str]],
+) -> dict[str, object]:
+    current_ingestion_batch: int | None = None
+    slack_day_documents_missing = 0
+    ingested_production_roots: list[str] = []
+    skipped_production_roots: list[str] = []
+    warnings: list[str] = []
+    gmail_ms = 0.0
+    for descriptor in gmail_export_descriptors:
+        export_root = Path(descriptor["root"])
+        source_started = time.perf_counter()
+        try:
+            gmail_result = ingest_gmail_export_root(
+                connection,
+                paths,
+                root,
+                descriptor,
+                allowed_file_types=allowed_types,
+            )
+            stats["new"] += int(gmail_result["new"])
+            stats["updated"] += int(gmail_result["updated"])
+            stats["failed"] += int(gmail_result["failed"])
+            stats["gmail_documents_scanned"] += int(gmail_result["scanned_files"])
+            stats["mbox_sources_skipped"] += int(gmail_result["mbox_sources_skipped"])
+            stats["mbox_messages_created"] += int(gmail_result["mbox_messages_created"])
+            stats["mbox_messages_updated"] += int(gmail_result["mbox_messages_updated"])
+            stats["mbox_messages_deleted"] += int(gmail_result["mbox_messages_deleted"])
+            stats["gmail_linked_documents_created"] += int(gmail_result["gmail_linked_documents_created"])
+            stats["gmail_linked_documents_updated"] += int(gmail_result["gmail_linked_documents_updated"])
+            scanned_rel_paths.update(str(rel_path) for rel_path in list(gmail_result.get("scanned_filesystem_rel_paths", [])))
+            scanned_mbox_source_rel_paths.update(
+                str(rel_path) for rel_path in list(gmail_result.get("scanned_mbox_source_rel_paths", []))
+            )
+            failures.extend(list(gmail_result.get("failures", [])))
+        except Exception as exc:
+            stats["failed"] += 1
+            failures.append(
+                {
+                    "rel_path": relative_document_path(root, export_root),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        finally:
+            gmail_ms += (time.perf_counter() - source_started) * 1000.0
+    slack_ms = 0.0
+    for descriptor in slack_export_descriptors:
+        export_root = Path(descriptor["root"])
+        source_started = time.perf_counter()
+        try:
+            slack_result = ingest_slack_export_root(
+                connection,
+                paths,
+                export_root,
+                ingestion_batch_number=current_ingestion_batch,
+                staging_root=ingest_tmp_dir,
+            )
+            current_ingestion_batch = (
+                int(slack_result["ingestion_batch_number"])
+                if slack_result.get("ingestion_batch_number") is not None
+                else current_ingestion_batch
+            )
+            stats["new"] += int(slack_result["new"])
+            stats["updated"] += int(slack_result["updated"])
+            stats["failed"] += int(slack_result["failed"])
+            stats["slack_day_documents_scanned"] += int(slack_result["scanned_day_files"])
+            stats["slack_documents_created"] += int(slack_result["new"])
+            stats["slack_documents_updated"] += int(slack_result["updated"])
+            stats["slack_conversations"] += int(slack_result["conversations"])
+            slack_day_documents_missing += int(slack_result["missing"])
+            failures.extend(list(slack_result.get("failures", [])))
+        except Exception as exc:
+            stats["failed"] += 1
+            failures.append(
+                {
+                    "rel_path": relative_document_path(root, export_root),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        finally:
+            slack_ms += (time.perf_counter() - source_started) * 1000.0
+
+    production_ms = 0.0
+    if allowed_types is None:
+        for signature in production_signatures:
+            production_rel_root = str(signature["rel_root"])
+            resolved_production_root = Path(signature["root"]).resolve()
+            source_started = time.perf_counter()
+            try:
+                production_result = ingest_resolved_production_root(
+                    connection,
+                    paths,
+                    root,
+                    resolved_production_root,
+                    staging_root=ingest_tmp_dir,
+                )
+                ingested_production_roots.append(production_rel_root)
+                stats["new"] += int(production_result["created"])
+                stats["updated"] += int(production_result["updated"])
+                stats["production_documents_created"] += int(production_result["created"])
+                stats["production_documents_updated"] += int(production_result["updated"])
+                stats["production_documents_unchanged"] += int(production_result["unchanged"])
+                stats["production_documents_retired"] += int(production_result["retired"])
+                stats["production_families_reconstructed"] += int(production_result["families_reconstructed"])
+                stats["production_docs_missing_linked_text"] += int(production_result["docs_missing_linked_text"])
+                stats["production_docs_missing_linked_images"] += int(production_result["docs_missing_linked_images"])
+                stats["production_docs_missing_linked_natives"] += int(production_result["docs_missing_linked_natives"])
+                for failure in list(production_result.get("failures", [])):
+                    control_number = normalize_whitespace(str(failure.get("control_number") or ""))
+                    failure_entry: dict[str, str] = {
+                        "rel_path": (
+                            production_logical_rel_path(production_rel_root, control_number).as_posix()
+                            if control_number
+                            else production_rel_root
+                        ),
+                        "production_rel_root": production_rel_root,
+                        "error": str(failure.get("error") or ""),
+                    }
+                    if control_number:
+                        failure_entry["control_number"] = control_number
+                    failures.append(failure_entry)
+                stats["failed"] += len(list(production_result.get("failures", [])))
+            except Exception as exc:
+                stats["failed"] += 1
+                failures.append(
+                    {
+                        "rel_path": production_rel_root,
+                        "production_rel_root": production_rel_root,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            finally:
+                production_ms += (time.perf_counter() - source_started) * 1000.0
+    else:
+        skipped_production_roots = [str(signature["rel_root"]) for signature in production_signatures]
+        warnings = [
+            f"Detected processed production root at {signature['rel_root']}; use ingest-production instead."
+            for signature in production_signatures
+        ]
+
+    return {
+        "current_ingestion_batch": current_ingestion_batch,
+        "slack_day_documents_missing": slack_day_documents_missing,
+        "ingested_production_roots": ingested_production_roots,
+        "skipped_production_roots": skipped_production_roots,
+        "warnings": warnings,
+        "gmail_ms": gmail_ms,
+        "slack_ms": slack_ms,
+        "production_ms": production_ms,
+    }
+
+
+def load_loose_file_commit_state(
+    connection: sqlite3.Connection,
+    scanned_rel_paths: set[str],
+    gmail_owned_rel_paths: set[str],
+) -> tuple[dict[str, sqlite3.Row], dict[str, list[sqlite3.Row]]]:
+    existing_occurrence_rows = connection.execute(
+        """
+        SELECT *
+        FROM document_occurrences
+        WHERE parent_occurrence_id IS NULL
+          AND source_kind = ?
+          AND lifecycle_status != 'deleted'
+        """,
+        (FILESYSTEM_SOURCE_KIND,),
+    ).fetchall()
+    existing_occurrence_rows = [
+        row for row in existing_occurrence_rows if str(row["rel_path"]) not in gmail_owned_rel_paths
+    ]
+    existing_by_rel = {str(row["rel_path"]): row for row in existing_occurrence_rows}
+    unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in existing_occurrence_rows:
+        if str(row["rel_path"]) not in scanned_rel_paths and row["file_hash"]:
+            unseen_existing_by_hash[row["file_hash"]].append(row)
+    return existing_by_rel, unseen_existing_by_hash
+
+
+def ingest_prepare_worker_count() -> int:
+    raw_value = os.environ.get("RETRIEVER_INGEST_WORKERS")
+    if raw_value is None:
+        return 1
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return 1
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return 1
+
+
+def ingest_prepare_queue_capacity(prepare_workers: int) -> int:
+    return max(2, prepare_workers * 2)
+
+
+def ingest_prepare_queue_max_bytes() -> int:
+    raw_value = os.environ.get("RETRIEVER_INGEST_PREPARED_QUEUE_BYTES")
+    default_value = 512 * 1024 * 1024
+    if raw_value is None:
+        return default_value
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return default_value
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return default_value
+
+
+def ingest_prepare_spill_threshold_bytes() -> int:
+    raw_value = os.environ.get("RETRIEVER_INGEST_PREPARE_SPILL_BYTES")
+    default_value = 32 * 1024 * 1024
+    if raw_value is None:
+        return default_value
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return default_value
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return default_value
+
+
+def serialize_prepared_ingest_item(prepared_item: dict[str, object]) -> bytes:
+    return pickle.dumps(prepared_item, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def stage_prepared_ingest_item(
+    spill_dir: Path,
+    prepared_index: int,
+    serialized_payload: bytes,
+) -> Path:
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    spill_path = spill_dir / f"{prepared_index:08d}.prepared"
+    spill_path.write_bytes(serialized_payload)
+    return spill_path
+
+
+def hydrate_staged_prepared_ingest_item(spill_path: Path) -> dict[str, object]:
+    try:
+        return pickle.loads(spill_path.read_bytes())
+    finally:
+        remove_file_if_exists(spill_path)
+
+
+def iter_staged_prepared_items(
+    items: list[dict[str, object]],
+    *,
+    prepare_item,
+    config_benchmark_name: str,
+    queue_done_benchmark_name: str,
+    spill_subdir_name: str,
+    staging_root: Path | None = None,
+) -> Iterator[tuple[dict[str, object], float]]:
+    if not items:
+        return
+    prepare_workers = ingest_prepare_worker_count()
+    max_prepared_items = ingest_prepare_queue_capacity(prepare_workers)
+    queue_max_bytes = ingest_prepare_queue_max_bytes()
+    spill_threshold_bytes = ingest_prepare_spill_threshold_bytes()
+    benchmark_mark(
+        config_benchmark_name,
+        prepare_workers=prepare_workers,
+        max_prepared_items=max_prepared_items,
+        queue_max_bytes=queue_max_bytes,
+        spill_threshold_bytes=spill_threshold_bytes,
+    )
+    own_staging_dir = staging_root is None
+    spill_dir = (
+        Path(tempfile.mkdtemp(prefix="retriever-ingest-prepared-"))
+        if staging_root is None
+        else Path(staging_root) / spill_subdir_name
+    )
+    ready_entries_by_index: dict[int, dict[str, object]] = {}
+    ready_bytes_in_memory = 0
+    peak_ready_bytes_in_memory = 0
+    spilled_items = 0
+    spilled_bytes = 0
+    try:
+        with ThreadPoolExecutor(max_workers=prepare_workers) as executor:
+            pending_by_index: dict[int, object] = {}
+            future_to_index: dict[object, int] = {}
+            next_submit_index = 0
+            next_yield_index = 0
+
+            def submit_available() -> None:
+                nonlocal next_submit_index
+                while (
+                    next_submit_index < len(items)
+                    and len(pending_by_index) + len(ready_entries_by_index) < max_prepared_items
+                ):
+                    future = executor.submit(
+                        prepare_item,
+                        items[next_submit_index],
+                    )
+                    pending_by_index[next_submit_index] = future
+                    future_to_index[future] = next_submit_index
+                    next_submit_index += 1
+
+            def record_completed_future(future) -> None:
+                nonlocal ready_bytes_in_memory, peak_ready_bytes_in_memory, spilled_items, spilled_bytes
+                prepared_index = future_to_index.pop(future)
+                pending_by_index.pop(prepared_index, None)
+                prepared_item = future.result()
+                serialized_payload = serialize_prepared_ingest_item(prepared_item)
+                serialized_size = len(serialized_payload)
+                should_spill = (
+                    serialized_size >= spill_threshold_bytes
+                    or ready_bytes_in_memory + serialized_size > queue_max_bytes
+                )
+                if should_spill:
+                    spill_path = stage_prepared_ingest_item(spill_dir, prepared_index, serialized_payload)
+                    ready_entries_by_index[prepared_index] = {
+                        "storage": "spill",
+                        "spill_path": spill_path,
+                        "serialized_size": serialized_size,
+                    }
+                    spilled_items += 1
+                    spilled_bytes += serialized_size
+                    return
+                ready_entries_by_index[prepared_index] = {
+                    "storage": "memory",
+                    "prepared_item": prepared_item,
+                    "serialized_size": serialized_size,
+                }
+                ready_bytes_in_memory += serialized_size
+                peak_ready_bytes_in_memory = max(peak_ready_bytes_in_memory, ready_bytes_in_memory)
+
+            submit_available()
+            while next_yield_index < len(items):
+                wait_started = time.perf_counter()
+                while next_yield_index not in ready_entries_by_index:
+                    if not pending_by_index:
+                        raise RetrieverError(
+                            f"Prepared ingest queue drained before index {next_yield_index} was ready."
+                        )
+                    done, _ = wait(list(pending_by_index.values()), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        record_completed_future(future)
+                    submit_available()
+                wait_ms = (time.perf_counter() - wait_started) * 1000.0
+                entry = ready_entries_by_index.pop(next_yield_index)
+                if entry["storage"] == "spill":
+                    prepared_item = hydrate_staged_prepared_ingest_item(Path(entry["spill_path"]))
+                else:
+                    prepared_item = dict(entry["prepared_item"])
+                    ready_bytes_in_memory = max(0, ready_bytes_in_memory - int(entry["serialized_size"]))
+                yield prepared_item, wait_ms
+                next_yield_index += 1
+                submit_available()
+    finally:
+        benchmark_mark(
+            queue_done_benchmark_name,
+            spilled_items=spilled_items,
+            spilled_bytes=spilled_bytes,
+            peak_ready_bytes=peak_ready_bytes_in_memory,
+            spill_dir=str(spill_dir),
+        )
+        if own_staging_dir:
+            remove_directory_tree(spill_dir)
+
+
+def prepare_loose_file_item(item: dict[str, object]) -> dict[str, object]:
+    prepared_item = dict(item)
+    prepare_started = time.perf_counter()
+    try:
+        extracted_payload = extract_document(Path(item["path"]), include_attachments=True)
+        attachments = list(extracted_payload.get("attachments", []))
+        extracted_payload = dict(extracted_payload)
+        extracted_payload.pop("attachments", None)
+        chunk_started = time.perf_counter()
+        prepared_chunks = extracted_search_chunks(extracted_payload)
+        prepared_item["extracted_payload"] = extracted_payload
+        prepared_item["attachments"] = attachments
+        prepared_item["prepared_chunks"] = prepared_chunks
+        prepared_item["prepare_chunk_ms"] = (time.perf_counter() - chunk_started) * 1000.0
+        prepared_item["prepare_error"] = None
+    except Exception as exc:
+        prepared_item["extracted_payload"] = None
+        prepared_item["attachments"] = []
+        prepared_item["prepared_chunks"] = []
+        prepared_item["prepare_chunk_ms"] = 0.0
+        prepared_item["prepare_error"] = f"{type(exc).__name__}: {exc}"
+    prepared_item["prepare_ms"] = (time.perf_counter() - prepare_started) * 1000.0
+    return prepared_item
+
+
+def refresh_prepared_loose_file_item_if_stale(
+    prepared_item: dict[str, object],
+) -> tuple[dict[str, object], bool]:
+    path = Path(prepared_item["path"])
+    current_file_size, current_file_mtime_ns = source_file_snapshot(path)
+    if (
+        current_file_size == prepared_item.get("source_file_size")
+        and current_file_mtime_ns == prepared_item.get("source_file_mtime_ns")
+    ):
+        return prepared_item, False
+    benchmark_mark(
+        "ingest_loose_file_freshness_fallback",
+        rel_path=str(prepared_item["rel_path"]),
+        planned_file_size=prepared_item.get("source_file_size"),
+        current_file_size=current_file_size,
+        planned_file_mtime_ns=prepared_item.get("source_file_mtime_ns"),
+        current_file_mtime_ns=current_file_mtime_ns,
+    )
+    refreshed_item = refresh_ingest_item_filesystem_facts(prepared_item)
+    return prepare_loose_file_item(refreshed_item), True
+
+
+def iter_prepared_loose_file_items(
+    loose_file_items: list[dict[str, object]],
+    staging_root: Path | None = None,
+) -> Iterator[tuple[dict[str, object], float]]:
+    yield from iter_staged_prepared_items(
+        loose_file_items,
+        prepare_item=prepare_loose_file_item,
+        config_benchmark_name="ingest_loose_prepare_config",
+        queue_done_benchmark_name="ingest_loose_prepare_queue_done",
+        spill_subdir_name="prepared-loose",
+        staging_root=staging_root,
+    )
+
+
+def commit_prepared_loose_file(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    prepared_item: dict[str, object],
+    existing_by_rel: dict[str, sqlite3.Row],
+    unseen_existing_by_hash: dict[str, list[sqlite3.Row]],
+    ensure_filesystem_dataset,
+    current_ingestion_batch: int | None,
+) -> dict[str, object]:
+    prepared_item, freshness_fallback = refresh_prepared_loose_file_item_if_stale(prepared_item)
+    rel_path = str(prepared_item["rel_path"])
+    path = Path(prepared_item["path"])
+    file_type = str(prepared_item["file_type"])
+    file_hash = prepared_item.get("file_hash")
+    existing_occurrence_row = existing_by_rel.get(rel_path)
+    action = "new"
+    if existing_occurrence_row is not None:
+        existing_row = connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (existing_occurrence_row["document_id"],),
+        ).fetchone()
+        if existing_row is None:
+            raise RetrieverError(f"Occurrence {existing_occurrence_row['id']} points at a missing document.")
+        if (
+            existing_occurrence_row["file_hash"] == file_hash
+            and existing_occurrence_row["lifecycle_status"] == ACTIVE_OCCURRENCE_STATUS
+            and document_row_has_seeded_text_revisions(existing_row)
+            and document_row_has_email_threading(connection, existing_row)
+        ):
+            filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
+            connection.execute("BEGIN")
+            try:
+                mark_seen_without_reingest(
+                    connection,
+                    existing_occurrence_row,
+                    dataset_id=filesystem_dataset_id,
+                    dataset_source_id=filesystem_dataset_source_id,
+                )
+                connection.commit()
+                return {
+                    "action": "skipped",
+                    "current_ingestion_batch": current_ingestion_batch,
+                    "freshness_fallback": freshness_fallback,
+                }
+            except Exception:
+                connection.rollback()
+                raise
+        action = "updated"
+    else:
+        existing_row = None
+        rename_candidates = unseen_existing_by_hash.get(str(file_hash)) or []
+        if rename_candidates:
+            existing_occurrence_row = rename_candidates.pop(0)
+            action = "renamed"
+
+    prepare_error = prepared_item.get("prepare_error")
+    if prepare_error:
+        return {
+            "action": "failed",
+            "current_ingestion_batch": current_ingestion_batch,
+            "error": str(prepare_error),
+            "freshness_fallback": freshness_fallback,
+        }
+
+    if existing_occurrence_row is None and file_hash:
+        exact_duplicate_document = get_document_by_dedupe_key(
+            connection,
+            basis="file_hash",
+            key_value=str(file_hash),
+        )
+        if exact_duplicate_document is not None:
+            filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
+            connection.execute("BEGIN")
+            try:
+                now = utc_now()
+                duplicate_occurrence_id = attach_occurrence_to_existing_document(
+                    connection,
+                    exact_duplicate_document,
+                    existing_occurrence_row=None,
+                    rel_path=rel_path,
+                    file_name=path.name,
+                    file_type=file_type,
+                    file_size=path.stat().st_size,
+                    file_hash=str(file_hash),
+                    source_kind=FILESYSTEM_SOURCE_KIND,
+                    source_rel_path=rel_path,
+                    source_item_id=None,
+                    source_folder_path=None,
+                    custodian=infer_source_custodian(
+                        source_kind=FILESYSTEM_SOURCE_KIND,
+                        source_rel_path=rel_path,
+                    ),
+                    occurrence_control_number=str(exact_duplicate_document["control_number"] or ""),
+                    ingested_at=now,
+                    last_seen_at=now,
+                    updated_at=now,
+                )
+                clone_duplicate_family_child_occurrences(
+                    connection,
+                    paths,
+                    parent_document_id=int(exact_duplicate_document["id"]),
+                    parent_occurrence_id=duplicate_occurrence_id,
+                    parent_rel_path=rel_path,
+                    custodian=infer_source_custodian(
+                        source_kind=FILESYSTEM_SOURCE_KIND,
+                        source_rel_path=rel_path,
+                    ),
+                    ingested_at=now,
+                    last_seen_at=now,
+                    updated_at=now,
+                )
+                ensure_dataset_document_membership(
+                    connection,
+                    dataset_id=filesystem_dataset_id,
+                    document_id=int(exact_duplicate_document["id"]),
+                    dataset_source_id=filesystem_dataset_source_id,
+                )
+                connection.commit()
+                return {
+                    "action": "new",
+                    "current_ingestion_batch": current_ingestion_batch,
+                }
+            except Exception:
+                connection.rollback()
+                raise
+
+    filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
+    connection.execute("BEGIN")
+    try:
+        existing_row = None
+        reused_existing_occurrence_row = existing_occurrence_row
+        superseded_document_id: int | None = None
+        if existing_occurrence_row is not None:
+            existing_row = connection.execute(
+                "SELECT * FROM documents WHERE id = ?",
+                (existing_occurrence_row["document_id"],),
+            ).fetchone()
+            if existing_row is None:
+                raise RetrieverError(f"Occurrence {existing_occurrence_row['id']} points at a missing document.")
+            active_occurrence_rows = active_occurrence_rows_for_document(connection, int(existing_row["id"]))
+            if (
+                action == "updated"
+                and len(active_occurrence_rows) > 1
+                and existing_occurrence_row["file_hash"] != file_hash
+            ):
+                connection.execute(
+                    """
+                    UPDATE document_occurrences
+                    SET lifecycle_status = 'superseded', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (utc_now(), existing_occurrence_row["id"]),
+                )
+                superseded_document_id = int(existing_row["id"])
+                refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
+                refresh_document_from_occurrences(connection, superseded_document_id)
+                existing_row = None
+                reused_existing_occurrence_row = None
+        extracted = apply_manual_locks(existing_row, dict(prepared_item["extracted_payload"] or {}))
+        attachments = list(prepared_item.get("attachments", []))
+        if existing_row is None:
+            if current_ingestion_batch is None:
+                current_ingestion_batch = allocate_ingestion_batch_number(connection)
+            control_number_batch = current_ingestion_batch
+            control_number_family_sequence = reserve_control_number_family_sequence(connection, control_number_batch)
+            control_number = format_control_number(control_number_batch, control_number_family_sequence)
+            control_number_attachment_sequence = None
+        else:
+            control_number_batch = int(existing_row["control_number_batch"])
+            control_number_family_sequence = int(existing_row["control_number_family_sequence"])
+            control_number = str(existing_row["control_number"])
+            control_number_attachment_sequence = existing_row["control_number_attachment_sequence"]
+            cleanup_document_artifacts(paths, connection, existing_row)
+        document_id = upsert_document_row(
+            connection,
+            rel_path,
+            path,
+            existing_row,
+            extracted,
+            existing_occurrence_row=reused_existing_occurrence_row,
+            file_name=path.name,
+            parent_document_id=None,
+            control_number=control_number,
+            dataset_id=filesystem_dataset_id,
+            control_number_batch=control_number_batch,
+            control_number_family_sequence=control_number_family_sequence,
+            control_number_attachment_sequence=control_number_attachment_sequence,
+        )
+        replace_document_email_threading_row(
+            connection,
+            document_id=document_id,
+            email_threading=extracted.get("email_threading"),
+        )
+        seed_source_text_revision_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+            extracted=extracted,
+            existing_row=existing_row,
+        )
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=filesystem_dataset_id,
+            document_id=document_id,
+            dataset_source_id=filesystem_dataset_source_id,
+        )
+        preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
+        replace_document_related_rows(
+            connection,
+            document_id,
+            extracted | {"file_name": path.name},
+            list(prepared_item.get("prepared_chunks", [])),
+            preview_rows,
+        )
+        reconcile_attachment_documents(
+            connection,
+            paths,
+            document_id,
+            rel_path,
+            control_number_batch,
+            control_number_family_sequence,
+            attachments,
+            [(filesystem_dataset_id, filesystem_dataset_source_id)],
+        )
+        if superseded_document_id is not None and superseded_document_id != document_id:
+            refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
+            refresh_document_from_occurrences(connection, superseded_document_id)
+        connection.commit()
+        return {
+            "action": action,
+            "current_ingestion_batch": current_ingestion_batch,
+            "freshness_fallback": freshness_fallback,
+        }
+    except Exception as exc:
+        connection.rollback()
+        return {
+            "action": "failed",
+            "current_ingestion_batch": current_ingestion_batch,
+            "error": f"{type(exc).__name__}: {exc}",
+            "freshness_fallback": freshness_fallback,
+        }
+
+
+def finalize_ingest_postpass(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    allowed_types: set[str] | None,
+    scanned_rel_paths: set[str],
+    scanned_pst_source_rel_paths: set[str],
+    scanned_mbox_source_rel_paths: set[str],
+    slack_day_documents_missing: int,
+    stats: dict[str, int],
+) -> int:
+    filesystem_missing = mark_missing_documents(connection, scanned_rel_paths)
+    pst_sources_missing = 0
+    pst_documents_missing = 0
+    mbox_sources_missing = 0
+    mbox_documents_missing = 0
+    if allowed_types is None or PST_SOURCE_KIND in allowed_types:
+        pst_sources_missing, pst_documents_missing = mark_missing_pst_documents(connection, scanned_pst_source_rel_paths)
+    if allowed_types is None or MBOX_SOURCE_KIND in allowed_types:
+        mbox_sources_missing, mbox_documents_missing = mark_missing_mbox_documents(connection, scanned_mbox_source_rel_paths)
+    stats["pst_sources_missing"] = pst_sources_missing
+    stats["pst_documents_missing"] = pst_documents_missing
+    stats["mbox_sources_missing"] = mbox_sources_missing
+    stats["mbox_documents_missing"] = mbox_documents_missing
+    stats["slack_documents_missing"] = slack_day_documents_missing
+    stats["missing"] = filesystem_missing + pst_sources_missing + mbox_sources_missing + slack_day_documents_missing
+    connection.execute("BEGIN")
+    try:
+        conversation_assignment = assign_supported_conversations(connection)
+        refresh_conversation_previews(connection, paths)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    stats["email_conversations"] = int(conversation_assignment["email_conversations"])
+    stats["email_documents_reassigned"] = int(conversation_assignment["email_documents_reassigned"])
+    stats["email_child_documents_updated"] = int(conversation_assignment["email_child_documents_updated"])
+    stats["pst_chat_conversations"] = int(conversation_assignment["pst_chat_conversations"])
+    stats["pst_chat_documents_reassigned"] = int(conversation_assignment["pst_chat_documents_reassigned"])
+    stats["pst_chat_child_documents_updated"] = int(conversation_assignment["pst_chat_child_documents_updated"])
+    connection.execute("BEGIN")
+    try:
+        pruned_unused_filesystem_dataset = prune_unused_filesystem_dataset(connection)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return int(pruned_unused_filesystem_dataset)
+
+
 def ingest_production(root: Path, production_root: Path | str) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
-    connection = connect_db(paths["db_path"])
-    try:
-        apply_schema(connection, root)
-        reconcile_custom_fields_registry(connection, repair=True)
-        resolved_production_root = resolve_production_root_argument(root, production_root)
-        return ingest_resolved_production_root(connection, paths, root, resolved_production_root)
-    finally:
-        connection.close()
+    total_started = time.perf_counter()
+    benchmark_mark("ingest_production_begin")
+    with workspace_ingest_session(paths, command_name="ingest-production") as ingest_session:
+        connection = connect_db(paths["db_path"])
+        try:
+            setup_started = time.perf_counter()
+            apply_schema(connection, root)
+            reconcile_custom_fields_registry(connection, repair=True)
+            resolved_production_root = resolve_production_root_argument(root, production_root)
+            benchmark_mark(
+                "ingest_production_setup_done",
+                setup_ms=round((time.perf_counter() - setup_started) * 1000.0, 3),
+                production_root=str(resolved_production_root),
+            )
+            production_started = time.perf_counter()
+            result = ingest_resolved_production_root(
+                connection,
+                paths,
+                root,
+                resolved_production_root,
+                staging_root=Path(ingest_session["tmp_dir"]),
+            )
+            benchmark_mark(
+                "ingest_production_done",
+                production_ms=round((time.perf_counter() - production_started) * 1000.0, 3),
+                total_ms=round((time.perf_counter() - total_started) * 1000.0, 3),
+                created=int(result.get("created") or 0),
+                updated=int(result.get("updated") or 0),
+                failed=len(list(result.get("failures", []))),
+            )
+            return result
+        except Exception as exc:
+            benchmark_mark(
+                "ingest_production_failed",
+                total_ms=round((time.perf_counter() - total_started) * 1000.0, 3),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            connection.close()
 
 
 def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
     allowed_types = parse_file_types(raw_file_types)
-    connection = connect_db(paths["db_path"])
-    try:
-        apply_schema(connection, root)
-        reconcile_custom_fields_registry(connection, repair=True)
-        filesystem_dataset_id: int | None = None
-        filesystem_dataset_source_id: int | None = None
+    total_started = time.perf_counter()
+    benchmark_mark(
+        "ingest_begin",
+        recursive=recursive,
+        file_type_filter_count=(len(allowed_types) if allowed_types is not None else 0),
+    )
+    with workspace_ingest_session(paths, command_name="ingest") as ingest_session:
+        connection = connect_db(paths["db_path"])
+        try:
+            setup_started = time.perf_counter()
+            apply_schema(connection, root)
+            reconcile_custom_fields_registry(connection, repair=True)
+            benchmark_mark(
+                "ingest_setup_done",
+                setup_ms=round((time.perf_counter() - setup_started) * 1000.0, 3),
+            )
+            filesystem_dataset_id: int | None = None
+            filesystem_dataset_source_id: int | None = None
 
-        def ensure_filesystem_dataset() -> tuple[int, int]:
-            nonlocal filesystem_dataset_id, filesystem_dataset_source_id
-            if filesystem_dataset_id is None or filesystem_dataset_source_id is None:
-                filesystem_dataset_id, filesystem_dataset_source_id = ensure_source_backed_dataset(
-                    connection,
-                    source_kind=FILESYSTEM_SOURCE_KIND,
-                    source_locator=filesystem_dataset_locator(),
-                    dataset_name=filesystem_dataset_name(root),
-                )
-                connection.commit()
-            return filesystem_dataset_id, filesystem_dataset_source_id
+            def ensure_filesystem_dataset() -> tuple[int, int]:
+                nonlocal filesystem_dataset_id, filesystem_dataset_source_id
+                if filesystem_dataset_id is None or filesystem_dataset_source_id is None:
+                    filesystem_dataset_id, filesystem_dataset_source_id = ensure_source_backed_dataset(
+                        connection,
+                        source_kind=FILESYSTEM_SOURCE_KIND,
+                        source_locator=filesystem_dataset_locator(),
+                        dataset_name=filesystem_dataset_name(root),
+                    )
+                    connection.commit()
+                return filesystem_dataset_id, filesystem_dataset_source_id
 
-        production_signatures = find_production_root_signatures(root, recursive, connection)
-        production_root_paths = [Path(signature["root"]).resolve() for signature in production_signatures]
-        slack_export_descriptors = find_slack_export_roots(root, recursive, allowed_types)
-        slack_export_root_paths = [Path(descriptor["root"]).resolve() for descriptor in slack_export_descriptors]
-        gmail_export_descriptors = find_gmail_export_roots(root, recursive, allowed_types)
-        gmail_owned_paths = {
-            Path(path).resolve()
-            for descriptor in gmail_export_descriptors
-            for path in list(descriptor.get("owned_paths") or [])
-        }
-        gmail_owned_rel_paths = {
-            relative_document_path(root, owned_path)
-            for owned_path in gmail_owned_paths
-            if root.resolve() == owned_path.resolve() or root.resolve() in owned_path.resolve().parents
-        }
-        scanned_files = [
-            path
-            for path in collect_files(root, recursive, allowed_types)
-            if not any(production_root == path.resolve() or production_root in path.resolve().parents for production_root in production_root_paths)
-            and not any(slack_root == path.resolve() or slack_root in path.resolve().parents for slack_root in slack_export_root_paths)
-            and path.resolve() not in gmail_owned_paths
-        ]
-        scanned_rel_paths: set[str] = set()
-        scanned_pst_source_rel_paths: set[str] = set()
-        scanned_mbox_source_rel_paths: set[str] = set()
-        scanned_items: list[dict[str, object]] = []
-        for path in scanned_files:
-            rel_path = relative_document_path(root, path)
-            file_type = normalize_extension(path)
-            scanned_rel_paths.add(rel_path)
-            if file_type == PST_SOURCE_KIND:
-                scanned_pst_source_rel_paths.add(rel_path)
-            if file_type == MBOX_SOURCE_KIND:
-                scanned_mbox_source_rel_paths.add(rel_path)
-            scanned_items.append(
-                {
-                    "path": path,
-                    "rel_path": rel_path,
-                    "file_type": file_type,
-                    "file_hash": None if file_type in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} else sha256_file(path),
-                }
+            scan_started = time.perf_counter()
+            ingest_plan = plan_ingest_work(root, recursive, allowed_types, connection)
+            production_signatures = list(ingest_plan["production_signatures"])
+            slack_export_descriptors = list(ingest_plan["slack_export_descriptors"])
+            gmail_export_descriptors = list(ingest_plan["gmail_export_descriptors"])
+            scanned_items = list(ingest_plan["scanned_items"])
+            loose_file_items = list(ingest_plan["loose_file_items"])
+            scanned_rel_paths = set(ingest_plan["scanned_rel_paths"])
+            scanned_pst_source_rel_paths = set(ingest_plan["scanned_pst_source_rel_paths"])
+            scanned_mbox_source_rel_paths = set(ingest_plan["scanned_mbox_source_rel_paths"])
+            gmail_owned_rel_paths = set(ingest_plan["gmail_owned_rel_paths"])
+            benchmark_mark(
+                "ingest_scan_done",
+                scan_ms=round((time.perf_counter() - scan_started) * 1000.0, 3),
+                hash_ms=round(float(ingest_plan["scan_hash_ms"]), 3),
+                scanned_files=len(list(ingest_plan["scanned_files"])),
+                production_roots=len(production_signatures),
+                slack_export_roots=len(slack_export_descriptors),
+                gmail_export_roots=len(gmail_export_descriptors),
             )
 
-        current_ingestion_batch: int | None = None
-        slack_day_documents_missing = 0
+            stats = default_ingest_stats(len(slack_export_descriptors), len(gmail_export_descriptors))
+            failures: list[dict[str, str]] = []
+            special_source_state = ingest_serial_special_sources(
+                connection,
+                paths,
+                root,
+                Path(ingest_session["tmp_dir"]),
+                allowed_types,
+                production_signatures,
+                slack_export_descriptors,
+                gmail_export_descriptors,
+                scanned_rel_paths,
+                scanned_mbox_source_rel_paths,
+                stats,
+                failures,
+            )
+            current_ingestion_batch = special_source_state["current_ingestion_batch"]
+            slack_day_documents_missing = int(special_source_state["slack_day_documents_missing"])
+            ingested_production_roots = list(special_source_state["ingested_production_roots"])
+            skipped_production_roots = list(special_source_state["skipped_production_roots"])
+            warnings = list(special_source_state["warnings"])
+            benchmark_mark(
+                "ingest_special_sources_done",
+                gmail_ms=round(float(special_source_state["gmail_ms"]), 3),
+                slack_ms=round(float(special_source_state["slack_ms"]), 3),
+                production_ms=round(float(special_source_state["production_ms"]), 3),
+                source_failures=stats["failed"],
+            )
 
-        stats = {
-            "new": 0,
-            "updated": 0,
-            "renamed": 0,
-            "missing": 0,
-            "skipped": 0,
-            "failed": 0,
-            "pst_sources_skipped": 0,
-            "pst_messages_created": 0,
-            "pst_messages_updated": 0,
-            "pst_messages_deleted": 0,
-            "pst_sources_missing": 0,
-            "pst_documents_missing": 0,
-            "mbox_sources_skipped": 0,
-            "mbox_messages_created": 0,
-            "mbox_messages_updated": 0,
-            "mbox_messages_deleted": 0,
-            "mbox_sources_missing": 0,
-            "mbox_documents_missing": 0,
-            "gmail_exports_detected": len(gmail_export_descriptors),
-            "gmail_linked_documents_created": 0,
-            "gmail_linked_documents_updated": 0,
-            "gmail_documents_scanned": 0,
-            "slack_exports_detected": len(slack_export_descriptors),
-            "slack_day_documents_scanned": 0,
-            "slack_documents_created": 0,
-            "slack_documents_updated": 0,
-            "slack_documents_missing": 0,
-            "slack_conversations": 0,
-            "email_conversations": 0,
-            "email_documents_reassigned": 0,
-            "email_child_documents_updated": 0,
-            "pst_chat_conversations": 0,
-            "pst_chat_documents_reassigned": 0,
-            "pst_chat_child_documents_updated": 0,
-            "production_documents_created": 0,
-            "production_documents_updated": 0,
-            "production_documents_unchanged": 0,
-            "production_documents_retired": 0,
-            "production_families_reconstructed": 0,
-            "production_docs_missing_linked_text": 0,
-            "production_docs_missing_linked_images": 0,
-            "production_docs_missing_linked_natives": 0,
-        }
-        failures: list[dict[str, str]] = []
-        ingested_production_roots: list[str] = []
-        skipped_production_roots: list[str] = []
-        warnings: list[str] = []
+            existing_by_rel, unseen_existing_by_hash = load_loose_file_commit_state(
+                connection,
+                scanned_rel_paths,
+                gmail_owned_rel_paths,
+            )
 
-        for descriptor in gmail_export_descriptors:
-            export_root = Path(descriptor["root"])
-            try:
-                gmail_result = ingest_gmail_export_root(
-                    connection,
-                    paths,
-                    root,
-                    descriptor,
-                    allowed_file_types=allowed_types,
-                )
-                stats["new"] += int(gmail_result["new"])
-                stats["updated"] += int(gmail_result["updated"])
-                stats["failed"] += int(gmail_result["failed"])
-                stats["gmail_documents_scanned"] += int(gmail_result["scanned_files"])
-                stats["mbox_sources_skipped"] += int(gmail_result["mbox_sources_skipped"])
-                stats["mbox_messages_created"] += int(gmail_result["mbox_messages_created"])
-                stats["mbox_messages_updated"] += int(gmail_result["mbox_messages_updated"])
-                stats["mbox_messages_deleted"] += int(gmail_result["mbox_messages_deleted"])
-                stats["gmail_linked_documents_created"] += int(gmail_result["gmail_linked_documents_created"])
-                stats["gmail_linked_documents_updated"] += int(gmail_result["gmail_linked_documents_updated"])
-                scanned_rel_paths.update(str(rel_path) for rel_path in list(gmail_result.get("scanned_filesystem_rel_paths", [])))
-                scanned_mbox_source_rel_paths.update(
-                    str(rel_path) for rel_path in list(gmail_result.get("scanned_mbox_source_rel_paths", []))
-                )
-                failures.extend(list(gmail_result.get("failures", [])))
-            except Exception as exc:
-                stats["failed"] += 1
-                failures.append(
-                    {
-                        "rel_path": relative_document_path(root, export_root),
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-
-        for descriptor in slack_export_descriptors:
-            export_root = Path(descriptor["root"])
-            try:
-                slack_result = ingest_slack_export_root(
-                    connection,
-                    paths,
-                    export_root,
-                    ingestion_batch_number=current_ingestion_batch,
-                )
-                current_ingestion_batch = (
-                    int(slack_result["ingestion_batch_number"])
-                    if slack_result.get("ingestion_batch_number") is not None
-                    else current_ingestion_batch
-                )
-                stats["new"] += int(slack_result["new"])
-                stats["updated"] += int(slack_result["updated"])
-                stats["failed"] += int(slack_result["failed"])
-                stats["slack_day_documents_scanned"] += int(slack_result["scanned_day_files"])
-                stats["slack_documents_created"] += int(slack_result["new"])
-                stats["slack_documents_updated"] += int(slack_result["updated"])
-                stats["slack_conversations"] += int(slack_result["conversations"])
-                slack_day_documents_missing += int(slack_result["missing"])
-                failures.extend(list(slack_result.get("failures", [])))
-            except Exception as exc:
-                stats["failed"] += 1
-                failures.append(
-                    {
-                        "rel_path": relative_document_path(root, export_root),
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-
-        if allowed_types is None:
-            for signature in production_signatures:
-                production_rel_root = str(signature["rel_root"])
-                resolved_production_root = Path(signature["root"]).resolve()
+            loop_started = time.perf_counter()
+            container_source_ms = 0.0
+            loose_file_ms = 0.0
+            loose_extract_ms = 0.0
+            loose_chunk_ms = 0.0
+            loose_prepare_wait_ms = 0.0
+            loose_commit_ms = 0.0
+            loose_freshness_fallbacks = 0
+            prepared_loose_items = iter_prepared_loose_file_items(
+                loose_file_items,
+                Path(ingest_session["tmp_dir"]),
+            )
+            for item in scanned_items:
+                rel_path = str(item["rel_path"])
+                path = item["path"]
+                file_type = str(item["file_type"])
+                item_started = time.perf_counter()
+                if file_type == PST_SOURCE_KIND:
+                    try:
+                        pst_result = ingest_pst_source(connection, paths, path, rel_path)
+                        stats[str(pst_result["action"])] += 1
+                        stats["pst_sources_skipped"] += int(pst_result["pst_sources_skipped"])
+                        stats["pst_messages_created"] += int(pst_result["pst_messages_created"])
+                        stats["pst_messages_updated"] += int(pst_result["pst_messages_updated"])
+                        stats["pst_messages_deleted"] += int(pst_result["pst_messages_deleted"])
+                    except Exception as exc:
+                        stats["failed"] += 1
+                        failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
+                    finally:
+                        container_source_ms += (time.perf_counter() - item_started) * 1000.0
+                    continue
+                if file_type == MBOX_SOURCE_KIND:
+                    try:
+                        mbox_result = ingest_mbox_source(connection, paths, path, rel_path)
+                        stats[str(mbox_result["action"])] += 1
+                        stats["mbox_sources_skipped"] += int(mbox_result["mbox_sources_skipped"])
+                        stats["mbox_messages_created"] += int(mbox_result["mbox_messages_created"])
+                        stats["mbox_messages_updated"] += int(mbox_result["mbox_messages_updated"])
+                        stats["mbox_messages_deleted"] += int(mbox_result["mbox_messages_deleted"])
+                    except Exception as exc:
+                        stats["failed"] += 1
+                        failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
+                    finally:
+                        container_source_ms += (time.perf_counter() - item_started) * 1000.0
+                    continue
                 try:
-                    production_result = ingest_resolved_production_root(
+                    prepared_item, wait_ms = next(prepared_loose_items)
+                    if str(prepared_item["rel_path"]) != rel_path:
+                        raise RetrieverError(
+                            f"Prepared loose-file order drifted: expected {rel_path}, got {prepared_item['rel_path']}"
+                        )
+                    loose_prepare_wait_ms += wait_ms
+                    loose_extract_ms += float(prepared_item["prepare_ms"])
+                    loose_chunk_ms += float(prepared_item.get("prepare_chunk_ms") or 0.0)
+                    commit_started = time.perf_counter()
+                    commit_result = commit_prepared_loose_file(
                         connection,
                         paths,
-                        root,
-                        resolved_production_root,
+                        prepared_item,
+                        existing_by_rel,
+                        unseen_existing_by_hash,
+                        ensure_filesystem_dataset,
+                        current_ingestion_batch,
                     )
-                    ingested_production_roots.append(production_rel_root)
-                    stats["new"] += int(production_result["created"])
-                    stats["updated"] += int(production_result["updated"])
-                    stats["production_documents_created"] += int(production_result["created"])
-                    stats["production_documents_updated"] += int(production_result["updated"])
-                    stats["production_documents_unchanged"] += int(production_result["unchanged"])
-                    stats["production_documents_retired"] += int(production_result["retired"])
-                    stats["production_families_reconstructed"] += int(production_result["families_reconstructed"])
-                    stats["production_docs_missing_linked_text"] += int(production_result["docs_missing_linked_text"])
-                    stats["production_docs_missing_linked_images"] += int(production_result["docs_missing_linked_images"])
-                    stats["production_docs_missing_linked_natives"] += int(production_result["docs_missing_linked_natives"])
-                    for failure in list(production_result.get("failures", [])):
-                        control_number = normalize_whitespace(str(failure.get("control_number") or ""))
-                        failure_entry: dict[str, str] = {
-                            "rel_path": (
-                                production_logical_rel_path(production_rel_root, control_number).as_posix()
-                                if control_number
-                                else production_rel_root
-                            ),
-                            "production_rel_root": production_rel_root,
-                            "error": str(failure.get("error") or ""),
-                        }
-                        if control_number:
-                            failure_entry["control_number"] = control_number
-                        failures.append(failure_entry)
-                    stats["failed"] += len(list(production_result.get("failures", [])))
-                except Exception as exc:
-                    stats["failed"] += 1
-                    failures.append(
-                        {
-                            "rel_path": production_rel_root,
-                            "production_rel_root": production_rel_root,
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
-        else:
-            skipped_production_roots = [str(signature["rel_root"]) for signature in production_signatures]
-            warnings = [
-                f"Detected processed production root at {signature['rel_root']}; use ingest-production instead."
-                for signature in production_signatures
-            ]
+                    loose_commit_ms += (time.perf_counter() - commit_started) * 1000.0
+                    current_ingestion_batch = commit_result["current_ingestion_batch"]
+                    if bool(commit_result.get("freshness_fallback")):
+                        loose_freshness_fallbacks += 1
+                    action = str(commit_result["action"])
+                    if action == "failed":
+                        stats["failed"] += 1
+                        failures.append({"rel_path": rel_path, "error": str(commit_result["error"])})
+                    else:
+                        stats[action] += 1
+                finally:
+                    loose_file_ms += (time.perf_counter() - item_started) * 1000.0
+            benchmark_mark(
+                "ingest_item_loop_done",
+                loop_ms=round((time.perf_counter() - loop_started) * 1000.0, 3),
+                loose_file_ms=round(loose_file_ms, 3),
+                loose_extract_ms=round(loose_extract_ms, 3),
+                loose_chunk_ms=round(loose_chunk_ms, 3),
+                loose_prepare_wait_ms=round(loose_prepare_wait_ms, 3),
+                loose_commit_ms=round(loose_commit_ms, 3),
+                loose_freshness_fallbacks=loose_freshness_fallbacks,
+                container_source_ms=round(container_source_ms, 3),
+            )
 
-        existing_occurrence_rows = connection.execute(
-            """
-            SELECT *
-            FROM document_occurrences
-            WHERE parent_occurrence_id IS NULL
-              AND source_kind = ?
-              AND lifecycle_status != 'deleted'
-            """
-        , (FILESYSTEM_SOURCE_KIND,)).fetchall()
-        existing_occurrence_rows = [
-            row for row in existing_occurrence_rows if str(row["rel_path"]) not in gmail_owned_rel_paths
-        ]
-        existing_by_rel = {str(row["rel_path"]): row for row in existing_occurrence_rows}
-        unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
-        for row in existing_occurrence_rows:
-            if row["rel_path"] not in scanned_rel_paths and row["file_hash"]:
-                unseen_existing_by_hash[row["file_hash"]].append(row)
-
-        for item in scanned_items:
-            rel_path = str(item["rel_path"])
-            path = item["path"]
-            file_type = str(item["file_type"])
-            file_hash = item["file_hash"]
-            if file_type == PST_SOURCE_KIND:
-                try:
-                    pst_result = ingest_pst_source(connection, paths, path, rel_path)
-                    stats[str(pst_result["action"])] += 1
-                    stats["pst_sources_skipped"] += int(pst_result["pst_sources_skipped"])
-                    stats["pst_messages_created"] += int(pst_result["pst_messages_created"])
-                    stats["pst_messages_updated"] += int(pst_result["pst_messages_updated"])
-                    stats["pst_messages_deleted"] += int(pst_result["pst_messages_deleted"])
-                    continue
-                except Exception as exc:
-                    stats["failed"] += 1
-                    failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
-                    continue
-            if file_type == MBOX_SOURCE_KIND:
-                try:
-                    mbox_result = ingest_mbox_source(connection, paths, path, rel_path)
-                    stats[str(mbox_result["action"])] += 1
-                    stats["mbox_sources_skipped"] += int(mbox_result["mbox_sources_skipped"])
-                    stats["mbox_messages_created"] += int(mbox_result["mbox_messages_created"])
-                    stats["mbox_messages_updated"] += int(mbox_result["mbox_messages_updated"])
-                    stats["mbox_messages_deleted"] += int(mbox_result["mbox_messages_deleted"])
-                    continue
-                except Exception as exc:
-                    stats["failed"] += 1
-                    failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
-                    continue
-            existing_occurrence_row = existing_by_rel.get(rel_path)
-            action = "new"
-            if existing_occurrence_row is not None:
-                existing_row = connection.execute(
-                    "SELECT * FROM documents WHERE id = ?",
-                    (existing_occurrence_row["document_id"],),
-                ).fetchone()
-                if existing_row is None:
-                    raise RetrieverError(f"Occurrence {existing_occurrence_row['id']} points at a missing document.")
-                if (
-                    existing_occurrence_row["file_hash"] == file_hash
-                    and existing_occurrence_row["lifecycle_status"] == ACTIVE_OCCURRENCE_STATUS
-                    and document_row_has_seeded_text_revisions(existing_row)
-                    and document_row_has_email_threading(connection, existing_row)
-                ):
-                    filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
-                    connection.execute("BEGIN")
-                    try:
-                        mark_seen_without_reingest(
-                            connection,
-                            existing_occurrence_row,
-                            dataset_id=filesystem_dataset_id,
-                            dataset_source_id=filesystem_dataset_source_id,
-                        )
-                        connection.commit()
-                        stats["skipped"] += 1
-                        continue
-                    except Exception:
-                        connection.rollback()
-                        raise
-                action = "updated"
-            else:
-                existing_row = None
-                rename_candidates = unseen_existing_by_hash.get(file_hash) or []
-                if rename_candidates:
-                    existing_occurrence_row = rename_candidates.pop(0)
-                    action = "renamed"
-
-            exact_duplicate_document = None
-            if existing_occurrence_row is None and file_hash:
-                exact_duplicate_document = get_document_by_dedupe_key(
-                    connection,
-                    basis="file_hash",
-                    key_value=str(file_hash),
-                )
-                if exact_duplicate_document is not None:
-                    filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
-                    connection.execute("BEGIN")
-                    try:
-                        now = utc_now()
-                        duplicate_occurrence_id = attach_occurrence_to_existing_document(
-                            connection,
-                            exact_duplicate_document,
-                            existing_occurrence_row=None,
-                            rel_path=rel_path,
-                            file_name=path.name,
-                            file_type=file_type,
-                            file_size=path.stat().st_size,
-                            file_hash=str(file_hash),
-                            source_kind=FILESYSTEM_SOURCE_KIND,
-                            source_rel_path=rel_path,
-                            source_item_id=None,
-                            source_folder_path=None,
-                            custodian=infer_source_custodian(
-                                source_kind=FILESYSTEM_SOURCE_KIND,
-                                source_rel_path=rel_path,
-                            ),
-                            occurrence_control_number=str(exact_duplicate_document["control_number"] or ""),
-                            ingested_at=now,
-                            last_seen_at=now,
-                            updated_at=now,
-                        )
-                        clone_duplicate_family_child_occurrences(
-                            connection,
-                            paths,
-                            parent_document_id=int(exact_duplicate_document["id"]),
-                            parent_occurrence_id=duplicate_occurrence_id,
-                            parent_rel_path=rel_path,
-                            custodian=infer_source_custodian(
-                                source_kind=FILESYSTEM_SOURCE_KIND,
-                                source_rel_path=rel_path,
-                            ),
-                            ingested_at=now,
-                            last_seen_at=now,
-                            updated_at=now,
-                        )
-                        ensure_dataset_document_membership(
-                            connection,
-                            dataset_id=filesystem_dataset_id,
-                            document_id=int(exact_duplicate_document["id"]),
-                            dataset_source_id=filesystem_dataset_source_id,
-                        )
-                        connection.commit()
-                        stats["new"] += 1
-                        continue
-                    except Exception:
-                        connection.rollback()
-                        raise
-
-            filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
-            connection.execute("BEGIN")
-            try:
-                existing_row = None
-                reused_existing_occurrence_row = existing_occurrence_row
-                superseded_document_id: int | None = None
-                if existing_occurrence_row is not None:
-                    existing_row = connection.execute(
-                        "SELECT * FROM documents WHERE id = ?",
-                        (existing_occurrence_row["document_id"],),
-                    ).fetchone()
-                    if existing_row is None:
-                        raise RetrieverError(f"Occurrence {existing_occurrence_row['id']} points at a missing document.")
-                    active_occurrence_rows = active_occurrence_rows_for_document(connection, int(existing_row["id"]))
-                    if (
-                        action == "updated"
-                        and len(active_occurrence_rows) > 1
-                        and existing_occurrence_row["file_hash"] != file_hash
-                    ):
-                        connection.execute(
-                            """
-                            UPDATE document_occurrences
-                            SET lifecycle_status = 'superseded', updated_at = ?
-                            WHERE id = ?
-                            """,
-                            (utc_now(), existing_occurrence_row["id"]),
-                        )
-                        superseded_document_id = int(existing_row["id"])
-                        refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
-                        refresh_document_from_occurrences(connection, superseded_document_id)
-                        existing_row = None
-                        reused_existing_occurrence_row = None
-                extracted_payload = extract_document(path, include_attachments=True)
-                attachments = list(extracted_payload.get("attachments", []))
-                extracted_payload.pop("attachments", None)
-                extracted = apply_manual_locks(existing_row, extracted_payload)
-                if existing_row is None:
-                    if current_ingestion_batch is None:
-                        current_ingestion_batch = allocate_ingestion_batch_number(connection)
-                    control_number_batch = current_ingestion_batch
-                    control_number_family_sequence = reserve_control_number_family_sequence(connection, control_number_batch)
-                    control_number = format_control_number(control_number_batch, control_number_family_sequence)
-                    control_number_attachment_sequence = None
-                else:
-                    control_number_batch = int(existing_row["control_number_batch"])
-                    control_number_family_sequence = int(existing_row["control_number_family_sequence"])
-                    control_number = str(existing_row["control_number"])
-                    control_number_attachment_sequence = existing_row["control_number_attachment_sequence"]
-                    cleanup_document_artifacts(paths, connection, existing_row)
-                document_id = upsert_document_row(
-                    connection,
-                    rel_path,
-                    path,
-                    existing_row,
-                    extracted,
-                    existing_occurrence_row=reused_existing_occurrence_row,
-                    file_name=path.name,
-                    parent_document_id=None,
-                    control_number=control_number,
-                    dataset_id=filesystem_dataset_id,
-                    control_number_batch=control_number_batch,
-                    control_number_family_sequence=control_number_family_sequence,
-                    control_number_attachment_sequence=control_number_attachment_sequence,
-                )
-                replace_document_email_threading_row(
-                    connection,
-                    document_id=document_id,
-                    email_threading=extracted.get("email_threading"),
-                )
-                seed_source_text_revision_for_document(
-                    connection,
-                    paths,
-                    document_id=document_id,
-                    extracted=extracted,
-                    existing_row=existing_row,
-                )
-                ensure_dataset_document_membership(
-                    connection,
-                    dataset_id=filesystem_dataset_id,
-                    document_id=document_id,
-                    dataset_source_id=filesystem_dataset_source_id,
-                )
-                preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
-                chunks = extracted_search_chunks(extracted)
-                replace_document_related_rows(connection, document_id, extracted | {"file_name": path.name}, chunks, preview_rows)
-                reconcile_attachment_documents(
-                    connection,
-                    paths,
-                    document_id,
-                    rel_path,
-                    control_number_batch,
-                    control_number_family_sequence,
-                    attachments,
-                    [(filesystem_dataset_id, filesystem_dataset_source_id)],
-                )
-                if superseded_document_id is not None and superseded_document_id != document_id:
-                    refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
-                    refresh_document_from_occurrences(connection, superseded_document_id)
-                connection.commit()
-                stats[action] += 1
-            except Exception as exc:
-                connection.rollback()
-                stats["failed"] += 1
-                failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
-
-        filesystem_missing = mark_missing_documents(connection, scanned_rel_paths)
-        pst_sources_missing = 0
-        pst_documents_missing = 0
-        mbox_sources_missing = 0
-        mbox_documents_missing = 0
-        if allowed_types is None or PST_SOURCE_KIND in allowed_types:
-            pst_sources_missing, pst_documents_missing = mark_missing_pst_documents(connection, scanned_pst_source_rel_paths)
-        if allowed_types is None or MBOX_SOURCE_KIND in allowed_types:
-            mbox_sources_missing, mbox_documents_missing = mark_missing_mbox_documents(connection, scanned_mbox_source_rel_paths)
-        stats["pst_sources_missing"] = pst_sources_missing
-        stats["pst_documents_missing"] = pst_documents_missing
-        stats["mbox_sources_missing"] = mbox_sources_missing
-        stats["mbox_documents_missing"] = mbox_documents_missing
-        stats["slack_documents_missing"] = slack_day_documents_missing
-        stats["missing"] = filesystem_missing + pst_sources_missing + mbox_sources_missing + slack_day_documents_missing
-        connection.execute("BEGIN")
-        try:
-            conversation_assignment = assign_supported_conversations(connection)
-            refresh_conversation_previews(connection, paths)
-            connection.commit()
-        except Exception:
-            connection.rollback()
+            postpass_started = time.perf_counter()
+            pruned_unused_filesystem_dataset = finalize_ingest_postpass(
+                connection,
+                paths,
+                allowed_types,
+                scanned_rel_paths,
+                scanned_pst_source_rel_paths,
+                scanned_mbox_source_rel_paths,
+                slack_day_documents_missing,
+                stats,
+            )
+            benchmark_mark(
+                "ingest_postpass_done",
+                postpass_ms=round((time.perf_counter() - postpass_started) * 1000.0, 3),
+                missing=stats["missing"],
+                email_conversations=stats["email_conversations"],
+                pst_chat_conversations=stats["pst_chat_conversations"],
+            )
+            workspace_inventory = document_inventory_counts(connection)
+            result = dict(stats)
+            result["failures"] = failures
+            result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
+            result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
+            result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
+            result["ingested_production_roots"] = ingested_production_roots
+            result["skipped_production_roots"] = skipped_production_roots
+            if warnings:
+                result["warnings"] = warnings
+            result["workspace_parent_documents"] = workspace_inventory["parent_documents"]
+            result["workspace_missing_parent_documents"] = workspace_inventory["missing_parent_documents"]
+            result["workspace_attachment_children"] = workspace_inventory["attachment_children"]
+            result["workspace_documents_total"] = workspace_inventory["documents_total"]
+            benchmark_mark(
+                "ingest_done",
+                total_ms=round((time.perf_counter() - total_started) * 1000.0, 3),
+                scanned=result["scanned"],
+                new=stats["new"],
+                updated=stats["updated"],
+                failed=stats["failed"],
+            )
+            return result
+        except Exception as exc:
+            benchmark_mark(
+                "ingest_failed",
+                total_ms=round((time.perf_counter() - total_started) * 1000.0, 3),
+                error=f"{type(exc).__name__}: {exc}",
+            )
             raise
-        stats["email_conversations"] = int(conversation_assignment["email_conversations"])
-        stats["email_documents_reassigned"] = int(conversation_assignment["email_documents_reassigned"])
-        stats["email_child_documents_updated"] = int(conversation_assignment["email_child_documents_updated"])
-        stats["pst_chat_conversations"] = int(conversation_assignment["pst_chat_conversations"])
-        stats["pst_chat_documents_reassigned"] = int(conversation_assignment["pst_chat_documents_reassigned"])
-        stats["pst_chat_child_documents_updated"] = int(conversation_assignment["pst_chat_child_documents_updated"])
-        connection.execute("BEGIN")
-        try:
-            pruned_unused_filesystem_dataset = prune_unused_filesystem_dataset(connection)
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        workspace_inventory = document_inventory_counts(connection)
-        result = dict(stats)
-        result["failures"] = failures
-        result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
-        result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
-        result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
-        result["ingested_production_roots"] = ingested_production_roots
-        result["skipped_production_roots"] = skipped_production_roots
-        if warnings:
-            result["warnings"] = warnings
-        result["workspace_parent_documents"] = workspace_inventory["parent_documents"]
-        result["workspace_missing_parent_documents"] = workspace_inventory["missing_parent_documents"]
-        result["workspace_attachment_children"] = workspace_inventory["attachment_children"]
-        result["workspace_documents_total"] = workspace_inventory["documents_total"]
-        return result
-    finally:
-        connection.close()
+        finally:
+            connection.close()
 
 
 def value_from_type(field_type: str, value: str | None) -> object:

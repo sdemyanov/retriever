@@ -1640,12 +1640,15 @@ def container_email_documents_missing_threading(
         SELECT 1
         FROM documents d
         LEFT JOIN document_email_threading det ON det.document_id = d.id
+        LEFT JOIN document_chat_threading dct ON dct.document_id = d.id
         WHERE d.source_kind = ?
           AND d.source_rel_path = ?
           AND d.parent_document_id IS NULL
-          AND d.content_type = 'Email'
           AND d.lifecycle_status != 'deleted'
-          AND det.document_id IS NULL
+          AND (
+            (d.content_type = 'Email' AND det.document_id IS NULL)
+            OR (d.content_type = 'Chat' AND dct.document_id IS NULL)
+          )
         LIMIT 1
         """,
         (source_kind, source_rel_path),
@@ -5320,6 +5323,276 @@ def production_document_file_size(text_path: Path | None, image_paths: list[Path
     return total if found else None
 
 
+def plan_production_record_work(
+    workspace_root: Path,
+    resolved_production_root: Path,
+    signature: dict[str, object],
+    metadata_rows: list[dict[str, str]],
+    resolved_image_rows: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], set[str]]:
+    plans: list[dict[str, object]] = []
+    seen_control_numbers: set[str] = set()
+    for record in metadata_rows:
+        begin_bates = str(record.get("begin_bates") or "").strip()
+        end_bates = str(record.get("end_bates") or begin_bates).strip()
+        if not begin_bates:
+            continue
+        control_number = begin_bates
+        seen_control_numbers.add(control_number)
+        text_path = resolve_production_source_path(workspace_root, resolved_production_root, record.get("text_path"))
+        native_path = resolve_production_source_path(workspace_root, resolved_production_root, record.get("native_path"))
+        matching_image_paths = [
+            Path(image_row["resolved_path"])
+            for image_row in resolved_image_rows
+            if image_row.get("resolved_path") is not None
+            and bates_inclusive_contains(begin_bates, end_bates, image_row["page_bates"])
+        ]
+        plans.append(
+            {
+                "production_name": str(signature["production_name"]),
+                "production_rel_root": str(signature["rel_root"]),
+                "control_number": control_number,
+                "begin_bates": begin_bates,
+                "end_bates": end_bates,
+                "begin_attachment": record.get("begin_attachment"),
+                "end_attachment": record.get("end_attachment"),
+                "text_path": text_path,
+                "native_path": native_path,
+                "matching_image_paths": matching_image_paths,
+                "missing_linked_text": bool(record.get("text_path") and (text_path is None or not text_path.exists())),
+                "missing_linked_images": bool(resolved_image_rows and not matching_image_paths),
+                "missing_linked_natives": bool(record.get("native_path") and (native_path is None or not native_path.exists())),
+            }
+        )
+    return plans, seen_control_numbers
+
+
+def prepare_production_row_plan(
+    workspace_root: Path,
+    prepared_plan: dict[str, object],
+) -> dict[str, object]:
+    prepared_item = dict(prepared_plan)
+    prepare_started = time.perf_counter()
+    try:
+        text_path = Path(prepared_plan["text_path"]) if prepared_plan.get("text_path") is not None else None
+        native_path = Path(prepared_plan["native_path"]) if prepared_plan.get("native_path") is not None else None
+        matching_image_paths = [Path(path) for path in list(prepared_plan.get("matching_image_paths") or [])]
+        available_text_path = text_path if text_path is not None and text_path.exists() else None
+        available_native_path = native_path if native_path is not None and native_path.exists() else None
+        extracted_payload = build_production_extracted_payload(
+            workspace_root,
+            production_name=str(prepared_plan["production_name"]),
+            control_number=str(prepared_plan["control_number"]),
+            begin_bates=str(prepared_plan["begin_bates"]),
+            end_bates=str(prepared_plan["end_bates"]),
+            begin_attachment=prepared_plan.get("begin_attachment"),
+            end_attachment=prepared_plan.get("end_attachment"),
+            text_path=available_text_path,
+            image_paths=matching_image_paths,
+            native_path=available_native_path,
+        )
+        preferred_native = extracted_payload.pop("preferred_native", None)
+        source_parts = production_source_parts(
+            workspace_root,
+            text_path=available_text_path,
+            image_paths=matching_image_paths,
+            native_path=available_native_path,
+        )
+        chunk_started = time.perf_counter()
+        prepared_chunks = chunk_text(str(extracted_payload.get("text_content") or ""))
+        rel_path = production_logical_rel_path(str(prepared_plan["production_rel_root"]), str(prepared_plan["control_number"])).as_posix()
+        file_name = (
+            (preferred_native.name if isinstance(preferred_native, Path) else None)
+            or (available_native_path.name if available_native_path is not None else None)
+            or f"{prepared_plan['control_number']}.production"
+        )
+        preferred_source_path = (
+            preferred_native
+            if isinstance(preferred_native, Path)
+            else available_text_path
+        )
+        prepared_item["extracted_payload"] = extracted_payload
+        prepared_item["preferred_native"] = preferred_native
+        prepared_item["preferred_source_path"] = preferred_source_path
+        prepared_item["source_parts"] = source_parts
+        prepared_item["prepared_chunks"] = prepared_chunks
+        prepared_item["prepare_chunk_ms"] = (time.perf_counter() - chunk_started) * 1000.0
+        prepared_item["rel_path"] = rel_path
+        prepared_item["file_name"] = file_name
+        prepared_item["available_text_path"] = available_text_path
+        prepared_item["available_native_path"] = available_native_path
+        prepared_item["matching_image_paths"] = matching_image_paths
+        prepared_item["file_type_override"] = (
+            normalize_extension(preferred_native)
+            if isinstance(preferred_native, Path)
+            else (normalize_extension(native_path) if native_path is not None else None)
+        )
+        prepared_item["file_size_override"] = production_document_file_size(
+            available_text_path,
+            matching_image_paths,
+            available_native_path,
+        )
+        prepared_item["file_hash_override"] = (
+            sha256_file(preferred_native)
+            if isinstance(preferred_native, Path)
+            else (sha256_file(available_text_path) if available_text_path is not None else None)
+        )
+        prepared_item["prepare_error"] = None
+    except Exception as exc:
+        prepared_item["extracted_payload"] = None
+        prepared_item["preferred_native"] = None
+        prepared_item["preferred_source_path"] = None
+        prepared_item["source_parts"] = []
+        prepared_item["prepared_chunks"] = []
+        prepared_item["prepare_chunk_ms"] = 0.0
+        prepared_item["rel_path"] = production_logical_rel_path(
+            str(prepared_plan["production_rel_root"]),
+            str(prepared_plan["control_number"]),
+        ).as_posix()
+        prepared_item["file_name"] = f"{prepared_plan['control_number']}.production"
+        prepared_item["available_text_path"] = None
+        prepared_item["available_native_path"] = None
+        prepared_item["matching_image_paths"] = []
+        prepared_item["file_type_override"] = None
+        prepared_item["file_size_override"] = None
+        prepared_item["file_hash_override"] = None
+        prepared_item["prepare_error"] = f"{type(exc).__name__}: {exc}"
+    prepared_item["prepare_ms"] = (time.perf_counter() - prepare_started) * 1000.0
+    return prepared_item
+
+
+def iter_prepared_production_row_plans(
+    workspace_root: Path,
+    production_row_plans: list[dict[str, object]],
+    staging_root: Path | None = None,
+) -> Iterator[tuple[dict[str, object], float]]:
+    effective_staging_root = staging_root
+    if staging_root is not None and production_row_plans:
+        effective_staging_root = (
+            Path(staging_root)
+            / "production"
+            / sanitize_storage_filename(str(production_row_plans[0]["production_rel_root"]))
+        )
+    yield from iter_staged_prepared_items(
+        production_row_plans,
+        prepare_item=lambda plan: prepare_production_row_plan(workspace_root, plan),
+        config_benchmark_name="ingest_production_prepare_config",
+        queue_done_benchmark_name="ingest_production_prepare_queue_done",
+        spill_subdir_name="prepared-production",
+        staging_root=effective_staging_root,
+    )
+
+
+def commit_prepared_production_row(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    existing_row: sqlite3.Row | None,
+    prepared_item: dict[str, object],
+    *,
+    dataset_id: int,
+    dataset_source_id: int,
+    production_id: int,
+) -> dict[str, object]:
+    control_number = str(prepared_item["control_number"])
+    prepare_error = prepared_item.get("prepare_error")
+    if prepare_error:
+        return {
+            "action": "failed",
+            "control_number": control_number,
+            "error": str(prepare_error),
+            "page_images_linked": 0,
+        }
+
+    connection.execute("BEGIN")
+    try:
+        existing_signature = existing_production_row_signature(connection, existing_row)
+        extracted = apply_manual_locks(existing_row, dict(prepared_item["extracted_payload"] or {}))
+        desired_signature = production_row_signature(
+            existing_row,
+            rel_path=str(prepared_item["rel_path"]),
+            file_name=str(prepared_item["file_name"]),
+            source_kind=PRODUCTION_SOURCE_KIND,
+            production_id=production_id,
+            begin_bates=str(prepared_item["begin_bates"]),
+            end_bates=str(prepared_item["end_bates"]),
+            begin_attachment=prepared_item.get("begin_attachment"),
+            end_attachment=prepared_item.get("end_attachment"),
+            extracted=extracted,
+            source_parts=list(prepared_item.get("source_parts", [])),
+        )
+        if existing_row is not None:
+            cleanup_document_artifacts(paths, connection, existing_row)
+        document_id = upsert_document_row(
+            connection,
+            str(prepared_item["rel_path"]),
+            (
+                prepared_item["preferred_source_path"]
+                if isinstance(prepared_item.get("preferred_source_path"), Path)
+                else None
+            ),
+            existing_row,
+            extracted,
+            file_name=str(prepared_item["file_name"]),
+            parent_document_id=None,
+            control_number=control_number,
+            dataset_id=dataset_id,
+            control_number_batch=None,
+            control_number_family_sequence=None,
+            control_number_attachment_sequence=None,
+            source_kind=PRODUCTION_SOURCE_KIND,
+            production_id=production_id,
+            begin_bates=str(prepared_item["begin_bates"]),
+            end_bates=str(prepared_item["end_bates"]),
+            begin_attachment=prepared_item.get("begin_attachment"),
+            end_attachment=prepared_item.get("end_attachment"),
+            file_type_override=prepared_item.get("file_type_override"),
+            file_size_override=prepared_item.get("file_size_override"),
+            file_hash_override=prepared_item.get("file_hash_override"),
+        )
+        seed_source_text_revision_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+            extracted=extracted,
+            existing_row=existing_row,
+        )
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            dataset_source_id=dataset_source_id,
+        )
+        preview_rows = write_preview_artifacts(paths, str(prepared_item["rel_path"]), list(extracted.get("preview_artifacts", [])))
+        replace_document_related_rows(
+            connection,
+            document_id,
+            extracted | {"file_name": str(prepared_item["file_name"])},
+            list(prepared_item.get("prepared_chunks", [])),
+            preview_rows,
+        )
+        replace_document_source_parts(connection, document_id, list(prepared_item.get("source_parts", [])))
+        connection.commit()
+        if existing_row is None:
+            action = "created"
+        elif existing_row["lifecycle_status"] == "active" and existing_signature == desired_signature:
+            action = "unchanged"
+        else:
+            action = "updated"
+        return {
+            "action": action,
+            "control_number": control_number,
+            "page_images_linked": len(list(prepared_item.get("matching_image_paths", []))),
+        }
+    except Exception as exc:
+        connection.rollback()
+        return {
+            "action": "failed",
+            "control_number": control_number,
+            "error": f"{type(exc).__name__}: {exc}",
+            "page_images_linked": 0,
+        }
+
+
 def update_production_family_relationships(connection: sqlite3.Connection, production_id: int) -> int:
     rows = connection.execute(
         """
@@ -5361,6 +5634,7 @@ def ingest_resolved_production_root(
     paths: dict[str, Path],
     workspace_root: Path,
     resolved_production_root: Path,
+    staging_root: Path | None = None,
 ) -> dict[str, object]:
     workspace_root = workspace_root.resolve()
     resolved_production_root = resolved_production_root.resolve()
@@ -5398,12 +5672,18 @@ def ingest_resolved_production_root(
         (production_id,),
     ).fetchall()
     existing_by_control_number = {str(row["control_number"]): row for row in existing_rows if row["control_number"]}
-    seen_control_numbers: set[str] = set()
 
     resolved_image_rows: list[dict[str, object]] = []
     for image_row in image_rows:
         resolved_path = resolve_production_source_path(workspace_root, resolved_production_root, image_row["image_path"])
         resolved_image_rows.append({**image_row, "resolved_path": resolved_path})
+    production_row_plans, seen_control_numbers = plan_production_record_work(
+        workspace_root,
+        resolved_production_root,
+        signature,
+        list(metadata["rows"]),
+        resolved_image_rows,
+    )
 
     stats: dict[str, int] = {
         "created": 0,
@@ -5417,139 +5697,62 @@ def ingest_resolved_production_root(
         "docs_missing_linked_natives": 0,
     }
     failures: list[dict[str, str]] = []
+    stats["docs_missing_linked_text"] = sum(int(plan["missing_linked_text"]) for plan in production_row_plans)
+    stats["docs_missing_linked_images"] = sum(int(plan["missing_linked_images"]) for plan in production_row_plans)
+    stats["docs_missing_linked_natives"] = sum(int(plan["missing_linked_natives"]) for plan in production_row_plans)
 
-    for record in metadata["rows"]:
-        begin_bates = str(record.get("begin_bates") or "").strip()
-        end_bates = str(record.get("end_bates") or begin_bates).strip()
-        if not begin_bates:
-            continue
-        control_number = begin_bates
-        seen_control_numbers.add(control_number)
+    prepare_ms = 0.0
+    prepare_chunk_ms = 0.0
+    prepare_wait_ms = 0.0
+    commit_ms = 0.0
+    row_loop_started = time.perf_counter()
+    for prepared_item, wait_ms in iter_prepared_production_row_plans(
+        workspace_root,
+        production_row_plans,
+        staging_root=staging_root,
+    ):
+        prepare_wait_ms += wait_ms
+        prepare_ms += float(prepared_item.get("prepare_ms") or 0.0)
+        prepare_chunk_ms += float(prepared_item.get("prepare_chunk_ms") or 0.0)
+        control_number = str(prepared_item["control_number"])
         existing_row = existing_by_control_number.get(control_number)
-        connection.execute("BEGIN")
-        try:
-            existing_signature = existing_production_row_signature(connection, existing_row)
-            text_path = resolve_production_source_path(workspace_root, resolved_production_root, record.get("text_path"))
-            native_path = resolve_production_source_path(workspace_root, resolved_production_root, record.get("native_path"))
-            matching_image_paths = [
-                Path(image_row["resolved_path"])
-                for image_row in resolved_image_rows
-                if image_row.get("resolved_path") is not None
-                and bates_inclusive_contains(begin_bates, end_bates, image_row["page_bates"])
-            ]
-            if record.get("text_path") and (text_path is None or not text_path.exists()):
-                stats["docs_missing_linked_text"] += 1
-            if image_rows and not matching_image_paths:
-                stats["docs_missing_linked_images"] += 1
-            if record.get("native_path") and (native_path is None or not native_path.exists()):
-                stats["docs_missing_linked_natives"] += 1
+        commit_started = time.perf_counter()
+        commit_result = commit_prepared_production_row(
+            connection,
+            paths,
+            existing_row,
+            prepared_item,
+            dataset_id=dataset_id,
+            dataset_source_id=dataset_source_id,
+            production_id=production_id,
+        )
+        commit_ms += (time.perf_counter() - commit_started) * 1000.0
+        action = str(commit_result["action"])
+        if action == "failed":
+            failures.append(
+                {
+                    "control_number": control_number,
+                    "error": str(commit_result.get("error") or "Unknown production ingest failure."),
+                }
+            )
+            continue
+        stats[action] += 1
+        stats["page_images_linked"] += int(commit_result["page_images_linked"])
+    benchmark_mark(
+        "ingest_production_rows_done",
+        row_count=len(production_row_plans),
+        row_loop_ms=round((time.perf_counter() - row_loop_started) * 1000.0, 3),
+        prepare_ms=round(prepare_ms, 3),
+        prepare_chunk_ms=round(prepare_chunk_ms, 3),
+        prepare_wait_ms=round(prepare_wait_ms, 3),
+        commit_ms=round(commit_ms, 3),
+        created=stats["created"],
+        updated=stats["updated"],
+        unchanged=stats["unchanged"],
+        failed=len(failures),
+    )
 
-            extracted_payload = build_production_extracted_payload(
-                workspace_root,
-                production_name=str(signature["production_name"]),
-                control_number=control_number,
-                begin_bates=begin_bates,
-                end_bates=end_bates,
-                begin_attachment=record.get("begin_attachment"),
-                end_attachment=record.get("end_attachment"),
-                text_path=text_path if text_path is not None and text_path.exists() else None,
-                image_paths=matching_image_paths,
-                native_path=native_path if native_path is not None and native_path.exists() else None,
-            )
-            preferred_native = extracted_payload.pop("preferred_native", None)
-            extracted = apply_manual_locks(existing_row, extracted_payload)
-            source_parts = production_source_parts(
-                workspace_root,
-                text_path=text_path if text_path is not None and text_path.exists() else None,
-                image_paths=matching_image_paths,
-                native_path=native_path if native_path is not None and native_path.exists() else None,
-            )
-            rel_path = production_logical_rel_path(str(signature["rel_root"]), control_number).as_posix()
-            file_name = (
-                (preferred_native.name if isinstance(preferred_native, Path) else None)
-                or (native_path.name if native_path is not None and native_path.exists() else None)
-                or f"{control_number}.production"
-            )
-            desired_signature = production_row_signature(
-                existing_row,
-                rel_path=rel_path,
-                file_name=file_name,
-                source_kind=PRODUCTION_SOURCE_KIND,
-                production_id=production_id,
-                begin_bates=begin_bates,
-                end_bates=end_bates,
-                begin_attachment=record.get("begin_attachment"),
-                end_attachment=record.get("end_attachment"),
-                extracted=extracted,
-                source_parts=source_parts,
-            )
-            if existing_row is not None:
-                cleanup_document_artifacts(paths, connection, existing_row)
-            document_id = upsert_document_row(
-                connection,
-                rel_path,
-                preferred_native if isinstance(preferred_native, Path) else (text_path if text_path is not None and text_path.exists() else None),
-                existing_row,
-                extracted,
-                file_name=file_name,
-                parent_document_id=None,
-                control_number=control_number,
-                dataset_id=dataset_id,
-                control_number_batch=None,
-                control_number_family_sequence=None,
-                control_number_attachment_sequence=None,
-                source_kind=PRODUCTION_SOURCE_KIND,
-                production_id=production_id,
-                begin_bates=begin_bates,
-                end_bates=end_bates,
-                begin_attachment=record.get("begin_attachment"),
-                end_attachment=record.get("end_attachment"),
-                file_type_override=(
-                    normalize_extension(preferred_native)
-                    if isinstance(preferred_native, Path)
-                    else (normalize_extension(native_path) if native_path is not None else None)
-                ),
-                file_size_override=production_document_file_size(
-                    text_path if text_path is not None and text_path.exists() else None,
-                    matching_image_paths,
-                    native_path if native_path is not None and native_path.exists() else None,
-                ),
-                file_hash_override=(
-                    sha256_file(preferred_native)
-                    if isinstance(preferred_native, Path)
-                    else (sha256_file(text_path) if text_path is not None and text_path.exists() else None)
-                ),
-            )
-            seed_source_text_revision_for_document(
-                connection,
-                paths,
-                document_id=document_id,
-                extracted=extracted,
-                existing_row=existing_row,
-            )
-            ensure_dataset_document_membership(
-                connection,
-                dataset_id=dataset_id,
-                document_id=document_id,
-                dataset_source_id=dataset_source_id,
-            )
-            preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
-            chunks = chunk_text(str(extracted.get("text_content") or ""))
-            replace_document_related_rows(connection, document_id, extracted | {"file_name": file_name}, chunks, preview_rows)
-            replace_document_source_parts(connection, document_id, source_parts)
-            connection.commit()
-
-            if existing_row is None:
-                stats["created"] += 1
-            elif existing_row["lifecycle_status"] == "active" and existing_signature == desired_signature:
-                stats["unchanged"] += 1
-            else:
-                stats["updated"] += 1
-            stats["page_images_linked"] += len(matching_image_paths)
-        except Exception as exc:
-            connection.rollback()
-            failures.append({"control_number": control_number, "error": f"{type(exc).__name__}: {exc}"})
-
+    retire_started = time.perf_counter()
     for row in existing_rows:
         control_number = str(row["control_number"] or "")
         if control_number and control_number in seen_control_numbers:
@@ -5571,7 +5774,13 @@ def ingest_resolved_production_root(
         except Exception:
             connection.rollback()
             raise
+    benchmark_mark(
+        "ingest_production_retire_done",
+        retire_ms=round((time.perf_counter() - retire_started) * 1000.0, 3),
+        retired=stats["retired"],
+    )
 
+    finalize_started = time.perf_counter()
     connection.execute("BEGIN")
     try:
         parent_link_updates = update_production_family_relationships(connection, production_id)
@@ -5612,6 +5821,13 @@ def ingest_resolved_production_root(
     )
     stats["parent_link_updates"] = parent_link_updates
     stats["attachment_preview_updates"] = attachment_preview_updates
+    benchmark_mark(
+        "ingest_production_finalize_done",
+        finalize_ms=round((time.perf_counter() - finalize_started) * 1000.0, 3),
+        parent_link_updates=parent_link_updates,
+        attachment_preview_updates=attachment_preview_updates,
+        families_reconstructed=stats["families_reconstructed"],
+    )
 
     return {
         "status": "ok",
