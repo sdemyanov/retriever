@@ -2,13 +2,13 @@
 
 ## Template metadata
 
-- tool version: `0.17.2`
-- schema version: `20`
-- requirements version: `2026-04-20-phase10-conversations-and-export-previews`
+- tool version: `0.19.0`
+- schema version: `22`
+- requirements version: `2026-04-21-phase11-document-deduplication`
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `dfea00324a2a6229542a14395438212bfa7110e74c38a7bdbcf74ab85587940d`
+- source checksum (SHA256): `3e13df611c26b91633dc194aa2f3b1ca4fe3e89fcfb752a5e169fc273d038052`
 
 ## Current command surface
 

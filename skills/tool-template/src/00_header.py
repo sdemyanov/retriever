@@ -67,8 +67,8 @@ except Exception:  # pragma: no cover - platform-specific locking
     msvcrt = None
 
 
-TOOL_VERSION = "0.18.0"
-SCHEMA_VERSION = 21
+TOOL_VERSION = "0.19.0"
+SCHEMA_VERSION = 22
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
@@ -323,7 +323,6 @@ TEXT_FILE_TYPES = {"csv", "htm", "html", "ics", "json", "md", "txt", *CURATED_TE
 EDITABLE_BUILTIN_FIELDS = {
     "author",
     "content_type",
-    "custodian",
     "date_created",
     "date_modified",
     "page_count",
@@ -405,7 +404,6 @@ BUILTIN_FIELD_TYPES = {
     "page_count": "integer",
     "author": "text",
     "content_type": "text",
-    "custodian": "text",
     "date_created": "date",
     "date_modified": "date",
     "title": "text",
@@ -444,12 +442,14 @@ REGISTRY_FIELD_TYPES = {
     "text": "TEXT",
 }
 VIRTUAL_FILTER_FIELD_TYPES = {
+    "custodian": "text",
     "dataset_name": "text",
     "is_attachment": "boolean",
     "has_attachments": "boolean",
     "production_name": "text",
 }
 DISPLAYABLE_VIRTUAL_FIELDS = {
+    "custodian",
     "dataset_name",
     "is_attachment",
     "production_name",
@@ -505,10 +505,14 @@ BUILTIN_FIELD_DESCRIPTIONS = {
     "updated_at": "ISO timestamp when Retriever last updated the document row",
 }
 VIRTUAL_FIELD_DESCRIPTIONS = {
+    "custodian": "Custodian or mailbox owner across the document's active collected copies",
     "dataset_name": "Logical dataset label for PSTs, MBOXes, productions, and manual document sets",
     "has_attachments": "Whether the document has one or more attachment child documents",
     "is_attachment": "Whether the document is an attachment child document",
     "production_name": "Friendly production name for production-derived documents",
+}
+INTERNAL_DOCUMENT_COLUMNS = {
+    "custodians_json",
 }
 CONTENT_TYPE_EXTENSION_GROUPS = [
     ("Email", "dbx eml emlx mbox msg nsf ost p7m p7s pst tnef vcf"),
