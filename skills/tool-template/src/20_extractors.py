@@ -2081,7 +2081,12 @@ def build_email_extracted_payload(
         normalized_text,
         [author, recipients or None],
     )
-    preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
+    normalized_attachments = list(attachments or [])
+    preview_html_body = inline_cid_references_in_html(normalized_html, normalized_attachments)
+    document_attachments = filter_html_preview_embedded_image_attachments(
+        normalized_html,
+        normalized_attachments,
+    )
     preview = build_email_message_preview_html(
         {
             "id": 0,
@@ -2107,7 +2112,7 @@ def build_email_extracted_payload(
         "recipients": recipients or None,
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
-        "attachments": list(attachments or []),
+        "attachments": document_attachments,
         "email_threading": dict(email_threading or {}),
         "preview_artifacts": [
             {
@@ -2351,7 +2356,8 @@ def build_calendar_extracted_payload(
         normalized_text = strip_html_tags(normalized_html)
     normalized_text = normalize_whitespace(normalized_text)
     resolved_subject = normalize_generated_document_title(subject)
-    preview_html_body = inline_cid_references_in_html(normalized_html, attachments)
+    normalized_attachments = list(attachments or [])
+    preview_html_body = inline_cid_references_in_html(normalized_html, normalized_attachments)
     preview_title = resolved_subject or "Retriever Calendar Preview"
     preview = build_html_preview(
         {
@@ -2376,7 +2382,10 @@ def build_calendar_extracted_payload(
         "recipients": recipients or None,
         "text_content": normalized_text,
         "text_status": "empty" if not normalized_text else "ok",
-        "attachments": list(attachments or []),
+        "attachments": filter_html_preview_embedded_image_attachments(
+            normalized_html,
+            normalized_attachments,
+        ),
         "preview_artifacts": [
             {
                 "file_name": preview_file_name,

@@ -72,6 +72,7 @@
 ## Attachment family behavior
 
 - EML and MSG parents may emit one level of child attachment documents.
+- CID-backed images that are rendered inline inside the generated HTML preview are kept as preview assets and are not materialized as child attachment documents.
 - Store extracted attachment payloads under `.retriever/previews/<parent>/attachments/`.
 - Child attachment rows are derived documents linked back to the parent email; they are not top-level scanned workspace files.
 - Re-ingesting a parent email must reconcile its child attachments inside the same parent transaction.
