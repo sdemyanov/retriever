@@ -923,6 +923,7 @@ def upsert_document_row(
     existing_row: sqlite3.Row | None,
     extracted: dict[str, object],
     *,
+    existing_occurrence_row: sqlite3.Row | None = None,
     file_name: str,
     parent_document_id: int | None,
     child_document_kind: str | None = None,
@@ -971,6 +972,12 @@ def upsert_document_row(
         if effective_child_kind == CHILD_DOCUMENT_KIND_ATTACHMENT
         else FILESYSTEM_SOURCE_KIND
     )
+    effective_source_rel_path = source_rel_path
+    if effective_source_rel_path is None:
+        if existing_row is not None and existing_row["source_rel_path"] is not None:
+            effective_source_rel_path = existing_row["source_rel_path"]
+        else:
+            effective_source_rel_path = rel_path
     effective_dataset_id = dataset_id
     if effective_dataset_id is None and existing_row is not None and existing_row["dataset_id"] is not None:
         effective_dataset_id = int(existing_row["dataset_id"])
@@ -997,13 +1004,19 @@ def upsert_document_row(
         )
     common_values = {
         "control_number": control_number,
+        "canonical_kind": canonical_kind_from_metadata(
+            extracted_content_type=extracted.get("content_type"),
+            file_type=file_type,
+            source_kind=effective_source_kind,
+        ),
+        "canonical_status": CANONICAL_STATUS_ACTIVE,
         "conversation_id": effective_conversation_id,
         "conversation_assignment_mode": effective_conversation_assignment,
         "dataset_id": effective_dataset_id,
         "parent_document_id": parent_document_id,
         "child_document_kind": effective_child_kind,
         "source_kind": effective_source_kind,
-        "source_rel_path": source_rel_path,
+        "source_rel_path": effective_source_rel_path,
         "source_item_id": source_item_id,
         "root_message_key": effective_root_message_key,
         "source_folder_path": source_folder_path,
@@ -1041,17 +1054,21 @@ def upsert_document_row(
         connection.execute(
             """
             INSERT INTO documents (
-              control_number, conversation_id, conversation_assignment_mode, dataset_id, parent_document_id, child_document_kind,
+              control_number, canonical_kind, canonical_status, merged_into_document_id,
+              conversation_id, conversation_assignment_mode, dataset_id, parent_document_id, child_document_kind,
               source_kind, source_rel_path, source_item_id, root_message_key, source_folder_path,
               production_id, begin_bates, end_bates, begin_attachment, end_attachment,
               rel_path, file_name, file_type, file_size, page_count, author, custodian, date_created,
               content_type, date_modified, title, subject, participants, recipients, manual_field_locks_json, file_hash,
               content_hash, text_status, lifecycle_status, ingested_at, last_seen_at, updated_at,
               control_number_batch, control_number_family_sequence, control_number_attachment_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 common_values["control_number"],
+                common_values["canonical_kind"],
+                common_values["canonical_status"],
+                None,
                 common_values["conversation_id"],
                 common_values["conversation_assignment_mode"],
                 common_values["dataset_id"],
@@ -1094,73 +1111,338 @@ def upsert_document_row(
                 common_values["control_number_attachment_sequence"],
             ),
         )
-        return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        document_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+    else:
+        locked_value = existing_row[MANUAL_FIELD_LOCKS_COLUMN] or "[]"
+        connection.execute(
+            """
+            UPDATE documents
+            SET control_number = ?, canonical_kind = ?, canonical_status = ?, merged_into_document_id = NULL,
+                conversation_id = ?, conversation_assignment_mode = ?, dataset_id = ?, parent_document_id = ?, child_document_kind = ?,
+                source_kind = ?, source_rel_path = ?, source_item_id = ?, root_message_key = ?, source_folder_path = ?,
+                production_id = ?, begin_bates = ?, end_bates = ?, begin_attachment = ?, end_attachment = ?,
+                rel_path = ?, file_name = ?, file_type = ?, file_size = ?, page_count = ?,
+                author = ?, custodian = ?, content_type = ?, date_created = ?, date_modified = ?, title = ?, subject = ?,
+                participants = ?, recipients = ?, file_hash = ?, content_hash = ?, text_status = ?, lifecycle_status = ?,
+                ingested_at = ?, last_seen_at = ?, updated_at = ?, manual_field_locks_json = ?,
+                control_number_batch = ?, control_number_family_sequence = ?, control_number_attachment_sequence = ?
+            WHERE id = ?
+            """,
+            (
+                common_values["control_number"],
+                common_values["canonical_kind"],
+                common_values["canonical_status"],
+                common_values["conversation_id"],
+                common_values["conversation_assignment_mode"],
+                common_values["dataset_id"],
+                common_values["parent_document_id"],
+                common_values["child_document_kind"],
+                common_values["source_kind"],
+                common_values["source_rel_path"],
+                common_values["source_item_id"],
+                common_values["root_message_key"],
+                common_values["source_folder_path"],
+                common_values["production_id"],
+                common_values["begin_bates"],
+                common_values["end_bates"],
+                common_values["begin_attachment"],
+                common_values["end_attachment"],
+                common_values["rel_path"],
+                common_values["file_name"],
+                common_values["file_type"],
+                common_values["file_size"],
+                common_values["page_count"],
+                common_values["author"],
+                common_values["custodian"],
+                common_values["content_type"],
+                common_values["date_created"],
+                common_values["date_modified"],
+                common_values["title"],
+                common_values["subject"],
+                common_values["participants"],
+                common_values["recipients"],
+                common_values["file_hash"],
+                common_values["content_hash"],
+                common_values["text_status"],
+                common_values["lifecycle_status"],
+                common_values["ingested_at"],
+                common_values["last_seen_at"],
+                common_values["updated_at"],
+                locked_value,
+                common_values["control_number_batch"],
+                common_values["control_number_family_sequence"],
+                common_values["control_number_attachment_sequence"],
+                existing_row["id"],
+            ),
+        )
+        document_id = int(existing_row["id"])
 
-    locked_value = existing_row[MANUAL_FIELD_LOCKS_COLUMN] or "[]"
-    connection.execute(
-        """
-        UPDATE documents
-        SET control_number = ?, conversation_id = ?, conversation_assignment_mode = ?, dataset_id = ?, parent_document_id = ?, child_document_kind = ?,
-            source_kind = ?, source_rel_path = ?, source_item_id = ?, root_message_key = ?, source_folder_path = ?,
-            production_id = ?, begin_bates = ?, end_bates = ?, begin_attachment = ?, end_attachment = ?,
-            rel_path = ?, file_name = ?, file_type = ?, file_size = ?, page_count = ?,
-            author = ?, custodian = ?, content_type = ?, date_created = ?, date_modified = ?, title = ?, subject = ?,
-            participants = ?, recipients = ?, file_hash = ?, content_hash = ?, text_status = ?, lifecycle_status = ?,
-            ingested_at = ?, last_seen_at = ?, updated_at = ?, manual_field_locks_json = ?,
-            control_number_batch = ?, control_number_family_sequence = ?, control_number_attachment_sequence = ?
-        WHERE id = ?
-        """,
-        (
-            common_values["control_number"],
-            common_values["conversation_id"],
-            common_values["conversation_assignment_mode"],
-            common_values["dataset_id"],
-            common_values["parent_document_id"],
-            common_values["child_document_kind"],
-            common_values["source_kind"],
-            common_values["source_rel_path"],
-            common_values["source_item_id"],
-            common_values["root_message_key"],
-            common_values["source_folder_path"],
-            common_values["production_id"],
-            common_values["begin_bates"],
-            common_values["end_bates"],
-            common_values["begin_attachment"],
-            common_values["end_attachment"],
-            common_values["rel_path"],
-            common_values["file_name"],
-            common_values["file_type"],
-            common_values["file_size"],
-            common_values["page_count"],
-            common_values["author"],
-            common_values["custodian"],
-            common_values["content_type"],
-            common_values["date_created"],
-            common_values["date_modified"],
-            common_values["title"],
-            common_values["subject"],
-            common_values["participants"],
-            common_values["recipients"],
-            common_values["file_hash"],
-            common_values["content_hash"],
-            common_values["text_status"],
-            common_values["lifecycle_status"],
-            common_values["ingested_at"],
-            common_values["last_seen_at"],
-            common_values["updated_at"],
-            locked_value,
-            common_values["control_number_batch"],
-            common_values["control_number_family_sequence"],
-            common_values["control_number_attachment_sequence"],
-            existing_row["id"],
-        ),
+    effective_existing_occurrence = existing_occurrence_row
+    if effective_existing_occurrence is None and existing_row is not None:
+        effective_existing_occurrence = find_active_occurrence_by_source_identity(
+            connection,
+            source_kind=effective_source_kind,
+            custodian=custodian,
+            source_rel_path=effective_source_rel_path,
+            source_item_id=source_item_id,
+        )
+        if effective_existing_occurrence is None:
+            effective_existing_occurrence = connection.execute(
+                """
+                SELECT *
+                FROM document_occurrences
+                WHERE document_id = ?
+                  AND rel_path = ?
+                  AND lifecycle_status = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (document_id, rel_path, ACTIVE_OCCURRENCE_STATUS),
+            ).fetchone()
+
+    parent_occurrence_id = None
+    if parent_document_id is not None:
+        parent_occurrence = select_preferred_occurrence(active_occurrence_rows_for_document(connection, int(parent_document_id)))
+        if parent_occurrence is not None:
+            parent_occurrence_id = int(parent_occurrence["id"])
+
+    upsert_document_occurrence(
+        connection,
+        document_id=document_id,
+        existing_occurrence_id=(int(effective_existing_occurrence["id"]) if effective_existing_occurrence is not None else None),
+        parent_occurrence_id=parent_occurrence_id,
+        occurrence_control_number=control_number,
+        source_kind=effective_source_kind,
+        source_rel_path=effective_source_rel_path,
+        source_item_id=source_item_id,
+        source_folder_path=source_folder_path,
+        production_id=production_id,
+        begin_bates=begin_bates,
+        end_bates=end_bates,
+        begin_attachment=begin_attachment,
+        end_attachment=end_attachment,
+        rel_path=rel_path,
+        file_name=file_name,
+        file_type=file_type,
+        mime_type=None,
+        file_size=file_size,
+        file_hash=file_hash,
+        custodian=custodian,
+        fs_created_at=None,
+        fs_modified_at=None,
+        extracted=extracted,
+        has_preview=bool(extracted.get("preview_artifacts")),
+        text_status=str(common_values["text_status"]),
+        ingested_at=str(common_values["ingested_at"]),
+        last_seen_at=str(common_values["last_seen_at"]),
+        updated_at=str(common_values["updated_at"]),
     )
-    return int(existing_row["id"])
+    if parent_document_id is None and effective_source_kind in {FILESYSTEM_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND}:
+        bind_document_dedupe_key(
+            connection,
+            basis="file_hash",
+            key_value=file_hash,
+            document_id=document_id,
+        )
+    refresh_source_backed_dataset_memberships_for_document(connection, document_id)
+    refresh_document_from_occurrences(connection, document_id)
+    return document_id
+
+
+def attach_occurrence_to_existing_document(
+    connection: sqlite3.Connection,
+    document_row: sqlite3.Row,
+    *,
+    existing_occurrence_row: sqlite3.Row | None,
+    rel_path: str,
+    file_name: str,
+    file_type: str | None,
+    file_size: int | None,
+    file_hash: str | None,
+    source_kind: str,
+    source_rel_path: str,
+    source_item_id: str | None,
+    source_folder_path: str | None,
+    custodian: str | None,
+    production_id: int | None = None,
+    begin_bates: str | None = None,
+    end_bates: str | None = None,
+    begin_attachment: str | None = None,
+    end_attachment: str | None = None,
+    parent_document_id: int | None = None,
+    parent_occurrence_id: int | None = None,
+    occurrence_control_number: str | None = None,
+    ingested_at: str | None = None,
+    last_seen_at: str | None = None,
+    updated_at: str | None = None,
+) -> int:
+    resolved_parent_occurrence_id = parent_occurrence_id
+    if resolved_parent_occurrence_id is None and parent_document_id is not None:
+        parent_occurrence = select_preferred_occurrence(active_occurrence_rows_for_document(connection, parent_document_id))
+        if parent_occurrence is not None:
+            resolved_parent_occurrence_id = int(parent_occurrence["id"])
+    preview_exists = connection.execute(
+        "SELECT 1 FROM document_previews WHERE document_id = ? LIMIT 1",
+        (document_row["id"],),
+    ).fetchone() is not None
+    occurrence_id = upsert_document_occurrence(
+        connection,
+        document_id=int(document_row["id"]),
+        existing_occurrence_id=(int(existing_occurrence_row["id"]) if existing_occurrence_row is not None else None),
+        parent_occurrence_id=resolved_parent_occurrence_id,
+        occurrence_control_number=occurrence_control_number or document_row["control_number"],
+        source_kind=source_kind,
+        source_rel_path=source_rel_path,
+        source_item_id=source_item_id,
+        source_folder_path=source_folder_path,
+        production_id=production_id,
+        begin_bates=begin_bates,
+        end_bates=end_bates,
+        begin_attachment=begin_attachment,
+        end_attachment=end_attachment,
+        rel_path=rel_path,
+        file_name=file_name,
+        file_type=file_type,
+        mime_type=None,
+        file_size=file_size,
+        file_hash=file_hash,
+        custodian=custodian,
+        fs_created_at=None,
+        fs_modified_at=None,
+        extracted={
+            "author": document_row["author"],
+            "title": document_row["title"],
+            "subject": document_row["subject"],
+            "participants": document_row["participants"],
+            "recipients": document_row["recipients"],
+            "date_created": document_row["date_created"],
+            "date_modified": document_row["date_modified"],
+            "content_type": document_row["content_type"],
+        },
+        has_preview=preview_exists,
+        text_status=str(document_row["text_status"] or "ok"),
+        ingested_at=ingested_at or str(document_row["ingested_at"] or utc_now()),
+        last_seen_at=last_seen_at or str(document_row["last_seen_at"] or document_row["ingested_at"] or utc_now()),
+        updated_at=updated_at or str(document_row["updated_at"] or utc_now()),
+    )
+    if parent_document_id is None and source_kind in {FILESYSTEM_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND}:
+        bind_document_dedupe_key(
+            connection,
+            basis="file_hash",
+            key_value=file_hash,
+            document_id=int(document_row["id"]),
+        )
+    refresh_source_backed_dataset_memberships_for_document(connection, int(document_row["id"]))
+    refresh_document_from_occurrences(connection, int(document_row["id"]))
+    return occurrence_id
+
+
+def clone_duplicate_family_child_occurrences(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    parent_document_id: int,
+    parent_occurrence_id: int,
+    parent_rel_path: str,
+    custodian: str | None,
+    ingested_at: str | None = None,
+    last_seen_at: str | None = None,
+    updated_at: str | None = None,
+) -> int:
+    child_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE parent_document_id = ?
+          AND lifecycle_status != 'deleted'
+        ORDER BY
+          CASE WHEN control_number_attachment_sequence IS NULL THEN 1 ELSE 0 END ASC,
+          control_number_attachment_sequence ASC,
+          id ASC
+        """,
+        (parent_document_id,),
+    ).fetchall()
+    cloned_count = 0
+    for child_row in child_rows:
+        child_document_id = int(child_row["id"])
+        preferred_occurrence = select_preferred_occurrence(
+            active_occurrence_rows_for_document(connection, child_document_id)
+        )
+        child_source_rel_path = (
+            str(preferred_occurrence["rel_path"])
+            if preferred_occurrence is not None and preferred_occurrence["rel_path"] is not None
+            else str(child_row["rel_path"])
+        )
+        child_source_path = document_absolute_path(paths, child_source_rel_path)
+        if not child_source_path.exists():
+            raise RetrieverError(
+                f"Could not clone duplicate family child {child_document_id}: missing source artifact {child_source_rel_path!r}."
+            )
+        cloned_rel_path, cloned_path = write_attachment_blob(
+            paths,
+            parent_rel_path,
+            str(child_row["control_number"]),
+            str(child_row["file_name"]),
+            child_source_path.read_bytes(),
+        )
+        attach_occurrence_to_existing_document(
+            connection,
+            child_row,
+            existing_occurrence_row=None,
+            rel_path=cloned_rel_path,
+            file_name=str(child_row["file_name"]),
+            file_type=(
+                str(preferred_occurrence["file_type"])
+                if preferred_occurrence is not None and preferred_occurrence["file_type"] is not None
+                else child_row["file_type"]
+            ),
+            file_size=(
+                int(preferred_occurrence["file_size"])
+                if preferred_occurrence is not None and preferred_occurrence["file_size"] is not None
+                else cloned_path.stat().st_size
+            ),
+            file_hash=(
+                str(preferred_occurrence["file_hash"])
+                if preferred_occurrence is not None and preferred_occurrence["file_hash"] is not None
+                else str(child_row["file_hash"])
+                if child_row["file_hash"] is not None
+                else sha256_file(cloned_path)
+            ),
+            source_kind=(
+                str(preferred_occurrence["source_kind"])
+                if preferred_occurrence is not None and preferred_occurrence["source_kind"] is not None
+                else str(child_row["source_kind"])
+            ),
+            source_rel_path=cloned_rel_path,
+            source_item_id=(
+                str(preferred_occurrence["source_item_id"])
+                if preferred_occurrence is not None and preferred_occurrence["source_item_id"] is not None
+                else str(child_row["source_item_id"])
+                if child_row["source_item_id"] is not None
+                else None
+            ),
+            source_folder_path=(
+                str(preferred_occurrence["source_folder_path"])
+                if preferred_occurrence is not None and preferred_occurrence["source_folder_path"] is not None
+                else str(child_row["source_folder_path"])
+                if child_row["source_folder_path"] is not None
+                else None
+            ),
+            custodian=custodian,
+            parent_document_id=parent_document_id,
+            parent_occurrence_id=parent_occurrence_id,
+            occurrence_control_number=str(child_row["control_number"] or ""),
+            ingested_at=ingested_at,
+            last_seen_at=last_seen_at,
+            updated_at=updated_at,
+        )
+        cloned_count += 1
+    return cloned_count
 
 
 def mark_seen_without_reingest(
     connection: sqlite3.Connection,
-    row: sqlite3.Row,
+    occurrence_row: sqlite3.Row,
     *,
     dataset_id: int | None = None,
     dataset_source_id: int | None = None,
@@ -1168,43 +1450,48 @@ def mark_seen_without_reingest(
     now = utc_now()
     connection.execute(
         """
-        UPDATE documents
-        SET dataset_id = COALESCE(?, dataset_id), lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
+        UPDATE document_occurrences
+        SET lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
         WHERE id = ?
         """,
-        (dataset_id, now, now, row["id"]),
+        (now, now, occurrence_row["id"]),
     )
     connection.execute(
         """
-        UPDATE documents
-        SET dataset_id = COALESCE(?, dataset_id), lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
-        WHERE parent_document_id = ? AND lifecycle_status != 'deleted'
+        UPDATE document_occurrences
+        SET lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
+        WHERE parent_occurrence_id = ? AND lifecycle_status != 'deleted'
         """,
-        (dataset_id, now, now, row["id"]),
+        (now, now, occurrence_row["id"]),
     )
     if dataset_id is not None:
         ensure_dataset_document_membership(
             connection,
             dataset_id=dataset_id,
-            document_id=int(row["id"]),
+            document_id=int(occurrence_row["document_id"]),
             dataset_source_id=dataset_source_id,
         )
         child_rows = connection.execute(
             """
-            SELECT id
-            FROM documents
-            WHERE parent_document_id = ? AND lifecycle_status != 'deleted'
-            ORDER BY id ASC
+            SELECT DISTINCT document_id
+            FROM document_occurrences
+            WHERE parent_occurrence_id = ?
+              AND lifecycle_status != 'deleted'
+            ORDER BY document_id ASC
             """,
-            (row["id"],),
+            (occurrence_row["id"],),
         ).fetchall()
         for child_row in child_rows:
             ensure_dataset_document_membership(
                 connection,
                 dataset_id=dataset_id,
-                document_id=int(child_row["id"]),
+                document_id=int(child_row["document_id"]),
                 dataset_source_id=dataset_source_id,
             )
+            refresh_source_backed_dataset_memberships_for_document(connection, int(child_row["document_id"]))
+            refresh_document_from_occurrences(connection, int(child_row["document_id"]))
+    refresh_source_backed_dataset_memberships_for_document(connection, int(occurrence_row["document_id"]))
+    refresh_document_from_occurrences(connection, int(occurrence_row["document_id"]))
 
 
 def replace_document_email_threading_row(
@@ -3448,31 +3735,49 @@ def refresh_conversation_previews(
 
 
 def mark_missing_documents(connection: sqlite3.Connection, scanned_rel_paths: set[str]) -> int:
-    rows = connection.execute(
+    occurrence_rows = connection.execute(
         """
-        SELECT id, rel_path, lifecycle_status
-        FROM documents
-        WHERE parent_document_id IS NULL
-          AND COALESCE(source_kind, ?) = ?
+        SELECT id, document_id, rel_path, lifecycle_status
+        FROM document_occurrences
+        WHERE parent_occurrence_id IS NULL
+          AND source_kind = ?
           AND lifecycle_status != 'deleted'
         """
-    , (FILESYSTEM_SOURCE_KIND, FILESYSTEM_SOURCE_KIND)).fetchall()
-    missing_ids = [row["id"] for row in rows if row["rel_path"] not in scanned_rel_paths and row["lifecycle_status"] != "missing"]
-    if not missing_ids:
+    , (FILESYSTEM_SOURCE_KIND,)).fetchall()
+    missing_occurrence_ids = [
+        int(row["id"])
+        for row in occurrence_rows
+        if row["rel_path"] not in scanned_rel_paths and row["lifecycle_status"] != "missing"
+    ]
+    if not missing_occurrence_ids:
         return 0
     now = utc_now()
-    placeholders = ", ".join("?" for _ in missing_ids)
+    placeholders = ", ".join("?" for _ in missing_occurrence_ids)
     connection.execute(
         f"""
-        UPDATE documents
+        UPDATE document_occurrences
         SET lifecycle_status = 'missing', updated_at = ?
         WHERE lifecycle_status != 'deleted'
-          AND (id IN ({placeholders}) OR parent_document_id IN ({placeholders}))
+          AND (id IN ({placeholders}) OR parent_occurrence_id IN ({placeholders}))
         """,
-        [now, *missing_ids, *missing_ids],
+        [now, *missing_occurrence_ids, *missing_occurrence_ids],
     )
+    affected_document_ids = {
+        int(row["document_id"])
+        for row in connection.execute(
+            f"""
+            SELECT DISTINCT document_id
+            FROM document_occurrences
+            WHERE id IN ({placeholders}) OR parent_occurrence_id IN ({placeholders})
+            """,
+            [*missing_occurrence_ids, *missing_occurrence_ids],
+        ).fetchall()
+    }
+    for document_id in affected_document_ids:
+        refresh_source_backed_dataset_memberships_for_document(connection, document_id)
+        refresh_document_from_occurrences(connection, document_id)
     connection.commit()
-    return len(missing_ids)
+    return len(missing_occurrence_ids)
 
 
 def select_attachment_match_candidate(
@@ -3571,6 +3876,28 @@ def reconcile_attachment_documents(
         """,
         (parent_document_id,),
     ).fetchall()
+    active_occurrences_by_document_id: dict[int, sqlite3.Row] = {}
+    if existing_rows:
+        existing_document_ids = [int(row["id"]) for row in existing_rows]
+        placeholders = ", ".join("?" for _ in existing_document_ids)
+        occurrence_rows = connection.execute(
+            f"""
+            SELECT *
+            FROM document_occurrences
+            WHERE document_id IN ({placeholders})
+              AND lifecycle_status != 'deleted'
+            ORDER BY id ASC
+            """,
+            existing_document_ids,
+        ).fetchall()
+        grouped_occurrences: dict[int, list[sqlite3.Row]] = defaultdict(list)
+        for occurrence_row in occurrence_rows:
+            grouped_occurrences[int(occurrence_row["document_id"])].append(occurrence_row)
+        active_occurrences_by_document_id = {
+            document_id: select_preferred_occurrence(rows) or rows[0]
+            for document_id, rows in grouped_occurrences.items()
+            if rows
+        }
     matches, removed_rows = match_attachment_rows(existing_rows, attachments)
     next_new_attachment_sequence = next_attachment_sequence(connection, parent_document_id)
 
@@ -3601,6 +3928,11 @@ def reconcile_attachment_documents(
             child_path,
             existing_row,
             extracted,
+            existing_occurrence_row=(
+                active_occurrences_by_document_id.get(int(existing_row["id"]))
+                if existing_row is not None
+                else None
+            ),
             file_name=str(attachment["file_name"]),
             parent_document_id=parent_document_id,
             control_number=control_number,
@@ -3644,6 +3976,14 @@ def reconcile_attachment_documents(
             UPDATE documents
             SET lifecycle_status = 'deleted', updated_at = ?
             WHERE id = ?
+            """,
+            (utc_now(), row["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE document_occurrences
+            SET lifecycle_status = 'deleted', updated_at = ?
+            WHERE document_id = ?
             """,
             (utc_now(), row["id"]),
         )

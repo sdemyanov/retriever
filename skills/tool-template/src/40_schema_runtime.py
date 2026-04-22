@@ -690,6 +690,154 @@ def backfill_control_number_batches(connection: sqlite3.Connection) -> int:
     return updated
 
 
+def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
+    if not table_exists(connection, "documents") or not table_exists(connection, "document_occurrences"):
+        return 0
+
+    preview_counts = {
+        int(row["document_id"]): int(row["count"] or 0)
+        for row in connection.execute(
+            """
+            SELECT document_id, COUNT(*) AS count
+            FROM document_previews
+            GROUP BY document_id
+            """
+        ).fetchall()
+    }
+    occurrence_rows = connection.execute(
+        """
+        SELECT id, document_id, parent_occurrence_id
+        FROM document_occurrences
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    occurrence_ids_by_document: dict[int, list[int]] = defaultdict(list)
+    for row in occurrence_rows:
+        occurrence_ids_by_document[int(row["document_id"])].append(int(row["id"]))
+
+    inserted = 0
+    document_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
+        """
+    ).fetchall()
+    for row in document_rows:
+        document_id = int(row["id"])
+        if occurrence_ids_by_document.get(document_id):
+            continue
+        if row["canonical_status"] == CANONICAL_STATUS_MERGED:
+            continue
+        occurrence_id = upsert_document_occurrence(
+            connection,
+            document_id=document_id,
+            existing_occurrence_id=None,
+            parent_occurrence_id=None,
+            occurrence_control_number=row["control_number"],
+            source_kind=row["source_kind"],
+            source_rel_path=row["source_rel_path"] or row["rel_path"],
+            source_item_id=row["source_item_id"],
+            source_folder_path=row["source_folder_path"],
+            production_id=row["production_id"],
+            begin_bates=row["begin_bates"],
+            end_bates=row["end_bates"],
+            begin_attachment=row["begin_attachment"],
+            end_attachment=row["end_attachment"],
+            rel_path=str(row["rel_path"]),
+            file_name=str(row["file_name"]),
+            file_type=row["file_type"],
+            mime_type=None,
+            file_size=row["file_size"],
+            file_hash=row["file_hash"],
+            custodian=row["custodian"],
+            fs_created_at=None,
+            fs_modified_at=None,
+            extracted={
+                "author": row["author"],
+                "title": row["title"],
+                "subject": row["subject"],
+                "participants": row["participants"],
+                "recipients": row["recipients"],
+                "date_created": row["date_created"],
+                "date_modified": row["date_modified"],
+                "content_type": row["content_type"],
+            },
+            has_preview=preview_counts.get(document_id, 0) > 0,
+            text_status=str(row["text_status"] or "ok"),
+            ingested_at=str(row["ingested_at"] or row["updated_at"] or utc_now()),
+            last_seen_at=str(row["last_seen_at"] or row["ingested_at"] or row["updated_at"] or utc_now()),
+            updated_at=str(row["updated_at"] or row["last_seen_at"] or row["ingested_at"] or utc_now()),
+        )
+        occurrence_ids_by_document[document_id].append(occurrence_id)
+        inserted += 1
+
+    child_rows = connection.execute(
+        """
+        SELECT id, parent_document_id
+        FROM documents
+        WHERE parent_document_id IS NOT NULL
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for row in child_rows:
+        child_occurrence_ids = occurrence_ids_by_document.get(int(row["id"])) or []
+        parent_occurrence_ids = occurrence_ids_by_document.get(int(row["parent_document_id"])) or []
+        if not child_occurrence_ids or not parent_occurrence_ids:
+            continue
+        connection.execute(
+            """
+            UPDATE document_occurrences
+            SET parent_occurrence_id = ?
+            WHERE id = ? AND parent_occurrence_id IS NULL
+            """,
+            (parent_occurrence_ids[0], child_occurrence_ids[0]),
+        )
+    return inserted
+
+
+def backfill_document_dedupe_keys(connection: sqlite3.Connection) -> int:
+    if not table_exists(connection, "documents") or not table_exists(connection, "document_dedupe_keys"):
+        return 0
+    before = connection.total_changes
+    rows = connection.execute(
+        """
+        SELECT id, source_kind, file_hash
+        FROM documents
+        WHERE parent_document_id IS NULL
+          AND file_hash IS NOT NULL
+          AND lifecycle_status != 'deleted'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
+        if source_kind not in {FILESYSTEM_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND}:
+            continue
+        bind_document_dedupe_key(
+            connection,
+            basis="file_hash",
+            key_value=str(row["file_hash"]),
+            document_id=int(row["id"]),
+        )
+    return connection.total_changes - before
+
+
+def refresh_documents_from_occurrences(connection: sqlite3.Connection) -> int:
+    if not table_exists(connection, "documents") or not table_exists(connection, "document_occurrences"):
+        return 0
+    rows = connection.execute(
+        """
+        SELECT id
+        FROM documents
+        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        refresh_document_from_occurrences(connection, int(row["id"]))
+    return len(rows)
+
+
 def backfill_control_numbers(connection: sqlite3.Connection) -> int:
     columns = table_columns(connection, "documents")
     required = {
@@ -945,6 +1093,9 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         rename_column_if_needed(connection, "documents", "display_attachment_sequence", "control_number_attachment_sequence")
 
     ensure_column(connection, "documents", f"{MANUAL_FIELD_LOCKS_COLUMN} TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(connection, "documents", "canonical_kind TEXT NOT NULL DEFAULT 'unknown'")
+    ensure_column(connection, "documents", "canonical_status TEXT NOT NULL DEFAULT 'active'")
+    ensure_column(connection, "documents", "merged_into_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL")
     ensure_column(connection, "documents", "content_type TEXT")
     ensure_column(connection, "documents", "custodian TEXT")
     ensure_column(connection, "documents", "participants TEXT")
@@ -972,6 +1123,19 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "documents", "active_text_source_kind TEXT")
     ensure_column(connection, "documents", "active_text_language TEXT")
     ensure_column(connection, "documents", "active_text_quality_score REAL")
+    ensure_column(connection, "document_occurrences", "mime_type TEXT")
+    ensure_column(connection, "document_occurrences", "fs_created_at TEXT")
+    ensure_column(connection, "document_occurrences", "fs_modified_at TEXT")
+    ensure_column(connection, "document_occurrences", "has_preview INTEGER NOT NULL DEFAULT 0")
+    ensure_column(connection, "document_occurrences", "extracted_author TEXT")
+    ensure_column(connection, "document_occurrences", "extracted_title TEXT")
+    ensure_column(connection, "document_occurrences", "extracted_subject TEXT")
+    ensure_column(connection, "document_occurrences", "extracted_participants TEXT")
+    ensure_column(connection, "document_occurrences", "extracted_recipients TEXT")
+    ensure_column(connection, "document_occurrences", "extracted_doc_authored_at TEXT")
+    ensure_column(connection, "document_occurrences", "extracted_doc_modified_at TEXT")
+    ensure_column(connection, "document_occurrences", "extracted_content_type TEXT")
+    ensure_column(connection, "document_occurrences", "extracted_kind TEXT")
     ensure_column(connection, "document_email_threading", "message_id TEXT")
     ensure_column(connection, "document_email_threading", "in_reply_to TEXT")
     ensure_column(connection, "document_email_threading", "references_json TEXT NOT NULL DEFAULT '[]'")
@@ -1046,6 +1210,9 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_parent_document_id ON documents(parent_document_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_child_document_kind ON documents(child_document_kind)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_dataset_id ON documents(dataset_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_canonical_status ON documents(canonical_status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_merged_into_document_id ON documents(merged_into_document_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_canonical_status_content_hash ON documents(canonical_status, content_hash)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_kind ON documents(source_kind)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_rel_path ON documents(source_rel_path)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_root_message_key ON documents(root_message_key)")
@@ -1056,6 +1223,25 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_documents_active_search_text_revision_id ON documents(active_search_text_revision_id)"
     )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_document_id ON document_occurrences(document_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_document_status_ingested ON document_occurrences(document_id, lifecycle_status, ingested_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_document_kind_status ON document_occurrences(document_id, extracted_kind, text_status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_file_hash ON document_occurrences(file_hash)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_source_rel_path ON document_occurrences(source_rel_path)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_document_occurrences_active_rel_path ON document_occurrences(rel_path) WHERE lifecycle_status = 'active'")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_document_occurrences_active_source_identity
+        ON document_occurrences(source_kind, COALESCE(custodian, ''), COALESCE(source_rel_path, ''), COALESCE(source_item_id, ''))
+        WHERE lifecycle_status = 'active'
+        """
+    )
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_document_dedupe_keys_basis_value ON document_dedupe_keys(basis, key_value)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_dedupe_keys_document_id ON document_dedupe_keys(document_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_canonical_metadata_conflicts_document_field ON canonical_metadata_conflicts(document_id, field_name)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_control_number_aliases_alias_value ON document_control_number_aliases(alias_value)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_merge_events_survivor_loser_created ON document_merge_events(survivor_document_id, loser_document_id, created_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_field_conflicts_merge_event_id ON document_field_conflicts(merge_event_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_dataset_sources_dataset_id ON dataset_sources(dataset_id)")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_sources_locator_unique ON dataset_sources(source_kind, source_locator)")
     connection.execute("DROP INDEX IF EXISTS idx_conversations_source_kind_key")
@@ -1209,6 +1395,9 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     backfilled_custodian = backfill_custodian(connection)
     backfilled_control_numbers = backfill_control_numbers(connection)
     rebuilt_control_number_batches = backfill_control_number_batches(connection)
+    backfilled_document_occurrences = backfill_document_occurrences(connection)
+    backfilled_document_dedupe_keys = backfill_document_dedupe_keys(connection)
+    refreshed_document_occurrence_caches = refresh_documents_from_occurrences(connection)
     rebuilt_documents_fts = ensure_documents_fts(connection)
     connection.commit()
     return {
@@ -1226,6 +1415,9 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         "rewrote_internal_rel_path_prefix": rewrote_internal_rel_path_prefix,
         "backfilled_control_numbers": backfilled_control_numbers,
         "rebuilt_control_number_batches": rebuilt_control_number_batches,
+        "backfilled_document_occurrences": backfilled_document_occurrences,
+        "backfilled_document_dedupe_keys": backfilled_document_dedupe_keys,
+        "refreshed_document_occurrence_caches": refreshed_document_occurrence_caches,
         "backfilled_legacy_control_number": backfilled_legacy_control_number,
         "backfilled_legacy_control_number_batch": backfilled_legacy_control_number_batch,
         "backfilled_legacy_control_number_family_sequence": backfilled_legacy_control_number_family_sequence,

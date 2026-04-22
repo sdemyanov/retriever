@@ -419,6 +419,30 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def fetch_occurrence_rows(self, document_id: int) -> list[sqlite3.Row]:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            return connection.execute(
+                """
+                SELECT *
+                FROM document_occurrences
+                WHERE document_id = ?
+                ORDER BY id ASC
+                """,
+                (document_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+    def count_rows(self, table_name: str) -> int:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            row = connection.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
+            self.assertIsNotNone(row)
+            return int(row["count"] or 0)
+        finally:
+            connection.close()
+
     def write_email_message(
         self,
         path: Path,
@@ -4148,8 +4172,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual([item["document_id"] for item in stored_run_payload["run"]["documents"]], [alpha_row["id"]])
 
     def test_create_run_select_from_scope_and_narrows_with_explicit_dataset(self) -> None:
-        (self.root / "alpha.txt").write_text("shared dataset body\n", encoding="utf-8")
-        (self.root / "beta.txt").write_text("shared dataset body\n", encoding="utf-8")
+        (self.root / "alpha.txt").write_text("scope dataset alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("scope dataset beta body\n", encoding="utf-8")
 
         retriever_tools.bootstrap(self.root)
         ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
@@ -7480,6 +7504,564 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(sorted(result["dataset_names"]), ["Review Set", self.root.name])
         self.assertIsNone(result["dataset_id"])
         self.assertNotIn("dataset_name", result)
+
+    def test_exact_duplicate_files_share_one_canonical_document_and_two_occurrences(self) -> None:
+        left_dir = self.root / "custodian-a"
+        right_dir = self.root / "custodian-b"
+        left_dir.mkdir()
+        right_dir.mkdir()
+        duplicate_text = "duplicate witness line\nsecond line\n"
+        (left_dir / "dup.txt").write_text(duplicate_text, encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_ingest["new"], 1)
+        self.assertEqual(first_ingest["failed"], 0)
+
+        (right_dir / "dup-copy.txt").write_text(duplicate_text, encoding="utf-8")
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(second_ingest["failed"], 0)
+
+        search_result = retriever_tools.search(self.root, "duplicate witness line", None, None, None, 1, 20)
+        self.assertEqual(search_result["total_hits"], 1)
+        document_id = int(search_result["results"][0]["id"])
+        occurrence_rows = self.fetch_occurrence_rows(document_id)
+        active_rel_paths = sorted(
+            str(row["rel_path"])
+            for row in occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+        )
+        self.assertEqual(active_rel_paths, ["custodian-a/dup.txt", "custodian-b/dup-copy.txt"])
+        self.assertEqual(self.count_rows("documents"), 1)
+        self.assertEqual(self.count_rows("document_occurrences"), 2)
+
+        chunk_count = retriever_tools.search_chunks(
+            self.root,
+            "duplicate witness line",
+            None,
+            None,
+            None,
+            10,
+            3,
+            count_only=True,
+            distinct_docs=True,
+        )
+        self.assertEqual(chunk_count["documents_with_hits"], 1)
+
+    def test_rel_path_filter_picks_matching_occurrence_for_duplicate_result_links(self) -> None:
+        left_dir = self.root / "custodian-a"
+        right_dir = self.root / "custodian-b"
+        left_dir.mkdir()
+        right_dir.mkdir()
+        duplicate_text = "same logical document body\n"
+        (left_dir / "dup.txt").write_text(duplicate_text, encoding="utf-8")
+        (right_dir / "dup-copy.txt").write_text(duplicate_text, encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        filtered_result = retriever_tools.search(
+            self.root,
+            "",
+            [["rel_path", "eq", "custodian-b/dup-copy.txt"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(filtered_result["total_hits"], 1)
+        result = filtered_result["results"][0]
+        self.assertEqual(result["rel_path"], "custodian-b/dup-copy.txt")
+        self.assertEqual(result["abs_path"], str(self.root / "custodian-b" / "dup-copy.txt"))
+        self.assertEqual(result["source_rel_path"], "custodian-b/dup-copy.txt")
+
+    def test_exact_duplicate_email_family_keeps_attachment_occurrences_for_both_custodians(self) -> None:
+        left_dir = self.root / "custodian-a"
+        right_dir = self.root / "custodian-b"
+        left_dir.mkdir()
+        right_dir.mkdir()
+
+        left_path = left_dir / "message.eml"
+        right_path = right_dir / "message-copy.eml"
+        self.write_email_message(
+            left_path,
+            subject="Family duplicate",
+            body_text="Shared family body.\n",
+            attachment_name="notes.txt",
+            attachment_text="shared attachment detail",
+            message_id="<family-duplicate@example.com>",
+        )
+        shutil.copyfile(left_path, right_path)
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        root_search = retriever_tools.search(self.root, "Family duplicate", None, None, None, 1, 20)
+        self.assertEqual(root_search["total_hits"], 1)
+        root_document_id = int(root_search["results"][0]["id"])
+        root_occurrence_rows = self.fetch_occurrence_rows(root_document_id)
+        active_root_occurrence_rows = [
+            row
+            for row in root_occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+        ]
+        self.assertEqual(
+            sorted(str(row["rel_path"]) for row in active_root_occurrence_rows),
+            ["custodian-a/message.eml", "custodian-b/message-copy.eml"],
+        )
+
+        child_rows = self.fetch_child_rows(root_document_id)
+        self.assertEqual(len(child_rows), 1)
+        child_row = child_rows[0]
+        child_occurrence_rows = self.fetch_occurrence_rows(int(child_row["id"]))
+        active_child_occurrence_rows = [
+            row
+            for row in child_occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+        ]
+        self.assertEqual(len(active_child_occurrence_rows), 2)
+        self.assertEqual(
+            {int(row["parent_occurrence_id"]) for row in active_child_occurrence_rows},
+            {int(row["id"]) for row in active_root_occurrence_rows},
+        )
+        self.assertTrue(
+            any(
+                str(row["rel_path"]).startswith(
+                    f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/custodian-a/message.eml/attachments/"
+                )
+                for row in active_child_occurrence_rows
+            )
+        )
+        self.assertTrue(
+            any(
+                str(row["rel_path"]).startswith(
+                    f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/custodian-b/message-copy.eml/attachments/"
+                )
+                for row in active_child_occurrence_rows
+            )
+        )
+        right_occurrence_rel_path = next(
+            str(row["rel_path"])
+            for row in active_child_occurrence_rows
+            if str(row["rel_path"]).startswith(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/custodian-b/message-copy.eml/attachments/"
+            )
+        )
+
+        filtered_attachment_search = retriever_tools.search(
+            self.root,
+            "shared attachment detail",
+            [["rel_path", "eq", right_occurrence_rel_path]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(filtered_attachment_search["total_hits"], 1)
+        self.assertEqual(filtered_attachment_search["results"][0]["id"], child_row["id"])
+        self.assertTrue(
+            filtered_attachment_search["results"][0]["rel_path"].startswith(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/custodian-b/message-copy.eml/attachments/"
+            )
+        )
+
+    def test_reconcile_duplicates_merges_same_email_attachment_family(self) -> None:
+        self.write_email_message(
+            self.root / "alpha.eml",
+            subject="Family merge ready",
+            body_text="Shared family merge body.\n",
+            attachment_name="notes.txt",
+            attachment_text="family attachment detail",
+            message_id="<alpha-family@example.com>",
+        )
+        self.write_email_message(
+            self.root / "beta.eml",
+            subject="Family merge ready",
+            body_text="Shared family merge body.\n",
+            attachment_name="notes.txt",
+            attachment_text="family attachment detail",
+            message_id="<beta-family@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        exit_code, dry_run_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(dry_run_payload)
+        self.assertEqual(dry_run_payload["candidate_group_count"], 1)
+        candidate_group = dry_run_payload["candidate_groups"][0]
+        self.assertEqual(candidate_group["status"], "ready")
+        self.assertEqual(candidate_group["family_child_group_count"], 1)
+
+        exit_code, apply_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--apply",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["merged_group_count"], 1)
+        merged_group = apply_payload["applied_groups"][0]
+        self.assertEqual(merged_group["status"], "merged")
+        self.assertEqual(merged_group["family_child_group_count"], 1)
+        self.assertEqual(len(merged_group["merge_event_ids"]), 2)
+
+        survivor_document_id = int(merged_group["survivor_document_id"])
+        root_occurrence_rows = self.fetch_occurrence_rows(survivor_document_id)
+        active_root_rel_paths = sorted(
+            str(row["rel_path"])
+            for row in root_occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+        )
+        self.assertEqual(active_root_rel_paths, ["alpha.eml", "beta.eml"])
+
+        survivor_child_rows = self.fetch_child_rows(survivor_document_id)
+        self.assertEqual(len(survivor_child_rows), 1)
+        child_occurrence_rows = self.fetch_occurrence_rows(int(survivor_child_rows[0]["id"]))
+        active_child_rel_paths = sorted(
+            str(row["rel_path"])
+            for row in child_occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+        )
+        self.assertEqual(len(active_child_rel_paths), 2)
+
+        subject_search = retriever_tools.search(self.root, "Family merge ready", None, None, None, 1, 20)
+        self.assertEqual(subject_search["total_hits"], 1)
+        self.assertEqual(subject_search["results"][0]["id"], survivor_document_id)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            merged_document_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM documents
+                WHERE canonical_status = ?
+                """,
+                (retriever_tools.CANONICAL_STATUS_MERGED,),
+            ).fetchone()
+            merge_event_count = connection.execute(
+                "SELECT COUNT(*) AS row_count FROM document_merge_events",
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(int(merged_document_count["row_count"] or 0), 2)
+        self.assertEqual(int(merge_event_count["row_count"] or 0), 2)
+
+    def test_reconcile_duplicates_skips_same_email_body_with_different_attachment_family(self) -> None:
+        self.write_email_message(
+            self.root / "alpha.eml",
+            subject="Family mismatch",
+            body_text="Shared body but different family.\n",
+            attachment_name="notes.txt",
+            attachment_text="alpha attachment detail",
+            message_id="<alpha-family-mismatch@example.com>",
+        )
+        self.write_email_message(
+            self.root / "beta.eml",
+            subject="Family mismatch",
+            body_text="Shared body but different family.\n",
+            attachment_name="notes.txt",
+            attachment_text="beta attachment detail",
+            message_id="<beta-family-mismatch@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        exit_code, dry_run_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(dry_run_payload)
+        self.assertEqual(dry_run_payload["candidate_group_count"], 0)
+        self.assertEqual(dry_run_payload["mergeable_group_count"], 0)
+        self.assertEqual(dry_run_payload["blocked_group_count"], 0)
+
+        exit_code, apply_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--apply",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["merged_group_count"], 0)
+        self.assertEqual(apply_payload["blocked_group_count"], 0)
+
+        subject_search = retriever_tools.search(self.root, "Family mismatch", None, None, None, 1, 20)
+        self.assertEqual(subject_search["total_hits"], 2)
+
+    def test_reconcile_duplicates_dry_run_and_apply_merge_ready_content_hash_group(self) -> None:
+        (self.root / "alpha.txt").write_text("shared clause alpha version\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("shared clause beta version\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        beta_row = self.fetch_document_row("beta.txt")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            review_dataset_id = retriever_tools.create_dataset_row(connection, "Review Set")
+            retriever_tools.ensure_dataset_document_membership(
+                connection,
+                dataset_id=review_dataset_id,
+                document_id=int(beta_row["id"]),
+                dataset_source_id=None,
+            )
+            retriever_tools.refresh_document_dataset_cache(connection, int(beta_row["id"]))
+            connection.execute(
+                """
+                UPDATE documents
+                SET content_hash = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (alpha_row["content_hash"], retriever_tools.utc_now(), int(beta_row["id"])),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        exit_code, dry_run_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(dry_run_payload)
+        self.assertEqual(dry_run_payload["mode"], "dry-run")
+        self.assertEqual(dry_run_payload["candidate_group_count"], 1)
+        self.assertEqual(dry_run_payload["mergeable_group_count"], 1)
+        candidate_group = dry_run_payload["candidate_groups"][0]
+        self.assertEqual(candidate_group["status"], "ready")
+        self.assertEqual(
+            sorted(candidate_group["document_ids"]),
+            sorted([int(alpha_row["id"]), int(beta_row["id"])]),
+        )
+
+        exit_code, apply_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--apply",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["mode"], "apply")
+        self.assertEqual(apply_payload["merged_group_count"], 1)
+
+        merged_group = apply_payload["applied_groups"][0]
+        survivor_document_id = int(merged_group["survivor_document_id"])
+        loser_document_id = int(merged_group["loser_document_ids"][0])
+        self.assertEqual(merged_group["status"], "merged")
+        self.assertEqual(len(merged_group["merge_event_ids"]), 1)
+
+        loser_row = self.fetch_document_by_id(loser_document_id)
+        self.assertEqual(loser_row["canonical_status"], retriever_tools.CANONICAL_STATUS_MERGED)
+        self.assertEqual(loser_row["merged_into_document_id"], survivor_document_id)
+        self.assertEqual(loser_row["lifecycle_status"], "deleted")
+
+        occurrence_rows = self.fetch_occurrence_rows(survivor_document_id)
+        active_rel_paths = sorted(
+            str(row["rel_path"])
+            for row in occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+        )
+        self.assertEqual(active_rel_paths, ["alpha.txt", "beta.txt"])
+
+        search_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(search_result["total_hits"], 1)
+        self.assertEqual(search_result["results"][0]["id"], survivor_document_id)
+
+        review_set_result = retriever_tools.search(
+            self.root,
+            "",
+            [["dataset_name", "eq", "Review Set"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(review_set_result["total_hits"], 1)
+        self.assertEqual(review_set_result["results"][0]["id"], survivor_document_id)
+
+        rel_path_result = retriever_tools.search(
+            self.root,
+            "",
+            [["rel_path", "eq", "beta.txt"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(rel_path_result["total_hits"], 1)
+        self.assertEqual(rel_path_result["results"][0]["id"], survivor_document_id)
+        self.assertEqual(rel_path_result["results"][0]["rel_path"], "beta.txt")
+
+        chunk_count = retriever_tools.search_chunks(
+            self.root,
+            "shared",
+            None,
+            None,
+            None,
+            10,
+            3,
+            count_only=True,
+            distinct_docs=True,
+        )
+        self.assertEqual(chunk_count["documents_with_hits"], 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            loser_chunk_count = connection.execute(
+                "SELECT COUNT(*) AS row_count FROM document_chunks WHERE document_id = ?",
+                (loser_document_id,),
+            ).fetchone()
+            loser_chunk_fts_count = connection.execute(
+                "SELECT COUNT(*) AS row_count FROM chunks_fts WHERE document_id = ?",
+                (loser_document_id,),
+            ).fetchone()
+            loser_doc_fts_count = connection.execute(
+                "SELECT COUNT(*) AS row_count FROM documents_fts WHERE document_id = ?",
+                (loser_document_id,),
+            ).fetchone()
+            merge_event_count = connection.execute(
+                "SELECT COUNT(*) AS row_count FROM document_merge_events",
+            ).fetchone()
+            title_conflict_row = connection.execute(
+                """
+                SELECT field_name, resolution
+                FROM document_field_conflicts
+                WHERE document_id = ?
+                  AND field_name = 'title'
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (survivor_document_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(int(loser_chunk_count["row_count"] or 0), 0)
+        self.assertEqual(int(loser_chunk_fts_count["row_count"] or 0), 0)
+        self.assertEqual(int(loser_doc_fts_count["row_count"] or 0), 0)
+        self.assertEqual(int(merge_event_count["row_count"] or 0), 1)
+        self.assertIsNotNone(title_conflict_row)
+        self.assertEqual(title_conflict_row["resolution"], "kept_survivor")
+
+    def test_reconcile_duplicates_blocks_conflicting_custom_fields(self) -> None:
+        (self.root / "alpha.txt").write_text("shared clause alpha version\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("shared clause beta version\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        beta_row = self.fetch_document_row("beta.txt")
+
+        self.assertEqual(self.run_cli("add-field", str(self.root), "effective_date", "text")[0], 0)
+        self.assertEqual(
+            self.run_cli(
+                "set-field",
+                str(self.root),
+                "--doc-id",
+                str(alpha_row["id"]),
+                "--field",
+                "effective_date",
+                "--value",
+                "2026-04-01",
+            )[0],
+            0,
+        )
+        self.assertEqual(
+            self.run_cli(
+                "set-field",
+                str(self.root),
+                "--doc-id",
+                str(beta_row["id"]),
+                "--field",
+                "effective_date",
+                "--value",
+                "2026-04-15",
+            )[0],
+            0,
+        )
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                """
+                UPDATE documents
+                SET content_hash = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (alpha_row["content_hash"], retriever_tools.utc_now(), int(beta_row["id"])),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        exit_code, dry_run_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(dry_run_payload)
+        self.assertEqual(dry_run_payload["candidate_group_count"], 1)
+        self.assertEqual(dry_run_payload["blocked_group_count"], 1)
+        candidate_group = dry_run_payload["candidate_groups"][0]
+        self.assertEqual(candidate_group["status"], "blocked")
+        effective_date_conflict = next(
+            conflict
+            for conflict in candidate_group["blocking_conflicts"]
+            if conflict["type"] == "custom_field_conflict" and conflict["field_name"] == "effective_date"
+        )
+        self.assertEqual(
+            sorted(item["value"] for item in effective_date_conflict["values"]),
+            ["2026-04-01", "2026-04-15"],
+        )
+
+        exit_code, apply_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--apply",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["merged_group_count"], 0)
+        self.assertEqual(apply_payload["blocked_group_count"], 1)
+        self.assertEqual(apply_payload["blocked_groups"][0]["status"], "blocked")
+
+        search_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(search_result["total_hits"], 2)
+        self.assertEqual(len(self.fetch_occurrence_rows(int(alpha_row["id"]))), 1)
+        self.assertEqual(len(self.fetch_occurrence_rows(int(beta_row["id"]))), 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            merge_event_count = connection.execute(
+                "SELECT COUNT(*) AS row_count FROM document_merge_events",
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(int(merge_event_count["row_count"] or 0), 0)
 
     def test_search_omits_documents_without_dataset_memberships(self) -> None:
         document_path = self.root / "sample.txt"

@@ -14,14 +14,36 @@ def parse_filter_args(raw_filters: list[list[str]] | None) -> list[dict[str, obj
     return parsed
 
 
-def build_filter_clause(alias: str, field_def: dict[str, str], operator: str, value: str | None) -> tuple[str, list[object]]:
-    field_name = field_def["field_name"]
-    field_type = field_def["field_type"]
-    field_source = field_def.get("source")
-    if field_source == "virtual":
-        return build_virtual_filter_clause(alias, field_name, field_type, operator, value)
-    column_expr = f"{alias}.{quote_identifier(field_name)}"
+OCCURRENCE_FILTER_FIELDS = {
+    "begin_attachment",
+    "begin_bates",
+    "custodian",
+    "end_attachment",
+    "end_bates",
+    "file_hash",
+    "file_name",
+    "file_size",
+    "file_type",
+    "ingested_at",
+    "last_seen_at",
+    "lifecycle_status",
+    "production_id",
+    "rel_path",
+    "source_folder_path",
+    "source_item_id",
+    "source_kind",
+    "source_rel_path",
+    "text_status",
+    "updated_at",
+}
 
+
+def build_scalar_filter_clause(
+    column_expr: str,
+    field_type: str,
+    operator: str,
+    value: str | None,
+) -> tuple[str, list[object]]:
     if operator == "is-null":
         return f"{column_expr} IS NULL", []
     if operator == "not-null":
@@ -52,6 +74,31 @@ def build_filter_clause(alias: str, field_def: dict[str, str], operator: str, va
         raise RetrieverError(f"Operator '{operator}' is not valid for field type '{field_type}'.")
 
     return f"{column_expr} {comparator} ?", [typed_value]
+
+
+def build_filter_clause(alias: str, field_def: dict[str, str], operator: str, value: str | None) -> tuple[str, list[object]]:
+    field_name = field_def["field_name"]
+    field_type = field_def["field_type"]
+    field_source = field_def.get("source")
+    if field_source == "virtual":
+        return build_virtual_filter_clause(alias, field_name, field_type, operator, value)
+    if alias == "d" and field_name in OCCURRENCE_FILTER_FIELDS:
+        occurrence_clause, occurrence_params = build_scalar_filter_clause(
+            f"o.{quote_identifier(field_name)}",
+            field_type,
+            operator,
+            value,
+        )
+        return (
+            "EXISTS ("
+            "SELECT 1 FROM document_occurrences o "
+            f"WHERE o.document_id = {alias}.id "
+            "AND o.lifecycle_status = 'active' "
+            f"AND {occurrence_clause}"
+            ")",
+            occurrence_params,
+        )
+    return build_scalar_filter_clause(f"{alias}.{quote_identifier(field_name)}", field_type, operator, value)
 
 
 def build_virtual_filter_clause(
@@ -764,17 +811,98 @@ def fetch_documents_by_ids(connection: sqlite3.Connection, document_ids: list[in
     return {int(row["id"]): row for row in rows}
 
 
+def build_occurrence_scope_filters(
+    connection: sqlite3.Connection,
+    raw_filters: object | None,
+) -> tuple[list[str], list[object]]:
+    clauses = ["o.lifecycle_status = 'active'"]
+    params: list[object] = []
+    if not uses_legacy_tuple_filters(raw_filters):
+        return clauses, params
+    for raw_filter in parse_filter_args(raw_filters):
+        field_def = resolve_field_definition(connection, str(raw_filter["field_name"]))
+        if field_def.get("source") == "virtual":
+            continue
+        if field_def["field_name"] not in OCCURRENCE_FILTER_FIELDS:
+            continue
+        clause, clause_params = build_scalar_filter_clause(
+            f"o.{quote_identifier(field_def['field_name'])}",
+            field_def["field_type"],
+            str(raw_filter["operator"]),
+            raw_filter["value"],  # type: ignore[arg-type]
+        )
+        clauses.append(clause)
+        params.extend(clause_params)
+    return clauses, params
+
+
+def preferred_occurrence_for_document(
+    connection: sqlite3.Connection,
+    document_id: int,
+    occurrence_scope_clauses: list[str],
+    occurrence_scope_params: list[object],
+) -> sqlite3.Row | None:
+    scoped_rows = connection.execute(
+        f"""
+        SELECT *
+        FROM document_occurrences o
+        WHERE o.document_id = ?
+          AND {' AND '.join(occurrence_scope_clauses)}
+        ORDER BY o.id ASC
+        """,
+        [document_id, *occurrence_scope_params],
+    ).fetchall()
+    preferred = select_preferred_occurrence(scoped_rows)
+    if preferred is not None:
+        return preferred
+    return select_preferred_occurrence(active_occurrence_rows_for_document(connection, document_id))
+
+
+def preferred_occurrences_by_document(
+    connection: sqlite3.Connection,
+    document_ids: list[int],
+    occurrence_scope_clauses: list[str],
+    occurrence_scope_params: list[object],
+) -> dict[int, sqlite3.Row]:
+    preferred: dict[int, sqlite3.Row] = {}
+    for document_id in document_ids:
+        occurrence_row = preferred_occurrence_for_document(
+            connection,
+            document_id,
+            occurrence_scope_clauses,
+            occurrence_scope_params,
+        )
+        if occurrence_row is not None:
+            preferred[document_id] = occurrence_row
+    return preferred
+
+
 def document_path_payload(
     paths: dict[str, Path],
     connection: sqlite3.Connection,
     row: sqlite3.Row,
     *,
+    occurrence_row: sqlite3.Row | None = None,
     include_preview_targets: bool = True,
 ) -> dict[str, object]:
     preview_target = default_preview_target(paths, row, connection)
+    effective_rel_path = str(occurrence_row["rel_path"]) if occurrence_row is not None else str(row["rel_path"])
+    if (
+        occurrence_row is not None
+        and str(preview_target.get("preview_type") or "") == "native"
+        and str(preview_target.get("rel_path") or "") == str(row["rel_path"])
+    ):
+        effective_abs_path = str(document_absolute_path(paths, effective_rel_path))
+        preview_target = build_preview_target_payload(
+            rel_path=effective_rel_path,
+            abs_path=effective_abs_path,
+            preview_type="native",
+            label=None,
+            ordinal=0,
+        )
     payload = {
-        "rel_path": row["rel_path"],
-        "abs_path": str(document_absolute_path(paths, row["rel_path"])),
+        "rel_path": effective_rel_path,
+        "abs_path": str(document_absolute_path(paths, effective_rel_path)),
         "preview_rel_path": preview_target["rel_path"],
         "preview_abs_path": preview_target["abs_path"],
         "preview_file_rel_path": preview_target["file_rel_path"],
@@ -782,7 +910,7 @@ def document_path_payload(
         "preview_target_fragment": preview_target["target_fragment"],
     }
     if include_preview_targets:
-        payload["preview_targets"] = collect_preview_targets(paths, int(row["id"]), row["rel_path"], connection)
+        payload["preview_targets"] = collect_preview_targets(paths, int(row["id"]), effective_rel_path, connection)
     return payload
 
 
@@ -1240,9 +1368,11 @@ def document_overview_payload(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
     *,
+    occurrence_row: sqlite3.Row | None = None,
     include_parent_context: bool = True,
     include_attachment_context: bool = True,
 ) -> dict[str, object]:
+    source_row = occurrence_row or row
     payload: dict[str, object] = {
         "document_id": int(row["id"]),
         "control_number": row["control_number"],
@@ -1251,35 +1381,35 @@ def document_overview_payload(
         "parent_document_id": row["parent_document_id"],
         "child_document_kind": row["child_document_kind"],
         "root_message_key": row["root_message_key"],
-        "source_kind": row["source_kind"],
-        "source_rel_path": row["source_rel_path"],
-        "source_item_id": row["source_item_id"],
-        "source_folder_path": row["source_folder_path"],
-        "production_id": row["production_id"],
-        **document_path_payload(paths, connection, row),
-        "file_name": row["file_name"],
-        "file_type": row["file_type"],
+        "source_kind": source_row["source_kind"],
+        "source_rel_path": source_row["source_rel_path"],
+        "source_item_id": source_row["source_item_id"],
+        "source_folder_path": source_row["source_folder_path"],
+        "production_id": source_row["production_id"],
+        **document_path_payload(paths, connection, row, occurrence_row=occurrence_row),
+        "file_name": source_row["file_name"],
+        "file_type": source_row["file_type"],
         "metadata": {
             "author": row["author"],
-            "begin_attachment": row["begin_attachment"],
-            "begin_bates": row["begin_bates"],
+            "begin_attachment": source_row["begin_attachment"],
+            "begin_bates": source_row["begin_bates"],
             "child_document_kind": row["child_document_kind"],
             "content_type": row["content_type"],
             "conversation_id": row["conversation_id"],
-            "custodian": row["custodian"],
+            "custodian": source_row["custodian"],
             "dataset_id": row["dataset_id"],
             "date_created": row["date_created"],
             "date_modified": row["date_modified"],
-            "end_attachment": row["end_attachment"],
-            "end_bates": row["end_bates"],
+            "end_attachment": source_row["end_attachment"],
+            "end_bates": source_row["end_bates"],
             "page_count": row["page_count"],
             "participants": row["participants"],
             "recipients": row["recipients"],
             "root_message_key": row["root_message_key"],
-            "source_kind": row["source_kind"],
-            "source_rel_path": row["source_rel_path"],
-            "source_item_id": row["source_item_id"],
-            "source_folder_path": row["source_folder_path"],
+            "source_kind": source_row["source_kind"],
+            "source_rel_path": source_row["source_rel_path"],
+            "source_item_id": source_row["source_item_id"],
+            "source_folder_path": source_row["source_folder_path"],
             "subject": row["subject"],
             "title": row["title"],
             "updated_at": row["updated_at"],
@@ -1318,6 +1448,7 @@ def document_overview_payload(
 
 def build_chunk_citation_payload(
     row: sqlite3.Row,
+    occurrence_row: sqlite3.Row | None = None,
     *,
     preview_rel_path: str,
     preview_abs_path: str,
@@ -1326,10 +1457,11 @@ def build_chunk_citation_payload(
     char_end: int,
     snippet: str,
 ) -> dict[str, object]:
+    source_row = occurrence_row or row
     return {
         "document_id": int(row["id"]),
         "control_number": row["control_number"],
-        "file_name": row["file_name"],
+        "file_name": source_row["file_name"],
         "chunk_index": chunk_index,
         "char_start": char_start,
         "char_end": char_end,
@@ -2010,6 +2142,7 @@ def search(
             raw_column_list,
             drop_missing=False,
         )
+        occurrence_scope_clauses, occurrence_scope_params = build_occurrence_scope_filters(connection, raw_filters)
 
         results: list[dict[str, object]] = []
         for match in selection["results"]:
@@ -2091,6 +2224,12 @@ def search(
         total_hits = int(selection["total_hits"])
         total_pages = max(1, (total_hits + per_page - 1) // per_page)
         paged_rows = [item["row"] for item in paged_results]
+        preferred_occurrences = preferred_occurrences_by_document(
+            connection,
+            [int(row["id"]) for row in paged_rows],
+            occurrence_scope_clauses,
+            occurrence_scope_params,
+        )
         paged_parent_ids = [int(row["id"]) for row in paged_rows if row["parent_document_id"] is None]
         production_names = fetch_production_names(connection, paged_rows)
         dataset_memberships = fetch_document_dataset_memberships(connection, paged_rows)
@@ -2118,6 +2257,43 @@ def search(
         )
         for item in paged_results:
             row = item["row"]
+            occurrence_row = preferred_occurrences.get(int(row["id"]))
+            source_row = occurrence_row or row
+            path_payload = document_path_payload(
+                paths,
+                connection,
+                row,
+                occurrence_row=occurrence_row,
+                include_preview_targets=not compact_mode,
+            )
+            item["rel_path"] = path_payload["rel_path"]
+            item["abs_path"] = path_payload["abs_path"]
+            item["preview_rel_path"] = path_payload["preview_rel_path"]
+            item["preview_abs_path"] = path_payload["preview_abs_path"]
+            item["preview_file_rel_path"] = path_payload["preview_file_rel_path"]
+            item["preview_file_abs_path"] = path_payload["preview_file_abs_path"]
+            item["preview_target_fragment"] = path_payload["preview_target_fragment"]
+            if not compact_mode:
+                item["preview_targets"] = path_payload["preview_targets"]
+            item["file_name"] = source_row["file_name"]
+            item["file_type"] = source_row["file_type"]
+            if compact_mode:
+                item["metadata"]["custodian"] = source_row["custodian"]
+            else:
+                item["source_kind"] = source_row["source_kind"]
+                item["source_rel_path"] = source_row["source_rel_path"]
+                item["source_item_id"] = source_row["source_item_id"]
+                item["source_folder_path"] = source_row["source_folder_path"]
+                item["production_id"] = source_row["production_id"]
+                item["metadata"]["begin_attachment"] = source_row["begin_attachment"]
+                item["metadata"]["begin_bates"] = source_row["begin_bates"]
+                item["metadata"]["custodian"] = source_row["custodian"]
+                item["metadata"]["end_attachment"] = source_row["end_attachment"]
+                item["metadata"]["end_bates"] = source_row["end_bates"]
+                item["metadata"]["source_kind"] = source_row["source_kind"]
+                item["metadata"]["source_rel_path"] = source_row["source_rel_path"]
+                item["metadata"]["source_item_id"] = source_row["source_item_id"]
+                item["metadata"]["source_folder_path"] = source_row["source_folder_path"]
             memberships = dataset_memberships.get(int(row["id"]), {"ids": [], "names": []})
             dataset_ids = [int(dataset_id) for dataset_id in memberships["ids"]]
             dataset_names = [str(dataset_name) for dataset_name in memberships["names"]]
@@ -2134,9 +2310,9 @@ def search(
             if len(dataset_names) == 1:
                 item["dataset_name"] = dataset_names[0]
                 item["metadata"]["dataset_name"] = dataset_names[0]
-            if row["production_id"] is not None:
-                item["production_name"] = production_names.get(int(row["production_id"]))
-                item["metadata"]["production_name"] = production_names.get(int(row["production_id"]))
+            if source_row["production_id"] is not None:
+                item["production_name"] = production_names.get(int(source_row["production_id"]))
+                item["metadata"]["production_name"] = production_names.get(int(source_row["production_id"]))
             if row["parent_document_id"] is None:
                 if compact_mode:
                     attachment_count = attachment_counts.get(int(row["id"]), 0)
@@ -6067,6 +6243,7 @@ def get_doc(
         ).fetchone()
         if row is None:
             raise RetrieverError(f"Unknown active document id: {document_id}")
+        occurrence_row = preferred_occurrence_for_document(connection, document_id, ["o.lifecycle_status = 'active'"], [])
 
         chunk_rows = document_chunk_rows(connection, document_id)
         requested_chunk_indexes = sorted(dict.fromkeys(int(chunk_index) for chunk_index in (chunk_indexes or [])))
@@ -6082,6 +6259,18 @@ def get_doc(
         exact_chunks: list[dict[str, object]] = []
         total_text_chars = 0
         preview_target = default_preview_target(paths, row, connection)
+        if (
+            occurrence_row is not None
+            and str(preview_target.get("preview_type") or "") == "native"
+            and str(preview_target.get("rel_path") or "") == str(row["rel_path"])
+        ):
+            preview_target = build_preview_target_payload(
+                rel_path=str(occurrence_row["rel_path"]),
+                abs_path=str(document_absolute_path(paths, str(occurrence_row["rel_path"]))),
+                preview_type="native",
+                label=None,
+                ordinal=0,
+            )
         preview_rel_path = str(preview_target["rel_path"])
         preview_abs_path = str(preview_target["abs_path"])
         for chunk_index in requested_chunk_indexes:
@@ -6101,6 +6290,7 @@ def get_doc(
                     "snippet": snippet,
                     "citation": build_chunk_citation_payload(
                         row,
+                        occurrence_row,
                         preview_rel_path=preview_rel_path,
                         preview_abs_path=preview_abs_path,
                         chunk_index=int(chunk_row["chunk_index"]),
@@ -6120,7 +6310,7 @@ def get_doc(
 
         return {
             "status": "ok",
-            "document": document_overview_payload(paths, connection, row),
+            "document": document_overview_payload(paths, connection, row, occurrence_row=occurrence_row),
             "chunk_count": len(chunk_rows),
             "include_text": normalized_include_text,
             "text_summary": text_summary,
@@ -6152,6 +6342,7 @@ def list_chunks(root: Path, document_id: int, page: int, per_page: int) -> dict[
         ).fetchone()
         if row is None:
             raise RetrieverError(f"Unknown active document id: {document_id}")
+        occurrence_row = preferred_occurrence_for_document(connection, document_id, ["o.lifecycle_status = 'active'"], [])
 
         chunk_rows = document_chunk_rows(connection, document_id)
         total_chunks = len(chunk_rows)
@@ -6164,7 +6355,7 @@ def list_chunks(root: Path, document_id: int, page: int, per_page: int) -> dict[
             "document": {
                 "document_id": int(row["id"]),
                 "control_number": row["control_number"],
-                "file_name": row["file_name"],
+                "file_name": occurrence_row["file_name"] if occurrence_row is not None else row["file_name"],
             },
             "page": page,
             "per_page": per_page,
@@ -6344,6 +6535,7 @@ def search_chunks(
             raw_filters=raw_filters,
             select_from_scope=select_from_scope,
         )
+        occurrence_scope_clauses, occurrence_scope_params = build_occurrence_scope_filters(connection, raw_filters)
         if count_only:
             payload = {
                 "query": query,
@@ -6380,21 +6572,41 @@ def search_chunks(
         results: list[dict[str, object]] = []
         dataset_memberships = fetch_document_dataset_memberships(connection, returned_rows)
         production_names = fetch_production_names(connection, returned_rows)
+        preferred_occurrences = preferred_occurrences_by_document(
+            connection,
+            [int(row["id"]) for row in returned_rows],
+            occurrence_scope_clauses,
+            occurrence_scope_params,
+        )
         parent_summaries = fetch_parent_summaries(
             connection,
             [row for row in returned_rows if row["parent_document_id"] is not None],
         )
         for row in returned_rows:
+            occurrence_row = preferred_occurrences.get(int(row["id"]))
             preview_target = default_preview_target(paths, row, connection)
+            if (
+                occurrence_row is not None
+                and str(preview_target.get("preview_type") or "") == "native"
+                and str(preview_target.get("rel_path") or "") == str(row["rel_path"])
+            ):
+                preview_target = build_preview_target_payload(
+                    rel_path=str(occurrence_row["rel_path"]),
+                    abs_path=str(document_absolute_path(paths, str(occurrence_row["rel_path"]))),
+                    preview_type="native",
+                    label=None,
+                    ordinal=0,
+                )
             preview_rel_path = str(preview_target["rel_path"])
             preview_abs_path = str(preview_target["abs_path"])
             snippet = make_snippet(str(row["text_content"] or ""), query)
+            source_row = occurrence_row or row
             result = {
-                **document_path_payload(paths, connection, row),
+                **document_path_payload(paths, connection, row, occurrence_row=occurrence_row),
                 "document_id": int(row["id"]),
                 "control_number": row["control_number"],
-                "file_name": row["file_name"],
-                "file_type": row["file_type"],
+                "file_name": source_row["file_name"],
+                "file_type": source_row["file_type"],
                 "chunk_index": int(row["chunk_index"]),
                 "char_start": int(row["char_start"]),
                 "char_end": int(row["char_end"]),
@@ -6405,7 +6617,7 @@ def search_chunks(
                 "metadata": {
                     "author": row["author"],
                     "content_type": row["content_type"],
-                    "custodian": row["custodian"],
+                    "custodian": source_row["custodian"],
                     "date_created": row["date_created"],
                     "date_modified": row["date_modified"],
                     "participants": row["participants"],
@@ -6416,6 +6628,7 @@ def search_chunks(
                 },
                 "citation": build_chunk_citation_payload(
                     row,
+                    occurrence_row,
                     preview_rel_path=preview_rel_path,
                     preview_abs_path=preview_abs_path,
                     chunk_index=int(row["chunk_index"]),
@@ -6433,8 +6646,8 @@ def search_chunks(
                 result["dataset_id"] = dataset_ids[0]
             if len(dataset_names) == 1:
                 result["dataset_name"] = dataset_names[0]
-            if row["production_id"] is not None:
-                result["production_name"] = production_names.get(int(row["production_id"]))
+            if source_row["production_id"] is not None:
+                result["production_name"] = production_names.get(int(source_row["production_id"]))
             if row["parent_document_id"] is not None:
                 result["parent"] = parent_summaries.get(int(row["parent_document_id"]))
             results.append(result)
@@ -7276,6 +7489,21 @@ def build_parser() -> argparse.ArgumentParser:
     set_field_parser.add_argument("--field", required=True, help="Field name")
     set_field_parser.add_argument("--value", help="Field value")
 
+    reconcile_duplicates_parser = subparsers.add_parser(
+        "reconcile-duplicates",
+        help="Dry-run or apply post-ingest duplicate reconciliation",
+    )
+    reconcile_duplicates_parser.add_argument("workspace", help="Workspace root path")
+    reconcile_duplicates_parser.add_argument(
+        "--basis",
+        choices=("content_hash",),
+        default="content_hash",
+        help="Reconciliation basis",
+    )
+    reconcile_mode_group = reconcile_duplicates_parser.add_mutually_exclusive_group()
+    reconcile_mode_group.add_argument("--dry-run", action="store_true", help="Preview merge candidates without applying them")
+    reconcile_mode_group.add_argument("--apply", action="store_true", help="Apply mergeable reconciliation candidates")
+
     merge_conversation_parser = subparsers.add_parser(
         "merge-into-conversation",
         help="Manually assign one document family into another document's conversation",
@@ -7926,6 +8154,16 @@ def main() -> int:
 
         if args.command == "set-field":
             return emit_cli_payload("set-field", set_field(root, args.doc_id, args.field, args.value))
+
+        if args.command == "reconcile-duplicates":
+            return emit_cli_payload(
+                "reconcile-duplicates",
+                reconcile_duplicates(
+                    root,
+                    basis=args.basis,
+                    apply_changes=bool(args.apply),
+                ),
+            )
 
         if args.command == "merge-into-conversation":
             return emit_cli_payload(

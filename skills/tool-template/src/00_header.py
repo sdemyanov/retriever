@@ -80,10 +80,10 @@ except Exception:  # pragma: no cover - required PST backend probe
     pypff = None
 
 
-TOOL_VERSION = "0.17.2"
-SCHEMA_VERSION = 20
+TOOL_VERSION = "0.18.0"
+SCHEMA_VERSION = 21
 SESSION_SCHEMA_VERSION = 1
-REQUIREMENTS_VERSION = "2026-04-20-phase10-conversations-and-export-previews"
+REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
 MANUAL_FIELD_LOCKS_COLUMN = "manual_field_locks_json"
 LEGACY_METADATA_LOCKS_COLUMN = "locked_metadata_fields_json"
@@ -341,6 +341,8 @@ SYSTEM_MANAGED_FIELDS = {
     "active_text_language",
     "active_text_quality_score",
     "active_text_source_kind",
+    "canonical_kind",
+    "canonical_status",
     "content_hash",
     "control_number_attachment_sequence",
     "control_number_batch",
@@ -359,6 +361,7 @@ SYSTEM_MANAGED_FIELDS = {
     "lifecycle_status",
     MANUAL_FIELD_LOCKS_COLUMN,
     LEGACY_METADATA_LOCKS_COLUMN,
+    "merged_into_document_id",
     "begin_attachment",
     "begin_bates",
     "end_attachment",
@@ -378,10 +381,13 @@ SYSTEM_MANAGED_FIELDS = {
 }
 BUILTIN_FIELD_TYPES = {
     "id": "integer",
+    "canonical_kind": "text",
+    "canonical_status": "text",
     "control_number": "text",
     "conversation_id": "integer",
     "conversation_assignment_mode": "text",
     "dataset_id": "integer",
+    "merged_into_document_id": "integer",
     "parent_document_id": "integer",
     "child_document_kind": "text",
     "source_kind": "text",
@@ -474,6 +480,8 @@ AGGREGATABLE_VIRTUAL_FIELDS = {"dataset_name"}
 BUILTIN_FIELD_DESCRIPTIONS = {
     "author": "Document author from file metadata",
     "begin_bates": "Beginning Bates label for a production document",
+    "canonical_kind": "Normalized logical content family used for dedupe safety checks",
+    "canonical_status": "Logical document lifecycle state such as active, derelict, or merged",
     "content_type": "Normalized content category such as Email, E-Doc, or Chat",
     "control_number": "Stable document label used for review and export",
     "conversation_id": "Internal conversation grouping id shared by related documents",
@@ -485,6 +493,7 @@ BUILTIN_FIELD_DESCRIPTIONS = {
     "file_name": "Document file name",
     "file_size": "File size in bytes",
     "file_type": "Normalized file extension such as pdf, docx, or eml",
+    "merged_into_document_id": "Canonical survivor id when this document has been merged",
     "page_count": "Page or sheet count when available",
     "child_document_kind": "Contained-child semantics such as attachment or reply_thread",
     "participants": "Participants extracted from chat or email-style content",
@@ -544,6 +553,37 @@ MBOX_SOURCE_KIND = "mbox"
 PST_SOURCE_KIND = "pst"
 SLACK_EXPORT_SOURCE_KIND = "slack_export"
 MANUAL_DATASET_SOURCE_KIND = "manual"
+ACTIVE_OCCURRENCE_STATUS = "active"
+OCCURRENCE_LIFECYCLE_STATUSES = {"active", "superseded", "missing", "deleted"}
+CANONICAL_STATUS_ACTIVE = "active"
+CANONICAL_STATUS_DERELICT = "derelict"
+CANONICAL_STATUS_MERGED = "merged"
+CANONICAL_KIND_VALUES = {
+    "email",
+    "document",
+    "spreadsheet",
+    "presentation",
+    "image",
+    "code",
+    "data",
+    "binary",
+    "unknown",
+}
+TEXT_STATUS_PRIORITIES = {
+    "ok": 0,
+    "partial": 1,
+    "empty": 2,
+    "failed": 3,
+    "error": 4,
+}
+SOURCE_KIND_PREFERRED_ORDER = {
+    PRODUCTION_SOURCE_KIND: 0,
+    FILESYSTEM_SOURCE_KIND: 1,
+    PST_SOURCE_KIND: 2,
+    MBOX_SOURCE_KIND: 3,
+    SLACK_EXPORT_SOURCE_KIND: 4,
+    EMAIL_ATTACHMENT_SOURCE_KIND: 5,
+}
 CHILD_DOCUMENT_KIND_ATTACHMENT = "attachment"
 CHILD_DOCUMENT_KIND_REPLY_THREAD = "reply_thread"
 ALLOWED_CHILD_DOCUMENT_KINDS = {
