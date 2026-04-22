@@ -4921,6 +4921,42 @@ def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) 
     browse_mode = normalize_browse_mode(payload.get("browse_mode"))
     result_label = "conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "docs"
 
+    if command_name == "field":
+        field_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
+        if not field_args or field_args == ["list"]:
+            fields = payload.get("fields")
+            if not isinstance(fields, list) or not fields:
+                return "Custom fields: (none)"
+            lines = ["Custom fields:"]
+            for item in fields:
+                if not isinstance(item, dict):
+                    continue
+                field_name = normalize_inline_whitespace(str(item.get("field_name") or ""))
+                field_type = normalize_inline_whitespace(str(item.get("field_type") or ""))
+                if not field_name or not field_type:
+                    continue
+                document_count = int(item.get("documents_with_values") or 0)
+                instruction = normalize_inline_whitespace(str(item.get("instruction") or ""))
+                suffix = f": {instruction}" if instruction else ""
+                lines.append(f"- {field_name} ({field_type}, {document_count} docs){suffix}")
+            return "\n".join(lines)
+        return None
+
+    if command_name == "fill" and (
+        payload.get("status") == "confirm_required" or bool(payload.get("dry_run"))
+    ):
+        field_name = normalize_inline_whitespace(str(payload.get("field_name") or ""))
+        if not field_name:
+            return None
+        action = "clear" if bool(payload.get("clear")) else f"fill {field_name}={payload.get('value')!r}"
+        document_count = int(payload.get("would_write") or 0)
+        summary = f"Preview: {action} on {document_count} document"
+        if document_count != 1:
+            summary += "s"
+        if payload.get("status") == "confirm_required":
+            summary += ". Re-run with --confirm to apply."
+        return summary
+
     if command_name in {"next", "previous", "documents", "conversations"}:
         rendered_markdown = payload.get("rendered_markdown")
         if payload_has_meaningful_value(rendered_markdown):
@@ -5086,6 +5122,22 @@ def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) 
     return None
 
 
+def render_list_fields_table(payload: dict[str, object]) -> str:
+    fields = payload.get("fields")
+    if not isinstance(fields, list) or not fields:
+        return "Custom fields: (none)"
+    lines = ["NAME | TYPE | DOCS | DESCRIPTION"]
+    for item in fields:
+        if not isinstance(item, dict):
+            continue
+        field_name = normalize_inline_whitespace(str(item.get("field_name") or ""))
+        field_type = normalize_inline_whitespace(str(item.get("field_type") or ""))
+        document_count = int(item.get("documents_with_values") or 0)
+        instruction = normalize_inline_whitespace(str(item.get("instruction") or ""))
+        lines.append(f"{field_name} | {field_type} | {document_count} | {instruction}")
+    return "\n".join(lines)
+
+
 def clear_session_browsing(session_state: dict[str, object]) -> dict[str, object]:
     session_state["browsing"] = coerce_mode_payloads({}, coerce_browsing_payload)
     return session_state
@@ -5213,6 +5265,299 @@ def refresh_dataset_name_refs_in_saved_scopes(paths: dict[str, Path], dataset_id
         if before != after:
             changed = True
     if changed:
+        write_saved_scopes_state(paths, saved_scopes_state)
+
+
+def filter_expression_references_field(expression: str, field_name: str) -> bool:
+    tokens = tokenize_sql_filter_expression(expression)
+    for token in tokens:
+        if token["kind"] != "identifier":
+            continue
+        if str(token["value"]) == field_name:
+            return True
+    return False
+
+
+def rewrite_filter_expression_field_name(
+    expression: str,
+    old_field_name: str,
+    new_field_name: str,
+) -> tuple[str, bool]:
+    tokens = tokenize_sql_filter_expression(expression)
+    parts: list[str] = []
+    cursor = 0
+    changed = False
+    for token in tokens:
+        if token["kind"] == "eof":
+            break
+        start = int(token["start"])
+        end = int(token["end"])
+        parts.append(expression[cursor:start])
+        if token["kind"] == "identifier" and str(token["value"]) == old_field_name:
+            parts.append(new_field_name)
+            changed = True
+        else:
+            parts.append(expression[start:end])
+        cursor = end
+    parts.append(expression[cursor:])
+    return "".join(parts), changed
+
+
+def field_filter_blocker(scope_name: str, field_name: str, expression: str, *, invalid: bool = False) -> dict[str, object]:
+    if invalid:
+        return {
+            "kind": "invalid_filter_reference",
+            "scope": scope_name,
+            "field_name": field_name,
+            "expression": expression,
+            "message": f"{scope_name} filter could not be rewritten safely for field '{field_name}'.",
+        }
+    return {
+        "kind": "filter_reference",
+        "scope": scope_name,
+        "field_name": field_name,
+        "expression": expression,
+        "message": f"{scope_name} filter references field '{field_name}'.",
+    }
+
+
+def rewrite_scope_filter_field_name(
+    scope_payload: object,
+    old_field_name: str,
+    new_field_name: str,
+    *,
+    scope_name: str,
+) -> tuple[dict[str, object], list[dict[str, object]], int]:
+    scope = coerce_scope_payload(scope_payload)
+    expression = normalize_inline_whitespace(str(scope.get("filter") or ""))
+    if not expression:
+        return scope, [], 0
+    try:
+        next_expression, changed = rewrite_filter_expression_field_name(expression, old_field_name, new_field_name)
+    except RetrieverError:
+        if old_field_name in expression:
+            return scope, [field_filter_blocker(scope_name, old_field_name, expression, invalid=True)], 0
+        return scope, [], 0
+    if not changed:
+        return scope, [], 0
+    scope["filter"] = next_expression
+    return scope, [], 1
+
+
+def detect_scope_filter_field_refs(
+    scope_payload: object,
+    field_name: str,
+    *,
+    scope_name: str,
+) -> list[dict[str, object]]:
+    scope = coerce_scope_payload(scope_payload)
+    expression = normalize_inline_whitespace(str(scope.get("filter") or ""))
+    if not expression:
+        return []
+    try:
+        if filter_expression_references_field(expression, field_name):
+            return [field_filter_blocker(scope_name, field_name, expression)]
+    except RetrieverError:
+        if field_name in expression:
+            return [field_filter_blocker(scope_name, field_name, expression, invalid=True)]
+    return []
+
+
+def update_session_display_field_refs(
+    session_state: dict[str, object],
+    old_field_name: str,
+    *,
+    new_field_name: str | None = None,
+) -> int:
+    display_root = session_state.get("display")
+    if not isinstance(display_root, dict):
+        display_root = {}
+    changed = 0
+    for browse_mode in (BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS):
+        display_state = session_display_state(session_state, browse_mode=browse_mode)
+        columns = display_state.get("columns")
+        if not isinstance(columns, list):
+            continue
+        next_columns: list[str] = []
+        seen_names: set[str] = set()
+        branch_changed = False
+        for raw_column in columns:
+            column_name = normalize_inline_whitespace(str(raw_column or ""))
+            if not column_name:
+                branch_changed = True
+                continue
+            if column_name == old_field_name:
+                branch_changed = True
+                if new_field_name is None:
+                    continue
+                column_name = new_field_name
+            if column_name in seen_names:
+                branch_changed = True
+                continue
+            seen_names.add(column_name)
+            next_columns.append(column_name)
+        if not branch_changed:
+            continue
+        changed += 1
+        if next_columns:
+            display_state["columns"] = next_columns
+        else:
+            display_state.pop("columns", None)
+        display_root[browse_mode] = coerce_display_payload(display_state)
+    session_state["display"] = coerce_mode_payloads(display_root, coerce_display_payload)
+    return changed
+
+
+def update_session_sort_field_refs(
+    session_state: dict[str, object],
+    old_field_name: str,
+    *,
+    new_field_name: str | None = None,
+) -> int:
+    browsing_root = session_state.get("browsing")
+    if not isinstance(browsing_root, dict):
+        browsing_root = {}
+    changed = 0
+    for browse_mode in (BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS):
+        browsing_state = session_browsing_state(session_state, browse_mode=browse_mode)
+        sort_specs = coerce_sort_specs(browsing_state.get("sort"))
+        if not sort_specs:
+            continue
+        next_specs: list[tuple[str, str]] = []
+        branch_changed = False
+        seen_specs: set[tuple[str, str]] = set()
+        for field_name, direction in sort_specs:
+            next_field_name = field_name
+            if field_name == old_field_name:
+                branch_changed = True
+                if new_field_name is None:
+                    continue
+                next_field_name = new_field_name
+            spec = (next_field_name, direction)
+            if spec in seen_specs:
+                branch_changed = True
+                continue
+            seen_specs.add(spec)
+            next_specs.append(spec)
+        if not branch_changed:
+            continue
+        changed += 1
+        if next_specs:
+            browsing_state["sort"] = serialize_sort_specs(next_specs)
+        else:
+            browsing_state.pop("sort", None)
+        browsing_root[browse_mode] = coerce_browsing_payload(browsing_state)
+    session_state["browsing"] = coerce_mode_payloads(browsing_root, coerce_browsing_payload)
+    return changed
+
+
+def plan_field_rename_state_changes(
+    paths: dict[str, Path],
+    old_field_name: str,
+    new_field_name: str,
+) -> dict[str, object]:
+    session_state = read_session_state(paths)
+    saved_scopes_state = read_saved_scopes_state(paths)
+    blockers: list[dict[str, object]] = []
+    changes = {
+        "display_columns_updated": update_session_display_field_refs(
+            session_state,
+            old_field_name,
+            new_field_name=new_field_name,
+        ),
+        "sort_specs_updated": update_session_sort_field_refs(
+            session_state,
+            old_field_name,
+            new_field_name=new_field_name,
+        ),
+        "active_scope_filters_updated": 0,
+        "saved_scope_filters_updated": 0,
+    }
+
+    next_scope, scope_blockers, active_scope_updates = rewrite_scope_filter_field_name(
+        session_state.get("scope"),
+        old_field_name,
+        new_field_name,
+        scope_name="active scope",
+    )
+    blockers.extend(scope_blockers)
+    changes["active_scope_filters_updated"] = active_scope_updates
+    session_state["scope"] = next_scope
+
+    scopes = saved_scopes_state.get("scopes")
+    if isinstance(scopes, dict):
+        updated_saved_scope_filters = 0
+        for scope_name, scope_payload in scopes.items():
+            if not isinstance(scope_payload, dict):
+                continue
+            next_saved_scope, saved_scope_blockers, saved_scope_updates = rewrite_scope_filter_field_name(
+                scope_payload,
+                old_field_name,
+                new_field_name,
+                scope_name=f"saved scope '{scope_name}'",
+            )
+            blockers.extend(saved_scope_blockers)
+            scopes[scope_name] = coerce_saved_scope_payload(next_saved_scope)
+            updated_saved_scope_filters += saved_scope_updates
+        changes["saved_scope_filters_updated"] = updated_saved_scope_filters
+
+    return {
+        "session_state": session_state,
+        "saved_scopes_state": saved_scopes_state,
+        "blockers": blockers,
+        "changes": changes,
+    }
+
+
+def plan_field_delete_state_changes(paths: dict[str, Path], field_name: str) -> dict[str, object]:
+    session_state = read_session_state(paths)
+    saved_scopes_state = read_saved_scopes_state(paths)
+    blockers: list[dict[str, object]] = []
+    changes = {
+        "display_columns_updated": update_session_display_field_refs(session_state, field_name),
+        "sort_specs_updated": update_session_sort_field_refs(session_state, field_name),
+        "active_scope_filters_blocked": 0,
+        "saved_scope_filters_blocked": 0,
+    }
+
+    active_scope_blockers = detect_scope_filter_field_refs(
+        session_state.get("scope"),
+        field_name,
+        scope_name="active scope",
+    )
+    blockers.extend(active_scope_blockers)
+    changes["active_scope_filters_blocked"] = len(active_scope_blockers)
+
+    scopes = saved_scopes_state.get("scopes")
+    if isinstance(scopes, dict):
+        saved_scope_blockers: list[dict[str, object]] = []
+        for scope_name, scope_payload in scopes.items():
+            if not isinstance(scope_payload, dict):
+                continue
+            saved_scope_blockers.extend(
+                detect_scope_filter_field_refs(
+                    scope_payload,
+                    field_name,
+                    scope_name=f"saved scope '{scope_name}'",
+                )
+            )
+        blockers.extend(saved_scope_blockers)
+        changes["saved_scope_filters_blocked"] = len(saved_scope_blockers)
+
+    return {
+        "session_state": session_state,
+        "saved_scopes_state": saved_scopes_state,
+        "blockers": blockers,
+        "changes": changes,
+    }
+
+
+def apply_field_state_change_plan(paths: dict[str, Path], plan: dict[str, object]) -> None:
+    session_state = plan.get("session_state")
+    if isinstance(session_state, dict):
+        write_session_state(paths, session_state)
+    saved_scopes_state = plan.get("saved_scopes_state")
+    if isinstance(saved_scopes_state, dict):
         write_saved_scopes_state(paths, saved_scopes_state)
 
 
@@ -5409,6 +5754,63 @@ def build_effective_scope_selector(
     return compose_scope_selectors_and(base_scope, explicit_selector)
 
 
+def parse_fill_slash_arguments(normalized_tail: str) -> dict[str, object]:
+    tokens = shlex_split_slash_tail(normalized_tail)
+    if len(tokens) < 2:
+        raise RetrieverError("Usage: /fill <field> <value-or-clear> [on <doc-ref[,doc-ref,...]>] [--confirm]")
+
+    confirm = False
+    filtered_tokens: list[str] = []
+    for token in tokens:
+        if token == "--confirm":
+            confirm = True
+            continue
+        filtered_tokens.append(token)
+    tokens = filtered_tokens
+    if len(tokens) < 2:
+        raise RetrieverError("Usage: /fill <field> <value-or-clear> [on <doc-ref[,doc-ref,...]>] [--confirm]")
+
+    field_name = tokens[0]
+    on_index = -1
+    for index in range(1, len(tokens)):
+        if tokens[index] == "on":
+            on_index = index
+            break
+
+    if on_index == -1:
+        value_tokens = tokens[1:]
+        doc_refs: list[str] = []
+    else:
+        value_tokens = tokens[1:on_index]
+        trailing_tokens = tokens[on_index + 1 :]
+        if not trailing_tokens:
+            raise RetrieverError("Usage: /fill <field> <value-or-clear> on <doc-ref[,doc-ref,...]> [--confirm]")
+        raw_doc_ref_text = " ".join(trailing_tokens)
+        doc_refs = split_quoted_comma_values(raw_doc_ref_text)
+        if len(doc_refs) == 1 and "," not in raw_doc_ref_text and len(trailing_tokens) > 1:
+            doc_refs = [
+                normalize_inline_whitespace(token)
+                for token in trailing_tokens
+                if normalize_inline_whitespace(token)
+            ]
+
+    if not value_tokens:
+        raise RetrieverError("Usage: /fill <field> <value-or-clear> [on <doc-ref[,doc-ref,...]>] [--confirm]")
+
+    clear = len(value_tokens) == 1 and value_tokens[0].lower() == "clear"
+    value = None if clear else normalize_inline_whitespace(" ".join(value_tokens))
+    if not clear and not value:
+        raise RetrieverError("Fill value cannot be empty.")
+
+    return {
+        "field_name": field_name,
+        "value": value,
+        "clear": clear,
+        "doc_refs": doc_refs,
+        "confirm": confirm,
+    }
+
+
 def resolve_scope_document_search_with_explicit_sort(
     connection: sqlite3.Connection,
     raw_scope: object,
@@ -5588,6 +5990,83 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
                 loaded_scope = coerce_scope_payload(saved_scope)
                 return run_scope_search_from_session(root, paths, loaded_scope)
             raise RetrieverError(f"Unknown /scope command: {subcommand}")
+
+        if command_name == "field":
+            field_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
+            if not field_args or field_args == ["list"]:
+                return list_fields(root)
+            subcommand = field_args[0]
+            if subcommand == "add":
+                if len(field_args) < 3:
+                    raise RetrieverError("Usage: /field add <name> <type> [description]")
+                instruction = " ".join(field_args[3:]) if len(field_args) > 3 else None
+                return add_field(root, field_args[1], field_args[2], instruction)
+            if subcommand == "rename":
+                if len(field_args) != 3:
+                    raise RetrieverError("Usage: /field rename <old> <new>")
+                return rename_field(root, field_args[1], field_args[2])
+            if subcommand == "delete":
+                if len(field_args) < 2:
+                    raise RetrieverError("Usage: /field delete <name> [--confirm]")
+                confirm = False
+                extra_tokens: list[str] = []
+                for token in field_args[2:]:
+                    if token == "--confirm":
+                        confirm = True
+                    else:
+                        extra_tokens.append(token)
+                if extra_tokens:
+                    raise RetrieverError("Usage: /field delete <name> [--confirm]")
+                return delete_field(root, field_args[1], confirm=confirm)
+            if subcommand == "describe":
+                if len(field_args) < 2:
+                    raise RetrieverError("Usage: /field describe <name> <text> | /field describe <name> --clear")
+                clear = False
+                text_tokens: list[str] = []
+                for token in field_args[2:]:
+                    if token == "--clear":
+                        clear = True
+                    else:
+                        text_tokens.append(token)
+                if clear and text_tokens:
+                    raise RetrieverError("Usage: /field describe <name> <text> | /field describe <name> --clear")
+                if not clear and not text_tokens:
+                    raise RetrieverError("Usage: /field describe <name> <text> | /field describe <name> --clear")
+                return describe_field(
+                    root,
+                    field_args[1],
+                    text=None if clear else " ".join(text_tokens),
+                    clear=clear,
+                )
+            if subcommand == "type":
+                if len(field_args) != 3:
+                    raise RetrieverError("Usage: /field type <name> <new-type>")
+                return change_field_type(root, field_args[1], field_args[2])
+            raise RetrieverError(f"Unknown /field command: {subcommand}")
+
+        if command_name == "fill":
+            if not normalized_tail:
+                raise RetrieverError("Usage: /fill <field> <value-or-clear> [on <doc-ref[,doc-ref,...]>] [--confirm]")
+            fill_args = parse_fill_slash_arguments(normalized_tail)
+            raw_doc_refs = fill_args["doc_refs"]
+            if isinstance(raw_doc_refs, list) and raw_doc_refs:
+                document_ids = resolve_fill_document_refs(connection, [str(item) for item in raw_doc_refs])
+                return fill_field(
+                    root,
+                    field_name=str(fill_args["field_name"]),
+                    value=(str(fill_args["value"]) if fill_args["value"] is not None else None),
+                    clear=bool(fill_args["clear"]),
+                    document_ids=document_ids,
+                    confirm=bool(fill_args["confirm"]),
+                )
+            return fill_field(
+                root,
+                field_name=str(fill_args["field_name"]),
+                value=(str(fill_args["value"]) if fill_args["value"] is not None else None),
+                clear=bool(fill_args["clear"]),
+                select_from_scope=True,
+                confirm=bool(fill_args["confirm"]),
+            )
 
         if command_name in {"documents", "conversations"}:
             if normalized_tail:
@@ -6024,6 +6503,34 @@ def fetch_visible_document_rows_by_ids(
     if errors:
         raise RetrieverError(" ".join(errors))
     return [visible_rows_by_id[document_id] for document_id in normalized_document_ids]
+
+
+def resolve_fill_document_refs(connection: sqlite3.Connection, raw_doc_refs: list[str]) -> list[int]:
+    resolved_document_ids: list[int] = []
+    for raw_doc_ref in raw_doc_refs:
+        doc_ref = normalize_inline_whitespace(str(raw_doc_ref or ""))
+        if not doc_ref:
+            continue
+        if doc_ref.isdigit():
+            resolved_document_ids.append(int(doc_ref))
+            continue
+        rows = connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE control_number = ?
+            ORDER BY id ASC
+            """,
+            (doc_ref,),
+        ).fetchall()
+        if not rows:
+            raise RetrieverError(f"Unknown document reference: {doc_ref}")
+        if len(rows) > 1:
+            raise RetrieverError(f"Document reference '{doc_ref}' is ambiguous.")
+        resolved_document_ids.append(int(rows[0]["id"]))
+
+    fetch_visible_document_rows_by_ids(connection, resolved_document_ids)
+    return list(dict.fromkeys(resolved_document_ids))
 
 
 def fetch_attachment_parent_ids(
@@ -8963,18 +9470,70 @@ def build_parser() -> argparse.ArgumentParser:
     create_job_version_parser.add_argument("--aggregation-strategy", help="Optional aggregation strategy")
     create_job_version_parser.add_argument("--display-name", help="Optional display name override")
 
+    list_fields_parser = subparsers.add_parser("list-fields", help="List registered custom document fields")
+    list_fields_parser.add_argument("workspace", help="Workspace root path")
+    list_fields_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
     add_field_parser = subparsers.add_parser("add-field", help="Add a custom document field")
     add_field_parser.add_argument("workspace", help="Workspace root path")
     add_field_parser.add_argument("field_name", help="Field name")
     add_field_parser.add_argument("field_type", choices=sorted(REGISTRY_FIELD_TYPES), help="Field type")
     add_field_parser.add_argument("--instruction", help="Field extraction instruction")
 
-    promote_field_parser = subparsers.add_parser("promote-field-type", help="Promote a custom field type in place")
+    rename_field_parser = subparsers.add_parser("rename-field", help="Rename an existing custom field")
+    rename_field_parser.add_argument("workspace", help="Workspace root path")
+    rename_field_parser.add_argument("old_name", help="Existing custom field name")
+    rename_field_parser.add_argument("new_name", help="New custom field name")
+
+    delete_field_parser = subparsers.add_parser("delete-field", help="Delete an existing custom field")
+    delete_field_parser.add_argument("workspace", help="Workspace root path")
+    delete_field_parser.add_argument("field_name", help="Existing custom field name")
+    delete_field_parser.add_argument("--confirm", action="store_true", help="Confirm the irreversible delete")
+
+    describe_field_parser = subparsers.add_parser("describe-field", help="Set or clear a custom field description")
+    describe_field_parser.add_argument("workspace", help="Workspace root path")
+    describe_field_parser.add_argument("field_name", help="Existing custom field name")
+    describe_group = describe_field_parser.add_mutually_exclusive_group(required=True)
+    describe_group.add_argument("--text", help="Replacement description text")
+    describe_group.add_argument("--clear", action="store_true", help="Clear the existing description")
+
+    change_field_type_parser = subparsers.add_parser("change-field-type", help="Change a custom field type in place")
+    change_field_type_parser.add_argument("workspace", help="Workspace root path")
+    change_field_type_parser.add_argument("field_name", help="Existing custom field name")
+    change_field_type_parser.add_argument(
+        "target_field_type",
+        choices=sorted(REGISTRY_FIELD_TYPES),
+        help="Target field type",
+    )
+
+    promote_field_parser = subparsers.add_parser("promote-field-type", help=argparse.SUPPRESS)
     promote_field_parser.add_argument("workspace", help="Workspace root path")
     promote_field_parser.add_argument("field_name", help="Existing custom field name")
     promote_field_parser.add_argument("target_field_type", choices=("date",), help="Target field type")
 
-    set_field_parser = subparsers.add_parser("set-field", help="Set a field value on one document")
+    fill_field_parser = subparsers.add_parser("fill-field", help="Set or clear a field value on one or more documents")
+    fill_field_parser.add_argument("workspace", help="Workspace root path")
+    fill_field_parser.add_argument("--field", required=True, help="Field name")
+    fill_value_group = fill_field_parser.add_mutually_exclusive_group(required=True)
+    fill_value_group.add_argument("--value", help="Replacement field value")
+    fill_value_group.add_argument("--clear", action="store_true", help="Clear the field value")
+    add_scope_run_selector_arguments(fill_field_parser)
+    fill_field_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to update (repeatable)",
+    )
+    fill_field_parser.add_argument("--dry-run", action="store_true", help="Preview matching documents without writing")
+    fill_field_parser.add_argument("--confirm", action="store_true", help="Confirm bulk writes")
+
+    set_field_parser = subparsers.add_parser("set-field", help=argparse.SUPPRESS)
     set_field_parser.add_argument("workspace", help="Workspace root path")
     set_field_parser.add_argument("--doc-id", type=int, required=True, help="Document id")
     set_field_parser.add_argument("--field", required=True, help="Field name")
@@ -9660,11 +10219,57 @@ def main() -> int:
             )
             return 0
 
+        if args.command == "list-fields":
+            payload = list_fields(root)
+            if args.format == "table":
+                sys.stdout.write(render_list_fields_table(payload) + "\n")
+                sys.stdout.flush()
+                return 0
+            return emit_cli_payload("list-fields", payload)
+
         if args.command == "add-field":
             return emit_cli_payload("add-field", add_field(root, args.field_name, args.field_type, args.instruction))
 
+        if args.command == "rename-field":
+            return emit_cli_payload("rename-field", rename_field(root, args.old_name, args.new_name))
+
+        if args.command == "delete-field":
+            return emit_cli_payload("delete-field", delete_field(root, args.field_name, confirm=args.confirm))
+
+        if args.command == "describe-field":
+            return emit_cli_payload(
+                "describe-field",
+                describe_field(root, args.field_name, text=args.text, clear=args.clear),
+            )
+
+        if args.command == "change-field-type":
+            return emit_cli_payload(
+                "change-field-type",
+                change_field_type(root, args.field_name, args.target_field_type),
+            )
+
         if args.command == "promote-field-type":
             return emit_cli_payload("promote-field-type", promote_field_type(root, args.field_name, args.target_field_type))
+
+        if args.command == "fill-field":
+            return emit_cli_payload(
+                "fill-field",
+                fill_field(
+                    root,
+                    field_name=args.field,
+                    value=args.value,
+                    clear=args.clear,
+                    document_ids=args.document_ids,
+                    query=args.query,
+                    raw_bates=args.bates,
+                    raw_filters=args.filters,
+                    dataset_names=args.dataset_names,
+                    from_run_id=args.from_run_id,
+                    select_from_scope=args.select_from_scope,
+                    dry_run=args.dry_run,
+                    confirm=args.confirm,
+                ),
+            )
 
         if args.command == "set-field":
             return emit_cli_payload("set-field", set_field(root, args.doc_id, args.field, args.value))

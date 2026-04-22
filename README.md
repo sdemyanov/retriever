@@ -86,7 +86,7 @@ Retriever uses a small vocabulary that shows up in every section that follows. E
 
 **Preview / Preview panel.** The document viewer that opens when you click a result's title. Retriever uses the native renderer where possible and generates HTML or CSV previews where it needs to. The preview panel sits alongside the conversation so you can confirm a hit and move on.
 
-**Custom field.** A user-defined metadata field added with `add-field`. You can set values on individual documents by hand (`set-field`) or populate them in bulk through a processing job. Manual edits are locked against being overwritten by later automated passes unless you explicitly override them.
+**Custom field.** A user-defined metadata field added with `add-field` or `/field add`. You can set values on individual documents by hand with `fill-field --doc-id ...` or `/fill ... on ...`, or populate them in bulk through `/fill`, `fill-field`, or a processing job. Manual edits are locked against being overwritten by later automated passes unless you explicitly override them.
 
 **Job.** A structured processing operation applied to a set of documents. Jobs are how you extend Retriever beyond its default ingest behavior — examples include extracting an "issue tag" per document, OCRing scanned PDFs and writing the result back as the document's indexed text, or generating short descriptions of images so they become searchable.
 
@@ -114,7 +114,7 @@ When you want to be precise, you use slash commands. `/search`, `/filter`, `/sor
 
 Results render inline as a table. Each row's title is a link that opens the document in the preview panel alongside the conversation, so you can skim a hit, confirm it, and move to the next one without leaving the workflow. Native files preview natively where possible; Retriever generates HTML or CSV previews for types that need them.
 
-Skills are the other half of the form factor. A skill is a prewritten recipe Claude can follow for a specific Retriever operation — `ingest`, `doctor`, `search`, `bates`, `filter`, `scope`, `page`, `page-size`, `columns`, `sort`, `add-field`, `set-field`, `ingest-production`, `pst`, `run-job`, and others.
+Skills are the other half of the form factor. A skill is a prewritten recipe Claude can follow for a specific Retriever operation — `ingest`, `doctor`, `search`, `bates`, `filter`, `scope`, `page`, `page-size`, `columns`, `sort`, `field`, `fill`, `ingest-production`, `pst`, `run-job`, and others.
 
 The division of labor is worth understanding:
 
@@ -543,13 +543,14 @@ Examples:
 
 ```bash
 python3 .retriever/bin/retriever_tools.py add-field . privilege_status text --instruction "Privilege designation"
-python3 .retriever/bin/retriever_tools.py set-field . --doc-id 42 --field privilege_status --value "privileged"
-python3 .retriever/bin/retriever_tools.py set-field . --doc-id 42 --field title --value "Board Minutes"
+python3 .retriever/bin/retriever_tools.py fill-field . --field privilege_status --value privileged --doc-id 42
+python3 .retriever/bin/retriever_tools.py fill-field . --field title --value "Board Minutes" --doc-id 42
+python3 .retriever/bin/retriever_tools.py slash . /fill privilege_status privileged on 42
 ```
 
 Important detail:
 
-- Manual `set-field` edits are locked and preserved on later ingest or review passes until you explicitly overwrite them.
+- Manual `fill-field` / `/fill` edits are locked and preserved on later ingest or review passes until you explicitly overwrite them.
 
 ### 8. Run structured processing jobs
 
@@ -726,7 +727,7 @@ Effective filter:
 You can filter on:
 
 - Built-in fields such as `title`, `subject`, `author`, `participants`, `content_type`, `file_name`, `file_type`, `file_size`, `page_count`, `custodian`, `date_created`, `date_modified`, and `control_number`.
-- Custom fields added with `add-field`.
+- Custom fields added with `add-field` or `/field add`.
 - Virtual fields such as `dataset_name`, `production_name`, `is_attachment`, and `has_attachments`.
 
 Prefer canonical field names such as `date_created` instead of ad hoc variants.
@@ -845,7 +846,7 @@ python3 .retriever/bin/retriever_tools.py export-archive . review.zip --select-f
 
 ```bash
 python3 .retriever/bin/retriever_tools.py add-field . privilege_status text
-python3 .retriever/bin/retriever_tools.py set-field . --doc-id 42 --field privilege_status --value privileged
+python3 .retriever/bin/retriever_tools.py fill-field . --field privilege_status --value privileged --doc-id 42
 python3 .retriever/bin/retriever_tools.py merge-into-conversation . --doc-id 42 --target-doc-id 17
 python3 .retriever/bin/retriever_tools.py split-from-conversation . --doc-id 42
 python3 .retriever/bin/retriever_tools.py clear-conversation-assignment . --doc-id 42
