@@ -4786,6 +4786,97 @@ def export_preview_unit_file_name(unit: dict[str, object]) -> str:
     return f"document-{int(unit['documents'][0]['id']):08d}.html"
 
 
+def export_preview_document_file_name(document: dict[str, object]) -> str:
+    return f"document-{int(document['id']):08d}.html"
+
+
+def build_export_preview_document_html(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    unit: dict[str, object],
+    document: dict[str, object],
+    document_output_path: Path,
+    unit_output_path: Path,
+) -> str:
+    document_id = int(document["id"])
+    document_heading = conversation_preview_document_heading(document) or f"Document {document_id}"
+    content_type = normalize_whitespace(str(document.get("content_type") or "")).lower()
+    unit_documents = list(unit["documents"])
+    if content_type == "email":
+        conversation_row = None
+        conversation_documents = None
+        position_index = None
+        thread_link_href = None
+        if str(unit["unit_kind"]) == "email_conversation" and len(unit_documents) > 1:
+            conversation_row = {"display_name": str(unit["title"])}
+            conversation_documents = unit_documents
+            email_document_ids = [
+                int(item["id"])
+                for item in unit_documents
+                if normalize_whitespace(str(item.get("content_type") or "")).lower() == "email"
+            ]
+            if document_id in email_document_ids:
+                position_index = email_document_ids.index(document_id) + 1
+            thread_link_href = relative_preview_href(unit_output_path, document_output_path)
+        body_html = (
+            str(document.get("standalone_preview_body_html"))
+            if isinstance(document.get("standalone_preview_body_html"), str)
+            and str(document.get("standalone_preview_body_html")).strip()
+            else None
+        )
+        return build_email_message_preview_html(
+            document,
+            body_html=body_html,
+            conversation_row=conversation_row,
+            conversation_documents=conversation_documents,
+            position_index=position_index,
+            thread_link_href=thread_link_href,
+        )
+
+    attachment_links = (
+        conversation_attachment_links_by_document_id(
+            connection,
+            paths,
+            segment_preview_path=document_output_path,
+            documents=[document],
+        ).get(document_id)
+        or []
+    )
+    section_html = render_conversation_document_section(
+        document,
+        current_segment_href=document_output_path.name,
+        doc_target_hrefs={document_id: f"#{conversation_preview_anchor(document_id)}"},
+        attachment_links_by_document_id={document_id: attachment_links} if attachment_links else None,
+    )
+    nav_links = ['<a href="../index.html">Contents</a>']
+    if len(unit_documents) > 1:
+        nav_label = "Thread" if str(unit["unit_kind"]) == "email_conversation" else "Group"
+        nav_links.append(
+            f'<a href="{html.escape(relative_preview_href(unit_output_path, document_output_path))}">{html.escape(nav_label)}</a>'
+        )
+    headers = {
+        "Preview": document_heading,
+        "Type": conversation_preview_document_kind(document),
+    }
+    if len(unit_documents) > 1:
+        headers["Group"] = str(unit["title"])
+    return build_html_preview(
+        headers,
+        body_html=(
+            "<main>"
+            '<div class="conversation-nav">'
+            f'<div class="conversation-nav-links">{"".join(nav_links)}</div>'
+            "</div>"
+            f"{section_html}"
+            "</main>"
+        ),
+        document_title=document_heading,
+        head_html=build_conversation_preview_head_html(),
+        heading=document_heading,
+    )
+
+
 def build_export_preview_unit_html(
     unit: dict[str, object],
     *,
@@ -4897,6 +4988,11 @@ def cleanup_previous_export_preview_outputs(output_dir: Path) -> None:
     for unit in manifest_payload.get("units", []):
         if isinstance(unit, dict):
             value = unit.get("output_rel_path")
+            if isinstance(value, str) and value:
+                relative_paths.add(value)
+    for document_target in manifest_payload.get("document_targets", []):
+        if isinstance(document_target, dict):
+            value = document_target.get("output_rel_path")
             if isinstance(value, str) and value:
                 relative_paths.add(value)
     relative_paths.add("manifest.json")
@@ -6073,6 +6169,8 @@ def export_previews(
         cleanup_previous_export_preview_outputs(output_dir)
         units_dir = output_dir / "units"
         units_dir.mkdir(parents=True, exist_ok=True)
+        documents_dir = output_dir / "documents"
+        documents_dir.mkdir(parents=True, exist_ok=True)
 
         units = build_export_preview_units(connection, paths, rows)
         unit_payloads: list[dict[str, object]] = []
@@ -6103,15 +6201,38 @@ def export_previews(
                 document_id = int(document["id"])
                 if document_id not in unit_payload["selected_document_ids"]:
                     continue
+                target_output_path = unit_output_path
+                target_output_rel_path = unit_output_rel_path.as_posix()
+                target_href = unit_output_rel_path.as_posix()
+                if str(unit["unit_kind"]) == "email_conversation" and len(unit["documents"]) > 1:
+                    document_file_name = export_preview_document_file_name(document)
+                    document_output_path = documents_dir / document_file_name
+                    document_output_path.write_text(
+                        build_export_preview_document_html(
+                            connection,
+                            paths,
+                            unit=unit,
+                            document=document,
+                            document_output_path=document_output_path,
+                            unit_output_path=unit_output_path,
+                        ),
+                        encoding="utf-8",
+                    )
+                    document_output_rel_path = Path("documents") / document_file_name
+                    target_output_path = document_output_path
+                    target_output_rel_path = document_output_rel_path.as_posix()
+                    target_href = document_output_rel_path.as_posix()
                 document_targets_by_id[document_id] = {
                     "document_id": document_id,
                     "title": conversation_preview_document_heading(document),
-                    "output_path": str(unit_output_path),
-                    "output_rel_path": unit_output_rel_path.as_posix(),
+                    "output_path": str(target_output_path),
+                    "output_rel_path": target_output_rel_path,
+                    "unit_output_path": str(unit_output_path),
+                    "unit_output_rel_path": unit_output_rel_path.as_posix(),
                     "file_output_path": str(unit_output_path),
                     "file_output_rel_path": unit_output_rel_path.as_posix(),
                     "target_fragment": conversation_preview_anchor(document_id),
-                    "href": f"{unit_output_rel_path.as_posix()}#{conversation_preview_anchor(document_id)}",
+                    "href": target_href,
                 }
 
         index_path = output_dir / "index.html"
