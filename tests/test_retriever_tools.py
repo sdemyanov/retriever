@@ -6450,15 +6450,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(self.run_cli("slash", str(self.root), "/dataset", "Review Set")[0], 0)
         self.assertEqual(self.run_cli("slash", str(self.root), "/scope", "save", "review")[0], 0)
 
-        search_show_exit, search_show_payload, _, _ = self.run_cli("slash", str(self.root), "/search")
+        search_show_exit, search_show_stdout, search_show_stderr = self.run_cli_raw("slash", str(self.root), "/search")
         scope_show_exit, scope_show_stdout, scope_show_stderr = self.run_cli_raw("slash", str(self.root), "/scope")
         scope_list_exit, scope_list_stdout, scope_list_stderr = self.run_cli_raw("slash", str(self.root), "/scope", "list")
         dataset_show_exit, dataset_show_stdout, dataset_show_stderr = self.run_cli_raw("slash", str(self.root), "/dataset")
         dataset_list_exit, dataset_list_stdout, dataset_list_stderr = self.run_cli_raw("slash", str(self.root), "/dataset", "list")
 
         self.assertEqual(search_show_exit, 0)
-        self.assertIsNotNone(search_show_payload)
-        self.assertEqual(search_show_payload["keyword"], "alpha")
+        self.assertEqual(search_show_stderr, "")
+        self.assertEqual(search_show_stdout.strip(), "Search: alpha")
 
         self.assertEqual(scope_show_exit, 0)
         self.assertEqual(scope_show_stderr, "")
@@ -6577,26 +6577,26 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        search_show_exit, search_show_payload, _, _ = self.run_cli("slash", str(self.root), "/search")
-        filter_show_exit, filter_show_payload, _, _ = self.run_cli("slash", str(self.root), "/filter")
-        bates_show_exit, bates_show_payload, _, _ = self.run_cli("slash", str(self.root), "/bates")
-        from_run_show_exit, from_run_show_payload, _, _ = self.run_cli("slash", str(self.root), "/from-run")
+        search_show_exit, search_show_stdout, search_show_stderr = self.run_cli_raw("slash", str(self.root), "/search")
+        filter_show_exit, filter_show_stdout, filter_show_stderr = self.run_cli_raw("slash", str(self.root), "/filter")
+        bates_show_exit, bates_show_stdout, bates_show_stderr = self.run_cli_raw("slash", str(self.root), "/bates")
+        from_run_show_exit, from_run_show_stdout, from_run_show_stderr = self.run_cli_raw("slash", str(self.root), "/from-run")
 
         self.assertEqual(search_show_exit, 0)
-        self.assertIsNotNone(search_show_payload)
-        self.assertEqual(search_show_payload["keyword"], "alpha")
+        self.assertEqual(search_show_stderr, "")
+        self.assertEqual(search_show_stdout.strip(), "Search: alpha")
 
         self.assertEqual(filter_show_exit, 0)
-        self.assertIsNotNone(filter_show_payload)
-        self.assertEqual(filter_show_payload["filter"], "content_type = 'Email'")
+        self.assertEqual(filter_show_stderr, "")
+        self.assertEqual(filter_show_stdout.strip(), "Filter: content_type = 'Email'")
 
         self.assertEqual(bates_show_exit, 0)
-        self.assertIsNotNone(bates_show_payload)
-        self.assertEqual(bates_show_payload["bates"], {"begin": "ABC0001", "end": "ABC0010"})
+        self.assertEqual(bates_show_stderr, "")
+        self.assertEqual(bates_show_stdout.strip(), "Bates: ABC0001-ABC0010")
 
         self.assertEqual(from_run_show_exit, 0)
-        self.assertIsNotNone(from_run_show_payload)
-        self.assertEqual(from_run_show_payload["from_run_id"], 42)
+        self.assertEqual(from_run_show_stderr, "")
+        self.assertEqual(from_run_show_stdout.strip(), "From run: 42")
 
     def test_slash_sort_and_paging_persist_browsing_state(self) -> None:
         for index in range(25):
@@ -6617,16 +6617,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(session_payload["browsing"]["sort"], [["file_name", "asc"]])
         self.assertEqual(session_payload["browsing"]["offset"], 0)
 
-        next_exit, next_payload, _, _ = self.run_cli("slash", str(self.root), "/next")
+        next_exit, next_stdout, next_stderr = self.run_cli_raw("slash", str(self.root), "/next")
         page_exit, page_payload, _, _ = self.run_cli("slash", str(self.root), "/page", "last")
-        previous_exit, previous_payload, _, _ = self.run_cli("slash", str(self.root), "/previous")
+        previous_exit, previous_stdout, previous_stderr = self.run_cli_raw("slash", str(self.root), "/previous")
         default_exit, default_payload, _, _ = self.run_cli("slash", str(self.root), "/sort", "default")
 
         self.assertEqual(next_exit, 0)
-        self.assertIsNotNone(next_payload)
-        self.assertEqual(next_payload["page"], 2)
-        self.assertEqual(next_payload["offset"], 10)
-        self.assertEqual(next_payload["results"][0]["file_name"], "doc-10.txt")
+        self.assertEqual(next_stderr, "")
+        self.assertIn("Sort: file_name asc", next_stdout)
+        self.assertIn("Page: 2 of 3  (docs 11-20 of 25)", next_stdout)
+        self.assertIn("doc-10.txt", next_stdout)
 
         self.assertEqual(page_exit, 0)
         self.assertIsNotNone(page_payload)
@@ -6634,9 +6634,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(page_payload["offset"], 20)
 
         self.assertEqual(previous_exit, 0)
-        self.assertIsNotNone(previous_payload)
-        self.assertEqual(previous_payload["page"], 2)
-        self.assertEqual(previous_payload["offset"], 10)
+        self.assertEqual(previous_stderr, "")
+        self.assertIn("Sort: file_name asc", previous_stdout)
+        self.assertIn("Page: 2 of 3  (docs 11-20 of 25)", previous_stdout)
+        self.assertIn("doc-10.txt", previous_stdout)
 
         self.assertEqual(default_exit, 0)
         self.assertIsNotNone(default_payload)
@@ -6779,7 +6780,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(ingest_result["new"], 12)
 
         size_exit, size_payload, _, _ = self.run_cli("slash", str(self.root), "/page-size 5")
-        next_exit, next_payload, _, _ = self.run_cli("slash", str(self.root), "/next")
+        next_exit, next_stdout, next_stderr = self.run_cli_raw("slash", str(self.root), "/next")
 
         self.assertEqual(size_exit, 0)
         self.assertIsNotNone(size_payload)
@@ -6791,10 +6792,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(session_payload["display"]["page_size"], 5)
 
         self.assertEqual(next_exit, 0)
-        self.assertIsNotNone(next_payload)
-        self.assertEqual(next_payload["offset"], 5)
-        self.assertEqual(next_payload["per_page"], 5)
-        self.assertEqual(next_payload["page"], 2)
+        self.assertEqual(next_stderr, "")
+        self.assertIn("Page: 2 of 3  (docs 6-10 of 12)", next_stdout)
+        self.assertIn("doc-05.txt", next_stdout)
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["display"]["page_size"], 5)
+        self.assertEqual(session_payload["browsing"]["offset"], 5)
 
     def test_view_search_persists_browse_page_size_for_followup_slash_navigation(self) -> None:
         for index in range(25):
@@ -6813,7 +6816,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "--per-page",
             "5",
         )
-        next_exit, next_payload, _, _ = self.run_cli("slash", str(self.root), "/next")
+        next_exit, next_stdout, next_stderr = self.run_cli_raw("slash", str(self.root), "/next")
 
         self.assertEqual(search_exit, 0)
         self.assertIsNotNone(search_payload)
@@ -6826,11 +6829,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(session_payload["scope"]["keyword"], "document")
 
         self.assertEqual(next_exit, 0)
-        self.assertIsNotNone(next_payload)
-        self.assertEqual(next_payload["offset"], 5)
-        self.assertEqual(next_payload["per_page"], 5)
-        self.assertEqual(next_payload["page"], 2)
-        self.assertEqual(len(next_payload["results"]), 5)
+        self.assertEqual(next_stderr, "")
+        self.assertIn("Page: 2 of 5  (docs 6-10 of 25)", next_stdout)
+        self.assertIn("doc-05.txt", next_stdout)
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["display"]["page_size"], 5)
+        self.assertEqual(session_payload["scope"]["keyword"], "document")
+        self.assertEqual(session_payload["browsing"]["offset"], 5)
 
     def test_slash_search_drops_stale_display_columns_with_warning(self) -> None:
         (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")

@@ -10,19 +10,25 @@ metadata:
 
 # Retriever /from-run
 
-This skill is a thin visible alias for Retriever's internal slash-command browse surface.
+Use this skill for `/from-run`, `/from-run <run-id>`, and `/from-run clear`.
 
-## Load order
+## Read-only fast path
+
+For the exact read-only form `/from-run`:
+
+- Do not read [../search/SKILL.md](../search/SKILL.md).
+- Do not read [../run-job/SKILL.md](../run-job/SKILL.md) unless the command fails.
+- Run exactly one Bash command from the workspace root:
+  - `/from-run`: `python3 .retriever/bin/retriever_tools.py slash . /from-run`
+- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+- Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
+
+## Other forms
+
+For `/from-run <run-id>` and `/from-run clear`:
 
 1. Read [../search/SKILL.md](../search/SKILL.md).
 2. Read [../run-job/SKILL.md](../run-job/SKILL.md) only if run-id semantics are unclear.
-
-## Behavior
-
-- Treat this skill as the slash command `/from-run`.
-- Supported forms:
-  - `/from-run` shows the active run selector.
-  - `/from-run <run-id>` scopes the browse surface to results from that run.
-  - `/from-run clear` clears the active run selector.
-- Use the run id exactly as provided unless the user asks for help finding it.
-- Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion around the slash-command result.
+3. Treat this skill as the slash command `/from-run`.
+4. Use the run id exactly as provided unless the user asks for help finding it.
+5. Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.
