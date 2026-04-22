@@ -248,18 +248,21 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 for signature in production_signatures
             ]
 
-        existing_rows = connection.execute(
+        existing_occurrence_rows = connection.execute(
             """
             SELECT *
-            FROM documents
-            WHERE parent_document_id IS NULL
-              AND COALESCE(source_kind, ?) = ?
+            FROM document_occurrences
+            WHERE parent_occurrence_id IS NULL
+              AND source_kind = ?
+              AND lifecycle_status != 'deleted'
             """
-        , (FILESYSTEM_SOURCE_KIND, FILESYSTEM_SOURCE_KIND)).fetchall()
-        existing_rows = [row for row in existing_rows if str(row["rel_path"]) not in gmail_owned_rel_paths]
-        existing_by_rel = {row["rel_path"]: row for row in existing_rows}
+        , (FILESYSTEM_SOURCE_KIND,)).fetchall()
+        existing_occurrence_rows = [
+            row for row in existing_occurrence_rows if str(row["rel_path"]) not in gmail_owned_rel_paths
+        ]
+        existing_by_rel = {str(row["rel_path"]): row for row in existing_occurrence_rows}
         unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
-        for row in existing_rows:
+        for row in existing_occurrence_rows:
             if row["rel_path"] not in scanned_rel_paths and row["file_hash"]:
                 unseen_existing_by_hash[row["file_hash"]].append(row)
 
@@ -294,12 +297,18 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     stats["failed"] += 1
                     failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
                     continue
-            existing_row = existing_by_rel.get(rel_path)
+            existing_occurrence_row = existing_by_rel.get(rel_path)
             action = "new"
-            if existing_row is not None:
+            if existing_occurrence_row is not None:
+                existing_row = connection.execute(
+                    "SELECT * FROM documents WHERE id = ?",
+                    (existing_occurrence_row["document_id"],),
+                ).fetchone()
+                if existing_row is None:
+                    raise RetrieverError(f"Occurrence {existing_occurrence_row['id']} points at a missing document.")
                 if (
-                    existing_row["file_hash"] == file_hash
-                    and existing_row["lifecycle_status"] == "active"
+                    existing_occurrence_row["file_hash"] == file_hash
+                    and existing_occurrence_row["lifecycle_status"] == ACTIVE_OCCURRENCE_STATUS
                     and document_row_has_seeded_text_revisions(existing_row)
                     and document_row_has_email_threading(connection, existing_row)
                 ):
@@ -308,7 +317,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     try:
                         mark_seen_without_reingest(
                             connection,
-                            existing_row,
+                            existing_occurrence_row,
                             dataset_id=filesystem_dataset_id,
                             dataset_source_id=filesystem_dataset_source_id,
                         )
@@ -320,14 +329,105 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                         raise
                 action = "updated"
             else:
+                existing_row = None
                 rename_candidates = unseen_existing_by_hash.get(file_hash) or []
                 if rename_candidates:
-                    existing_row = rename_candidates.pop(0)
+                    existing_occurrence_row = rename_candidates.pop(0)
                     action = "renamed"
+
+            exact_duplicate_document = None
+            if existing_occurrence_row is None and file_hash:
+                exact_duplicate_document = get_document_by_dedupe_key(
+                    connection,
+                    basis="file_hash",
+                    key_value=str(file_hash),
+                )
+                if exact_duplicate_document is not None:
+                    filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
+                    connection.execute("BEGIN")
+                    try:
+                        now = utc_now()
+                        duplicate_occurrence_id = attach_occurrence_to_existing_document(
+                            connection,
+                            exact_duplicate_document,
+                            existing_occurrence_row=None,
+                            rel_path=rel_path,
+                            file_name=path.name,
+                            file_type=file_type,
+                            file_size=path.stat().st_size,
+                            file_hash=str(file_hash),
+                            source_kind=FILESYSTEM_SOURCE_KIND,
+                            source_rel_path=rel_path,
+                            source_item_id=None,
+                            source_folder_path=None,
+                            custodian=infer_source_custodian(
+                                source_kind=FILESYSTEM_SOURCE_KIND,
+                                source_rel_path=rel_path,
+                            ),
+                            occurrence_control_number=str(exact_duplicate_document["control_number"] or ""),
+                            ingested_at=now,
+                            last_seen_at=now,
+                            updated_at=now,
+                        )
+                        clone_duplicate_family_child_occurrences(
+                            connection,
+                            paths,
+                            parent_document_id=int(exact_duplicate_document["id"]),
+                            parent_occurrence_id=duplicate_occurrence_id,
+                            parent_rel_path=rel_path,
+                            custodian=infer_source_custodian(
+                                source_kind=FILESYSTEM_SOURCE_KIND,
+                                source_rel_path=rel_path,
+                            ),
+                            ingested_at=now,
+                            last_seen_at=now,
+                            updated_at=now,
+                        )
+                        ensure_dataset_document_membership(
+                            connection,
+                            dataset_id=filesystem_dataset_id,
+                            document_id=int(exact_duplicate_document["id"]),
+                            dataset_source_id=filesystem_dataset_source_id,
+                        )
+                        connection.commit()
+                        stats["new"] += 1
+                        continue
+                    except Exception:
+                        connection.rollback()
+                        raise
 
             filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
             connection.execute("BEGIN")
             try:
+                existing_row = None
+                reused_existing_occurrence_row = existing_occurrence_row
+                superseded_document_id: int | None = None
+                if existing_occurrence_row is not None:
+                    existing_row = connection.execute(
+                        "SELECT * FROM documents WHERE id = ?",
+                        (existing_occurrence_row["document_id"],),
+                    ).fetchone()
+                    if existing_row is None:
+                        raise RetrieverError(f"Occurrence {existing_occurrence_row['id']} points at a missing document.")
+                    active_occurrence_rows = active_occurrence_rows_for_document(connection, int(existing_row["id"]))
+                    if (
+                        action == "updated"
+                        and len(active_occurrence_rows) > 1
+                        and existing_occurrence_row["file_hash"] != file_hash
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE document_occurrences
+                            SET lifecycle_status = 'superseded', updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (utc_now(), existing_occurrence_row["id"]),
+                        )
+                        superseded_document_id = int(existing_row["id"])
+                        refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
+                        refresh_document_from_occurrences(connection, superseded_document_id)
+                        existing_row = None
+                        reused_existing_occurrence_row = None
                 extracted_payload = extract_document(path, include_attachments=True)
                 attachments = list(extracted_payload.get("attachments", []))
                 extracted_payload.pop("attachments", None)
@@ -351,6 +451,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     path,
                     existing_row,
                     extracted,
+                    existing_occurrence_row=reused_existing_occurrence_row,
                     file_name=path.name,
                     parent_document_id=None,
                     control_number=control_number,
@@ -390,6 +491,9 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                     attachments,
                     [(filesystem_dataset_id, filesystem_dataset_source_id)],
                 )
+                if superseded_document_id is not None and superseded_document_id != document_id:
+                    refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
+                    refresh_document_from_occurrences(connection, superseded_document_id)
                 connection.commit()
                 stats[action] += 1
             except Exception as exc:
@@ -544,6 +648,953 @@ def lock_field(connection: sqlite3.Connection, document_id: int, field_name: str
             (json.dumps(locks), utc_now(), document_id),
         )
     return locks
+
+
+def row_to_plain_dict(row: sqlite3.Row | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    return {key: row[key] for key in row.keys()}
+
+
+def normalize_merge_field_value(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = normalize_whitespace(value)
+        return normalized or None
+    return value
+
+
+def serialize_merge_field_value(value: object) -> object:
+    normalized = normalize_merge_field_value(value)
+    if normalized is None:
+        return None
+    if isinstance(normalized, (str, int, float, bool)):
+        return normalized
+    return json.dumps(normalized, ensure_ascii=True, sort_keys=True)
+
+
+def merge_field_value_key(value: object) -> str | None:
+    normalized = normalize_merge_field_value(value)
+    if normalized is None:
+        return None
+    return json.dumps(normalized, ensure_ascii=True, sort_keys=True)
+
+
+def reconcile_custom_field_names(connection: sqlite3.Connection) -> list[str]:
+    document_columns = table_columns(connection, "documents")
+    rows = connection.execute(
+        """
+        SELECT field_name
+        FROM custom_fields_registry
+        ORDER BY field_name ASC
+        """
+    ).fetchall()
+    return [str(row["field_name"]) for row in rows if str(row["field_name"]) in document_columns]
+
+
+def document_has_non_deleted_children(connection: sqlite3.Connection, document_id: int) -> list[int]:
+    rows = connection.execute(
+        """
+        SELECT id
+        FROM documents
+        WHERE parent_document_id = ?
+          AND lifecycle_status != 'deleted'
+        ORDER BY id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def document_text_length(connection: sqlite3.Connection, document_id: int) -> int:
+    row = connection.execute(
+        """
+        SELECT COALESCE(MAX(char_end), 0) AS text_length
+        FROM document_chunks
+        WHERE document_id = ?
+        """,
+        (document_id,),
+    ).fetchone()
+    if row is None:
+        return 0
+    return int(row["text_length"] or 0)
+
+
+def document_active_occurrence_count(connection: sqlite3.Connection, document_id: int) -> int:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS occurrence_count
+        FROM document_occurrences
+        WHERE document_id = ?
+          AND lifecycle_status = ?
+        """,
+        (document_id, ACTIVE_OCCURRENCE_STATUS),
+    ).fetchone()
+    if row is None:
+        return 0
+    return int(row["occurrence_count"] or 0)
+
+
+def document_earliest_active_occurrence_ingested_at(
+    connection: sqlite3.Connection,
+    document_id: int,
+) -> datetime:
+    row = connection.execute(
+        """
+        SELECT MIN(ingested_at) AS earliest_ingested_at
+        FROM document_occurrences
+        WHERE document_id = ?
+          AND lifecycle_status = ?
+        """,
+        (document_id, ACTIVE_OCCURRENCE_STATUS),
+    ).fetchone()
+    parsed = parse_utc_timestamp(row["earliest_ingested_at"]) if row is not None else None
+    return parsed or datetime.max.replace(tzinfo=timezone.utc)
+
+
+def document_canonical_field_count(row: sqlite3.Row | dict[str, object]) -> int:
+    field_names = [
+        "author",
+        "content_type",
+        "custodian",
+        "date_created",
+        "date_modified",
+        "page_count",
+        "participants",
+        "recipients",
+        "subject",
+        "title",
+    ]
+    return sum(1 for field_name in field_names if normalize_merge_field_value(row[field_name]) is not None)
+
+
+def collect_distinct_document_field_values(
+    document_rows: list[sqlite3.Row],
+    field_name: str,
+) -> list[dict[str, object]]:
+    distinct_values: dict[str, dict[str, object]] = {}
+    for row in document_rows:
+        value = normalize_merge_field_value(row[field_name])
+        if value is None:
+            continue
+        value_key = merge_field_value_key(value)
+        assert value_key is not None
+        entry = distinct_values.setdefault(
+            value_key,
+            {
+                "value": value,
+                "document_ids": [],
+                "locked_document_ids": [],
+            },
+        )
+        entry["document_ids"].append(int(row["id"]))
+        if field_name in normalize_string_list(row[MANUAL_FIELD_LOCKS_COLUMN]):
+            entry["locked_document_ids"].append(int(row["id"]))
+    return list(distinct_values.values())
+
+
+def choose_reconcile_survivor(
+    connection: sqlite3.Connection,
+    document_rows: list[sqlite3.Row],
+) -> sqlite3.Row:
+    ranked_rows = sorted(
+        document_rows,
+        key=lambda row: (
+            text_status_priority(row["text_status"]),
+            -document_canonical_field_count(row),
+            -document_text_length(connection, int(row["id"])),
+            -document_active_occurrence_count(connection, int(row["id"])),
+            document_earliest_active_occurrence_ingested_at(connection, int(row["id"])),
+            int(row["id"]),
+        ),
+    )
+    return ranked_rows[0]
+
+
+def document_artifact_counts(connection: sqlite3.Connection, document_id: int) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for table_name in (
+        "document_chunks",
+        "chunks_fts",
+        "document_previews",
+        "document_source_parts",
+        "documents_fts",
+        "text_revisions",
+    ):
+        row = connection.execute(
+            f"SELECT COUNT(*) AS row_count FROM {table_name} WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        counts[table_name] = int(row["row_count"] or 0) if row is not None else 0
+    return counts
+
+
+def document_merge_snapshot(connection: sqlite3.Connection, document_id: int) -> dict[str, object]:
+    document_row = connection.execute(
+        "SELECT * FROM documents WHERE id = ?",
+        (document_id,),
+    ).fetchone()
+    occurrence_rows = connection.execute(
+        """
+        SELECT *
+        FROM document_occurrences
+        WHERE document_id = ?
+        ORDER BY id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    dataset_rows = connection.execute(
+        """
+        SELECT *
+        FROM dataset_documents
+        WHERE document_id = ?
+        ORDER BY dataset_id ASC, COALESCE(dataset_source_id, 0) ASC, id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    alias_rows = connection.execute(
+        """
+        SELECT *
+        FROM document_control_number_aliases
+        WHERE document_id = ?
+        ORDER BY id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    text_revision_rows = connection.execute(
+        """
+        SELECT *
+        FROM text_revisions
+        WHERE document_id = ?
+        ORDER BY id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "document": row_to_plain_dict(document_row),
+        "occurrences": [row_to_plain_dict(row) for row in occurrence_rows],
+        "dataset_memberships": [row_to_plain_dict(row) for row in dataset_rows],
+        "control_number_aliases": [row_to_plain_dict(row) for row in alias_rows],
+        "text_revisions": [row_to_plain_dict(row) for row in text_revision_rows],
+    }
+
+
+def insert_document_merge_event(
+    connection: sqlite3.Connection,
+    *,
+    survivor_document_id: int,
+    loser_document_id: int,
+    merge_basis: str,
+    pre_merge_survivor_snapshot: dict[str, object],
+    pre_merge_loser_snapshot: dict[str, object],
+    artifact_counts: dict[str, object],
+) -> int:
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO document_merge_events (
+          survivor_document_id, loser_document_id, merge_basis, actor, schema_version,
+          pre_merge_survivor_json, pre_merge_loser_json, artifact_counts_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            survivor_document_id,
+            loser_document_id,
+            merge_basis,
+            "reconcile-duplicates",
+            SCHEMA_VERSION,
+            json.dumps(pre_merge_survivor_snapshot, ensure_ascii=True, sort_keys=True),
+            json.dumps(pre_merge_loser_snapshot, ensure_ascii=True, sort_keys=True),
+            json.dumps(artifact_counts, ensure_ascii=True, sort_keys=True),
+            now,
+        ),
+    )
+    return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def insert_document_field_conflicts(
+    connection: sqlite3.Connection,
+    *,
+    merge_event_id: int,
+    survivor_document_id: int,
+    final_survivor_row: sqlite3.Row,
+    pre_merge_survivor_row: sqlite3.Row,
+    pre_merge_loser_row: sqlite3.Row,
+    custom_field_names: list[str],
+) -> None:
+    tracked_fields = sorted(set(custom_field_names) | set(EDITABLE_BUILTIN_FIELDS))
+    rows_to_insert: list[tuple[int, int, str, object, object, str, str]] = []
+    now = utc_now()
+    for field_name in tracked_fields:
+        pre_survivor_value = normalize_merge_field_value(pre_merge_survivor_row[field_name])
+        loser_value = normalize_merge_field_value(pre_merge_loser_row[field_name])
+        if pre_survivor_value == loser_value:
+            continue
+        final_value = normalize_merge_field_value(final_survivor_row[field_name])
+        if final_value == loser_value and loser_value is not None:
+            resolution = "adopted_loser"
+        elif final_value == pre_survivor_value:
+            resolution = "kept_survivor"
+        else:
+            resolution = "recomputed"
+        rows_to_insert.append(
+            (
+                merge_event_id,
+                survivor_document_id,
+                field_name,
+                serialize_merge_field_value(pre_survivor_value),
+                serialize_merge_field_value(loser_value),
+                resolution,
+                now,
+            )
+        )
+    if rows_to_insert:
+        connection.executemany(
+            """
+            INSERT INTO document_field_conflicts (
+              merge_event_id, document_id, field_name, survivor_value, loser_value, resolution, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows_to_insert,
+        )
+
+
+def tombstone_rel_path_for_merged_document(document_id: int) -> str:
+    return (Path(".retriever") / "merged" / f"{document_id}.merged").as_posix()
+
+
+def active_child_rows_for_parent_document(
+    connection: sqlite3.Connection,
+    parent_document_id: int,
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE parent_document_id = ?
+          AND lifecycle_status = 'active'
+        ORDER BY id ASC
+        """,
+        (parent_document_id,),
+    ).fetchall()
+
+
+def family_child_signature_payload(row: sqlite3.Row) -> dict[str, object]:
+    canonical_kind = normalize_whitespace(str(row["canonical_kind"] or "")).lower()
+    return {
+        "child_document_kind": normalize_whitespace(str(row["child_document_kind"] or "")).lower() or None,
+        "file_name": normalize_whitespace(str(row["file_name"] or "")).lower() or None,
+        "content_hash": normalize_whitespace(str(row["content_hash"] or "")) or None,
+        "file_hash": normalize_whitespace(str(row["file_hash"] or "")) or None,
+        "content_type": normalize_whitespace(str(row["content_type"] or "")) or None,
+        "canonical_kind": canonical_kind if canonical_kind not in {"", "unknown"} else None,
+    }
+
+
+def family_child_signature_key(row: sqlite3.Row) -> str:
+    return sha256_json_value(family_child_signature_payload(row))
+
+
+def document_family_descriptor(
+    connection: sqlite3.Connection,
+    document_row: sqlite3.Row,
+) -> dict[str, object]:
+    child_rows = active_child_rows_for_parent_document(connection, int(document_row["id"]))
+    ordered_children = sorted(
+        child_rows,
+        key=lambda row: (
+            family_child_signature_key(row),
+            int(row["id"]),
+        ),
+    )
+    child_slot_keys = [family_child_signature_key(row) for row in ordered_children]
+    return {
+        "document_id": int(document_row["id"]),
+        "fingerprint": sha256_json_value({"child_slots": child_slot_keys}),
+        "child_rows": ordered_children,
+        "child_slot_keys": child_slot_keys,
+    }
+
+
+def survivor_selection_payload(
+    connection: sqlite3.Connection,
+    survivor_row: sqlite3.Row,
+    *,
+    rule: str,
+) -> dict[str, object]:
+    survivor_id = int(survivor_row["id"])
+    return {
+        "rule": rule,
+        "text_status": survivor_row["text_status"],
+        "canonical_field_count": document_canonical_field_count(survivor_row),
+        "text_length": document_text_length(connection, survivor_id),
+        "active_occurrence_count": document_active_occurrence_count(connection, survivor_id),
+        "earliest_active_ingested_at": format_utc_timestamp(
+            document_earliest_active_occurrence_ingested_at(connection, survivor_id)
+        ),
+    }
+
+
+def evaluate_document_merge_group(
+    connection: sqlite3.Connection,
+    document_rows: list[sqlite3.Row],
+    *,
+    custom_fields: list[str],
+    forced_survivor_document_id: int | None = None,
+    selection_rule: str | None = None,
+) -> dict[str, object]:
+    if forced_survivor_document_id is None:
+        survivor_row = choose_reconcile_survivor(connection, document_rows)
+        resolved_selection_rule = selection_rule or "text_status>field_count>text_length>occurrence_count>earliest_ingested_at>document_id"
+    else:
+        survivor_row = next(
+            (row for row in document_rows if int(row["id"]) == int(forced_survivor_document_id)),
+            None,
+        )
+        if survivor_row is None:
+            raise RetrieverError(f"Forced survivor document id {forced_survivor_document_id} is not present in the merge group.")
+        resolved_selection_rule = selection_rule or "family_slot_survivor"
+
+    survivor_id = int(survivor_row["id"])
+    loser_document_ids = [int(row["id"]) for row in document_rows if int(row["id"]) != survivor_id]
+    survivor_locks = set(normalize_string_list(survivor_row[MANUAL_FIELD_LOCKS_COLUMN]))
+
+    blockers: list[dict[str, object]] = []
+    machine_field_conflicts: list[dict[str, object]] = []
+    custom_field_updates: dict[str, object] = {}
+    builtin_field_updates: dict[str, object] = {}
+    fields_to_lock: set[str] = set(survivor_locks)
+
+    non_unknown_kinds = sorted(
+        {
+            normalize_whitespace(str(row["canonical_kind"] or "")).lower()
+            for row in document_rows
+            if normalize_whitespace(str(row["canonical_kind"] or "")).lower() not in {"", "unknown"}
+        }
+    )
+    if len(non_unknown_kinds) > 1:
+        blockers.append(
+            {
+                "type": "canonical_kind_conflict",
+                "canonical_kinds": non_unknown_kinds,
+                "document_ids": [int(row["id"]) for row in document_rows],
+            }
+        )
+
+    for field_name in custom_fields:
+        distinct_values = collect_distinct_document_field_values(document_rows, field_name)
+        if len(distinct_values) > 1:
+            blockers.append(
+                {
+                    "type": "custom_field_conflict",
+                    "field_name": field_name,
+                    "values": [
+                        {
+                            "value": serialize_merge_field_value(item["value"]),
+                            "document_ids": item["document_ids"],
+                        }
+                        for item in distinct_values
+                    ],
+                }
+            )
+            continue
+        if not distinct_values:
+            continue
+        chosen_value = distinct_values[0]["value"]
+        if normalize_merge_field_value(survivor_row[field_name]) is None:
+            custom_field_updates[field_name] = chosen_value
+        if field_name in survivor_locks or distinct_values[0]["locked_document_ids"]:
+            fields_to_lock.add(field_name)
+
+    for field_name in sorted(EDITABLE_BUILTIN_FIELDS):
+        distinct_values = collect_distinct_document_field_values(document_rows, field_name)
+        if len(distinct_values) > 1 and any(item["locked_document_ids"] for item in distinct_values):
+            blockers.append(
+                {
+                    "type": "locked_builtin_conflict",
+                    "field_name": field_name,
+                    "values": [
+                        {
+                            "value": serialize_merge_field_value(item["value"]),
+                            "document_ids": item["document_ids"],
+                            "locked_document_ids": item["locked_document_ids"],
+                        }
+                        for item in distinct_values
+                    ],
+                }
+            )
+            continue
+        if len(distinct_values) > 1:
+            machine_field_conflicts.append(
+                {
+                    "field_name": field_name,
+                    "values": [
+                        {
+                            "value": serialize_merge_field_value(item["value"]),
+                            "document_ids": item["document_ids"],
+                        }
+                        for item in distinct_values
+                    ],
+                }
+            )
+        if not distinct_values:
+            continue
+        chosen_value = (
+            distinct_values[0]["value"]
+            if len(distinct_values) == 1
+            else normalize_merge_field_value(survivor_row[field_name])
+        )
+        field_should_lock = field_name in survivor_locks or (len(distinct_values) == 1 and bool(distinct_values[0]["locked_document_ids"]))
+        if field_should_lock:
+            fields_to_lock.add(field_name)
+            if chosen_value is not None:
+                builtin_field_updates[field_name] = chosen_value
+            continue
+        if (
+            field_name == "page_count"
+            and len(distinct_values) == 1
+            and normalize_merge_field_value(survivor_row[field_name]) is None
+            and chosen_value is not None
+        ):
+            builtin_field_updates[field_name] = chosen_value
+
+    return {
+        "document_ids": [int(row["id"]) for row in document_rows],
+        "survivor_document_id": survivor_id,
+        "loser_document_ids": loser_document_ids,
+        "status": "blocked" if blockers else "ready",
+        "blocking_conflicts": blockers,
+        "machine_field_conflicts": machine_field_conflicts,
+        "survivor_selection": survivor_selection_payload(
+            connection,
+            survivor_row,
+            rule=resolved_selection_rule,
+        ),
+        "_custom_field_names": custom_fields,
+        "_custom_field_updates": custom_field_updates,
+        "_builtin_field_updates": builtin_field_updates,
+        "_fields_to_lock": sorted(fields_to_lock),
+    }
+
+
+def evaluate_reconcile_candidate_group(
+    connection: sqlite3.Connection,
+    document_rows: list[sqlite3.Row],
+) -> dict[str, object]:
+    custom_fields = reconcile_custom_field_names(connection)
+    root_group = evaluate_document_merge_group(
+        connection,
+        document_rows,
+        custom_fields=custom_fields,
+    )
+    survivor_document_id = int(root_group["survivor_document_id"])
+    family_descriptors = {
+        int(row["id"]): document_family_descriptor(connection, row)
+        for row in document_rows
+    }
+    survivor_family = family_descriptors[survivor_document_id]
+    child_merge_groups: list[dict[str, object]] = []
+    child_blockers: list[dict[str, object]] = []
+
+    for slot_index, survivor_child_row in enumerate(list(survivor_family["child_rows"])):
+        child_group_rows = [
+            family_descriptors[int(row["id"])]["child_rows"][slot_index]
+            for row in document_rows
+        ]
+        child_group = evaluate_document_merge_group(
+            connection,
+            child_group_rows,
+            custom_fields=custom_fields,
+            forced_survivor_document_id=int(survivor_child_row["id"]),
+            selection_rule=f"family_slot[{slot_index}]",
+        )
+        child_merge_groups.append(child_group)
+        if child_group["status"] != "ready":
+            child_blockers.append(
+                {
+                    "type": "family_child_conflict",
+                    "slot_index": slot_index,
+                    "survivor_document_id": int(survivor_child_row["id"]),
+                    "child_document_ids": child_group["document_ids"],
+                    "blocking_conflicts": child_group["blocking_conflicts"],
+                }
+            )
+
+    blocking_conflicts = [*root_group["blocking_conflicts"], *child_blockers]
+    root_group["content_hash"] = document_rows[0]["content_hash"] if document_rows else None
+    root_group["family_fingerprint"] = survivor_family["fingerprint"]
+    root_group["family_child_group_count"] = len(child_merge_groups)
+    root_group["status"] = "blocked" if blocking_conflicts else "ready"
+    root_group["blocking_conflicts"] = blocking_conflicts
+    root_group["_child_merge_groups"] = child_merge_groups
+    return root_group
+
+
+def find_reconcile_candidate_groups(
+    connection: sqlite3.Connection,
+    *,
+    basis: str,
+) -> list[dict[str, object]]:
+    if basis != "content_hash":
+        raise RetrieverError(f"Unsupported reconciliation basis: {basis}")
+
+    candidate_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE canonical_status = ?
+          AND lifecycle_status = 'active'
+          AND parent_document_id IS NULL
+          AND content_hash IS NOT NULL
+          AND text_status IN ('ok', 'partial')
+        ORDER BY content_hash ASC, id ASC
+        """,
+        (CANONICAL_STATUS_ACTIVE,),
+    ).fetchall()
+
+    groups_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in candidate_rows:
+        groups_by_hash[str(row["content_hash"])].append(row)
+
+    candidate_groups: list[dict[str, object]] = []
+    for content_hash, grouped_rows in sorted(groups_by_hash.items()):
+        if len(grouped_rows) < 2:
+            continue
+        grouped_rows_by_family: dict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in grouped_rows:
+            family_descriptor = document_family_descriptor(connection, row)
+            grouped_rows_by_family[str(family_descriptor["fingerprint"])].append(row)
+        for family_fingerprint, family_rows in sorted(grouped_rows_by_family.items()):
+            if len(family_rows) < 2:
+                continue
+            candidate_group = evaluate_reconcile_candidate_group(connection, family_rows)
+            candidate_group["content_hash"] = content_hash
+            candidate_group["family_fingerprint"] = family_fingerprint
+            candidate_groups.append(candidate_group)
+    return candidate_groups
+
+
+def rebind_document_dedupe_keys(
+    connection: sqlite3.Connection,
+    *,
+    survivor_document_id: int,
+    loser_document_id: int,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT basis, key_value
+        FROM document_dedupe_keys
+        WHERE document_id = ?
+        ORDER BY basis ASC, key_value ASC
+        """,
+        (loser_document_id,),
+    ).fetchall()
+    for row in rows:
+        bind_document_dedupe_key(
+            connection,
+            basis=str(row["basis"]),
+            key_value=str(row["key_value"]),
+            document_id=survivor_document_id,
+        )
+    connection.execute(
+        "DELETE FROM document_dedupe_keys WHERE document_id = ?",
+        (loser_document_id,),
+    )
+
+
+def transfer_manual_dataset_memberships(
+    connection: sqlite3.Connection,
+    *,
+    survivor_document_id: int,
+    loser_document_id: int,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT dataset_id
+        FROM dataset_documents
+        WHERE document_id = ?
+          AND dataset_source_id IS NULL
+        ORDER BY dataset_id ASC
+        """,
+        (loser_document_id,),
+    ).fetchall()
+    for row in rows:
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=int(row["dataset_id"]),
+            document_id=survivor_document_id,
+            dataset_source_id=None,
+        )
+
+
+def apply_evaluated_document_merge_group(
+    connection: sqlite3.Connection,
+    *,
+    paths: dict[str, Path],
+    merge_basis: str,
+    merge_group: dict[str, object],
+) -> dict[str, object]:
+    survivor_document_id = int(merge_group["survivor_document_id"])
+    loser_document_ids = [int(document_id) for document_id in merge_group["loser_document_ids"]]
+    custom_field_names = [str(field_name) for field_name in merge_group["_custom_field_names"]]
+    custom_field_updates = dict(merge_group["_custom_field_updates"])
+    builtin_field_updates = dict(merge_group["_builtin_field_updates"])
+    fields_to_lock = list(merge_group["_fields_to_lock"])
+
+    pending_conflicts: list[tuple[int, sqlite3.Row, sqlite3.Row]] = []
+    merge_event_ids: list[int] = []
+    moved_occurrence_count = 0
+
+    for loser_document_id in loser_document_ids:
+        survivor_row = connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (survivor_document_id,),
+        ).fetchone()
+        loser_row = connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (loser_document_id,),
+        ).fetchone()
+        if survivor_row is None or loser_row is None:
+            raise RetrieverError(f"Unable to load merge pair survivor={survivor_document_id} loser={loser_document_id}.")
+
+        merge_event_id = insert_document_merge_event(
+            connection,
+            survivor_document_id=survivor_document_id,
+            loser_document_id=loser_document_id,
+            merge_basis=merge_basis,
+            pre_merge_survivor_snapshot=document_merge_snapshot(connection, survivor_document_id),
+            pre_merge_loser_snapshot=document_merge_snapshot(connection, loser_document_id),
+            artifact_counts={
+                "survivor": document_artifact_counts(connection, survivor_document_id),
+                "loser": document_artifact_counts(connection, loser_document_id),
+            },
+        )
+        merge_event_ids.append(merge_event_id)
+        pending_conflicts.append((merge_event_id, survivor_row, loser_row))
+
+        transfer_manual_dataset_memberships(
+            connection,
+            survivor_document_id=survivor_document_id,
+            loser_document_id=loser_document_id,
+        )
+        rebind_document_dedupe_keys(
+            connection,
+            survivor_document_id=survivor_document_id,
+            loser_document_id=loser_document_id,
+        )
+        occurrence_rows = connection.execute(
+            """
+            SELECT id
+            FROM document_occurrences
+            WHERE document_id = ?
+            ORDER BY id ASC
+            """,
+            (loser_document_id,),
+        ).fetchall()
+        moved_occurrence_count += len(occurrence_rows)
+        connection.execute(
+            """
+            UPDATE document_occurrences
+            SET document_id = ?, updated_at = ?
+            WHERE document_id = ?
+            """,
+            (survivor_document_id, utc_now(), loser_document_id),
+        )
+        connection.execute(
+            "DELETE FROM dataset_documents WHERE document_id = ?",
+            (loser_document_id,),
+        )
+        connection.execute(
+            "DELETE FROM document_control_number_aliases WHERE document_id IN (?, ?)",
+            (survivor_document_id, loser_document_id),
+        )
+        connection.execute(
+            "DELETE FROM canonical_metadata_conflicts WHERE document_id = ?",
+            (loser_document_id,),
+        )
+        cleanup_document_artifacts(paths, connection, loser_row)
+        delete_document_related_rows(connection, loser_document_id)
+        connection.execute(
+            """
+            UPDATE documents
+            SET control_number = NULL,
+                dataset_id = NULL,
+                canonical_status = ?,
+                merged_into_document_id = ?,
+                rel_path = ?,
+                lifecycle_status = 'deleted',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                CANONICAL_STATUS_MERGED,
+                survivor_document_id,
+                tombstone_rel_path_for_merged_document(loser_document_id),
+                utc_now(),
+                loser_document_id,
+            ),
+        )
+
+    if custom_field_updates or builtin_field_updates or fields_to_lock:
+        survivor_row = connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (survivor_document_id,),
+        ).fetchone()
+        if survivor_row is None:
+            raise RetrieverError(f"Unknown survivor document id: {survivor_document_id}")
+        update_fields: dict[str, object] = {}
+        update_fields.update(custom_field_updates)
+        update_fields.update(builtin_field_updates)
+        if fields_to_lock:
+            update_fields[MANUAL_FIELD_LOCKS_COLUMN] = json.dumps(sorted(dict.fromkeys(fields_to_lock)))
+        if update_fields:
+            update_fields["updated_at"] = utc_now()
+            assignments = ", ".join(f"{quote_identifier(field_name)} = ?" for field_name in update_fields)
+            connection.execute(
+                f"UPDATE documents SET {assignments} WHERE id = ?",
+                [*update_fields.values(), survivor_document_id],
+            )
+
+    refresh_source_backed_dataset_memberships_for_document(connection, survivor_document_id)
+    refresh_document_from_occurrences(connection, survivor_document_id)
+
+    final_survivor_row = connection.execute(
+        "SELECT * FROM documents WHERE id = ?",
+        (survivor_document_id,),
+    ).fetchone()
+    if final_survivor_row is None:
+        raise RetrieverError(f"Unknown survivor document id after merge: {survivor_document_id}")
+    for merge_event_id, pre_merge_survivor_row, pre_merge_loser_row in pending_conflicts:
+        insert_document_field_conflicts(
+            connection,
+            merge_event_id=merge_event_id,
+            survivor_document_id=survivor_document_id,
+            final_survivor_row=final_survivor_row,
+            pre_merge_survivor_row=pre_merge_survivor_row,
+            pre_merge_loser_row=pre_merge_loser_row,
+            custom_field_names=custom_field_names,
+        )
+
+    return {
+        "survivor_document_id": survivor_document_id,
+        "loser_document_ids": loser_document_ids,
+        "merge_event_ids": merge_event_ids,
+        "moved_occurrence_count": moved_occurrence_count,
+    }
+
+
+def apply_reconcile_group(
+    connection: sqlite3.Connection,
+    *,
+    paths: dict[str, Path],
+    basis: str,
+    candidate_group: dict[str, object],
+) -> dict[str, object]:
+    root_merge_result = apply_evaluated_document_merge_group(
+        connection,
+        paths=paths,
+        merge_basis=basis,
+        merge_group=candidate_group,
+    )
+    child_merge_groups = list(candidate_group.get("_child_merge_groups") or [])
+    child_merge_event_ids: list[int] = []
+    child_moved_occurrence_count = 0
+    for child_group in child_merge_groups:
+        child_merge_result = apply_evaluated_document_merge_group(
+            connection,
+            paths=paths,
+            merge_basis=f"{basis}:family_child",
+            merge_group=child_group,
+        )
+        child_merge_event_ids.extend(list(child_merge_result["merge_event_ids"]))
+        child_moved_occurrence_count += int(child_merge_result["moved_occurrence_count"])
+
+    return {
+        "content_hash": candidate_group["content_hash"],
+        "document_ids": candidate_group["document_ids"],
+        "survivor_document_id": root_merge_result["survivor_document_id"],
+        "loser_document_ids": root_merge_result["loser_document_ids"],
+        "status": "merged",
+        "merge_event_ids": [*root_merge_result["merge_event_ids"], *child_merge_event_ids],
+        "moved_occurrence_count": int(root_merge_result["moved_occurrence_count"]) + child_moved_occurrence_count,
+        "blocking_conflicts": [],
+        "machine_field_conflicts": candidate_group["machine_field_conflicts"],
+        "survivor_selection": candidate_group["survivor_selection"],
+        "family_child_group_count": len(child_merge_groups),
+    }
+
+
+def reconcile_duplicates(
+    root: Path,
+    *,
+    basis: str,
+    apply_changes: bool,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        reconcile_custom_fields_registry(connection, repair=True)
+        candidate_groups = find_reconcile_candidate_groups(connection, basis=basis)
+        if not apply_changes:
+            return {
+                "status": "ok",
+                "basis": basis,
+                "mode": "dry-run",
+                "candidate_group_count": len(candidate_groups),
+                "mergeable_group_count": sum(1 for group in candidate_groups if group["status"] == "ready"),
+                "blocked_group_count": sum(1 for group in candidate_groups if group["status"] == "blocked"),
+                "candidate_groups": [
+                    {
+                        key: value
+                        for key, value in group.items()
+                        if not key.startswith("_")
+                    }
+                    for group in candidate_groups
+                ],
+            }
+
+        applied_groups: list[dict[str, object]] = []
+        blocked_groups: list[dict[str, object]] = []
+        connection.execute("BEGIN")
+        try:
+            for candidate_group in candidate_groups:
+                if candidate_group["status"] != "ready":
+                    blocked_groups.append(
+                        {
+                            key: value
+                            for key, value in candidate_group.items()
+                            if not key.startswith("_")
+                        }
+                    )
+                    continue
+                applied_groups.append(
+                    apply_reconcile_group(
+                        connection,
+                        paths=paths,
+                        basis=basis,
+                        candidate_group=candidate_group,
+                    )
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "basis": basis,
+            "mode": "apply",
+            "candidate_group_count": len(candidate_groups),
+            "merged_group_count": len(applied_groups),
+            "blocked_group_count": len(blocked_groups),
+            "applied_groups": applied_groups,
+            "blocked_groups": blocked_groups,
+        }
+    finally:
+        connection.close()
 
 
 def list_datasets(root: Path) -> dict[str, object]:

@@ -79,6 +79,9 @@ SCHEMA_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS documents (
       id INTEGER PRIMARY KEY,
       control_number TEXT UNIQUE,
+      canonical_kind TEXT NOT NULL DEFAULT 'unknown',
+      canonical_status TEXT NOT NULL DEFAULT 'active',
+      merged_into_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
       conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
       conversation_assignment_mode TEXT NOT NULL DEFAULT 'auto',
       dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
@@ -119,6 +122,106 @@ SCHEMA_STATEMENTS = [
       control_number_batch INTEGER,
       control_number_family_sequence INTEGER,
       control_number_attachment_sequence INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_occurrences (
+      id INTEGER PRIMARY KEY,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      parent_occurrence_id INTEGER REFERENCES document_occurrences(id) ON DELETE SET NULL,
+      occurrence_control_number TEXT,
+      source_kind TEXT,
+      source_rel_path TEXT,
+      source_item_id TEXT,
+      source_folder_path TEXT,
+      production_id INTEGER REFERENCES productions(id) ON DELETE SET NULL,
+      begin_bates TEXT,
+      end_bates TEXT,
+      begin_attachment TEXT,
+      end_attachment TEXT,
+      rel_path TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      file_type TEXT,
+      mime_type TEXT,
+      file_size INTEGER,
+      file_hash TEXT,
+      custodian TEXT,
+      fs_created_at TEXT,
+      fs_modified_at TEXT,
+      extracted_author TEXT,
+      extracted_title TEXT,
+      extracted_subject TEXT,
+      extracted_participants TEXT,
+      extracted_recipients TEXT,
+      extracted_doc_authored_at TEXT,
+      extracted_doc_modified_at TEXT,
+      extracted_content_type TEXT,
+      extracted_kind TEXT,
+      text_status TEXT NOT NULL DEFAULT 'ok',
+      lifecycle_status TEXT NOT NULL DEFAULT 'active',
+      has_preview INTEGER NOT NULL DEFAULT 0,
+      ingested_at TEXT,
+      last_seen_at TEXT,
+      updated_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_dedupe_keys (
+      id INTEGER PRIMARY KEY,
+      basis TEXT NOT NULL,
+      key_value TEXT NOT NULL,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS canonical_metadata_conflicts (
+      id INTEGER PRIMARY KEY,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      field_name TEXT NOT NULL,
+      occurrence_id INTEGER NOT NULL REFERENCES document_occurrences(id) ON DELETE CASCADE,
+      value TEXT,
+      first_seen_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_control_number_aliases (
+      id INTEGER PRIMARY KEY,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      occurrence_id INTEGER REFERENCES document_occurrences(id) ON DELETE CASCADE,
+      alias_value TEXT NOT NULL,
+      alias_type TEXT NOT NULL,
+      active_flag INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_merge_events (
+      id INTEGER PRIMARY KEY,
+      survivor_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      loser_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      merge_basis TEXT NOT NULL,
+      actor TEXT,
+      schema_version INTEGER NOT NULL,
+      pre_merge_survivor_json TEXT NOT NULL,
+      pre_merge_loser_json TEXT NOT NULL,
+      artifact_counts_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_field_conflicts (
+      id INTEGER PRIMARY KEY,
+      merge_event_id INTEGER REFERENCES document_merge_events(id) ON DELETE CASCADE,
+      document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+      field_name TEXT NOT NULL,
+      survivor_value TEXT,
+      loser_value TEXT,
+      resolution TEXT,
+      created_at TEXT NOT NULL
     )
     """,
     """
@@ -2206,6 +2309,728 @@ def infer_content_type_from_extension(file_type: str) -> str | None:
     if file_type == "md":
         return "E-Doc"
     return CONTENT_TYPE_BY_EXTENSION.get(file_type)
+
+
+def canonical_kind_from_metadata(
+    *,
+    extracted_content_type: object = None,
+    extracted_kind: object = None,
+    file_type: object = None,
+    source_kind: object = None,
+) -> str:
+    normalized_kind = normalize_whitespace(str(extracted_kind or "")).lower()
+    if normalized_kind in CANONICAL_KIND_VALUES:
+        return normalized_kind
+
+    normalized_content_type = normalize_whitespace(str(extracted_content_type or "")).lower()
+    normalized_file_type = normalize_whitespace(str(file_type or "")).lower()
+    normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
+
+    if normalized_source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} or normalized_content_type == "email":
+        return "email"
+    if "spreadsheet" in normalized_content_type or "table" in normalized_content_type:
+        return "spreadsheet"
+    if "presentation" in normalized_content_type:
+        return "presentation"
+    if normalized_content_type == "image":
+        return "image"
+    if normalized_content_type == "source code":
+        return "code"
+    if normalized_content_type == "database":
+        return "data"
+    if normalized_content_type == "container":
+        return "binary"
+    if normalized_content_type in {"calendar", "message"}:
+        return "email"
+    if normalized_content_type in {"chat", "e-doc", "web"}:
+        return "document"
+
+    if normalized_file_type in {"csv", "json", "xml", "yaml", "yml"}:
+        return "data"
+    if normalized_file_type in {"xls", "xlsx", "xlsm", "xlsb", "ods", "numbers"}:
+        return "spreadsheet"
+    if normalized_file_type in {"ppt", "pptx", "pptm", "odp", "key"}:
+        return "presentation"
+    if normalized_file_type in {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "svg"}:
+        return "image"
+    if normalized_file_type in CURATED_TEXT_SOURCE_FILE_TYPES:
+        return "code"
+    if normalized_file_type in {"doc", "docx", "pdf", "txt", "rtf", "md", "html", "htm"}:
+        return "document"
+    return "unknown"
+
+
+def canonical_kind_compatible(left: object, right: object) -> bool:
+    left_kind = normalize_whitespace(str(left or "")).lower() or "unknown"
+    right_kind = normalize_whitespace(str(right or "")).lower() or "unknown"
+    return left_kind == "unknown" or right_kind == "unknown" or left_kind == right_kind
+
+
+def occurrence_field_count(row: sqlite3.Row | dict[str, object]) -> int:
+    fields = [
+        "extracted_author",
+        "extracted_title",
+        "extracted_subject",
+        "extracted_participants",
+        "extracted_recipients",
+        "extracted_doc_authored_at",
+        "extracted_doc_modified_at",
+        "extracted_content_type",
+        "extracted_kind",
+    ]
+    return sum(1 for field_name in fields if normalize_whitespace(str(row[field_name] or "")))
+
+
+def text_status_priority(status: object) -> int:
+    normalized = normalize_whitespace(str(status or "")).lower()
+    return TEXT_STATUS_PRIORITIES.get(normalized, max(TEXT_STATUS_PRIORITIES.values()) + 1)
+
+
+def source_kind_priority(source_kind: object) -> int:
+    normalized = normalize_whitespace(str(source_kind or "")).lower()
+    return SOURCE_KIND_PREFERRED_ORDER.get(normalized, max(SOURCE_KIND_PREFERRED_ORDER.values()) + 1)
+
+
+def active_occurrence_rows_for_document(
+    connection: sqlite3.Connection,
+    document_id: int,
+    *,
+    include_all_statuses: bool = False,
+) -> list[sqlite3.Row]:
+    if include_all_statuses:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM document_occurrences
+            WHERE document_id = ?
+            ORDER BY id ASC
+            """,
+            (document_id,),
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM document_occurrences
+            WHERE document_id = ?
+              AND lifecycle_status = ?
+            ORDER BY id ASC
+            """,
+            (document_id, ACTIVE_OCCURRENCE_STATUS),
+        ).fetchall()
+    return rows
+
+
+def select_preferred_occurrence(rows: list[sqlite3.Row]) -> sqlite3.Row | None:
+    if not rows:
+        return None
+    ranked_rows = sorted(
+        rows,
+        key=lambda row: (
+            0 if row["lifecycle_status"] == ACTIVE_OCCURRENCE_STATUS else 1,
+            source_kind_priority(row["source_kind"]),
+            text_status_priority(row["text_status"]),
+            -occurrence_field_count(row),
+            0 if int(row["has_preview"] or 0) else 1,
+            parse_utc_timestamp(row["ingested_at"]) or datetime.max.replace(tzinfo=timezone.utc),
+            int(row["id"]),
+        ),
+    )
+    return ranked_rows[0]
+
+
+def occurrence_field_value(
+    preferred_row: sqlite3.Row | None,
+    active_rows: list[sqlite3.Row],
+    preferred_column: str,
+) -> object:
+    if preferred_row is not None:
+        preferred_value = preferred_row[preferred_column]
+        if preferred_value not in (None, ""):
+            return preferred_value
+    sorted_rows = sorted(
+        active_rows,
+        key=lambda row: (
+            parse_utc_timestamp(row["ingested_at"]) or datetime.max.replace(tzinfo=timezone.utc),
+            int(row["id"]),
+        ),
+    )
+    for row in sorted_rows:
+        value = row[preferred_column]
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def refresh_document_control_number_aliases(connection: sqlite3.Connection, document_id: int) -> None:
+    now = utc_now()
+    connection.execute(
+        "DELETE FROM document_control_number_aliases WHERE document_id = ?",
+        (document_id,),
+    )
+    document_row = connection.execute(
+        "SELECT control_number FROM documents WHERE id = ?",
+        (document_id,),
+    ).fetchone()
+    alias_rows: list[tuple[int, int | None, str, str, int, str, str]] = []
+    if document_row is not None and normalize_whitespace(str(document_row["control_number"] or "")):
+        alias_rows.append(
+            (
+                document_id,
+                None,
+                str(document_row["control_number"]),
+                "document_primary",
+                1,
+                now,
+                now,
+            )
+        )
+    occurrence_rows = connection.execute(
+        """
+        SELECT id, occurrence_control_number, lifecycle_status
+        FROM document_occurrences
+        WHERE document_id = ?
+        ORDER BY id ASC
+        """,
+        (document_id,),
+    ).fetchall()
+    for occurrence_row in occurrence_rows:
+        alias_value = normalize_whitespace(str(occurrence_row["occurrence_control_number"] or ""))
+        if not alias_value:
+            continue
+        alias_rows.append(
+            (
+                document_id,
+                int(occurrence_row["id"]),
+                alias_value,
+                "occurrence_control_number",
+                1 if occurrence_row["lifecycle_status"] == ACTIVE_OCCURRENCE_STATUS else 0,
+                now,
+                now,
+            )
+        )
+    if alias_rows:
+        connection.executemany(
+            """
+            INSERT INTO document_control_number_aliases (
+              document_id, occurrence_id, alias_value, alias_type, active_flag, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            alias_rows,
+        )
+
+
+def refresh_canonical_metadata_conflicts(
+    connection: sqlite3.Connection,
+    document_id: int,
+    active_rows: list[sqlite3.Row],
+) -> None:
+    tracked_fields = {
+        "author": "extracted_author",
+        "title": "extracted_title",
+        "subject": "extracted_subject",
+        "participants": "extracted_participants",
+        "recipients": "extracted_recipients",
+        "date_created": "extracted_doc_authored_at",
+        "date_modified": "extracted_doc_modified_at",
+        "content_type": "extracted_content_type",
+    }
+    now = utc_now()
+    connection.execute(
+        "DELETE FROM canonical_metadata_conflicts WHERE document_id = ?",
+        (document_id,),
+    )
+    rows_to_insert: list[tuple[int, str, int, str, str, str]] = []
+    for field_name, occurrence_column in tracked_fields.items():
+        distinct_values = {
+            normalize_whitespace(str(row[occurrence_column] or "")): row
+            for row in active_rows
+            if normalize_whitespace(str(row[occurrence_column] or ""))
+        }
+        if len(distinct_values) <= 1:
+            continue
+        for value, row in distinct_values.items():
+            rows_to_insert.append(
+                (
+                    document_id,
+                    field_name,
+                    int(row["id"]),
+                    value,
+                    now,
+                    now,
+                )
+            )
+    if rows_to_insert:
+        connection.executemany(
+            """
+            INSERT INTO canonical_metadata_conflicts (
+              document_id, field_name, occurrence_id, value, first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            rows_to_insert,
+        )
+
+
+def dataset_source_row_for_occurrence(
+    connection: sqlite3.Connection,
+    occurrence_row: sqlite3.Row,
+) -> sqlite3.Row | None:
+    source_kind = normalize_whitespace(str(occurrence_row["source_kind"] or "")).lower()
+    source_rel_path = normalize_whitespace(str(occurrence_row["source_rel_path"] or ""))
+    if source_kind == FILESYSTEM_SOURCE_KIND:
+        return get_dataset_source_row(
+            connection,
+            source_kind=FILESYSTEM_SOURCE_KIND,
+            source_locator=filesystem_dataset_locator(),
+        )
+    if source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and source_rel_path:
+        return get_dataset_source_row(
+            connection,
+            source_kind=source_kind,
+            source_locator=source_rel_path,
+        )
+    if source_kind == PRODUCTION_SOURCE_KIND:
+        production_id = occurrence_row["production_id"]
+        if production_id is None:
+            return None
+        production_row = connection.execute(
+            "SELECT rel_root FROM productions WHERE id = ?",
+            (production_id,),
+        ).fetchone()
+        if production_row is None:
+            return None
+        return get_dataset_source_row(
+            connection,
+            source_kind=PRODUCTION_SOURCE_KIND,
+            source_locator=str(production_row["rel_root"]),
+        )
+    if source_kind == SLACK_EXPORT_SOURCE_KIND and source_rel_path:
+        return connection.execute(
+            """
+            SELECT *
+            FROM dataset_sources
+            WHERE source_kind = ?
+              AND (? = source_locator OR ? LIKE source_locator || '/%')
+            ORDER BY LENGTH(source_locator) DESC, id ASC
+            LIMIT 1
+            """,
+            (SLACK_EXPORT_SOURCE_KIND, source_rel_path, source_rel_path),
+        ).fetchone()
+    return None
+
+
+def refresh_source_backed_dataset_memberships_for_document(connection: sqlite3.Connection, document_id: int) -> None:
+    active_rows = active_occurrence_rows_for_document(connection, document_id)
+    document_row = connection.execute(
+        "SELECT parent_document_id FROM documents WHERE id = ?",
+        (document_id,),
+    ).fetchone()
+    connection.execute(
+        """
+        DELETE FROM dataset_documents
+        WHERE document_id = ?
+          AND dataset_source_id IS NOT NULL
+        """,
+        (document_id,),
+    )
+    if document_row is not None and document_row["parent_document_id"] is not None:
+        parent_source_rows = connection.execute(
+            """
+            SELECT dataset_id, dataset_source_id
+            FROM dataset_documents
+            WHERE document_id = ?
+              AND dataset_source_id IS NOT NULL
+            ORDER BY dataset_id ASC, dataset_source_id ASC
+            """,
+            (document_row["parent_document_id"],),
+        ).fetchall()
+        for parent_source_row in parent_source_rows:
+            ensure_dataset_document_membership(
+                connection,
+                dataset_id=int(parent_source_row["dataset_id"]),
+                document_id=document_id,
+                dataset_source_id=int(parent_source_row["dataset_source_id"]),
+            )
+        refresh_document_dataset_cache(connection, document_id)
+        return
+    for occurrence_row in active_rows:
+        dataset_source_row = dataset_source_row_for_occurrence(connection, occurrence_row)
+        if dataset_source_row is None:
+            continue
+        ensure_dataset_document_membership(
+            connection,
+            dataset_id=int(dataset_source_row["dataset_id"]),
+            document_id=document_id,
+            dataset_source_id=int(dataset_source_row["id"]),
+        )
+    refresh_document_dataset_cache(connection, document_id)
+
+
+def refresh_document_from_occurrences(connection: sqlite3.Connection, document_id: int) -> dict[str, object]:
+    document_row = connection.execute(
+        "SELECT * FROM documents WHERE id = ?",
+        (document_id,),
+    ).fetchone()
+    if document_row is None:
+        raise RetrieverError(f"Unknown document id: {document_id}")
+
+    active_rows = active_occurrence_rows_for_document(connection, document_id)
+    if not active_rows:
+        if document_row["canonical_status"] == CANONICAL_STATUS_MERGED:
+            connection.execute(
+                """
+                UPDATE documents
+                SET dataset_id = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), document_id),
+            )
+            refresh_document_control_number_aliases(connection, document_id)
+            return {
+                "document_id": document_id,
+                "preferred_occurrence_id": None,
+                "active_occurrence_count": 0,
+                "canonical_status": CANONICAL_STATUS_MERGED,
+            }
+        connection.execute(
+            """
+            UPDATE documents
+            SET canonical_status = ?, lifecycle_status = ?, dataset_id = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (CANONICAL_STATUS_DERELICT, "missing", utc_now(), document_id),
+        )
+        refresh_document_control_number_aliases(connection, document_id)
+        refresh_documents_fts_row(connection, document_id)
+        return {
+            "document_id": document_id,
+            "preferred_occurrence_id": None,
+            "active_occurrence_count": 0,
+            "canonical_status": CANONICAL_STATUS_DERELICT,
+        }
+
+    preferred_row = select_preferred_occurrence(active_rows)
+    assert preferred_row is not None
+    locked_fields = set(normalize_string_list(document_row[MANUAL_FIELD_LOCKS_COLUMN]))
+    resolved_author = occurrence_field_value(preferred_row, active_rows, "extracted_author")
+    resolved_content_type = occurrence_field_value(preferred_row, active_rows, "extracted_content_type")
+    resolved_custodian = preferred_row["custodian"]
+    resolved_date_created = occurrence_field_value(preferred_row, active_rows, "extracted_doc_authored_at")
+    resolved_date_modified = occurrence_field_value(preferred_row, active_rows, "extracted_doc_modified_at")
+    resolved_title = occurrence_field_value(preferred_row, active_rows, "extracted_title")
+    resolved_subject = occurrence_field_value(preferred_row, active_rows, "extracted_subject")
+    resolved_participants = occurrence_field_value(preferred_row, active_rows, "extracted_participants")
+    resolved_recipients = occurrence_field_value(preferred_row, active_rows, "extracted_recipients")
+    if "author" in locked_fields:
+        resolved_author = document_row["author"]
+    if "content_type" in locked_fields:
+        resolved_content_type = document_row["content_type"]
+    if "custodian" in locked_fields:
+        resolved_custodian = document_row["custodian"]
+    if "date_created" in locked_fields:
+        resolved_date_created = document_row["date_created"]
+    if "date_modified" in locked_fields:
+        resolved_date_modified = document_row["date_modified"]
+    if "title" in locked_fields:
+        resolved_title = document_row["title"]
+    if "subject" in locked_fields:
+        resolved_subject = document_row["subject"]
+    if "participants" in locked_fields:
+        resolved_participants = document_row["participants"]
+    if "recipients" in locked_fields:
+        resolved_recipients = document_row["recipients"]
+    canonical_control_number = None
+    for row in sorted(
+        active_rows,
+        key=lambda candidate: (
+            0 if int(candidate["id"]) == int(preferred_row["id"]) else 1,
+            source_kind_priority(candidate["source_kind"]),
+            text_status_priority(candidate["text_status"]),
+            parse_utc_timestamp(candidate["ingested_at"]) or datetime.max.replace(tzinfo=timezone.utc),
+            int(candidate["id"]),
+        ),
+    ):
+        candidate_control_number = normalize_whitespace(str(row["occurrence_control_number"] or ""))
+        if candidate_control_number:
+            canonical_control_number = candidate_control_number
+            break
+
+    updated_values = {
+        "control_number": canonical_control_number or document_row["control_number"],
+        "canonical_kind": canonical_kind_from_metadata(
+            extracted_content_type=occurrence_field_value(preferred_row, active_rows, "extracted_content_type"),
+            extracted_kind=occurrence_field_value(preferred_row, active_rows, "extracted_kind"),
+            file_type=preferred_row["file_type"],
+            source_kind=preferred_row["source_kind"],
+        ),
+        "canonical_status": CANONICAL_STATUS_ACTIVE,
+        "merged_into_document_id": None,
+        "source_kind": preferred_row["source_kind"],
+        "source_rel_path": preferred_row["source_rel_path"],
+        "source_item_id": preferred_row["source_item_id"],
+        "source_folder_path": preferred_row["source_folder_path"],
+        "production_id": preferred_row["production_id"],
+        "begin_bates": preferred_row["begin_bates"],
+        "end_bates": preferred_row["end_bates"],
+        "begin_attachment": preferred_row["begin_attachment"],
+        "end_attachment": preferred_row["end_attachment"],
+        "rel_path": preferred_row["rel_path"],
+        "file_name": preferred_row["file_name"],
+        "file_type": preferred_row["file_type"],
+        "file_size": preferred_row["file_size"],
+        "author": resolved_author,
+        "content_type": resolved_content_type,
+        "custodian": resolved_custodian,
+        "date_created": resolved_date_created,
+        "date_modified": resolved_date_modified,
+        "title": resolved_title,
+        "subject": resolved_subject,
+        "participants": resolved_participants,
+        "recipients": resolved_recipients,
+        "file_hash": preferred_row["file_hash"],
+        "text_status": min((row["text_status"] for row in active_rows), key=text_status_priority),
+        "lifecycle_status": "active",
+        "ingested_at": min(
+            (parse_utc_timestamp(row["ingested_at"]) or datetime.max.replace(tzinfo=timezone.utc) for row in active_rows)
+        ).isoformat().replace("+00:00", "Z"),
+        "last_seen_at": max(
+            (
+                parse_utc_timestamp(row["last_seen_at"]) or datetime.min.replace(tzinfo=timezone.utc)
+                for row in active_rows
+            )
+        ).isoformat().replace("+00:00", "Z"),
+        "updated_at": utc_now(),
+    }
+    connection.execute(
+        """
+        UPDATE documents
+        SET control_number = ?, canonical_kind = ?, canonical_status = ?, merged_into_document_id = ?,
+            source_kind = ?, source_rel_path = ?, source_item_id = ?, source_folder_path = ?, production_id = ?,
+            begin_bates = ?, end_bates = ?, begin_attachment = ?, end_attachment = ?, rel_path = ?, file_name = ?,
+            file_type = ?, file_size = ?, author = ?, content_type = ?, custodian = ?, date_created = ?, date_modified = ?,
+            title = ?, subject = ?, participants = ?, recipients = ?, file_hash = ?, text_status = ?,
+            lifecycle_status = ?, ingested_at = ?, last_seen_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            updated_values["control_number"],
+            updated_values["canonical_kind"],
+            updated_values["canonical_status"],
+            updated_values["merged_into_document_id"],
+            updated_values["source_kind"],
+            updated_values["source_rel_path"],
+            updated_values["source_item_id"],
+            updated_values["source_folder_path"],
+            updated_values["production_id"],
+            updated_values["begin_bates"],
+            updated_values["end_bates"],
+            updated_values["begin_attachment"],
+            updated_values["end_attachment"],
+            updated_values["rel_path"],
+            updated_values["file_name"],
+            updated_values["file_type"],
+            updated_values["file_size"],
+            updated_values["author"],
+            updated_values["content_type"],
+            updated_values["custodian"],
+            updated_values["date_created"],
+            updated_values["date_modified"],
+            updated_values["title"],
+            updated_values["subject"],
+            updated_values["participants"],
+            updated_values["recipients"],
+            updated_values["file_hash"],
+            updated_values["text_status"],
+            updated_values["lifecycle_status"],
+            updated_values["ingested_at"],
+            updated_values["last_seen_at"],
+            updated_values["updated_at"],
+            document_id,
+        ),
+    )
+    refresh_canonical_metadata_conflicts(connection, document_id, active_rows)
+    refresh_document_control_number_aliases(connection, document_id)
+    refresh_documents_fts_row(connection, document_id)
+    return {
+        "document_id": document_id,
+        "preferred_occurrence_id": int(preferred_row["id"]),
+        "active_occurrence_count": len(active_rows),
+        "canonical_status": CANONICAL_STATUS_ACTIVE,
+    }
+
+
+def get_document_by_dedupe_key(
+    connection: sqlite3.Connection,
+    *,
+    basis: str,
+    key_value: str | None,
+) -> sqlite3.Row | None:
+    normalized_key = normalize_whitespace(str(key_value or ""))
+    if not normalized_key:
+        return None
+    return connection.execute(
+        """
+        SELECT d.*
+        FROM document_dedupe_keys dk
+        JOIN documents d ON d.id = dk.document_id
+        WHERE dk.basis = ? AND dk.key_value = ?
+        """,
+        (basis, normalized_key),
+    ).fetchone()
+
+
+def bind_document_dedupe_key(
+    connection: sqlite3.Connection,
+    *,
+    basis: str,
+    key_value: str | None,
+    document_id: int,
+) -> None:
+    normalized_key = normalize_whitespace(str(key_value or ""))
+    if not normalized_key:
+        return
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO document_dedupe_keys (basis, key_value, document_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(basis, key_value) DO UPDATE SET
+          document_id = excluded.document_id,
+          updated_at = excluded.updated_at
+        """,
+        (basis, normalized_key, document_id, now, now),
+    )
+
+
+def find_active_occurrence_by_source_identity(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str | None,
+    custodian: str | None,
+    source_rel_path: str | None,
+    source_item_id: str | None,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM document_occurrences
+        WHERE source_kind = ?
+          AND COALESCE(custodian, '') = COALESCE(?, '')
+          AND COALESCE(source_rel_path, '') = COALESCE(?, '')
+          AND COALESCE(source_item_id, '') = COALESCE(?, '')
+          AND lifecycle_status = 'active'
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (source_kind, custodian, source_rel_path, source_item_id),
+    ).fetchone()
+
+
+def upsert_document_occurrence(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    existing_occurrence_id: int | None,
+    parent_occurrence_id: int | None,
+    occurrence_control_number: str | None,
+    source_kind: str | None,
+    source_rel_path: str | None,
+    source_item_id: str | None,
+    source_folder_path: str | None,
+    production_id: int | None,
+    begin_bates: str | None,
+    end_bates: str | None,
+    begin_attachment: str | None,
+    end_attachment: str | None,
+    rel_path: str,
+    file_name: str,
+    file_type: str | None,
+    mime_type: str | None,
+    file_size: int | None,
+    file_hash: str | None,
+    custodian: str | None,
+    fs_created_at: str | None,
+    fs_modified_at: str | None,
+    extracted: dict[str, object],
+    has_preview: bool,
+    text_status: str,
+    ingested_at: str,
+    last_seen_at: str,
+    updated_at: str,
+) -> int:
+    occurrence_values = (
+        document_id,
+        parent_occurrence_id,
+        occurrence_control_number,
+        source_kind,
+        source_rel_path,
+        source_item_id,
+        source_folder_path,
+        production_id,
+        begin_bates,
+        end_bates,
+        begin_attachment,
+        end_attachment,
+        rel_path,
+        file_name,
+        file_type,
+        mime_type,
+        file_size,
+        file_hash,
+        custodian,
+        fs_created_at,
+        fs_modified_at,
+        extracted.get("author"),
+        extracted.get("title"),
+        extracted.get("subject"),
+        extracted.get("participants"),
+        extracted.get("recipients"),
+        extracted.get("date_created"),
+        extracted.get("date_modified"),
+        extracted.get("content_type"),
+        canonical_kind_from_metadata(
+            extracted_content_type=extracted.get("content_type"),
+            file_type=file_type,
+            source_kind=source_kind,
+        ),
+        text_status,
+        ACTIVE_OCCURRENCE_STATUS,
+        1 if has_preview else 0,
+        ingested_at,
+        last_seen_at,
+        updated_at,
+    )
+    if existing_occurrence_id is None:
+        connection.execute(
+            """
+            INSERT INTO document_occurrences (
+              document_id, parent_occurrence_id, occurrence_control_number, source_kind, source_rel_path, source_item_id,
+              source_folder_path, production_id, begin_bates, end_bates, begin_attachment, end_attachment,
+              rel_path, file_name, file_type, mime_type, file_size, file_hash, custodian, fs_created_at, fs_modified_at,
+              extracted_author, extracted_title, extracted_subject, extracted_participants, extracted_recipients,
+              extracted_doc_authored_at, extracted_doc_modified_at, extracted_content_type, extracted_kind, text_status,
+              lifecycle_status, has_preview, ingested_at, last_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            occurrence_values,
+        )
+        return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    connection.execute(
+        """
+        UPDATE document_occurrences
+        SET document_id = ?, parent_occurrence_id = ?, occurrence_control_number = ?, source_kind = ?, source_rel_path = ?,
+            source_item_id = ?, source_folder_path = ?, production_id = ?, begin_bates = ?, end_bates = ?,
+            begin_attachment = ?, end_attachment = ?, rel_path = ?, file_name = ?, file_type = ?, mime_type = ?,
+            file_size = ?, file_hash = ?, custodian = ?, fs_created_at = ?, fs_modified_at = ?, extracted_author = ?,
+            extracted_title = ?, extracted_subject = ?, extracted_participants = ?, extracted_recipients = ?,
+            extracted_doc_authored_at = ?, extracted_doc_modified_at = ?, extracted_content_type = ?, extracted_kind = ?,
+            text_status = ?, lifecycle_status = ?, has_preview = ?, ingested_at = ?, last_seen_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (*occurrence_values, existing_occurrence_id),
+    )
+    return existing_occurrence_id
 
 
 def infer_registry_field_type(sqlite_type: str | None) -> str:
