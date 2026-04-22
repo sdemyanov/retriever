@@ -1452,7 +1452,6 @@ def document_canonical_field_count(row: sqlite3.Row | dict[str, object]) -> int:
     field_names = [
         "author",
         "content_type",
-        "custodian",
         "date_created",
         "date_modified",
         "page_count",
@@ -4383,6 +4382,8 @@ def set_field(root: Path, document_id: int, field_name: str, value: str | None) 
         apply_schema(connection, root)
         field_def = resolve_field_definition(connection, field_name)
         column_name = field_def["field_name"]
+        if field_def.get("source") == "virtual":
+            raise RetrieverError(f"Field '{column_name}' is derived and cannot be manually set.")
         if column_name in SYSTEM_MANAGED_FIELDS:
             raise RetrieverError(f"Field '{column_name}' is system-managed and cannot be manually set.")
         typed_value = value_from_type(field_def["field_type"], value)
@@ -4395,7 +4396,7 @@ def set_field(root: Path, document_id: int, field_name: str, value: str | None) 
                 f"UPDATE documents SET {quote_identifier(column_name)} = ?, updated_at = ? WHERE id = ?",
                 (typed_value, utc_now(), document_id),
             )
-            if column_name in {"author", "custodian", "participants", "recipients", "subject", "title"}:
+            if column_name in {"author", "participants", "recipients", "subject", "title"}:
                 refresh_documents_fts_row(connection, document_id)
             locks = lock_field(connection, document_id, column_name)
             connection.commit()

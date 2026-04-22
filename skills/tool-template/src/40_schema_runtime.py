@@ -4,7 +4,9 @@ def inspect_custom_fields_registry(connection: sqlite3.Connection) -> dict[str, 
     actual_custom_fields = [
         name
         for name in column_map
-        if name not in BUILTIN_FIELD_TYPES and name not in {LEGACY_METADATA_LOCKS_COLUMN}
+        if name not in BUILTIN_FIELD_TYPES
+        and name not in INTERNAL_DOCUMENT_COLUMNS
+        and name not in {LEGACY_METADATA_LOCKS_COLUMN}
     ]
     registry_rows = connection.execute(
         """
@@ -729,6 +731,12 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
             continue
         if row["canonical_status"] == CANONICAL_STATUS_MERGED:
             continue
+        legacy_custodian = None
+        if "custodian" in row.keys():
+            legacy_custodian = row["custodian"]
+        elif "custodians_json" in row.keys():
+            custodian_values = parse_document_custodians_json(row["custodians_json"])
+            legacy_custodian = custodian_values[0] if len(custodian_values) == 1 else None
         occurrence_id = upsert_document_occurrence(
             connection,
             document_id=document_id,
@@ -750,7 +758,7 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
             mime_type=None,
             file_size=row["file_size"],
             file_hash=row["file_hash"],
-            custodian=row["custodian"],
+            custodian=legacy_custodian,
             fs_created_at=None,
             fs_modified_at=None,
             extracted={
@@ -794,6 +802,42 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
             (parent_occurrence_ids[0], child_occurrence_ids[0]),
         )
     return inserted
+
+
+def drop_document_field_locks(connection: sqlite3.Connection, field_name: str) -> int:
+    if not table_exists(connection, "documents"):
+        return 0
+    rows = connection.execute(
+        f"""
+        SELECT id, {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} AS locks_json
+        FROM documents
+        WHERE {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} LIKE ?
+        """,
+        (f'%"{field_name}"%',),
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        locks = normalize_string_list(row["locks_json"])
+        filtered_locks = [lock_name for lock_name in locks if lock_name != field_name]
+        if filtered_locks == locks:
+            continue
+        connection.execute(
+            f"""
+            UPDATE documents
+            SET {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} = ?
+            WHERE id = ?
+            """,
+            (json.dumps(filtered_locks), int(row["id"])),
+        )
+        updated += 1
+    return updated
+
+
+def remove_documents_custodian_column(connection: sqlite3.Connection) -> bool:
+    if "custodian" not in table_columns(connection, "documents"):
+        return False
+    connection.execute("ALTER TABLE documents DROP COLUMN custodian")
+    return True
 
 
 def backfill_document_dedupe_keys(connection: sqlite3.Connection) -> int:
@@ -1042,7 +1086,7 @@ def ensure_documents_fts(connection: sqlite3.Connection) -> bool:
     )
     rows = connection.execute(
         """
-        SELECT id, file_name, title, subject, author, custodian, participants, recipients
+        SELECT id, file_name, title, subject, author, custodians_json, participants, recipients
         FROM documents
         """
     ).fetchall()
@@ -1059,7 +1103,7 @@ def ensure_documents_fts(connection: sqlite3.Connection) -> bool:
                     row["title"],
                     row["subject"],
                     row["author"],
-                    row["custodian"],
+                    document_custodian_display_text_from_row(row),
                     row["participants"],
                     row["recipients"],
                 )
@@ -1097,7 +1141,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "documents", "canonical_status TEXT NOT NULL DEFAULT 'active'")
     ensure_column(connection, "documents", "merged_into_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL")
     ensure_column(connection, "documents", "content_type TEXT")
-    ensure_column(connection, "documents", "custodian TEXT")
+    ensure_column(connection, "documents", "custodians_json TEXT NOT NULL DEFAULT '[]'")
     ensure_column(connection, "documents", "participants TEXT")
     ensure_column(connection, "documents", "control_number TEXT")
     ensure_column(connection, "documents", "conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL")
@@ -1398,6 +1442,8 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     backfilled_document_occurrences = backfill_document_occurrences(connection)
     backfilled_document_dedupe_keys = backfill_document_dedupe_keys(connection)
     refreshed_document_occurrence_caches = refresh_documents_from_occurrences(connection)
+    removed_custodian_locks = drop_document_field_locks(connection, "custodian")
+    removed_documents_custodian_column = remove_documents_custodian_column(connection)
     rebuilt_documents_fts = ensure_documents_fts(connection)
     connection.commit()
     return {
@@ -1418,6 +1464,8 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         "backfilled_document_occurrences": backfilled_document_occurrences,
         "backfilled_document_dedupe_keys": backfilled_document_dedupe_keys,
         "refreshed_document_occurrence_caches": refreshed_document_occurrence_caches,
+        "removed_custodian_locks": removed_custodian_locks,
+        "removed_documents_custodian_column": removed_documents_custodian_column,
         "backfilled_legacy_control_number": backfilled_legacy_control_number,
         "backfilled_legacy_control_number_batch": backfilled_legacy_control_number_batch,
         "backfilled_legacy_control_number_family_sequence": backfilled_legacy_control_number_family_sequence,
