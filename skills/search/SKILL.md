@@ -38,9 +38,10 @@ For the exact bare slash form `/search`:
 ## View vs compose
 
 - Use `--mode view` whenever the user primarily wants to see a document listing, not just when they literally say "table". Treat verbs like "show", "show me", "list", "display", "browse", "which documents", "what files", "show 10", and "show only" as view requests unless the user explicitly asks for a summary, explanation, or a different layout.
-- Use `--mode view` for the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, plus read-only `list` forms such as `/scope list`, `/dataset list`, `/sort list`, and `/columns list`).
+- Use `--mode view` for the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, and the internal browse-mode toggles `/documents` and `/conversations`, plus read-only `list` forms such as `/scope list`, `/dataset list`, `/sort list`, and `/columns list`).
 - For document-listing requests inside an active investigation, prefer the slash/session browse surface over a fresh stateless search so the current `/page-size`, `/columns`, `/sort`, and related browse state apply automatically.
 - If the user asks to show, list, browse, or display **conversations**, **threads**, **email threads**, **chat threads**, **channels**, **DMs**, or similar grouped discussion units, treat that as a conversation-browse request and switch the slash/session browse surface to `/conversations` before rendering results. If the user instead asks for individual documents, emails, messages, files, attachments, or per-item details, switch or stay in `/documents` mode before rendering results.
+- `/documents` and `/conversations` are agent-facing mode toggles. Use them on the user's behalf when intent is clear; do not ask or require the user to type those commands explicitly.
 - The standard `/search` rendered table is the default output contract for every document-listing request unless the user explicitly asks for a different presentation.
 - In `view` mode, the tool returns a `rendered_markdown` field containing the complete pre-formatted result table.
 - When `rendered_markdown` is present for a view request, your entire reply MUST be the exact contents of that field and nothing else: no preamble, no trailing commentary, no code fences, no reformatting, and no extra summary sentence. Treat any text before or after the markdown footer as a bug.
@@ -58,7 +59,7 @@ For the exact bare slash form `/search`:
 - Validate field names against built-in document columns, registered custom fields, and supported virtual filter fields.
 - Use browse mode when the user is mostly filtering, and keyword search when they provide terms.
 - For a single Bates/control token or a Bates range expression, prefer the Bates-aware search path over plain keyword FTS.
-- For persistent investigation flows, prefer the slash surface: `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, and `/columns`.
+- For persistent investigation flows, prefer the slash surface: `/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, plus the internal mode toggles `/documents` and `/conversations` when the request changes between per-document and per-conversation browsing.
 - Bare slash commands are read-only state inspection when supported: `/scope` shows the active scope, `/dataset` the active dataset selector, `/sort` the active sort, `/page` the current page state, `/page-size` the active page size, and `/columns` the active display columns.
 - Use `list` subcommands for discoverability: `/scope list` lists saved scopes, `/dataset list` lists available datasets, `/sort list` lists sortable fields, and `/columns list` lists displayable fields.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
