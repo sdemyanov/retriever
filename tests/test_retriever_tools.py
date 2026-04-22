@@ -376,7 +376,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def fetch_document_row(self, rel_path: str) -> sqlite3.Row:
+    def normalized_document_row(self, row: sqlite3.Row) -> dict[str, object]:
+        payload = {key: row[key] for key in row.keys()}
+        custodians = retriever_tools.parse_document_custodians_json(payload.get("custodians_json"))
+        payload["custodians"] = custodians
+        payload["custodian"] = ", ".join(custodians) if custodians else None
+        return payload
+
+    def fetch_document_row(self, rel_path: str) -> dict[str, object]:
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
             row = connection.execute(
@@ -384,16 +391,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 (rel_path,),
             ).fetchone()
             self.assertIsNotNone(row)
-            return row
+            assert row is not None
+            return self.normalized_document_row(row)
         finally:
             connection.close()
 
-    def fetch_document_by_id(self, document_id: int) -> sqlite3.Row:
+    def fetch_document_by_id(self, document_id: int) -> dict[str, object]:
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
             row = connection.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
             self.assertIsNotNone(row)
-            return row
+            assert row is not None
+            return self.normalized_document_row(row)
         finally:
             connection.close()
 
@@ -406,10 +415,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def fetch_child_rows(self, parent_document_id: int) -> list[sqlite3.Row]:
+    def fetch_child_rows(self, parent_document_id: int) -> list[dict[str, object]]:
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
-            return connection.execute(
+            rows = connection.execute(
                 """
                 SELECT *
                 FROM documents
@@ -418,6 +427,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 """,
                 (parent_document_id,),
             ).fetchall()
+            return [self.normalized_document_row(row) for row in rows]
         finally:
             connection.close()
 
@@ -1138,7 +1148,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             columns = retriever_tools.table_columns(connection, "documents")
             preview_columns = retriever_tools.table_columns(connection, "document_previews")
             self.assertIn("content_type", columns)
-            self.assertIn("custodian", columns)
+            self.assertIn("custodians_json", columns)
+            self.assertNotIn("custodian", columns)
             self.assertIn("participants", columns)
             self.assertIn("control_number", columns)
             self.assertIn("conversation_id", columns)
@@ -1150,7 +1161,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.assertIn("target_fragment", preview_columns)
             row = connection.execute(
                 """
-                SELECT content_type, custodian, participants, control_number, conversation_id,
+                SELECT content_type, custodians_json, participants, control_number, conversation_id,
                        conversation_assignment_mode, dataset_id, parent_document_id,
                        child_document_kind, root_message_key
                 FROM documents
@@ -1197,7 +1208,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(row["content_type"], "E-Doc")
-        self.assertIsNone(row["custodian"])
+        self.assertEqual(retriever_tools.parse_document_custodians_json(row["custodians_json"]), [])
         self.assertIsNone(row["participants"])
         self.assertEqual(row["control_number"], "DOC001.00000001")
         self.assertIsNone(row["conversation_id"])
@@ -8413,6 +8424,86 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(result["rel_path"], "custodian-b/dup-copy.txt")
         self.assertEqual(result["abs_path"], str(self.root / "custodian-b" / "dup-copy.txt"))
         self.assertEqual(result["source_rel_path"], "custodian-b/dup-copy.txt")
+
+    def test_sql_like_custodian_filter_picks_matching_occurrence_for_duplicate_links(self) -> None:
+        left_dir = self.root / "custodian-a"
+        right_dir = self.root / "custodian-b"
+        left_dir.mkdir()
+        right_dir.mkdir()
+        duplicate_text = "same logical document body\n"
+        (left_dir / "dup.txt").write_text(duplicate_text, encoding="utf-8")
+        (right_dir / "dup-copy.txt").write_text(duplicate_text, encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        search_result = retriever_tools.search(self.root, "same logical document body", None, None, None, 1, 20)
+        self.assertEqual(search_result["total_hits"], 1)
+        document_id = int(search_result["results"][0]["id"])
+        occurrence_rows = self.fetch_occurrence_rows(document_id)
+        occurrence_ids_by_path = {str(row["rel_path"]): int(row["id"]) for row in occurrence_rows}
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            now = retriever_tools.utc_now()
+            connection.execute(
+                """
+                UPDATE document_occurrences
+                SET custodian = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("mailbox-a", now, occurrence_ids_by_path["custodian-a/dup.txt"]),
+            )
+            connection.execute(
+                """
+                UPDATE document_occurrences
+                SET custodian = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("mailbox-b", now, occurrence_ids_by_path["custodian-b/dup-copy.txt"]),
+            )
+            retriever_tools.refresh_document_from_occurrences(connection, document_id)
+            connection.commit()
+        finally:
+            connection.close()
+
+        filter_expression = f"custodian = 'mailbox-b' AND dataset_name = '{self.root.name}'"
+        exit_code, payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            filter_expression,
+            "--verbose",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["total_hits"], 1)
+        result = payload["results"][0]
+        self.assertEqual(result["rel_path"], "custodian-b/dup-copy.txt")
+        self.assertEqual(
+            Path(result["abs_path"]).resolve(),
+            (self.root / "custodian-b" / "dup-copy.txt").resolve(),
+        )
+        self.assertEqual(result["source_rel_path"], "custodian-b/dup-copy.txt")
+        self.assertEqual(set(result["custodians"]), {"mailbox-a", "mailbox-b"})
+
+        chunk_exit, chunk_payload, _, _ = self.run_cli(
+            "search-chunks",
+            str(self.root),
+            "same logical document body",
+            "--filter",
+            filter_expression,
+            "--verbose",
+        )
+        self.assertEqual(chunk_exit, 0)
+        self.assertIsNotNone(chunk_payload)
+        self.assertEqual(len(chunk_payload["results"]), 1)
+        chunk_result = chunk_payload["results"][0]
+        self.assertEqual(chunk_result["document_id"], document_id)
+        self.assertEqual(chunk_result["rel_path"], "custodian-b/dup-copy.txt")
+        self.assertEqual(chunk_result["file_name"], "dup-copy.txt")
 
     def test_exact_duplicate_email_family_keeps_attachment_occurrences_for_both_custodians(self) -> None:
         left_dir = self.root / "custodian-a"

@@ -591,13 +591,11 @@ def replace_document_related_rows(
     preview_rows: list[dict[str, object]],
 ) -> None:
     delete_document_related_rows(connection, document_id)
-    custodian = metadata_values.get("custodian")
-    if custodian is None:
-        row = connection.execute(
-            "SELECT custodian FROM documents WHERE id = ?",
-            (document_id,),
-        ).fetchone()
-        custodian = row["custodian"] if row is not None else None
+    row = connection.execute(
+        "SELECT custodians_json FROM documents WHERE id = ?",
+        (document_id,),
+    ).fetchone()
+    custodian_text = document_custodian_display_text_from_row(row)
 
     insert_document_preview_rows(connection, document_id, preview_rows)
 
@@ -614,7 +612,7 @@ def replace_document_related_rows(
             metadata_values["title"],
             metadata_values["subject"],
             metadata_values["author"],
-            custodian,
+            custodian_text,
             metadata_values["participants"],
             metadata_values["recipients"],
         ),
@@ -767,7 +765,7 @@ def refresh_documents_fts_row(connection: sqlite3.Connection, document_id: int) 
     connection.execute("DELETE FROM documents_fts WHERE document_id = ?", (document_id,))
     row = connection.execute(
         """
-        SELECT id, file_name, title, subject, author, custodian, participants, recipients
+        SELECT id, file_name, title, subject, author, custodians_json, participants, recipients
         FROM documents
         WHERE id = ?
         """,
@@ -786,7 +784,7 @@ def refresh_documents_fts_row(connection: sqlite3.Connection, document_id: int) 
             row["title"],
             row["subject"],
             row["author"],
-            row["custodian"],
+            document_custodian_display_text_from_row(row),
             row["participants"],
             row["recipients"],
         ),
@@ -1032,7 +1030,6 @@ def upsert_document_row(
         "page_count": extracted.get("page_count"),
         "author": extracted.get("author"),
         "content_type": extracted.get("content_type"),
-        "custodian": custodian,
         "date_created": extracted.get("date_created"),
         "date_modified": extracted.get("date_modified"),
         "participants": extracted.get("participants"),
@@ -1058,11 +1055,11 @@ def upsert_document_row(
               conversation_id, conversation_assignment_mode, dataset_id, parent_document_id, child_document_kind,
               source_kind, source_rel_path, source_item_id, root_message_key, source_folder_path,
               production_id, begin_bates, end_bates, begin_attachment, end_attachment,
-              rel_path, file_name, file_type, file_size, page_count, author, custodian, date_created,
+              rel_path, file_name, file_type, file_size, page_count, author, date_created,
               content_type, date_modified, title, subject, participants, recipients, manual_field_locks_json, file_hash,
               content_hash, text_status, lifecycle_status, ingested_at, last_seen_at, updated_at,
               control_number_batch, control_number_family_sequence, control_number_attachment_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 common_values["control_number"],
@@ -1090,7 +1087,6 @@ def upsert_document_row(
                 common_values["file_size"],
                 common_values["page_count"],
                 common_values["author"],
-                common_values["custodian"],
                 common_values["date_created"],
                 common_values["content_type"],
                 common_values["date_modified"],
@@ -1122,7 +1118,7 @@ def upsert_document_row(
                 source_kind = ?, source_rel_path = ?, source_item_id = ?, root_message_key = ?, source_folder_path = ?,
                 production_id = ?, begin_bates = ?, end_bates = ?, begin_attachment = ?, end_attachment = ?,
                 rel_path = ?, file_name = ?, file_type = ?, file_size = ?, page_count = ?,
-                author = ?, custodian = ?, content_type = ?, date_created = ?, date_modified = ?, title = ?, subject = ?,
+                author = ?, content_type = ?, date_created = ?, date_modified = ?, title = ?, subject = ?,
                 participants = ?, recipients = ?, file_hash = ?, content_hash = ?, text_status = ?, lifecycle_status = ?,
                 ingested_at = ?, last_seen_at = ?, updated_at = ?, manual_field_locks_json = ?,
                 control_number_batch = ?, control_number_family_sequence = ?, control_number_attachment_sequence = ?
@@ -1153,7 +1149,6 @@ def upsert_document_row(
                 common_values["file_size"],
                 common_values["page_count"],
                 common_values["author"],
-                common_values["custodian"],
                 common_values["content_type"],
                 common_values["date_created"],
                 common_values["date_modified"],
@@ -1673,7 +1668,7 @@ def list_email_conversation_documents(connection: sqlite3.Connection) -> list[di
           d.subject,
           d.title,
           d.date_created,
-          d.custodian,
+          d.custodians_json,
           det.message_id,
           det.in_reply_to,
           det.references_json,
@@ -1697,6 +1692,7 @@ def list_email_conversation_documents(connection: sqlite3.Connection) -> list[di
         normalized_subject = normalize_email_thread_subject(
             row["normalized_subject"] or row["subject"] or row["conversation_topic"]
         )
+        custodians = parse_document_custodians_json(row["custodians_json"])
         documents.append(
             {
                 "id": int(row["id"]),
@@ -1712,7 +1708,7 @@ def list_email_conversation_documents(connection: sqlite3.Connection) -> list[di
                 "subject": normalize_whitespace(str(row["subject"] or "")) or None,
                 "title": normalize_whitespace(str(row["title"] or "")) or None,
                 "date_created": normalize_datetime(row["date_created"]),
-                "custodian": normalize_whitespace(str(row["custodian"] or "")) or None,
+                "custodians": custodians,
                 "message_id": normalize_email_message_id(row["message_id"]),
                 "in_reply_to": normalize_email_message_id(row["in_reply_to"]),
                 "references": references,
@@ -1774,9 +1770,7 @@ def add_document_to_email_cluster(
         heuristic_subject_index.setdefault((str(heuristic_scope), str(normalized_subject)), set()).add(cluster_id)
     participant_keys = set(document.get("participant_keys") or [])
     cluster["participant_keys"].update(participant_keys)
-    custodian = document.get("custodian")
-    if custodian:
-        cluster["custodians"].add(custodian)
+    cluster["custodians"].update(normalize_custodian_values(set(document.get("custodians") or [])))
     document_date = normalize_datetime(document.get("date_created"))
     if document_date and (cluster["latest_date"] is None or str(cluster["latest_date"]) < document_date):
         cluster["latest_date"] = document_date
@@ -1879,7 +1873,7 @@ def choose_heuristic_cluster(
         return None
     participant_keys = set(document.get("participant_keys") or [])
     document_date = normalize_datetime(document.get("date_created"))
-    document_custodian = document.get("custodian")
+    document_custodians = set(normalize_custodian_values(set(document.get("custodians") or [])))
     scored_candidates: list[tuple[int, str, int]] = []
     for cluster_id in candidate_cluster_ids:
         cluster = clusters[cluster_id]
@@ -1888,9 +1882,7 @@ def choose_heuristic_cluster(
         if overlap <= 0:
             continue
         cluster_custodians = set(cluster["custodians"])
-        if document_custodian and cluster_custodians and any(
-            custodian != document_custodian for custodian in cluster_custodians
-        ):
+        if document_custodians and cluster_custodians and document_custodians.isdisjoint(cluster_custodians):
             continue
         latest_date = normalize_datetime(cluster["latest_date"])
         if document_date and latest_date and latest_date > document_date:
@@ -2171,7 +2163,7 @@ def list_pst_chat_conversation_documents(connection: sqlite3.Connection) -> list
           d.title,
           d.participants,
           d.date_created,
-          d.custodian,
+          d.custodians_json,
           dct.thread_id,
           dct.thread_type,
           dct.participants_json
@@ -2216,7 +2208,7 @@ def list_pst_chat_conversation_documents(connection: sqlite3.Connection) -> list
                 "participants": normalize_whitespace(str(row["participants"] or "")) or None,
                 "participant_names": participant_names,
                 "date_created": normalize_datetime(row["date_created"]),
-                "custodian": normalize_whitespace(str(row["custodian"] or "")) or None,
+                "custodians": parse_document_custodians_json(row["custodians_json"]),
                 "thread_id": normalize_pst_chat_thread_id(row["thread_id"]),
                 "thread_type": normalize_whitespace(str(row["thread_type"] or "")).lower() or None,
             }
@@ -4204,12 +4196,11 @@ def reconcile_attachment_documents(
     dataset_memberships: list[tuple[int, int | None]] | None = None,
 ) -> None:
     parent_row = connection.execute(
-        "SELECT custodian, dataset_id, conversation_id, conversation_assignment_mode FROM documents WHERE id = ?",
+        "SELECT dataset_id, conversation_id, conversation_assignment_mode FROM documents WHERE id = ?",
         (parent_document_id,),
     ).fetchone()
-    parent_custodian = (
-        normalize_whitespace(str(parent_row["custodian"] or "")) if parent_row is not None else ""
-    ) or None
+    parent_occurrence = select_preferred_occurrence(active_occurrence_rows_for_document(connection, parent_document_id))
+    parent_custodian = normalize_whitespace(str(parent_occurrence["custodian"] or "")) or None if parent_occurrence is not None else None
     parent_dataset_id = int(parent_row["dataset_id"]) if parent_row is not None and parent_row["dataset_id"] is not None else None
     parent_conversation_id = int(parent_row["conversation_id"]) if parent_row is not None and parent_row["conversation_id"] is not None else None
     parent_conversation_assignment_mode = (
