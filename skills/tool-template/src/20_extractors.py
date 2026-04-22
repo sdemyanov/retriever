@@ -1890,11 +1890,36 @@ def extract_csv_file(path: Path) -> dict[str, object]:
     }
 
 
-def normalize_attachment_filename(file_name: str | None, ordinal: int) -> str:
+def normalize_attachment_filename(
+    file_name: str | None,
+    ordinal: int,
+    *,
+    payload: bytes | None = None,
+    content_type: object = None,
+    preferred_extension: object = None,
+) -> str:
     normalized = normalize_whitespace(file_name or "")
+    detected_file_type = infer_attachment_file_type(
+        file_name=normalized or None,
+        payload=payload,
+        content_type=content_type,
+        preferred_extension=preferred_extension,
+    )
     if normalized:
+        current_file_type = normalize_file_type_name(Path(normalized).suffix.lower().lstrip("."))
+        if (
+            current_file_type == "bin"
+            and re.fullmatch(rf"attachment-{ordinal:03d}\.bin", normalized, re.IGNORECASE)
+            and detected_file_type
+            and detected_file_type != "bin"
+        ):
+            return f"attachment-{ordinal:03d}.{detected_file_type}"
+        if current_file_type:
+            return normalized
+        if detected_file_type:
+            return f"{normalized}.{detected_file_type}"
         return normalized
-    return f"attachment-{ordinal:03d}.bin"
+    return f"attachment-{ordinal:03d}.{detected_file_type or 'bin'}"
 
 
 def coerce_email_part_payload(part: object) -> bytes | None:
@@ -1933,6 +1958,7 @@ def extract_eml_attachments(message: object) -> list[dict[str, object]]:
             continue
         disposition = (part.get_content_disposition() or "").lower()
         file_name = part.get_filename()
+        content_type = normalize_mime_type(part.get_content_type())
         content_id = normalize_content_id(part.get("Content-ID"))
         is_inline = disposition == "inline" or (content_id is not None and disposition != "attachment")
         if disposition != "attachment" and not file_name and not content_id:
@@ -1942,10 +1968,16 @@ def extract_eml_attachments(message: object) -> list[dict[str, object]]:
             continue
         attachments.append(
             {
-                "file_name": normalize_attachment_filename(file_name, ordinal),
+                "file_name": normalize_attachment_filename(
+                    file_name,
+                    ordinal,
+                    payload=payload,
+                    content_type=content_type,
+                ),
                 "ordinal": ordinal,
                 "payload": payload,
                 "file_hash": sha256_bytes(payload),
+                "content_type": content_type,
                 "content_id": content_id,
                 "is_inline": is_inline,
             }
@@ -1986,6 +2018,14 @@ def extract_msg_attachment_content_id(attachment: object) -> str | None:
     return None
 
 
+def extract_msg_attachment_content_type(attachment: object) -> str | None:
+    for attr_name in ("mimeTag", "mime_tag", "mimetype", "mime_type", "contentType", "content_type"):
+        normalized = normalize_mime_type(getattr(attachment, attr_name, None))
+        if normalized:
+            return normalized
+    return None
+
+
 def extract_msg_attachments(message: object) -> list[dict[str, object]]:
     attachments: list[dict[str, object]] = []
     ordinal = 1
@@ -1996,15 +2036,22 @@ def extract_msg_attachments(message: object) -> list[dict[str, object]]:
             file_name = attachment.getFilename()
         except Exception:
             file_name = None
+        content_type = extract_msg_attachment_content_type(attachment)
         payload = extract_msg_attachment_payload(attachment)
         if payload is None:
             continue
         attachments.append(
             {
-                "file_name": normalize_attachment_filename(file_name, ordinal),
+                "file_name": normalize_attachment_filename(
+                    file_name,
+                    ordinal,
+                    payload=payload,
+                    content_type=content_type,
+                ),
                 "ordinal": ordinal,
                 "payload": payload,
                 "file_hash": sha256_bytes(payload),
+                "content_type": content_type,
                 "content_id": extract_msg_attachment_content_id(attachment),
             }
         )
@@ -2670,6 +2717,11 @@ def coerce_pst_attachment_payload(attachment: object) -> bytes | None:
     return None
 
 
+PST_PROP_DISPLAY_NAME = 0x3001
+PST_PROP_ATTACH_EXTENSION = 0x3703
+PST_PROP_ATTACH_FILENAME = 0x3704
+PST_PROP_ATTACH_LONG_FILENAME = 0x3707
+PST_PROP_ATTACH_MIME_TAG = 0x370E
 PST_PROP_ATTACH_CONTENT_ID = 0x3712
 PST_DEBUG_SCOPE_NAME_PATTERN = re.compile(
     r"(team|teams|skype|conversation|thread|chat|channel|space|group|participant|member|roster)",
@@ -2869,17 +2921,89 @@ def pst_message_recipients(message: object, transport_headers: object = None) ->
     return extract_email_recipients_from_headers(transport_headers)
 
 
-def pst_attachment_file_name(attachment: object, ordinal: int) -> str:
+def pst_attachment_record_entry_text(attachment: object, *entry_types: int) -> str | None:
+    ordered_types = [int(entry_type) for entry_type in entry_types]
+    if not ordered_types:
+        return None
+    found_values: dict[int, str] = {}
+    for record_set in pst_record_sets(attachment):
+        for entry in pst_record_entries(record_set):
+            try:
+                entry_type = int(getattr(entry, "entry_type", 0) or 0)
+            except Exception:
+                continue
+            if entry_type not in ordered_types or entry_type in found_values:
+                continue
+            decoded = decode_pst_record_entry_value(entry)
+            if decoded:
+                found_values[entry_type] = decoded
+    for entry_type in ordered_types:
+        if entry_type in found_values:
+            return found_values[entry_type]
+    return None
+
+
+def pst_attachment_declared_file_name(attachment: object) -> str | None:
     raw_name = None
     if isinstance(attachment, dict):
         raw_name = attachment.get("file_name") or attachment.get("name") or attachment.get("filename")
     else:
-        for attr_name in ("name", "filename", "long_filename"):
+        for attr_name in ("long_filename", "filename", "name", "display_name"):
             value = getattr(attachment, attr_name, None)
             if value:
                 raw_name = value
                 break
-    return normalize_attachment_filename(raw_name if isinstance(raw_name, str) else None, ordinal)
+        if raw_name is None:
+            raw_name = pst_attachment_record_entry_text(
+                attachment,
+                PST_PROP_ATTACH_LONG_FILENAME,
+                PST_PROP_ATTACH_FILENAME,
+                PST_PROP_DISPLAY_NAME,
+            )
+    normalized = normalize_whitespace(raw_name if isinstance(raw_name, str) else "")
+    if normalized:
+        return normalized
+    return None
+
+
+def pst_attachment_extension(attachment: object) -> str | None:
+    if isinstance(attachment, dict):
+        for key in ("preferred_extension", "extension", "file_type"):
+            normalized = normalize_file_type_name(attachment.get(key))
+            if normalized:
+                return normalized
+        return None
+    for attr_name in ("extension", "attach_extension"):
+        normalized = normalize_file_type_name(getattr(attachment, attr_name, None))
+        if normalized:
+            return normalized
+    return normalize_file_type_name(pst_attachment_record_entry_text(attachment, PST_PROP_ATTACH_EXTENSION))
+
+
+def pst_attachment_content_type(attachment: object) -> str | None:
+    if isinstance(attachment, dict):
+        return normalize_mime_type(attachment.get("content_type") or attachment.get("mime_type"))
+    for attr_name in ("mime_tag", "attach_mime_tag", "mime_type", "content_type"):
+        normalized = normalize_mime_type(getattr(attachment, attr_name, None))
+        if normalized:
+            return normalized
+    return normalize_mime_type(pst_attachment_record_entry_text(attachment, PST_PROP_ATTACH_MIME_TAG))
+
+
+def pst_attachment_file_name(
+    attachment: object,
+    ordinal: int,
+    *,
+    payload: bytes | None = None,
+) -> str:
+    raw_name = pst_attachment_declared_file_name(attachment)
+    return normalize_attachment_filename(
+        raw_name,
+        ordinal,
+        payload=payload,
+        content_type=pst_attachment_content_type(attachment),
+        preferred_extension=pst_attachment_extension(attachment),
+    )
 
 
 def pst_message_html_body(message: object) -> str | None:
@@ -3146,12 +3270,14 @@ def iter_pst_raw_messages(
                 payload = coerce_pst_attachment_payload(attachment)
                 if payload is None:
                     continue
+                content_type = pst_attachment_content_type(attachment)
                 attachments.append(
                     {
-                        "file_name": pst_attachment_file_name(attachment, ordinal),
+                        "file_name": pst_attachment_file_name(attachment, ordinal, payload=payload),
                         "ordinal": ordinal,
                         "payload": payload,
                         "file_hash": sha256_bytes(payload),
+                        "content_type": content_type,
                         "content_id": pst_attachment_content_id(attachment),
                     }
                 )
@@ -3371,16 +3497,18 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
     normalized_attachments: list[dict[str, object]] = []
     for ordinal, raw_attachment in enumerate(list(message_dict.get("attachments") or []), start=1):
         raw_name = None
+        raw_content_type: object = None
+        raw_extension: object = None
         raw_content_id: object = None
         if isinstance(raw_attachment, dict):
             raw_name = raw_attachment.get("file_name") or raw_attachment.get("name") or raw_attachment.get("filename")
+            raw_content_type = raw_attachment.get("content_type") or raw_attachment.get("mime_type")
+            raw_extension = raw_attachment.get("preferred_extension") or raw_attachment.get("extension") or raw_attachment.get("file_type")
             raw_content_id = raw_attachment.get("content_id")
         else:
-            for attr_name in ("name", "filename", "long_filename"):
-                value = getattr(raw_attachment, attr_name, None)
-                if value:
-                    raw_name = value
-                    break
+            raw_name = pst_attachment_declared_file_name(raw_attachment)
+            raw_content_type = pst_attachment_content_type(raw_attachment)
+            raw_extension = pst_attachment_extension(raw_attachment)
             raw_content_id = pst_attachment_content_id(raw_attachment)
         payload = coerce_pst_attachment_payload(raw_attachment)
         if payload is None:
@@ -3393,10 +3521,17 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
                 attachment_ordinal = ordinal
         normalized_attachments.append(
             {
-                "file_name": normalize_attachment_filename(raw_name if isinstance(raw_name, str) else None, attachment_ordinal),
+                "file_name": normalize_attachment_filename(
+                    raw_name if isinstance(raw_name, str) else None,
+                    attachment_ordinal,
+                    payload=payload,
+                    content_type=raw_content_type,
+                    preferred_extension=raw_extension,
+                ),
                 "ordinal": attachment_ordinal,
                 "payload": payload,
                 "file_hash": sha256_bytes(payload),
+                "content_type": normalize_mime_type(raw_content_type),
                 "content_id": normalize_content_id(raw_content_id),
             }
         )

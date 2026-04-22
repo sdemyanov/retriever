@@ -2427,6 +2427,63 @@ def sanitize_storage_filename(file_name: str) -> str:
     return sanitized or "attachment.bin"
 
 
+FILE_TYPE_ALIASES = {
+    "htm": "html",
+    "jpe": "jpg",
+    "jpeg": "jpg",
+    "tiff": "tif",
+}
+ATTACHMENT_FILE_TYPE_BY_MIME_TYPE = {
+    "application/json": "json",
+    "application/pdf": "pdf",
+    "application/rtf": "rtf",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/xhtml+xml": "html",
+    "application/xml": "xml",
+    "application/zip": "zip",
+    "application/x-zip-compressed": "zip",
+    "text/calendar": "ics",
+    "text/csv": "csv",
+    "text/html": "html",
+    "text/json": "json",
+    "text/markdown": "md",
+    "text/plain": "txt",
+    "text/rtf": "rtf",
+    "text/xml": "xml",
+}
+OLE_COMPOUND_FILE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def normalize_file_type_name(raw_value: object) -> str | None:
+    normalized = normalize_whitespace(str(raw_value or "")).lower().lstrip(".")
+    if not normalized:
+        return None
+    return FILE_TYPE_ALIASES.get(normalized, normalized)
+
+
+def normalize_mime_type(raw_value: object) -> str | None:
+    normalized = normalize_whitespace(str(raw_value or "")).lower()
+    if not normalized:
+        return None
+    normalized = normalized.split(";", 1)[0].strip()
+    return normalized or None
+
+
+def attachment_file_type_from_mime_type(raw_value: object) -> str | None:
+    mime_type = normalize_mime_type(raw_value)
+    if mime_type is None or mime_type == "application/octet-stream":
+        return None
+    explicit = ATTACHMENT_FILE_TYPE_BY_MIME_TYPE.get(mime_type)
+    if explicit:
+        return explicit
+    guessed = mimetypes.guess_extension(mime_type, strict=False)
+    return normalize_file_type_name(guessed)
+
+
 def infer_content_type_from_extension(file_type: str) -> str | None:
     if not file_type:
         return None
@@ -3912,6 +3969,118 @@ def sniff_image_mime_type(payload: bytes) -> str | None:
     return None
 
 
+def decode_attachment_text_sample(payload: bytes, *, max_bytes: int = 65536) -> str | None:
+    if not isinstance(payload, (bytes, bytearray)):
+        return None
+    sample = bytes(payload[:max_bytes])
+    if not sample or b"\x00" in sample:
+        return None
+    decoded, _, _ = decode_bytes(sample)
+    if not decoded:
+        return None
+    replacement_count = decoded.count("\ufffd")
+    if replacement_count > max(4, len(decoded) // 50):
+        return None
+    control_count = sum(
+        1
+        for character in decoded
+        if ord(character) < 32 and character not in "\r\n\t\f\b"
+    )
+    if control_count > max(4, len(decoded) // 50):
+        return None
+    return decoded
+
+
+def sniff_attachment_file_type(payload: bytes) -> str | None:
+    if not isinstance(payload, (bytes, bytearray)) or not payload:
+        return None
+    data = bytes(payload)
+    sample = data[:65536]
+    trimmed_sample = sample.lstrip(b"\xef\xbb\xbf\r\n\t ")
+    if trimmed_sample.startswith(b"%PDF-"):
+        return "pdf"
+    image_mime_type = sniff_image_mime_type(data)
+    if image_mime_type:
+        return attachment_file_type_from_mime_type(image_mime_type)
+    if trimmed_sample.startswith(b"{\\rtf"):
+        return "rtf"
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                member_names = set(archive.namelist())
+        except Exception:
+            member_names = set()
+        if "[Content_Types].xml" in member_names:
+            if any(name.startswith("word/") for name in member_names):
+                return "docx"
+            if any(name.startswith("xl/") for name in member_names):
+                return "xlsx"
+            if any(name.startswith("ppt/") for name in member_names):
+                return "pptx"
+        return "zip"
+    if sample.startswith(OLE_COMPOUND_FILE_MAGIC):
+        if b"Workbook" in sample or b"Book" in sample:
+            return "xls"
+        if b"WordDocument" in sample:
+            return "doc"
+        if b"PowerPoint Document" in sample:
+            return "ppt"
+        return "ole"
+    decoded_text = decode_attachment_text_sample(data)
+    if not decoded_text:
+        return None
+    stripped_text = decoded_text.lstrip("\ufeff\r\n\t ")
+    if not stripped_text:
+        return None
+    preview = stripped_text[:1024]
+    preview_lower = preview.lower()
+    if stripped_text.upper().startswith("BEGIN:VCALENDAR"):
+        return "ics"
+    if (
+        preview_lower.startswith("<!doctype html")
+        or preview_lower.startswith("<html")
+        or preview_lower.startswith("<body")
+        or "<html" in preview_lower
+    ):
+        return "html"
+    if stripped_text.startswith("{") or stripped_text.startswith("["):
+        try:
+            parsed = json.loads(stripped_text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return "json"
+    if stripped_text.startswith("<?xml") or stripped_text.startswith("<"):
+        try:
+            ET.fromstring(stripped_text)
+        except Exception:
+            pass
+        else:
+            return "xml"
+    return "txt"
+
+
+def infer_attachment_file_type(
+    *,
+    file_name: str | None = None,
+    payload: bytes | None = None,
+    content_type: object = None,
+    preferred_extension: object = None,
+) -> str | None:
+    normalized_extension = normalize_file_type_name(preferred_extension)
+    if normalized_extension:
+        return normalized_extension
+    sniffed = sniff_attachment_file_type(payload) if isinstance(payload, (bytes, bytearray)) else None
+    if sniffed:
+        return sniffed
+    declared = attachment_file_type_from_mime_type(content_type)
+    if declared:
+        return declared
+    if file_name:
+        return normalize_file_type_name(Path(file_name).suffix.lower().lstrip("."))
+    return None
+
+
 def normalize_content_id(raw: object) -> str | None:
     if raw is None:
         return None
@@ -3942,7 +4111,11 @@ def build_cid_data_uri_map(attachments: list[dict[str, object]] | None) -> dict[
             continue
         payload_bytes = bytes(payload)
         file_name = str(attachment.get("file_name") or "")
-        mime_type = ooxml_image_mime_type(file_name) or sniff_image_mime_type(payload_bytes)
+        mime_type = normalize_mime_type(attachment.get("content_type"))
+        if mime_type is not None and not mime_type.startswith("image/"):
+            mime_type = None
+        if not mime_type:
+            mime_type = ooxml_image_mime_type(file_name) or sniff_image_mime_type(payload_bytes)
         if not mime_type:
             guessed, _ = mimetypes.guess_type(file_name)
             if guessed and guessed.startswith("image/"):
