@@ -2927,7 +2927,19 @@ def build_email_thread_preview_html(
     thread_link_href: str | None = None,
     thread_position_label: str | None = None,
     strip_quoted_history: bool = False,
+    newest_first: bool = False,
 ) -> str:
+    selected_card_script = ""
+    if selected_document_id is not None:
+        selected_card_script = (
+            "<script>"
+            "window.addEventListener('load', function () {"
+            "var selected = document.querySelector('.gmail-message-card--selected');"
+            "if (!selected) { return; }"
+            "selected.scrollIntoView({block: 'start'});"
+            "});"
+            "</script>"
+        )
     summary_html = build_email_thread_summary_html(
         documents,
         summary_documents=summary_documents,
@@ -2940,8 +2952,9 @@ def build_email_thread_preview_html(
         thread_link_href=thread_link_href,
         thread_position_label=thread_position_label,
     )
+    render_documents = list(reversed(documents)) if newest_first else list(documents)
     message_cards = []
-    for document in documents:
+    for document in render_documents:
         document_id = email_preview_document_id(document)
         message_cards.append(
             build_email_message_card_html(
@@ -2983,6 +2996,7 @@ def build_email_thread_preview_html(
         f'<section class="gmail-thread-messages">{"".join(message_cards)}</section>'
         "</main>"
         f"{body_source_template}"
+        f"{selected_card_script}"
         "</body></html>"
     )
 
@@ -3048,6 +3062,7 @@ def build_email_message_preview_html(
             thread_link_href=thread_link_href,
             thread_position_label=thread_position_label,
             strip_quoted_history=True,
+            newest_first=True,
         )
     thread_title = normalize_generated_document_title(document.get("subject") or document.get("title")) or document_title
     return build_email_thread_preview_html(
