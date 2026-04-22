@@ -3524,6 +3524,20 @@ def extract_attachment_document(path: Path) -> dict[str, object]:
         return build_fallback_extract(path)
 
 
+def extract_attachment_document_with_overrides(
+    path: Path,
+    attachment: dict[str, object],
+) -> dict[str, object]:
+    extracted = extract_attachment_document(path)
+    drive_record = attachment.get("gmail_drive_record")
+    if isinstance(drive_record, dict):
+        extracted = apply_gmail_drive_export_metadata(
+            dict(extracted),
+            drive_record=dict(drive_record),
+        )
+    return extracted
+
+
 def reconcile_attachment_documents(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
@@ -3577,7 +3591,10 @@ def reconcile_attachment_documents(
             str(attachment["file_name"]),
             bytes(attachment["payload"]),
         )
-        extracted = apply_manual_locks(existing_row, extract_attachment_document(child_path))
+        extracted = apply_manual_locks(
+            existing_row,
+            extract_attachment_document_with_overrides(child_path, attachment),
+        )
         document_id = upsert_document_row(
             connection,
             child_rel_path,
@@ -3976,8 +3993,11 @@ def ingest_container_source(
     iter_messages,
     normalize_message,
     file_type_override: str,
+    source_scan_hash_override: str | None = None,
 ) -> dict[str, object]:
-    source_scan_hash = sha256_text(f"{scan_hash_salt}:{sha256_file(path) or ''}")
+    source_scan_hash = normalize_whitespace(str(source_scan_hash_override or "")) or sha256_text(
+        f"{scan_hash_salt}:{sha256_file(path) or ''}"
+    )
     dataset_id, dataset_source_id = ensure_source_backed_dataset(
         connection,
         source_kind=source_kind,
@@ -4361,6 +4381,407 @@ def ingest_mbox_source(
         "mbox_messages_created": result["container_messages_created"],
         "mbox_messages_updated": result["container_messages_updated"],
         "mbox_messages_deleted": result["container_messages_deleted"],
+    }
+
+
+def remove_auto_filesystem_dataset_membership(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+) -> None:
+    filesystem_source_row = get_dataset_source_row(
+        connection,
+        source_kind=FILESYSTEM_SOURCE_KIND,
+        source_locator=filesystem_dataset_locator(),
+    )
+    if filesystem_source_row is None:
+        return
+    connection.execute(
+        """
+        DELETE FROM dataset_documents
+        WHERE document_id = ?
+          AND dataset_source_id = ?
+        """,
+        (document_id, int(filesystem_source_row["id"])),
+    )
+
+
+def retire_standalone_filesystem_documents_by_rel_paths(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    rel_paths: set[str],
+) -> int:
+    normalized_rel_paths = sorted(
+        {
+            normalize_whitespace(str(rel_path or ""))
+            for rel_path in rel_paths
+            if normalize_whitespace(str(rel_path or ""))
+        }
+    )
+    if not normalized_rel_paths:
+        return 0
+    placeholders = ", ".join("?" for _ in normalized_rel_paths)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM documents
+        WHERE parent_document_id IS NULL
+          AND rel_path IN ({placeholders})
+          AND COALESCE(source_kind, ?) = ?
+          AND lifecycle_status != 'deleted'
+        ORDER BY id ASC
+        """,
+        [*normalized_rel_paths, FILESYSTEM_SOURCE_KIND, FILESYSTEM_SOURCE_KIND],
+    ).fetchall()
+    retired = 0
+    now = utc_now()
+    for row in rows:
+        child_rows = connection.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE parent_document_id = ?
+            ORDER BY id ASC
+            """,
+            (row["id"],),
+        ).fetchall()
+        for child_row in child_rows:
+            cleanup_document_artifacts(paths, connection, child_row)
+            delete_document_related_rows(connection, int(child_row["id"]))
+        cleanup_document_artifacts(paths, connection, row)
+        delete_document_related_rows(connection, int(row["id"]))
+        related_ids = [int(row["id"]), *[int(child_row["id"]) for child_row in child_rows]]
+        related_placeholders = ", ".join("?" for _ in related_ids)
+        connection.execute(
+            f"""
+            UPDATE documents
+            SET lifecycle_status = 'deleted', updated_at = ?
+            WHERE id IN ({related_placeholders})
+            """,
+            [now, *related_ids],
+        )
+        retired += 1
+    return retired
+
+
+def ingest_gmail_export_root(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    root: Path,
+    descriptor: dict[str, object],
+    allowed_file_types: set[str] | None = None,
+) -> dict[str, object]:
+    all_mbox_paths = [Path(path) for path in list(descriptor.get("mbox_paths") or [])]
+    if not all_mbox_paths:
+        return {
+            "new": 0,
+            "updated": 0,
+            "failed": 0,
+            "scanned_files": 0,
+            "mbox_sources_skipped": 0,
+            "mbox_messages_created": 0,
+            "mbox_messages_updated": 0,
+            "mbox_messages_deleted": 0,
+            "gmail_linked_documents_created": 0,
+            "gmail_linked_documents_updated": 0,
+            "scanned_filesystem_rel_paths": [],
+            "scanned_mbox_source_rel_paths": [],
+            "failures": [],
+        }
+
+    include_mbox_sources = allowed_file_types is None or MBOX_SOURCE_KIND in allowed_file_types
+    selected_drive_file_types = (
+        None
+        if allowed_file_types is None
+        else {file_type for file_type in allowed_file_types if file_type != MBOX_SOURCE_KIND}
+    )
+    mbox_paths = list(all_mbox_paths) if include_mbox_sources else []
+    drive_documents: list[dict[str, object]] = []
+    for raw_drive_record in list(descriptor.get("drive_documents") or []):
+        drive_record = dict(raw_drive_record)
+        file_path_value = drive_record.get("file_path")
+        if not isinstance(file_path_value, Path):
+            continue
+        if include_mbox_sources and list(drive_record.get("linked_message_ids") or []):
+            continue
+        if (
+            selected_drive_file_types is not None
+            and normalize_extension(file_path_value) not in selected_drive_file_types
+        ):
+            continue
+        drive_documents.append(drive_record)
+
+    if not mbox_paths and not drive_documents:
+        return {
+            "new": 0,
+            "updated": 0,
+            "failed": 0,
+            "scanned_files": 0,
+            "mbox_sources_skipped": 0,
+            "mbox_messages_created": 0,
+            "mbox_messages_updated": 0,
+            "mbox_messages_deleted": 0,
+            "gmail_linked_documents_created": 0,
+            "gmail_linked_documents_updated": 0,
+            "scanned_filesystem_rel_paths": [],
+            "scanned_mbox_source_rel_paths": [],
+            "failures": [],
+        }
+
+    primary_source_rel_path = relative_document_path(root, all_mbox_paths[0])
+    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+        connection,
+        source_kind=MBOX_SOURCE_KIND,
+        source_locator=primary_source_rel_path,
+        dataset_name=mbox_dataset_name(primary_source_rel_path),
+    )
+    email_metadata_by_message_id = {
+        str(key): dict(value)
+        for key, value in dict(descriptor.get("email_metadata_by_message_id") or {}).items()
+    }
+    linked_drive_attachment_records_by_message_id = {
+        str(key): [dict(item) for item in list(value)]
+        for key, value in dict(descriptor.get("linked_drive_attachment_records_by_message_id") or {}).items()
+    }
+    linked_drive_records_by_message_id = {
+        str(key): [dict(item) for item in list(value)]
+        for key, value in dict(descriptor.get("linked_drive_records_by_message_id") or {}).items()
+    }
+    message_sidecar_hash = normalize_whitespace(str(descriptor.get("message_sidecar_hash") or "")) or None
+
+    stats = {
+        "new": 0,
+        "updated": 0,
+        "failed": 0,
+        "scanned_files": 0,
+        "mbox_sources_skipped": 0,
+        "mbox_messages_created": 0,
+        "mbox_messages_updated": 0,
+        "mbox_messages_deleted": 0,
+        "gmail_linked_documents_created": 0,
+        "gmail_linked_documents_updated": 0,
+    }
+    failures: list[dict[str, str]] = []
+    scanned_filesystem_rel_paths: set[str] = set()
+    scanned_mbox_source_rel_paths: set[str] = set()
+    current_ingestion_batch: int | None = None
+
+    for mbox_path in mbox_paths:
+        source_rel_path = relative_document_path(root, mbox_path)
+        scanned_mbox_source_rel_paths.add(source_rel_path)
+
+        def normalize_gmail_message(source_rel_path_for_message: str, message_dict: dict[str, object]) -> dict[str, object]:
+            normalized = normalize_mbox_message(source_rel_path_for_message, message_dict)
+            message_id = gmail_normalized_message_lookup_key(
+                message_dict.get("source_item_id") or normalized.get("source_item_id")
+            )
+            linked_drive_attachment_records = (
+                list(linked_drive_attachment_records_by_message_id.get(message_id, []))
+                if message_id is not None
+                else []
+            )
+            linked_drive_records = (
+                list(linked_drive_records_by_message_id.get(message_id, []))
+                if message_id is not None
+                else []
+            )
+            extracted = apply_gmail_email_export_metadata(
+                dict(normalized["extracted"]),
+                message_metadata=(email_metadata_by_message_id.get(message_id) if message_id is not None else None),
+                linked_drive_records=linked_drive_records,
+            )
+            attachment_payloads = [
+                attachment
+                for attachment in (
+                    gmail_drive_attachment_payload(dict(record))
+                    for record in linked_drive_attachment_records
+                )
+                if attachment is not None
+            ]
+            if attachment_payloads:
+                extracted["attachments"] = [*list(extracted.get("attachments") or []), *attachment_payloads]
+            normalized["extracted"] = extracted
+            normalized["file_hash"] = gmail_enriched_message_file_hash(
+                normalized.get("file_hash"),
+                message_metadata=(email_metadata_by_message_id.get(message_id) if message_id is not None else None),
+                linked_drive_records=linked_drive_records,
+                linked_drive_attachment_records=linked_drive_attachment_records,
+            )
+            return normalized
+
+        mbox_scan_hash_override = sha256_json_value(
+            {
+                "mbox_hash": sha256_file(mbox_path),
+                "message_sidecar_hash": message_sidecar_hash,
+                "source_rel_path": source_rel_path,
+            }
+        )
+        result = ingest_container_source(
+            connection,
+            paths,
+            mbox_path,
+            source_rel_path,
+            source_kind=MBOX_SOURCE_KIND,
+            scan_hash_salt="mbox-ingest-v2-gmail",
+            dataset_name=mbox_dataset_name(source_rel_path),
+            iter_messages=iter_mbox_messages,
+            normalize_message=normalize_gmail_message,
+            file_type_override=MBOX_SOURCE_KIND,
+            source_scan_hash_override=mbox_scan_hash_override,
+        )
+        if result["action"] == "new":
+            stats["new"] += 1
+        elif result["action"] == "updated":
+            stats["updated"] += 1
+        stats["scanned_files"] += 1
+        stats["mbox_sources_skipped"] += int(result["container_sources_skipped"])
+        stats["mbox_messages_created"] += int(result["container_messages_created"])
+        stats["mbox_messages_updated"] += int(result["container_messages_updated"])
+        stats["mbox_messages_deleted"] += int(result["container_messages_deleted"])
+
+    if include_mbox_sources:
+        linked_drive_rel_paths = {
+            relative_document_path(root, file_path)
+            for records in linked_drive_attachment_records_by_message_id.values()
+            for record in records
+            if isinstance(file_path := record.get("file_path"), Path) and file_path.exists()
+        }
+        if linked_drive_rel_paths:
+            connection.execute("BEGIN")
+            try:
+                retire_standalone_filesystem_documents_by_rel_paths(
+                    connection,
+                    paths,
+                    rel_paths=linked_drive_rel_paths,
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    for drive_record in drive_documents:
+        file_path_value = drive_record.get("file_path")
+        if not isinstance(file_path_value, Path) or not file_path_value.exists():
+            continue
+        rel_path = relative_document_path(root, file_path_value)
+        scanned_filesystem_rel_paths.add(rel_path)
+        existing_row = connection.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE parent_document_id IS NULL
+              AND rel_path = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (rel_path,),
+        ).fetchone()
+        connection.execute("BEGIN")
+        try:
+            extracted_payload = extract_document(file_path_value, include_attachments=True)
+            attachments = list(extracted_payload.get("attachments", []))
+            extracted_payload.pop("attachments", None)
+            extracted_payload = apply_gmail_drive_export_metadata(
+                dict(extracted_payload),
+                drive_record=drive_record,
+            )
+            extracted = apply_manual_locks(existing_row, extracted_payload)
+            if existing_row is None:
+                if current_ingestion_batch is None:
+                    current_ingestion_batch = allocate_ingestion_batch_number(connection)
+                control_number_batch = current_ingestion_batch
+                control_number_family_sequence = reserve_control_number_family_sequence(connection, control_number_batch)
+                control_number = format_control_number(control_number_batch, control_number_family_sequence)
+                control_number_attachment_sequence = None
+            else:
+                control_number_batch = int(existing_row["control_number_batch"])
+                control_number_family_sequence = int(existing_row["control_number_family_sequence"])
+                control_number = str(existing_row["control_number"])
+                control_number_attachment_sequence = existing_row["control_number_attachment_sequence"]
+                cleanup_document_artifacts(paths, connection, existing_row)
+            document_id = upsert_document_row(
+                connection,
+                rel_path,
+                file_path_value,
+                existing_row,
+                extracted,
+                file_name=file_path_value.name,
+                parent_document_id=None,
+                control_number=control_number,
+                dataset_id=dataset_id,
+                control_number_batch=control_number_batch,
+                control_number_family_sequence=control_number_family_sequence,
+                control_number_attachment_sequence=control_number_attachment_sequence,
+                source_kind=FILESYSTEM_SOURCE_KIND,
+                file_hash_override=gmail_drive_document_file_hash(file_path_value, drive_record),
+            )
+            replace_document_email_threading_row(
+                connection,
+                document_id=document_id,
+                email_threading=extracted.get("email_threading"),
+            )
+            replace_document_chat_threading_row(
+                connection,
+                document_id=document_id,
+                chat_threading=extracted.get("chat_threading"),
+            )
+            seed_source_text_revision_for_document(
+                connection,
+                paths,
+                document_id=document_id,
+                extracted=extracted,
+                existing_row=existing_row,
+            )
+            preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
+            chunks = extracted_search_chunks(extracted)
+            replace_document_related_rows(
+                connection,
+                document_id,
+                extracted | {"file_name": file_path_value.name},
+                chunks,
+                preview_rows,
+            )
+            remove_auto_filesystem_dataset_membership(connection, document_id=document_id)
+            ensure_dataset_document_membership(
+                connection,
+                dataset_id=dataset_id,
+                document_id=document_id,
+                dataset_source_id=dataset_source_id,
+            )
+            reconcile_attachment_documents(
+                connection,
+                paths,
+                document_id,
+                rel_path,
+                control_number_batch,
+                control_number_family_sequence,
+                attachments,
+                [(dataset_id, dataset_source_id)],
+            )
+            connection.commit()
+            stats["scanned_files"] += 1
+            if existing_row is None:
+                stats["new"] += 1
+                stats["gmail_linked_documents_created"] += 1
+            else:
+                stats["updated"] += 1
+                stats["gmail_linked_documents_updated"] += 1
+        except Exception as exc:
+            connection.rollback()
+            stats["failed"] += 1
+            failures.append(
+                {
+                    "rel_path": rel_path,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    return {
+        **stats,
+        "scanned_filesystem_rel_paths": sorted(scanned_filesystem_rel_paths),
+        "scanned_mbox_source_rel_paths": sorted(scanned_mbox_source_rel_paths),
+        "failures": failures,
     }
 
 
