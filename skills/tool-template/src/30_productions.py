@@ -2715,7 +2715,10 @@ def build_email_message_body_content_html(
     document: dict[str, object],
     *,
     body_html: str | None = None,
+    strip_quoted_history: bool = False,
 ) -> str:
+    text_content = str(document.get("text_content") or "")
+    visible_text, quoted_text = split_email_preview_text_content(text_content)
     preferred_body_html = body_html
     if preferred_body_html is None:
         stored_body_html = document.get("standalone_preview_body_html")
@@ -2726,16 +2729,27 @@ def build_email_message_body_content_html(
         )
     if preferred_body_html:
         normalized_html = preferred_body_html.strip()
-        if any(token in normalized_html for token in ('class="gmail-message-rendered-html"', 'class="gmail-message-plain"', 'class="gmail-message-quoted"')):
+        if strip_quoted_history:
+            original_html = normalized_html
+            stripped_html = strip_email_reply_history_html(normalized_html)
+            if stripped_html is not None:
+                normalized_html = stripped_html
+            elif visible_text:
+                normalized_html = ""
+            if quoted_text and normalized_html == original_html and visible_text:
+                normalized_html = ""
+        if normalized_html and any(
+            token in normalized_html
+            for token in ('class="gmail-message-rendered-html"', 'class="gmail-message-plain"', 'class="gmail-message-quoted"')
+        ):
             return normalized_html
         normalized_html = re.sub(r"(?is)<!doctype[^>]*>\s*", "", normalized_html).strip()
-        return f'<div class="gmail-message-rendered-html">{normalized_html}</div>'
-    text_content = str(document.get("text_content") or "")
-    visible_text, quoted_text = split_email_preview_text_content(text_content)
+        if normalized_html:
+            return f'<div class="gmail-message-rendered-html">{normalized_html}</div>'
     body_parts = [
         f'<div class="gmail-message-plain">{html.escape(visible_text or "No extracted text available.")}</div>'
     ]
-    if quoted_text:
+    if quoted_text and not strip_quoted_history:
         body_parts.append(
             "<details class=\"gmail-message-quoted\">"
             "<summary>Quoted text</summary>"
@@ -2751,6 +2765,7 @@ def build_email_message_card_html(
     body_html: str | None = None,
     selected: bool = False,
     attachment_links: list[dict[str, str]] | None = None,
+    strip_quoted_history: bool = False,
 ) -> str:
     author_name, author_email = normalize_email_preview_address(document.get("author"))
     author_label = author_name or author_email or "Unknown sender"
@@ -2768,7 +2783,11 @@ def build_email_message_card_html(
         avatar_foreground,
         author_label,
     )
-    message_body_html = build_email_message_body_content_html(document, body_html=body_html)
+    message_body_html = build_email_message_body_content_html(
+        document,
+        body_html=body_html,
+        strip_quoted_history=strip_quoted_history,
+    )
     attachment_links_html = render_html_preview_attachment_links(attachment_links or [])
     card_classes = "gmail-message-card gmail-message-card--selected" if selected else "gmail-message-card"
     anchor = conversation_preview_anchor(document_id) if (document_id := email_preview_document_id(document)) is not None else None
@@ -2803,21 +2822,24 @@ def build_email_message_card_html(
 def build_email_thread_summary_html(
     documents: list[dict[str, object]],
     *,
+    summary_documents: list[dict[str, object]] | None = None,
     position_index: int | None = None,
     segment_label: str | None = None,
     segment_count: int | None = None,
 ) -> str:
-    if not documents:
+    summary_scope = summary_documents if summary_documents is not None else documents
+    if not summary_scope:
         return ""
-    if len(documents) <= 1 and not (segment_label and (segment_count or 0) > 1):
+    total_messages = len(summary_scope)
+    if total_messages <= 1 and not (segment_label and (segment_count or 0) > 1):
         return ""
-    started_at, last_message_at = conversation_preview_bounds(documents)
-    participants = conversation_preview_participants(documents)
+    started_at, last_message_at = conversation_preview_bounds(summary_scope)
+    participants = conversation_preview_participants(summary_scope)
     pills: list[tuple[str, bool]] = []
     if segment_label and (segment_count or 0) > 1:
         pills.append((segment_label, False))
-    if len(documents) > 1:
-        pills.append((f"{len(documents)} messages", False))
+    if total_messages > 1:
+        pills.append((f"{total_messages} messages", False))
     started_label = format_chat_preview_timestamp(started_at) or started_at or ""
     if started_label:
         pills.append((f"Created {started_label}", False))
@@ -2826,8 +2848,8 @@ def build_email_thread_summary_html(
         pills.append((f"Last modified {last_message_label}", False))
     if participants:
         pills.append((f"Participants {participants}", False))
-    if position_index is not None and len(documents) > 1:
-        pills.append((f"Viewing message {position_index} of {len(documents)}", True))
+    if position_index is not None and total_messages > 1:
+        pills.append((f"Viewing message {position_index} of {total_messages}", True))
     if not pills:
         return ""
     pills_html = "".join(
@@ -2838,10 +2860,29 @@ def build_email_thread_summary_html(
     return f'<div class="gmail-thread-summary">{pills_html}</div>' if pills_html else ""
 
 
+def build_email_thread_title_html(
+    thread_title: str,
+    *,
+    thread_link_href: str | None = None,
+    thread_position_label: str | None = None,
+) -> str:
+    if not thread_link_href and not thread_position_label:
+        return html.escape(thread_title)
+    title_html = (
+        f'<a class="gmail-thread-title-link" href="{html.escape(thread_link_href)}">{html.escape(thread_title)}</a>'
+        if thread_link_href
+        else f'<span class="gmail-thread-title-text">{html.escape(thread_title)}</span>'
+    )
+    if thread_position_label:
+        title_html += f'<span class="gmail-thread-title-meta">({html.escape(thread_position_label)})</span>'
+    return title_html
+
+
 def build_email_thread_preview_html(
     *,
     thread_title: str,
     documents: list[dict[str, object]],
+    summary_documents: list[dict[str, object]] | None = None,
     page_title: str,
     selected_document_id: int | None = None,
     position_index: int | None = None,
@@ -2850,12 +2891,21 @@ def build_email_thread_preview_html(
     attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
     body_source_document: dict[str, object] | None = None,
     body_source_html: str | None = None,
+    thread_link_href: str | None = None,
+    thread_position_label: str | None = None,
+    strip_quoted_history: bool = False,
 ) -> str:
     summary_html = build_email_thread_summary_html(
         documents,
+        summary_documents=summary_documents,
         position_index=position_index,
         segment_label=segment_label,
         segment_count=segment_count,
+    )
+    title_html = build_email_thread_title_html(
+        thread_title,
+        thread_link_href=thread_link_href,
+        thread_position_label=thread_position_label,
     )
     message_cards = []
     for document in documents:
@@ -2869,6 +2919,7 @@ def build_email_thread_preview_html(
                     if document_id is not None
                     else None
                 ),
+                strip_quoted_history=strip_quoted_history,
             )
         )
     body_source_template = ""
@@ -2893,7 +2944,7 @@ def build_email_thread_preview_html(
         '<main class="gmail-thread-page">'
         '<header class="gmail-thread-header">'
         f"{header_kicker}"
-        f'<h1 class="gmail-thread-title">{html.escape(thread_title)}</h1>'
+        f'<h1 class="gmail-thread-title">{title_html}</h1>'
         f"{summary_html}"
         "</header>"
         f'<section class="gmail-thread-messages">{"".join(message_cards)}</section>'
@@ -2910,23 +2961,60 @@ def build_email_message_preview_html(
     conversation_row: sqlite3.Row | None = None,
     conversation_documents: list[dict[str, object]] | None = None,
     position_index: int | None = None,
+    thread_link_href: str | None = None,
 ) -> str:
     document_title = conversation_preview_document_heading(document) or "Retriever Email Preview"
     document_id = email_preview_document_id(document)
     if conversation_row is not None and conversation_documents is not None and len(conversation_documents) > 1:
+        email_documents = [
+            item
+            for item in conversation_documents
+            if normalize_whitespace(str(item.get("content_type") or "")).lower() == "email"
+        ]
+        selected_position = position_index
+        if selected_position is None and document_id is not None:
+            for index, candidate in enumerate(email_documents, start=1):
+                if email_preview_document_id(candidate) == document_id:
+                    selected_position = index
+                    break
+        if selected_position is None:
+            selected_rel_path = normalize_whitespace(str(document.get("rel_path") or ""))
+            for index, candidate in enumerate(email_documents, start=1):
+                if normalize_whitespace(str(candidate.get("rel_path") or "")) == selected_rel_path:
+                    selected_position = index
+                    break
+        timeline_documents = (
+            email_documents[:selected_position]
+            if selected_position is not None and selected_position > 0
+            else [document]
+        )
         thread_title = (
             normalize_whitespace(str(conversation_row["display_name"] or ""))
             or normalize_generated_document_title(document.get("subject") or document.get("title"))
             or document_title
         )
+        thread_message_count = len(email_documents)
+        thread_position_label = (
+            f"{selected_position}/{thread_message_count} in thread"
+            if selected_position is not None and thread_message_count > 1
+            else None
+        )
         return build_email_thread_preview_html(
             thread_title=thread_title,
-            documents=conversation_documents,
-            page_title=thread_title,
+            documents=timeline_documents,
+            summary_documents=email_documents,
+            page_title=(
+                f"{thread_title} ({thread_position_label})"
+                if thread_position_label
+                else thread_title
+            ),
             selected_document_id=document_id,
-            position_index=position_index,
+            position_index=selected_position,
             body_source_document=document,
             body_source_html=body_html,
+            thread_link_href=thread_link_href,
+            thread_position_label=thread_position_label,
+            strip_quoted_history=True,
         )
     thread_title = normalize_generated_document_title(document.get("subject") or document.get("title")) or document_title
     return build_email_thread_preview_html(
@@ -2939,6 +3027,20 @@ def build_email_message_preview_html(
     )
 
 
+def default_email_message_preview_rel_path(document: dict[str, object]) -> str | None:
+    rel_path = normalize_whitespace(str(document.get("rel_path") or ""))
+    if not rel_path:
+        return None
+    preview_base = preview_base_path_for_rel_path(rel_path)
+    source_kind = normalize_whitespace(str(document.get("source_kind") or "")).lower()
+    source_item_id = normalize_whitespace(str(document.get("source_item_id") or ""))
+    if source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and source_item_id:
+        preview_file_name = container_preview_file_name(source_item_id)
+    else:
+        preview_file_name = f"{Path(rel_path).name}.html"
+    return (preview_base / preview_file_name).as_posix()
+
+
 def rewrite_preserved_email_message_preview(
     paths: dict[str, Path],
     *,
@@ -2947,6 +3049,7 @@ def rewrite_preserved_email_message_preview(
     conversation_row: sqlite3.Row | None = None,
     conversation_documents: list[dict[str, object]] | None = None,
     position_index: int | None = None,
+    thread_rel_path: str | None = None,
 ) -> None:
     preferred_rows = sorted(
         preview_rows,
@@ -2964,10 +3067,28 @@ def rewrite_preserved_email_message_preview(
         None,
     )
     if target_row is None:
-        return
+        synthesized_rel_path = default_email_message_preview_rel_path(document)
+        if synthesized_rel_path is None:
+            return
+        target_row = {
+            "rel_preview_path": synthesized_rel_path,
+            "preview_type": "html",
+            "target_fragment": None,
+            "label": "message",
+            "ordinal": 0,
+        }
+        preview_rows.insert(0, target_row)
+    else:
+        preview_rows[:] = [target_row, *[row for row in preview_rows if row is not target_row]]
+        if not normalize_whitespace(str(target_row.get("label") or "")):
+            target_row["label"] = "message"
     preview_path = paths["state_dir"] / str(target_row["rel_preview_path"])
-    if not preview_path.exists():
-        return
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    thread_link_href = None
+    if thread_rel_path:
+        thread_path = paths["state_dir"] / thread_rel_path
+        if thread_path.exists():
+            thread_link_href = relative_preview_href(thread_path, preview_path)
     body_html = document.get("standalone_preview_body_html")
     preview_path.write_text(
         build_email_message_preview_html(
@@ -2976,6 +3097,7 @@ def rewrite_preserved_email_message_preview(
             conversation_row=conversation_row,
             conversation_documents=conversation_documents,
             position_index=position_index,
+            thread_link_href=thread_link_href,
         ),
         encoding="utf-8",
     )

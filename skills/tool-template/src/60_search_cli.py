@@ -7526,6 +7526,29 @@ def build_parser() -> argparse.ArgumentParser:
     clear_conversation_parser.add_argument("workspace", help="Workspace root path")
     clear_conversation_parser.add_argument("--doc-id", type=int, required=True, help="Document id to clear")
 
+    refresh_previews_parser = subparsers.add_parser(
+        "refresh-conversation-previews",
+        help="Regenerate thread and per-message HTML previews for existing conversations",
+    )
+    refresh_previews_parser.add_argument("workspace", help="Workspace root path")
+    refresh_previews_parser.add_argument(
+        "--conversation-id",
+        dest="conversation_ids",
+        action="append",
+        type=int,
+        help="Conversation id to refresh (repeatable)",
+    )
+    refresh_previews_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id whose conversation should be refreshed (repeatable)",
+    )
+    refresh_dataset_selector_group = refresh_previews_parser.add_mutually_exclusive_group()
+    refresh_dataset_selector_group.add_argument("--dataset-id", type=int, help="Dataset id")
+    refresh_dataset_selector_group.add_argument("--dataset-name", help="Exact dataset name")
+
     subparsers.add_parser("schema-version", help="Print the schema version")
 
     upgrade_workspace_parser = subparsers.add_parser(
@@ -8181,6 +8204,18 @@ def main() -> int:
             return emit_cli_payload(
                 "clear-conversation-assignment",
                 clear_conversation_assignment(root, args.doc_id),
+            )
+
+        if args.command == "refresh-conversation-previews":
+            return emit_cli_payload(
+                "refresh-conversation-previews",
+                refresh_generated_previews(
+                    root,
+                    conversation_ids=args.conversation_ids,
+                    document_ids=args.document_ids,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                ),
             )
 
         parser.error(f"Unknown command: {args.command}")
