@@ -3496,6 +3496,190 @@ def active_page_payload(session_state: dict[str, object]) -> dict[str, int]:
     }
 
 
+def parse_slash_command_text(raw_command: str) -> tuple[str, str]:
+    command_text = raw_command.strip()
+    if not command_text:
+        raise RetrieverError("Slash command cannot be empty.")
+    if not command_text.startswith("/"):
+        raise RetrieverError("Slash commands must begin with '/'.")
+    command_body = command_text[1:]
+    command_name, _, tail = command_body.partition(" ")
+    return command_name, tail.lstrip()
+
+
+def bates_scope_text(scope: dict[str, object]) -> str | None:
+    bates = scope.get("bates")
+    if not isinstance(bates, dict):
+        return None
+    begin = normalize_inline_whitespace(str(bates.get("begin") or ""))
+    end = normalize_inline_whitespace(str(bates.get("end") or ""))
+    if not begin or not end:
+        return None
+    return f"{begin}-{end}"
+
+
+def summarize_scope_inline(scope: dict[str, object]) -> str:
+    parts: list[str] = []
+    keyword = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+    if keyword:
+        parts.append(f"keyword={keyword}")
+    bates_text = bates_scope_text(scope)
+    if bates_text:
+        parts.append(f"bates={bates_text}")
+    filter_expression = normalize_inline_whitespace(str(scope.get("filter") or ""))
+    if filter_expression:
+        parts.append(f"filter={filter_expression}")
+    dataset_entries = coerce_scope_dataset_entries(scope.get("dataset"))
+    if dataset_entries:
+        parts.append("dataset=" + ", ".join(str(entry["name"]) for entry in dataset_entries))
+    from_run_id = scope.get("from_run_id")
+    if from_run_id is not None:
+        parts.append(f"from-run={from_run_id}")
+    return "; ".join(parts) if parts else "(none)"
+
+
+def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) -> str | None:
+    command_name, normalized_tail = parse_slash_command_text(raw_command)
+
+    if command_name == "scope":
+        scope_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
+        if not scope_args:
+            scope = coerce_scope_payload(payload.get("scope"))
+            lines = ["Scope:"]
+            if not scope:
+                lines[0] = "Scope: (none)"
+            else:
+                keyword = normalize_inline_whitespace(str(scope.get("keyword") or ""))
+                if keyword:
+                    lines.append(f"- keyword: {keyword}")
+                bates_text = bates_scope_text(scope)
+                if bates_text:
+                    lines.append(f"- bates: {bates_text}")
+                filter_expression = normalize_inline_whitespace(str(scope.get("filter") or ""))
+                if filter_expression:
+                    lines.append(f"- filter: {filter_expression}")
+                dataset_entries = coerce_scope_dataset_entries(scope.get("dataset"))
+                if dataset_entries:
+                    lines.append("- dataset: " + ", ".join(str(entry["name"]) for entry in dataset_entries))
+                from_run_id = scope.get("from_run_id")
+                if from_run_id is not None:
+                    lines.append(f"- from-run: {from_run_id}")
+            return "\n".join(lines)
+        if scope_args == ["list"]:
+            saved_scopes = payload.get("saved_scopes")
+            if not isinstance(saved_scopes, list) or not saved_scopes:
+                return "Saved scopes: (none)"
+            lines = ["Saved scopes:"]
+            for item in saved_scopes:
+                if not isinstance(item, dict):
+                    continue
+                name = normalize_inline_whitespace(str(item.get("name") or ""))
+                if not name:
+                    continue
+                scope = coerce_scope_payload(item.get("scope"))
+                lines.append(f"- {name}: {summarize_scope_inline(scope)}")
+            return "\n".join(lines)
+        return None
+
+    if command_name == "dataset":
+        dataset_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
+        if not dataset_args:
+            dataset_entries = coerce_scope_dataset_entries(payload.get("dataset"))
+            if not dataset_entries:
+                return "Dataset: (none)"
+            return "Dataset: " + ", ".join(str(entry["name"]) for entry in dataset_entries)
+        if dataset_args == ["list"]:
+            datasets = payload.get("datasets")
+            if not isinstance(datasets, list) or not datasets:
+                return "Datasets: (none)"
+            lines = ["Datasets:"]
+            for item in datasets:
+                if not isinstance(item, dict):
+                    continue
+                dataset_name = normalize_inline_whitespace(str(item.get("dataset_name") or ""))
+                if not dataset_name:
+                    continue
+                document_count = int(item.get("document_count") or 0)
+                manual_count = int(item.get("manual_document_count") or 0)
+                source_count = int(item.get("source_document_count") or 0)
+                lines.append(
+                    f"- {dataset_name}: {document_count} docs (manual {manual_count}, source {source_count})"
+                )
+            return "\n".join(lines)
+        return None
+
+    if command_name == "sort":
+        if not normalized_tail:
+            sort_spec = normalize_inline_whitespace(str(payload.get("sort_spec") or ""))
+            sort_source = normalize_inline_whitespace(str(payload.get("sort_source") or "")) or "default"
+            return f"Sort: {sort_spec} ({sort_source})" if sort_spec else "Sort: (none)"
+        if normalized_tail == "list":
+            sortable_fields = payload.get("sortable_fields")
+            if not isinstance(sortable_fields, list) or not sortable_fields:
+                return "Sortable fields: (none)"
+            lines = ["Sortable fields:"]
+            for item in sortable_fields:
+                if not isinstance(item, dict):
+                    continue
+                field_name = normalize_inline_whitespace(str(item.get("name") or ""))
+                if field_name:
+                    lines.append(f"- {field_name}")
+            return "\n".join(lines)
+        return None
+
+    if command_name == "columns":
+        if not normalized_tail:
+            display = payload.get("display") if isinstance(payload.get("display"), dict) else {}
+            columns = display.get("columns") if isinstance(display.get("columns"), list) else []
+            page_size = display.get("page_size")
+            lines = [
+                "Columns: " + ", ".join(str(column) for column in columns)
+                if columns
+                else "Columns: (none)"
+            ]
+            if page_size is not None:
+                lines.append(f"Page size: {page_size}")
+            warnings = payload.get("warnings")
+            if isinstance(warnings, list):
+                for warning in warnings:
+                    warning_text = normalize_inline_whitespace(str(warning or ""))
+                    if warning_text:
+                        lines.append(f"Warning: {warning_text}")
+            return "\n".join(lines)
+        if normalized_tail == "list":
+            columns = payload.get("columns")
+            if not isinstance(columns, list) or not columns:
+                return "Displayable columns: (none)"
+            lines = ["Displayable columns:"]
+            for item in columns:
+                if not isinstance(item, dict):
+                    continue
+                field_name = normalize_inline_whitespace(str(item.get("name") or ""))
+                if field_name:
+                    lines.append(f"- {field_name}")
+            return "\n".join(lines)
+        return None
+
+    if command_name == "page-size" and not normalized_tail:
+        return f"Page size: {int(payload.get('page_size') or 0)}"
+
+    if command_name == "page" and not normalized_tail:
+        page = int(payload.get("page") or 1)
+        per_page = int(payload.get("per_page") or 0)
+        offset = int(payload.get("offset") or 0)
+        total_known = int(payload.get("total_known") or 0)
+        total_pages = int(payload.get("total_pages") or 1)
+        if total_known > 0:
+            first_doc = offset + 1
+            last_doc = min(offset + per_page, total_known)
+        else:
+            first_doc = 0
+            last_doc = 0
+        return f"Page: {page} of {total_pages} (docs {first_doc}-{last_doc} of {total_known})"
+
+    return None
+
+
 def clear_session_browsing(session_state: dict[str, object]) -> dict[str, object]:
     session_state["browsing"] = {}
     return session_state
@@ -3926,11 +4110,7 @@ def run_scope_search_from_session(root: Path, paths: dict[str, Path], scope: dic
 
 
 def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
-    command_text = raw_command.strip()
-    if not command_text:
-        raise RetrieverError("Slash command cannot be empty.")
-    if not command_text.startswith("/"):
-        raise RetrieverError("Slash commands must begin with '/'.")
+    command_name, normalized_tail = parse_slash_command_text(raw_command)
 
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -3939,9 +4119,6 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
         apply_schema(connection, root)
         session_state = read_session_state(paths)
         scope = coerce_scope_payload(session_state.get("scope"))
-        command_body = command_text[1:]
-        command_name, _, tail = command_body.partition(" ")
-        normalized_tail = tail.lstrip()
 
         if command_name == "scope":
             scope_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
@@ -7293,13 +7470,14 @@ def main() -> int:
             )
 
         if args.command == "slash":
-            print(
-                json.dumps(
-                    run_slash_command(root, " ".join(args.command_text).strip()),
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
+            raw_command = " ".join(args.command_text).strip()
+            payload = run_slash_command(root, raw_command)
+            rendered_output = render_slash_read_only_output(raw_command, payload)
+            if rendered_output is not None:
+                sys.stdout.write(rendered_output + "\n")
+                sys.stdout.flush()
+            else:
+                print(json.dumps(payload, indent=2, sort_keys=True))
             return 0
 
         if args.command == "catalog":

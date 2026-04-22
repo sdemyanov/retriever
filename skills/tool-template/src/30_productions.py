@@ -1533,25 +1533,46 @@ def choose_outlook_cluster(
 ) -> int | None:
     conversation_index_root = document.get("conversation_index_root")
     conversation_topic = document.get("conversation_topic")
+    if not conversation_index_root:
+        return None
     root_candidates = (
         set(conversation_index_root_index.get(str(conversation_index_root), set()))
         if conversation_index_root
         else set()
     )
-    topic_candidates = (
-        set(conversation_topic_index.get(str(conversation_topic), set()))
-        if conversation_topic
-        else set()
-    )
-    if root_candidates and topic_candidates:
+    if not root_candidates:
+        return None
+    if conversation_topic:
+        topic_candidates = set(conversation_topic_index.get(str(conversation_topic), set()))
         intersection = root_candidates & topic_candidates
         chosen = choose_unique_cluster(intersection)
         if chosen is not None:
             return chosen
-    chosen = choose_unique_cluster(root_candidates)
-    if chosen is not None:
-        return chosen
-    return choose_unique_cluster(topic_candidates)
+    return choose_unique_cluster(root_candidates)
+
+
+def email_document_has_strong_threading_signals(document: dict[str, object]) -> bool:
+    if document.get("message_id"):
+        return True
+    if document.get("in_reply_to"):
+        return True
+    if list(document.get("references") or []):
+        return True
+    if document.get("conversation_index_root"):
+        return True
+    return False
+
+
+def email_document_allows_heuristic_fallback(document: dict[str, object]) -> bool:
+    source_kind = normalize_whitespace(str(document.get("source_kind") or "")).lower()
+    return source_kind in {FILESYSTEM_SOURCE_KIND, PRODUCTION_SOURCE_KIND}
+
+
+def email_document_can_use_heuristic_fallback(document: dict[str, object]) -> bool:
+    return (
+        email_document_allows_heuristic_fallback(document)
+        and not email_document_has_strong_threading_signals(document)
+    )
 
 
 def choose_heuristic_cluster(
@@ -1612,8 +1633,6 @@ def derive_email_conversation_key(cluster: dict[str, object]) -> str:
         return f"outlook:{conversation_topics[0]}:{conversation_index_roots[0]}"
     if conversation_index_roots:
         return f"outlook_index:{conversation_index_roots[0]}"
-    if conversation_topics:
-        return f"outlook_topic:{conversation_topics[0]}"
     normalized_subjects = sorted(
         str(value)
         for value in cluster["normalized_subjects"]
@@ -1773,7 +1792,7 @@ def assign_email_conversations(connection: sqlite3.Connection) -> dict[str, int]
             cluster_id = choose_reference_cluster(document, message_id_index)
         if cluster_id is None:
             cluster_id = choose_outlook_cluster(document, conversation_index_root_index, conversation_topic_index)
-        if cluster_id is None:
+        if cluster_id is None and email_document_can_use_heuristic_fallback(document):
             cluster_id = choose_heuristic_cluster(document, clusters, heuristic_subject_index)
         if cluster_id is None:
             cluster_id = len(clusters)
@@ -2237,8 +2256,447 @@ def conversation_preview_document_kind(document: dict[str, object]) -> str:
     return content_type or "Document"
 
 
+def conversation_preview_participants(documents: list[dict[str, object]]) -> str | None:
+    participants: list[str] = []
+    seen: set[str] = set()
+    for document in documents:
+        append_unique_participants(
+            participants,
+            seen,
+            [
+                normalize_whitespace(str(document.get("participants") or "")) or None,
+                normalize_whitespace(str(document.get("author") or "")) or None,
+                normalize_whitespace(str(document.get("recipients") or "")) or None,
+            ],
+        )
+    return ", ".join(participants) or None
+
+
+def conversation_preview_bounds(documents: list[dict[str, object]]) -> tuple[str | None, str | None]:
+    timestamps = sorted(
+        timestamp
+        for timestamp in (
+            conversation_preview_primary_timestamp(document)
+            for document in documents
+        )
+        if timestamp
+    )
+    if not timestamps:
+        return None, None
+    return timestamps[0], timestamps[-1]
+
+
+EMAIL_PREVIEW_BODY_SOURCE_PATTERN = re.compile(
+    r"<template\b[^>]*data-retriever-email-body-source\b[^>]*>(.*?)</template>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+EMAIL_QUOTED_REPLY_SEPARATOR_PATTERN = re.compile(
+    r"^(?:On .+ wrote:|Begin forwarded message:|-{2,}\s*Original Message\s*-{2,}|-{2,}\s*Forwarded message\s*-{2,})$",
+    flags=re.IGNORECASE,
+)
+EMAIL_QUOTED_REPLY_HEADER_PATTERN = re.compile(
+    r"^(?:From|Sent|To|Cc|Bcc|Subject|Date):\s+",
+    flags=re.IGNORECASE,
+)
+
+
+def build_email_preview_head_html() -> str:
+    return (
+        "<style>"
+        "body { margin: 0; background: #f6f8fc; color: #202124; font-family: Google Sans, Roboto, Arial, sans-serif; }"
+        ".gmail-thread-page { max-width: 1120px; margin: 0 auto; padding: 24px 18px 44px; }"
+        ".gmail-thread-header { margin-bottom: 1rem; }"
+        ".gmail-thread-kicker { margin: 0 0 0.45rem; color: #5f6368; font-size: 0.76rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }"
+        ".gmail-thread-title { margin: 0; font-size: clamp(1.85rem, 3.2vw, 2.7rem); line-height: 1.08; font-weight: 500; color: #202124; }"
+        ".gmail-thread-summary { display: flex; flex-wrap: wrap; gap: 0.55rem; margin-top: 0.95rem; }"
+        ".gmail-thread-pill { display: inline-flex; align-items: center; padding: 0.38rem 0.72rem; border-radius: 999px; background: #ffffff; border: 1px solid #dde3eb; color: #5f6368; font-size: 0.92rem; line-height: 1.2; }"
+        ".gmail-thread-pill--active { background: #e8f0fe; border-color: #aecbfa; color: #1a73e8; }"
+        ".gmail-thread-messages { display: grid; gap: 1rem; }"
+        ".gmail-message-card { display: flex; gap: 0.95rem; align-items: flex-start; padding: 1.08rem 1.15rem 1.15rem; background: #ffffff; border: 1px solid #e0e3e7; border-radius: 20px; box-shadow: 0 1px 2px rgba(60, 64, 67, 0.1); }"
+        ".gmail-message-card--selected { border-color: #aecbfa; box-shadow: 0 10px 26px rgba(26, 115, 232, 0.12); }"
+        ".gmail-message-main { min-width: 0; flex: 1 1 auto; }"
+        ".gmail-message-header { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 0.9rem; }"
+        ".gmail-message-header-main { min-width: 0; }"
+        ".gmail-message-author-line { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: baseline; }"
+        ".gmail-message-author { font-size: 1.03rem; font-weight: 700; color: #202124; }"
+        ".gmail-message-address, .gmail-message-recipient-line, .gmail-message-time { color: #5f6368; }"
+        ".gmail-message-address { font-size: 0.95rem; }"
+        ".gmail-message-recipient-line { margin-top: 0.2rem; font-size: 0.94rem; line-height: 1.4; }"
+        ".gmail-message-time { font-size: 0.92rem; white-space: nowrap; }"
+        ".gmail-message-body { color: #202124; line-height: 1.55; min-width: 0; }"
+        ".gmail-message-rendered-html { min-width: 0; }"
+        ".gmail-message-rendered-html img { max-width: 100%; height: auto; border-radius: 12px; }"
+        ".gmail-message-rendered-html table { max-width: 100%; }"
+        ".gmail-message-rendered-html a, .retriever-attachments a { color: #1a73e8; text-decoration: none; }"
+        ".gmail-message-rendered-html a:hover, .retriever-attachments a:hover { text-decoration: underline; }"
+        ".gmail-message-rendered-html .gmail_quote, .gmail-message-rendered-html blockquote[type='cite'], .gmail-message-rendered-html blockquote { margin: 1rem 0 0; padding-left: 0.9rem; border-left: 3px solid #d8dde3; color: #5f6368; }"
+        ".gmail-message-plain { white-space: pre-wrap; word-break: break-word; font: inherit; }"
+        ".gmail-message-quoted { margin-top: 1rem; }"
+        ".gmail-message-quoted summary { cursor: pointer; color: #5f6368; font-weight: 500; }"
+        ".gmail-message-quoted pre { white-space: pre-wrap; word-break: break-word; margin: 0.72rem 0 0; padding: 0.85rem 1rem; background: #f8fafc; border: 1px solid #e4e7eb; border-radius: 14px; font: inherit; color: #5f6368; }"
+        ".retriever-attachments { margin-top: 1rem; padding-top: 0.8rem; border-top: 1px solid #eceff3; }"
+        ".retriever-attachments h3 { margin: 0 0 0.5rem; font-size: 0.86rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #5f6368; }"
+        ".retriever-attachments ul { margin: 0; padding-left: 1.1rem; }"
+        ".retriever-attachments li { margin: 0.26rem 0; }"
+        ".chat-avatar-svg { width: 3rem; height: 3rem; flex: 0 0 auto; display: block; }"
+        "@media (max-width: 720px) {"
+        ".gmail-thread-page { padding: 18px 12px 30px; }"
+        ".gmail-message-card { padding: 0.95rem; }"
+        ".gmail-message-header { flex-direction: column; gap: 0.45rem; }"
+        ".gmail-message-time { white-space: normal; }"
+        "}"
+        "</style>"
+    )
+
+
+def email_preview_document_id(document: dict[str, object]) -> int | None:
+    try:
+        raw_value = document.get("id")
+        if raw_value is None:
+            return None
+        value = int(raw_value)
+        return value if value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_email_preview_address(value: object) -> tuple[str | None, str | None]:
+    normalized = normalize_whitespace(str(value or ""))
+    if not normalized:
+        return None, None
+    addresses = getaddresses([normalized])
+    if addresses:
+        name, address = addresses[0]
+        normalized_name = normalize_whitespace(name)
+        normalized_address = normalize_whitespace(address)
+        if normalized_name or normalized_address:
+            return normalized_name or normalized_address or None, normalized_address or None
+    return normalized, None
+
+
+def format_email_preview_person(value: object) -> str | None:
+    name, address = normalize_email_preview_address(value)
+    if name and address and name != address:
+        return f"{name} <{address}>"
+    return name or address
+
+
+def summarize_email_preview_recipients(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or ""))
+    if not normalized:
+        return None
+    addresses = getaddresses([normalized])
+    formatted_addresses = [
+        formatted
+        for formatted in (format_email_preview_person(f"{name} <{address}>") if address else normalize_whitespace(name) for name, address in addresses)
+        if formatted
+    ]
+    if formatted_addresses:
+        return f"to {', '.join(formatted_addresses)}"
+    return f"to {normalized}"
+
+
+def split_email_preview_text_content(text_content: str) -> tuple[str, str | None]:
+    normalized_text = text_content.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not normalized_text:
+        return "", None
+    lines = normalized_text.split("\n")
+    has_visible_content = False
+    for index, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if has_visible_content:
+            if raw_line.lstrip().startswith(">") or EMAIL_QUOTED_REPLY_SEPARATOR_PATTERN.match(stripped):
+                visible_text = "\n".join(lines[:index]).strip()
+                quoted_text = "\n".join(lines[index:]).strip()
+                if visible_text and quoted_text:
+                    return visible_text, quoted_text
+            if index > 0 and not lines[index - 1].strip() and EMAIL_QUOTED_REPLY_HEADER_PATTERN.match(stripped):
+                visible_text = "\n".join(lines[:index]).strip()
+                quoted_text = "\n".join(lines[index:]).strip()
+                if visible_text and quoted_text:
+                    return visible_text, quoted_text
+        has_visible_content = True
+    return normalized_text, None
+
+
+def build_email_message_body_content_html(
+    document: dict[str, object],
+    *,
+    body_html: str | None = None,
+) -> str:
+    preferred_body_html = body_html
+    if preferred_body_html is None:
+        stored_body_html = document.get("standalone_preview_body_html")
+        preferred_body_html = (
+            str(stored_body_html)
+            if isinstance(stored_body_html, str) and stored_body_html.strip()
+            else None
+        )
+    if preferred_body_html:
+        normalized_html = preferred_body_html.strip()
+        if any(token in normalized_html for token in ('class="gmail-message-rendered-html"', 'class="gmail-message-plain"', 'class="gmail-message-quoted"')):
+            return normalized_html
+        normalized_html = re.sub(r"(?is)<!doctype[^>]*>\s*", "", normalized_html).strip()
+        return f'<div class="gmail-message-rendered-html">{normalized_html}</div>'
+    text_content = str(document.get("text_content") or "")
+    visible_text, quoted_text = split_email_preview_text_content(text_content)
+    body_parts = [
+        f'<div class="gmail-message-plain">{html.escape(visible_text or "No extracted text available.")}</div>'
+    ]
+    if quoted_text:
+        body_parts.append(
+            "<details class=\"gmail-message-quoted\">"
+            "<summary>Quoted text</summary>"
+            f"<pre>{html.escape(quoted_text)}</pre>"
+            "</details>"
+        )
+    return "".join(body_parts)
+
+
+def build_email_message_card_html(
+    document: dict[str, object],
+    *,
+    body_html: str | None = None,
+    selected: bool = False,
+    attachment_links: list[dict[str, str]] | None = None,
+) -> str:
+    author_name, author_email = normalize_email_preview_address(document.get("author"))
+    author_label = author_name or author_email or "Unknown sender"
+    author_email_html = (
+        f'<span class="gmail-message-address">&lt;{html.escape(author_email)}&gt;</span>'
+        if author_email and author_email != author_label
+        else ""
+    )
+    recipients_line = summarize_email_preview_recipients(document.get("recipients"))
+    timestamp_label = format_chat_preview_timestamp(conversation_preview_primary_timestamp(document)) or ""
+    avatar_background, avatar_foreground = chat_avatar_colors(author_label)
+    avatar_html = build_chat_avatar_svg(
+        chat_avatar_initials(author_label),
+        avatar_background,
+        avatar_foreground,
+        author_label,
+    )
+    message_body_html = build_email_message_body_content_html(document, body_html=body_html)
+    attachment_links_html = render_html_preview_attachment_links(attachment_links or [])
+    card_classes = "gmail-message-card gmail-message-card--selected" if selected else "gmail-message-card"
+    anchor = conversation_preview_anchor(document_id) if (document_id := email_preview_document_id(document)) is not None else None
+    anchor_attr = f' id="{html.escape(anchor)}"' if anchor else ""
+    recipient_line_html = (
+        f'<div class="gmail-message-recipient-line">{html.escape(recipients_line)}</div>'
+        if recipients_line
+        else ""
+    )
+    time_html = f'<div class="gmail-message-time">{html.escape(timestamp_label)}</div>' if timestamp_label else ""
+    return (
+        f'<article class="{card_classes}"{anchor_attr}>'
+        f"{avatar_html}"
+        '<div class="gmail-message-main">'
+        '<header class="gmail-message-header">'
+        '<div class="gmail-message-header-main">'
+        '<div class="gmail-message-author-line">'
+        f'<span class="gmail-message-author">{html.escape(author_label)}</span>'
+        f"{author_email_html}"
+        "</div>"
+        f"{recipient_line_html}"
+        "</div>"
+        f"{time_html}"
+        "</header>"
+        f'<div class="gmail-message-body">{message_body_html}</div>'
+        f"{attachment_links_html}"
+        "</div>"
+        "</article>"
+    )
+
+
+def build_email_thread_summary_html(
+    documents: list[dict[str, object]],
+    *,
+    position_index: int | None = None,
+    segment_label: str | None = None,
+    segment_count: int | None = None,
+) -> str:
+    if not documents:
+        return ""
+    if len(documents) <= 1 and not (segment_label and (segment_count or 0) > 1):
+        return ""
+    started_at, last_message_at = conversation_preview_bounds(documents)
+    participants = conversation_preview_participants(documents)
+    pills: list[tuple[str, bool]] = []
+    if segment_label and (segment_count or 0) > 1:
+        pills.append((segment_label, False))
+    if len(documents) > 1:
+        pills.append((f"{len(documents)} messages", False))
+    started_label = format_chat_preview_timestamp(started_at) or started_at or ""
+    if started_label:
+        pills.append((f"Created {started_label}", False))
+    last_message_label = format_chat_preview_timestamp(last_message_at) or last_message_at or ""
+    if last_message_label and last_message_label != started_label:
+        pills.append((f"Last modified {last_message_label}", False))
+    if participants:
+        pills.append((f"Participants {participants}", False))
+    if position_index is not None and len(documents) > 1:
+        pills.append((f"Viewing message {position_index} of {len(documents)}", True))
+    if not pills:
+        return ""
+    pills_html = "".join(
+        f'<span class="gmail-thread-pill{" gmail-thread-pill--active" if is_active else ""}">{html.escape(label)}</span>'
+        for label, is_active in pills
+        if label
+    )
+    return f'<div class="gmail-thread-summary">{pills_html}</div>' if pills_html else ""
+
+
+def build_email_thread_preview_html(
+    *,
+    thread_title: str,
+    documents: list[dict[str, object]],
+    page_title: str,
+    selected_document_id: int | None = None,
+    position_index: int | None = None,
+    segment_label: str | None = None,
+    segment_count: int | None = None,
+    attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
+    body_source_document: dict[str, object] | None = None,
+    body_source_html: str | None = None,
+) -> str:
+    summary_html = build_email_thread_summary_html(
+        documents,
+        position_index=position_index,
+        segment_label=segment_label,
+        segment_count=segment_count,
+    )
+    message_cards = []
+    for document in documents:
+        document_id = email_preview_document_id(document)
+        message_cards.append(
+            build_email_message_card_html(
+                document,
+                selected=(selected_document_id is not None and document_id == selected_document_id),
+                attachment_links=(
+                    (attachment_links_by_document_id or {}).get(document_id, [])
+                    if document_id is not None
+                    else None
+                ),
+            )
+        )
+    body_source_template = ""
+    if body_source_document is not None:
+        body_source_template = (
+            '<template data-retriever-email-body-source>'
+            f"{build_email_message_body_content_html(body_source_document, body_html=body_source_html)}"
+            "</template>"
+        )
+    header_kicker = (
+        f'<p class="gmail-thread-kicker">{html.escape(segment_label)}</p>'
+        if segment_label and (segment_count or 0) > 1
+        else ""
+    )
+    return (
+        "<!DOCTYPE html>"
+        "<html><head>"
+        '<meta charset="utf-8"/>'
+        f"<title>{html.escape(page_title)}</title>"
+        f"{build_email_preview_head_html()}"
+        "</head><body>"
+        '<main class="gmail-thread-page">'
+        '<header class="gmail-thread-header">'
+        f"{header_kicker}"
+        f'<h1 class="gmail-thread-title">{html.escape(thread_title)}</h1>'
+        f"{summary_html}"
+        "</header>"
+        f'<section class="gmail-thread-messages">{"".join(message_cards)}</section>'
+        "</main>"
+        f"{body_source_template}"
+        "</body></html>"
+    )
+
+
+def build_email_message_preview_html(
+    document: dict[str, object],
+    *,
+    body_html: str | None,
+    conversation_row: sqlite3.Row | None = None,
+    conversation_documents: list[dict[str, object]] | None = None,
+    position_index: int | None = None,
+) -> str:
+    document_title = conversation_preview_document_heading(document) or "Retriever Email Preview"
+    document_id = email_preview_document_id(document)
+    if conversation_row is not None and conversation_documents is not None and len(conversation_documents) > 1:
+        thread_title = (
+            normalize_whitespace(str(conversation_row["display_name"] or ""))
+            or normalize_generated_document_title(document.get("subject") or document.get("title"))
+            or document_title
+        )
+        return build_email_thread_preview_html(
+            thread_title=thread_title,
+            documents=conversation_documents,
+            page_title=thread_title,
+            selected_document_id=document_id,
+            position_index=position_index,
+            body_source_document=document,
+            body_source_html=body_html,
+        )
+    thread_title = normalize_generated_document_title(document.get("subject") or document.get("title")) or document_title
+    return build_email_thread_preview_html(
+        thread_title=thread_title,
+        documents=[document],
+        page_title=document_title,
+        selected_document_id=document_id,
+        body_source_document=document,
+        body_source_html=body_html,
+    )
+
+
+def rewrite_preserved_email_message_preview(
+    paths: dict[str, Path],
+    *,
+    document: dict[str, object],
+    preview_rows: list[dict[str, object]],
+    conversation_row: sqlite3.Row | None = None,
+    conversation_documents: list[dict[str, object]] | None = None,
+    position_index: int | None = None,
+) -> None:
+    preferred_rows = sorted(
+        preview_rows,
+        key=lambda row: (
+            0 if normalize_whitespace(str(row.get("label") or "")).lower() == "message" else 1,
+            int(row.get("ordinal", 0)),
+        ),
+    )
+    target_row = next(
+        (
+            row
+            for row in preferred_rows
+            if normalize_whitespace(str(row.get("preview_type") or "")).lower() == "html"
+        ),
+        None,
+    )
+    if target_row is None:
+        return
+    preview_path = paths["state_dir"] / str(target_row["rel_preview_path"])
+    if not preview_path.exists():
+        return
+    body_html = document.get("standalone_preview_body_html")
+    preview_path.write_text(
+        build_email_message_preview_html(
+            document,
+            body_html=(str(body_html) if isinstance(body_html, str) and body_html.strip() else None),
+            conversation_row=conversation_row,
+            conversation_documents=conversation_documents,
+            position_index=position_index,
+        ),
+        encoding="utf-8",
+    )
+
+
 def extract_standalone_preview_body_html(preview_html: str) -> str | None:
     cleaned_preview_html = HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN.sub("", preview_html or "")
+    source_match = EMAIL_PREVIEW_BODY_SOURCE_PATTERN.search(cleaned_preview_html)
+    if source_match is not None:
+        normalized_source = source_match.group(1).strip()
+        return normalized_source or None
     body_match = re.search(
         r"<body\b[^>]*>(.*)</body>\s*</html>\s*$",
         cleaned_preview_html,
@@ -2399,14 +2857,28 @@ def render_conversation_document_section(
     timestamp_label = format_chat_preview_timestamp(conversation_preview_primary_timestamp(document)) or ""
     text_content = str(document.get("text_content") or "")
     standalone_preview_body_html = document.get("standalone_preview_body_html")
-    metadata_items: list[str] = []
-    for label, value in (
+    content_type = normalize_whitespace(str(document.get("content_type") or ""))
+    metadata_pairs: list[tuple[str, object]] = [
         ("Control number", document.get("control_number")),
         ("Created", timestamp_label),
-        ("Participants", document.get("participants")),
-        ("From", document.get("author")),
-        ("To", document.get("recipients")),
-    ):
+    ]
+    if content_type == "Email":
+        metadata_pairs.extend(
+            [
+                ("Author", document.get("author")),
+                ("Recipients", document.get("recipients")),
+            ]
+        )
+    else:
+        metadata_pairs.extend(
+            [
+                ("Participants", document.get("participants")),
+                ("From", document.get("author")),
+                ("To", document.get("recipients")),
+            ]
+        )
+    metadata_items: list[str] = []
+    for label, value in metadata_pairs:
         normalized = normalize_whitespace(str(value or ""))
         if not normalized:
             continue
@@ -2548,11 +3020,25 @@ def build_conversation_segment_html(
     attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
 ) -> str:
     current_file_name = Path(current_segment_rel_path).name
+    segment_documents = segment_items[segment_index]["documents"]
+    if normalize_whitespace(str(conversation_row["conversation_type"] or "")).lower() == "email":
+        thread_title = (
+            normalize_whitespace(str(conversation_row["display_name"] or ""))
+            or f"Conversation {int(conversation_row['id'])}"
+        )
+        return build_email_thread_preview_html(
+            thread_title=thread_title,
+            documents=segment_documents,
+            page_title=f"{thread_title} - {segment_label}",
+            segment_label=segment_label,
+            segment_count=segment_count,
+            attachment_links_by_document_id=attachment_links_by_document_id,
+        )
     headers = {
         "Conversation": normalize_whitespace(str(conversation_row["display_name"] or "")) or f"Conversation {int(conversation_row['id'])}",
         "Type": normalize_whitespace(str(conversation_row["conversation_type"] or "")),
         "Segment": segment_label,
-        "Documents": str(len(segment_items[segment_index]["documents"])),
+        "Documents": str(len(segment_documents)),
     }
     sections = "".join(
         render_conversation_document_section(
@@ -2561,7 +3047,7 @@ def build_conversation_segment_html(
             doc_target_hrefs=doc_target_hrefs,
             attachment_links_by_document_id=attachment_links_by_document_id,
         )
-        for document in segment_items[segment_index]["documents"]
+        for document in segment_documents
     )
     return build_html_preview(
         headers,
@@ -2612,6 +3098,10 @@ def build_conversation_entry_html(
         head_html=build_conversation_preview_head_html(),
         heading=document_heading or "Conversation document",
     )
+
+
+def conversation_document_uses_entry_preview(document: dict[str, object]) -> bool:
+    return normalize_whitespace(str(document.get("content_type") or "")).lower() == "chat"
 
 
 def load_document_preview_text(
@@ -2777,7 +3267,15 @@ def refresh_conversation_previews(
             paths,
             document_ids,
         )
-        total_entries = len(document_ids)
+        entry_document_ids = [
+            int(document["id"])
+            for document in documents
+            if conversation_document_uses_entry_preview(document)
+        ]
+        entry_position_by_document_id = {
+            document_id: index + 1
+            for index, document_id in enumerate(entry_document_ids)
+        }
         toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
         toc_abs_path = paths["state_dir"] / toc_rel_path
         toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2785,6 +3283,12 @@ def refresh_conversation_previews(
             int(document["id"]): f"{Path(str(segment['segment_rel_path'])).name}#{conversation_preview_anchor(int(document['id']))}"
             for segment in segment_items
             for document in segment["documents"]
+        }
+        email_message_position_by_document_id = {
+            int(document["id"]): index + 1
+            for index, document in enumerate(
+                [document for document in documents if normalize_whitespace(str(document.get("content_type") or "")).lower() == "email"]
+            )
         }
         toc_abs_path.write_text(
             build_conversation_toc_html(
@@ -2817,14 +3321,6 @@ def refresh_conversation_previews(
                 encoding="utf-8",
             )
         created_at = utc_now()
-        toc_row = {
-            "rel_preview_path": toc_rel_path,
-            "preview_type": "html",
-            "target_fragment": None,
-            "label": "contents",
-            "ordinal": 2,
-            "created_at": created_at,
-        }
         document_ids = [int(document["id"]) for document in documents]
         previous_preview_paths = [
             str(row["rel_preview_path"])
@@ -2837,7 +3333,6 @@ def refresh_conversation_previews(
                 document_ids,
             ).fetchall()
         ]
-        flat_index = 0
         for segment in segment_items:
             segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
             entry_attachment_links = conversation_attachment_links_by_document_id(
@@ -2848,26 +3343,38 @@ def refresh_conversation_previews(
             )
             for document in segment["documents"]:
                 document_id = int(document["id"])
-                entry_rel_path = conversation_preview_entry_rel_path(conversation_id, document_id)
-                entry_abs_path = paths["state_dir"] / entry_rel_path
-                entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
-                entry_abs_path.write_text(
-                    build_conversation_entry_html(
-                        conversation_row,
+                preserved_preview_rows = preserved_preview_rows_by_document_id.get(document_id, [])
+                if normalize_whitespace(str(document.get("content_type") or "")).lower() == "email":
+                    rewrite_preserved_email_message_preview(
+                        paths,
                         document=document,
-                        document_heading=conversation_preview_document_heading(document),
-                        segment_label=str(segment["label"]),
-                        attachment_links=entry_attachment_links.get(document_id) or [],
-                        position_index=flat_index + 1,
-                        total_count=total_entries,
-                    ),
-                    encoding="utf-8",
-                )
-                flat_index += 1
-                replace_document_preview_rows(
-                    connection,
-                    int(document["id"]),
-                    [
+                        preview_rows=preserved_preview_rows,
+                        conversation_row=conversation_row,
+                        conversation_documents=documents,
+                        position_index=(
+                            email_message_position_by_document_id.get(document_id)
+                            if len(documents) > 1
+                            else None
+                        ),
+                    )
+                preview_rows: list[dict[str, object]] = []
+                if conversation_document_uses_entry_preview(document):
+                    entry_rel_path = conversation_preview_entry_rel_path(conversation_id, document_id)
+                    entry_abs_path = paths["state_dir"] / entry_rel_path
+                    entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
+                    entry_abs_path.write_text(
+                        build_conversation_entry_html(
+                            conversation_row,
+                            document=document,
+                            document_heading=conversation_preview_document_heading(document),
+                            segment_label=str(segment["label"]),
+                            attachment_links=entry_attachment_links.get(document_id) or [],
+                            position_index=entry_position_by_document_id.get(document_id),
+                            total_count=len(entry_document_ids),
+                        ),
+                        encoding="utf-8",
+                    )
+                    preview_rows.append(
                         {
                             "rel_preview_path": entry_rel_path,
                             "preview_type": "html",
@@ -2875,22 +3382,65 @@ def refresh_conversation_previews(
                             "label": "entry",
                             "ordinal": 0,
                             "created_at": created_at,
-                        },
+                        }
+                    )
+                    segment_ordinal = len(preview_rows)
+                    preview_rows.append(
                         {
                             "rel_preview_path": str(segment["segment_rel_path"]),
                             "preview_type": "html",
                             "target_fragment": conversation_preview_anchor(int(document["id"])),
                             "label": "segment",
-                            "ordinal": 1,
+                            "ordinal": segment_ordinal,
                             "created_at": created_at,
-                        },
-                        toc_row,
-                        *rebase_preserved_preview_rows(
-                            preserved_preview_rows_by_document_id.get(document_id, []),
-                            start_ordinal=3,
-                            created_at=created_at,
-                        ),
-                    ],
+                        }
+                    )
+                    preview_rows.append(
+                        {
+                            "rel_preview_path": toc_rel_path,
+                            "preview_type": "html",
+                            "target_fragment": None,
+                            "label": "contents",
+                            "ordinal": len(preview_rows),
+                            "created_at": created_at,
+                        }
+                    )
+                    rebased_preview_rows = rebase_preserved_preview_rows(
+                        preserved_preview_rows,
+                        start_ordinal=len(preview_rows),
+                        created_at=created_at,
+                    )
+                else:
+                    rebased_preview_rows = rebase_preserved_preview_rows(
+                        preserved_preview_rows,
+                        start_ordinal=0,
+                        created_at=created_at,
+                    )
+                    preview_rows.extend(rebased_preview_rows)
+                    preview_rows.append(
+                        {
+                            "rel_preview_path": str(segment["segment_rel_path"]),
+                            "preview_type": "html",
+                            "target_fragment": conversation_preview_anchor(int(document["id"])),
+                            "label": "segment",
+                            "ordinal": len(preview_rows),
+                            "created_at": created_at,
+                        }
+                    )
+                    preview_rows.append(
+                        {
+                            "rel_preview_path": toc_rel_path,
+                            "preview_type": "html",
+                            "target_fragment": None,
+                            "label": "contents",
+                            "ordinal": len(preview_rows),
+                            "created_at": created_at,
+                        }
+                    )
+                replace_document_preview_rows(
+                    connection,
+                    int(document["id"]),
+                    preview_rows if not conversation_document_uses_entry_preview(document) else [*preview_rows, *rebased_preview_rows],
                 )
         cleanup_unreferenced_preview_files(paths, connection, previous_preview_paths)
         refreshed += 1

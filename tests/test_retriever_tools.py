@@ -181,8 +181,24 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             exit_code = retriever_tools.main()
         stdout_text = stdout.getvalue().strip()
         stderr_text = stderr.getvalue().strip()
-        payload = json.loads(stdout_text or stderr_text) if (stdout_text or stderr_text) else None
+        payload = None
+        if stdout_text or stderr_text:
+            try:
+                payload = json.loads(stdout_text or stderr_text)
+            except json.JSONDecodeError:
+                payload = None
         return exit_code, payload, stdout_text, stderr_text
+
+    def run_cli_raw(self, *args: str) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+            mock.patch.object(retriever_tools.sys, "argv", ["retriever_tools.py", *args]),
+        ):
+            exit_code = retriever_tools.main()
+        return exit_code, stdout.getvalue().strip(), stderr.getvalue().strip()
 
     def preview_target_file_path(self, target: dict[str, object]) -> Path:
         file_abs_path = str(target.get("file_abs_path") or target.get("abs_path") or "")
@@ -4475,8 +4491,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
 
         self.assertIn("<title>Energy Balance Revenue Summary - All messages</title>", preview_html)
-        self.assertIn("<h1>All messages</h1>", preview_html)
-        self.assertIn("<h2>Energy Balance Revenue Summary</h2>", preview_html)
+        self.assertIn('class="gmail-thread-title">Energy Balance Revenue Summary</h1>', preview_html)
         self.assertNotIn("Back Up Attachments:", preview_html)
         self.assertIn("<h2>Attachments</h2>", preview_html)
         self.assertIn(">notes.txt<", preview_html)
@@ -5459,9 +5474,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.preview_target_by_label(reply_result["preview_targets"], "message")["rel_path"],
         )
         self.assertIsNone(reply_result["preview_target_fragment"])
-        self.assertEqual(len(reply_result["preview_targets"]), 4)
+        self.assertEqual(len(reply_result["preview_targets"]), 3)
         self.assertEqual(reply_result["preview_targets"][0]["label"], "message")
-        self.assertEqual(reply_result["preview_targets"][1]["label"], "entry")
+        self.assertEqual(reply_result["preview_targets"][1]["label"], "segment")
+        self.assertFalse(any(target.get("label") == "entry" for target in reply_result["preview_targets"]))
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "segment")["target_fragment"], f"doc-{reply_row['id']}")
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "contents")["label"], "contents")
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "message")["label"], "message")
@@ -5472,17 +5488,19 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         message_preview_html = self.preview_target_file_path(
             self.preview_target_by_label(reply_result["preview_targets"], "message")
         ).read_text(encoding="utf-8")
-        entry_path = self.preview_target_file_path(
-            self.preview_target_by_label(reply_result["preview_targets"], "entry")
+        expected_entry_path = (
+            self.paths["state_dir"]
+            / retriever_tools.conversation_preview_entry_rel_path(root_row["conversation_id"], reply_row["id"])
         )
-        entry_html = entry_path.read_text(encoding="utf-8")
-        self.assertIn("Reply message body", entry_html)
-        self.assertIn('class="reply-rich-email"', entry_html)
-        self.assertIn('<table role="presentation">', entry_html)
-        self.assertNotIn("&lt;div class=&quot;reply-rich-email&quot;&gt;", entry_html)
-        self.assertNotIn("Contents", entry_html)
-        self.assertNotIn('class="conversation-nav-segment"', entry_html)
-        self.assertNotIn("window.location.replace", entry_html)
+        self.assertFalse(expected_entry_path.exists())
+        self.assertIn('class="gmail-thread-title">Status Update</h1>', message_preview_html)
+        self.assertIn("2 messages", message_preview_html)
+        self.assertIn("Created Apr 14, 2026 10:00 AM UTC", message_preview_html)
+        self.assertIn("Last modified Apr 14, 2026 11:00 AM UTC", message_preview_html)
+        self.assertIn("Viewing message 2 of 2", message_preview_html)
+        self.assertIn("Root message body", message_preview_html)
+        self.assertIn("Reply message body", message_preview_html)
+        self.assertIn('class="gmail-message-card gmail-message-card--selected"', message_preview_html)
         self.assertIn('class="reply-rich-email"', message_preview_html)
         segment_html = self.preview_target_file_path(
             self.preview_target_by_label(reply_result["preview_targets"], "segment")
@@ -5495,6 +5513,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Root message body", segment_html)
         self.assertIn("Reply message body", segment_html)
         self.assertIn('class="reply-rich-email"', segment_html)
+        self.assertIn('class="gmail-thread-messages"', segment_html)
+        self.assertIn('class="gmail-message-card"', segment_html)
+        self.assertIn("to Bob Example &lt;bob@example.com&gt;, Carol Example &lt;carol@example.com&gt;", segment_html)
+        self.assertNotIn("<dt>Author</dt>", segment_html)
+        self.assertNotIn("<dt>Recipients</dt>", segment_html)
+        self.assertNotIn("&lt;div class=&quot;reply-rich-email&quot;&gt;", segment_html)
         self.assertIn("Status Update", toc_html)
         self.assertNotIn("<a href=", toc_html)
         self.assertTrue(
@@ -5503,6 +5527,49 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(
             self.preview_target_file_path(self.preview_target_by_label(reply_result["preview_targets"], "message")).exists()
         )
+
+    def test_ingest_groups_loose_eml_messages_without_thread_headers_using_heuristics(self) -> None:
+        first_path = self.root / "first.eml"
+        second_path = self.root / "second.eml"
+        self.write_email_message(
+            first_path,
+            subject="Project Sync",
+            body_text="First loose message",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            cc=None,
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+            message_id=None,
+            in_reply_to=None,
+            references=None,
+            conversation_index=None,
+            conversation_topic=None,
+        )
+        self.write_email_message(
+            second_path,
+            subject="Re: Project Sync",
+            body_text="Second loose message",
+            author="Bob Example <bob@example.com>",
+            recipients="Alice Example <alice@example.com>",
+            cc=None,
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+            message_id=None,
+            in_reply_to=None,
+            references=None,
+            conversation_index=None,
+            conversation_topic=None,
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["email_conversations"], 1)
+
+        first_row = self.fetch_document_row("first.eml")
+        second_row = self.fetch_document_row("second.eml")
+        self.assertIsNotNone(first_row["conversation_id"])
+        self.assertEqual(first_row["conversation_id"], second_row["conversation_id"])
 
     def test_manual_conversation_assignment_mode_prevents_root_overwrite_and_retargets_auto_reply(self) -> None:
         root_path = self.root / "root.eml"
@@ -5721,6 +5788,40 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(root_row["conversation_id"])
         self.assertEqual(root_row["conversation_id"], reply_row["conversation_id"])
 
+    def test_ingest_mbox_same_subject_messages_without_thread_links_stay_separate(self) -> None:
+        first_message = self.build_fake_mbox_message(
+            subject="You've joined the Beagle group",
+            body_text="Mailbox one welcome",
+            message_id="<mbox-beagle-001@example.com>",
+            author="Beagle <welcome@example.com>",
+            recipients="Mailbox One <one@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        second_message = self.build_fake_mbox_message(
+            subject="You've joined the Beagle group",
+            body_text="Mailbox two welcome",
+            message_id="<mbox-beagle-002@example.com>",
+            author="Beagle <welcome@example.com>",
+            recipients="Mailbox Two <two@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+        self.write_fake_mbox_file([first_message, second_message])
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+
+        first_row = self.fetch_document_row(
+            retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-beagle-001@example.com>")
+        )
+        second_row = self.fetch_document_row(
+            retriever_tools.mbox_message_rel_path("mailbox.mbox", "<mbox-beagle-002@example.com>")
+        )
+        self.assertIsNotNone(first_row["conversation_id"])
+        self.assertIsNotNone(second_row["conversation_id"])
+        self.assertNotEqual(first_row["conversation_id"], second_row["conversation_id"])
+
     def test_ingest_pst_email_groups_threaded_messages_from_transport_headers(self) -> None:
         self.write_fake_pst_file()
         messages = [
@@ -5765,6 +5866,54 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         reply_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-email-reply"))
         self.assertIsNotNone(root_row["conversation_id"])
         self.assertEqual(root_row["conversation_id"], reply_row["conversation_id"])
+
+    def test_ingest_pst_email_topic_only_matches_do_not_merge_unrelated_messages(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-beagle-001",
+                subject="You've joined the Beagle group",
+                body_text="Mailbox one welcome",
+                author="Beagle",
+                recipients="Mailbox One <one@example.com>",
+                date_created="2026-04-24T00:00:00Z",
+                conversation_topic="You've joined the Beagle group",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-beagle-002",
+                subject="You've joined the Beagle group",
+                body_text="Mailbox two welcome",
+                author="Beagle",
+                recipients="Mailbox Two <two@example.com>",
+                date_created="2026-04-24T01:00:00Z",
+                conversation_topic="You've joined the Beagle group",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-beagle-003",
+                subject="You've joined the Beagle group",
+                body_text="Mailbox three welcome",
+                author="Beagle",
+                recipients="Mailbox Three <three@example.com>",
+                date_created="2026-04-24T02:00:00Z",
+                conversation_topic="You've joined the Beagle group",
+            ),
+        ]
+
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            retriever_tools.bootstrap(self.root)
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+
+        first_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-beagle-001"))
+        second_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-beagle-002"))
+        third_row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-beagle-003"))
+        self.assertIsNotNone(first_row["conversation_id"])
+        self.assertIsNotNone(second_row["conversation_id"])
+        self.assertIsNotNone(third_row["conversation_id"])
+        self.assertNotEqual(first_row["conversation_id"], second_row["conversation_id"])
+        self.assertNotEqual(first_row["conversation_id"], third_row["conversation_id"])
+        self.assertNotEqual(second_row["conversation_id"], third_row["conversation_id"])
 
     def test_search_parser_accepts_alias_flags_for_paging_and_sorting(self) -> None:
         parser = retriever_tools.build_parser()
@@ -6302,36 +6451,35 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(self.run_cli("slash", str(self.root), "/scope", "save", "review")[0], 0)
 
         search_show_exit, search_show_payload, _, _ = self.run_cli("slash", str(self.root), "/search")
-        scope_show_exit, scope_show_payload, _, _ = self.run_cli("slash", str(self.root), "/scope")
-        scope_list_exit, scope_list_payload, _, _ = self.run_cli("slash", str(self.root), "/scope", "list")
-        dataset_show_exit, dataset_show_payload, _, _ = self.run_cli("slash", str(self.root), "/dataset")
-        dataset_list_exit, dataset_list_payload, _, _ = self.run_cli("slash", str(self.root), "/dataset", "list")
+        scope_show_exit, scope_show_stdout, scope_show_stderr = self.run_cli_raw("slash", str(self.root), "/scope")
+        scope_list_exit, scope_list_stdout, scope_list_stderr = self.run_cli_raw("slash", str(self.root), "/scope", "list")
+        dataset_show_exit, dataset_show_stdout, dataset_show_stderr = self.run_cli_raw("slash", str(self.root), "/dataset")
+        dataset_list_exit, dataset_list_stdout, dataset_list_stderr = self.run_cli_raw("slash", str(self.root), "/dataset", "list")
 
         self.assertEqual(search_show_exit, 0)
         self.assertIsNotNone(search_show_payload)
         self.assertEqual(search_show_payload["keyword"], "alpha")
 
         self.assertEqual(scope_show_exit, 0)
-        self.assertIsNotNone(scope_show_payload)
-        self.assertEqual(scope_show_payload["scope"]["keyword"], "alpha")
-        self.assertEqual(scope_show_payload["scope"]["dataset"][0]["name"], "Review Set")
+        self.assertEqual(scope_show_stderr, "")
+        self.assertIn("Scope:", scope_show_stdout)
+        self.assertIn("- keyword: alpha", scope_show_stdout)
+        self.assertIn("- dataset: Review Set", scope_show_stdout)
 
         self.assertEqual(scope_list_exit, 0)
-        self.assertIsNotNone(scope_list_payload)
-        saved_scope_names = [item["name"] for item in scope_list_payload["saved_scopes"]]
-        self.assertEqual(saved_scope_names, ["review"])
-        self.assertEqual(scope_list_payload["saved_scopes"][0]["scope"]["keyword"], "alpha")
-        self.assertEqual(scope_list_payload["saved_scopes"][0]["scope"]["dataset"][0]["name"], "Review Set")
+        self.assertEqual(scope_list_stderr, "")
+        self.assertIn("Saved scopes:", scope_list_stdout)
+        self.assertIn("- review: keyword=alpha; dataset=Review Set", scope_list_stdout)
 
         self.assertEqual(dataset_show_exit, 0)
-        self.assertIsNotNone(dataset_show_payload)
-        self.assertEqual(dataset_show_payload["dataset"][0]["name"], "Review Set")
+        self.assertEqual(dataset_show_stderr, "")
+        self.assertEqual(dataset_show_stdout, "Dataset: Review Set")
 
         self.assertEqual(dataset_list_exit, 0)
-        self.assertIsNotNone(dataset_list_payload)
-        dataset_names = [item["dataset_name"] for item in dataset_list_payload["datasets"]]
-        self.assertIn("Review Set", dataset_names)
-        self.assertIn(self.root.name, dataset_names)
+        self.assertEqual(dataset_list_stderr, "")
+        self.assertIn("Datasets:", dataset_list_stdout)
+        self.assertIn("Review Set: 1 docs (manual 1, source 0)", dataset_list_stdout)
+        self.assertIn(f"{self.root.name}:", dataset_list_stdout)
 
     def test_slash_bates_within_intersects_ranges_and_rejects_cross_slot_and_mixed_prefix(self) -> None:
         retriever_tools.bootstrap(self.root)
@@ -6509,59 +6657,53 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         sort_exit, _, _, _ = self.run_cli("slash", str(self.root), "/sort", "file_name asc")
         self.assertEqual(sort_exit, 0)
 
-        sort_show_exit, sort_show_payload, _, _ = self.run_cli("slash", str(self.root), "/sort")
-        sort_list_exit, sort_list_payload, _, _ = self.run_cli("slash", str(self.root), "/sort", "list")
-        page_size_show_exit, page_size_show_payload, _, _ = self.run_cli("slash", str(self.root), "/page-size")
+        sort_show_exit, sort_show_stdout, sort_show_stderr = self.run_cli_raw("slash", str(self.root), "/sort")
+        sort_list_exit, sort_list_stdout, sort_list_stderr = self.run_cli_raw("slash", str(self.root), "/sort", "list")
+        page_size_show_exit, page_size_show_stdout, page_size_show_stderr = self.run_cli_raw("slash", str(self.root), "/page-size")
         self.assertEqual(self.run_cli("slash", str(self.root), "/page-size 5")[0], 0)
         self.assertEqual(self.run_cli("slash", str(self.root), "/next")[0], 0)
-        page_show_exit, page_show_payload, _, _ = self.run_cli("slash", str(self.root), "/page")
-        page_size_after_exit, page_size_after_payload, _, _ = self.run_cli("slash", str(self.root), "/page-size")
-        columns_show_exit, columns_show_payload, _, _ = self.run_cli("slash", str(self.root), "/columns")
-        columns_list_exit, columns_list_payload, _, _ = self.run_cli("slash", str(self.root), "/columns", "list")
+        page_show_exit, page_show_stdout, page_show_stderr = self.run_cli_raw("slash", str(self.root), "/page")
+        page_size_after_exit, page_size_after_stdout, page_size_after_stderr = self.run_cli_raw("slash", str(self.root), "/page-size")
+        columns_show_exit, columns_show_stdout, columns_show_stderr = self.run_cli_raw("slash", str(self.root), "/columns")
+        columns_list_exit, columns_list_stdout, columns_list_stderr = self.run_cli_raw("slash", str(self.root), "/columns", "list")
 
         self.assertEqual(sort_show_exit, 0)
-        self.assertIsNotNone(sort_show_payload)
-        self.assertEqual(sort_show_payload["sort"], "file_name")
-        self.assertEqual(sort_show_payload["order"], "asc")
-        self.assertEqual(sort_show_payload["sort_spec"], "file_name asc")
-        self.assertEqual(sort_show_payload["sort_source"], "override")
+        self.assertEqual(sort_show_stderr, "")
+        self.assertEqual(sort_show_stdout, "Sort: file_name asc (override)")
 
         self.assertEqual(sort_list_exit, 0)
-        self.assertIsNotNone(sort_list_payload)
-        sortable_names = [item["name"] for item in sort_list_payload["sortable_fields"]]
-        self.assertIn("file_name", sortable_names)
-        self.assertIn("title", sortable_names)
-        self.assertNotIn("dataset_name", sortable_names)
+        self.assertEqual(sort_list_stderr, "")
+        self.assertIn("Sortable fields:", sort_list_stdout)
+        self.assertIn("- file_name", sort_list_stdout)
+        self.assertIn("- title", sort_list_stdout)
+        self.assertNotIn("- dataset_name", sort_list_stdout)
 
         self.assertEqual(page_size_show_exit, 0)
-        self.assertIsNotNone(page_size_show_payload)
-        self.assertEqual(page_size_show_payload["page_size"], retriever_tools.DEFAULT_PAGE_SIZE)
+        self.assertEqual(page_size_show_stderr, "")
+        self.assertEqual(page_size_show_stdout, f"Page size: {retriever_tools.DEFAULT_PAGE_SIZE}")
 
         self.assertEqual(page_show_exit, 0)
-        self.assertIsNotNone(page_show_payload)
-        self.assertEqual(page_show_payload["page"], 2)
-        self.assertEqual(page_show_payload["per_page"], 5)
-        self.assertEqual(page_show_payload["offset"], 5)
-        self.assertEqual(page_show_payload["total_known"], 25)
-        self.assertEqual(page_show_payload["total_pages"], 5)
+        self.assertEqual(page_show_stderr, "")
+        self.assertEqual(page_show_stdout, "Page: 2 of 5 (docs 6-10 of 25)")
 
         self.assertEqual(page_size_after_exit, 0)
-        self.assertIsNotNone(page_size_after_payload)
-        self.assertEqual(page_size_after_payload["page_size"], 5)
+        self.assertEqual(page_size_after_stderr, "")
+        self.assertEqual(page_size_after_stdout, "Page size: 5")
 
         self.assertEqual(columns_show_exit, 0)
-        self.assertIsNotNone(columns_show_payload)
-        self.assertEqual(
-            columns_show_payload["display"]["columns"],
-            ["content_type", "title", "author", "date_created", "control_number"],
+        self.assertEqual(columns_show_stderr, "")
+        self.assertIn(
+            "Columns: content_type, title, author, date_created, control_number",
+            columns_show_stdout,
         )
+        self.assertIn("Page size: 5", columns_show_stdout)
 
         self.assertEqual(columns_list_exit, 0)
-        self.assertIsNotNone(columns_list_payload)
-        displayable_names = [item["name"] for item in columns_list_payload["columns"]]
-        self.assertIn("title", displayable_names)
-        self.assertIn("dataset_name", displayable_names)
-        self.assertNotIn("has_attachments", displayable_names)
+        self.assertEqual(columns_list_stderr, "")
+        self.assertIn("Displayable columns:", columns_list_stdout)
+        self.assertIn("- title", columns_list_stdout)
+        self.assertIn("- dataset_name", columns_list_stdout)
+        self.assertNotIn("- has_attachments", columns_list_stdout)
 
     def test_slash_columns_commands_persist_display_preferences_and_render_custom_fields(self) -> None:
         (self.root / "sample.txt").write_text("sample display body\n", encoding="utf-8")
@@ -6586,7 +6728,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             0,
         )
 
-        show_exit, show_payload, _, _ = self.run_cli("slash", str(self.root), "/columns")
+        show_exit, show_stdout, show_stderr = self.run_cli_raw("slash", str(self.root), "/columns")
         set_exit, set_payload, _, _ = self.run_cli(
             "slash",
             str(self.root),
@@ -6594,10 +6736,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual(show_exit, 0)
-        self.assertIsNotNone(show_payload)
+        self.assertEqual(show_stderr, "")
         self.assertEqual(
-            show_payload["display"]["columns"],
-            ["content_type", "title", "author", "date_created", "control_number"],
+            show_stdout,
+            "Columns: content_type, title, author, date_created, control_number\nPage size: 10",
         )
 
         self.assertEqual(set_exit, 0)
@@ -7604,6 +7746,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 subject="PST Parent",
                 body_text="Parent message body",
                 folder_path="Inbox",
+                recipients=None,
+                transport_headers="\n".join(
+                    [
+                        "To: Bob Example <bob@example.com>",
+                        "Cc: Carol Example <carol@example.com>",
+                        "",
+                    ]
+                ),
                 attachment_name="notes.txt",
                 attachment_text="pst attachment body",
             ),
@@ -7640,6 +7790,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNone(parent_row["file_size"])
         self.assertEqual(parent_row["content_type"], "Email")
         self.assertEqual(parent_row["custodian"], "mailbox")
+        self.assertEqual(
+            parent_row["recipients"],
+            "Bob Example <bob@example.com>, Carol Example <carol@example.com>",
+        )
         self.assertEqual(sibling_row["source_folder_path"], "Sent Items")
         self.assertEqual(sibling_row["custodian"], "mailbox")
         self.assertEqual(child_row["custodian"], "mailbox")
@@ -7694,11 +7848,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             parent_result["preview_rel_path"],
             self.preview_target_by_label(parent_result["preview_targets"], "message")["rel_path"],
         )
+        message_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(parent_result["preview_targets"], "message")
+        ).read_text(encoding="utf-8")
+        self.assertIn('class="gmail-thread-title">PST Parent</h1>', message_preview_html)
+        self.assertIn("to Bob Example &lt;bob@example.com&gt;, Carol Example &lt;carol@example.com&gt;", message_preview_html)
+        self.assertIn("Parent message body", message_preview_html)
+        self.assertNotIn("Viewing message", message_preview_html)
+        self.assertNotIn("2 messages", message_preview_html)
         parent_preview_html = self.preview_target_file_path(
             self.preview_target_by_label(parent_result["preview_targets"], "segment")
         ).read_text(encoding="utf-8")
         self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
         self.assertIn("PST Parent", parent_preview_html)
+        self.assertIn("to Bob Example &lt;bob@example.com&gt;, Carol Example &lt;carol@example.com&gt;", parent_preview_html)
 
         pst_only = retriever_tools.search(
             self.root,
@@ -10113,7 +10276,7 @@ class CidInliningTests(unittest.TestCase):
 
         preview_content = payload["preview_artifacts"][0]["content"]
         self.assertIn("<title>Legalweek 2023 Mobile App Now Available</title>", preview_content)
-        self.assertIn("<h1>Legalweek 2023 Mobile App Now Available</h1>", preview_content)
+        self.assertIn('class="gmail-thread-title">Legalweek 2023 Mobile App Now Available</h1>', preview_content)
         self.assertNotIn("Attachments: agenda.pdf", preview_content)
 
 
