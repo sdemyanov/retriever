@@ -3541,6 +3541,32 @@ def summarize_scope_inline(scope: dict[str, object]) -> str:
 def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) -> str | None:
     command_name, normalized_tail = parse_slash_command_text(raw_command)
 
+    if command_name in {"next", "previous"}:
+        rendered_markdown = payload.get("rendered_markdown")
+        if payload_has_meaningful_value(rendered_markdown):
+            return str(rendered_markdown)
+
+    if command_name == "search" and not normalized_tail:
+        keyword = normalize_inline_whitespace(str(payload.get("keyword") or ""))
+        return f"Search: {keyword}" if keyword else "Search: (none)"
+
+    if command_name == "filter" and not normalized_tail:
+        filter_expression = normalize_inline_whitespace(str(payload.get("filter") or ""))
+        return f"Filter: {filter_expression}" if filter_expression else "Filter: (none)"
+
+    if command_name == "bates" and not normalized_tail:
+        bates = payload.get("bates")
+        if isinstance(bates, dict):
+            begin = normalize_inline_whitespace(str(bates.get("begin") or ""))
+            end = normalize_inline_whitespace(str(bates.get("end") or ""))
+            if begin and end:
+                return f"Bates: {begin}-{end}"
+        return "Bates: (none)"
+
+    if command_name == "from-run" and not normalized_tail:
+        from_run_id = payload.get("from_run_id")
+        return f"From run: {from_run_id}" if from_run_id is not None else "From run: (none)"
+
     if command_name == "scope":
         scope_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
         if not scope_args:

@@ -10,19 +10,25 @@ metadata:
 
 # Retriever /bates
 
-This skill is a thin visible alias for Retriever's internal slash-command browse surface.
+Use this skill for `/bates`, `/bates <token-or-range>`, and `/bates clear`.
 
-## Load order
+## Read-only fast path
+
+For the exact read-only form `/bates`:
+
+- Do not read [../search/SKILL.md](../search/SKILL.md).
+- Do not read schema docs.
+- Run exactly one Bash command from the workspace root:
+  - `/bates`: `python3 .retriever/bin/retriever_tools.py slash . /bates`
+- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+- Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
+
+## Other forms
+
+For `/bates <token-or-range>` and `/bates clear`:
 
 1. Read [../search/SKILL.md](../search/SKILL.md).
-2. Read [../schema/schema.md](../schema/schema.md) if field names or operators are unclear.
-
-## Behavior
-
-- Treat this skill as the slash command `/bates`.
-- Supported forms:
-  - `/bates` shows the active Bates selector.
-  - `/bates <token-or-range>` applies a Bates-aware scope or browse.
-  - `/bates clear` clears the active Bates selector.
-- Prefer the Bates-aware path over plain keyword FTS when the user provides a single control token or a Bates range.
-- Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion around the slash-command result.
+2. Read [../schema/schema.md](../schema/schema.md) only if Bates-like identifier semantics are unclear.
+3. Treat this skill as the slash command `/bates`.
+4. Prefer the Bates-aware path over plain keyword FTS when the user provides a single control token or a Bates range.
+5. Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.

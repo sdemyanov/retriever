@@ -17,6 +17,17 @@ Use this skill when the user says things like:
 - "search for Latin emails"
 - "filter to NDA contracts"
 
+## Exact /search fast path
+
+For the exact bare slash form `/search`:
+
+- Do not read [../search-strategy/search-strategy.md](../search-strategy/search-strategy.md).
+- Do not read schema docs.
+- Run exactly one Bash command from the workspace root:
+  - `/search`: `python3 .retriever/bin/retriever_tools.py slash . /search`
+- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+- Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
+
 ## Load order
 
 1. Read [../search-strategy/search-strategy.md](../search-strategy/search-strategy.md).

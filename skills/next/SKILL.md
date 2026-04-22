@@ -10,15 +10,19 @@ metadata:
 
 # Retriever /next
 
-This skill is a thin visible alias for Retriever's internal slash-command browse surface.
+Use this skill for the exact slash command `/next`.
 
-## Load order
+## Fast path
 
-1. Read [../search/SKILL.md](../search/SKILL.md).
+- Do not read [../search/SKILL.md](../search/SKILL.md).
+- Run exactly one Bash command from the workspace root:
+  - `/next`: `python3 .retriever/bin/retriever_tools.py slash . /next`
+- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+- Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
 
 ## Behavior
 
 - Treat this skill as the slash command `/next`.
 - This is equivalent to `/page next`.
 - Fetch the next page of the active Retriever browse state.
-- Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion around the slash-command result.
+- Return only the resulting Retriever state or table output. Do not add a preamble, trailing summary, or follow-up suggestion.
