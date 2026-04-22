@@ -5,7 +5,7 @@ description: >
   supported document types. It defines file-type support, encoding behavior,
   preview artifact rules, and per-file failure isolation.
 metadata:
-  version: "0.9.4"
+  version: "0.9.5"
 ---
 
 # Retriever Parsing
@@ -15,7 +15,6 @@ Use this skill whenever a task changes or depends on document extraction behavio
 ## Required reference
 
 Read [parsing.md](parsing.md) before changing ingest logic or parser dependencies.
-For spreadsheet parser redesign work, also read [spreadsheet-parsing-plan.md](spreadsheet-parsing-plan.md).
 
 ## Rules
 
