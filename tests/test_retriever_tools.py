@@ -7566,6 +7566,389 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(result["source_kind"], retriever_tools.MBOX_SOURCE_KIND)
         self.assertEqual(result["dataset_name"], "sample_utf8.mbox")
 
+    def test_ingest_gmail_export_enriches_messages_and_skips_auxiliary_files(self) -> None:
+        export_root = self.root / "gmail-export"
+        export_root.mkdir()
+
+        mbox_path = export_root / "Export.mbox"
+        archive = mailbox.mbox(str(mbox_path), create=True)
+        try:
+            archive.add(
+                self.build_fake_mbox_message(
+                    subject="Drive sharing update",
+                    body_text="Email body that references a linked Drive document.",
+                    message_id="<gmail-msg-001@example.com>",
+                    author="Sender Example <sender@example.com>",
+                    recipients="Receiver Example <receiver@example.com>",
+                )
+            )
+            archive.add(
+                self.build_fake_mbox_message(
+                    subject="Plain Gmail export message",
+                    body_text="Regular mailbox content.",
+                    message_id="<gmail-msg-002@example.com>",
+                    author="Sender Example <sender@example.com>",
+                    recipients="Receiver Example <receiver@example.com>",
+                )
+            )
+            archive.flush()
+        finally:
+            archive.close()
+
+        metadata_headers = [
+            "Rfc822MessageId",
+            "GmailMessageId",
+            "FileName",
+            "Account",
+            "Labels",
+            "From",
+            "Subject",
+            "To",
+            "CC",
+            "BCC",
+            "DateSent",
+            "DateReceived",
+            "SubjectAtStart",
+            "SubjectAtEnd",
+            "DateFirstMessageSent",
+            "DateLastMessageSent",
+            "DateFirstMessageReceived",
+            "DateLastMessageReceived",
+            "ThreadedMessageCount",
+        ]
+        with (export_root / "Export-metadata.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=metadata_headers)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "Rfc822MessageId": "gmail-msg-001@example.com",
+                    "GmailMessageId": "1767000000000000001",
+                    "FileName": "1767000000000000001-1685123311000",
+                    "Account": "owner@example.com",
+                    "Labels": "^INBOX,projectalpha",
+                    "From": "sender@example.com Sender Example",
+                    "Subject": "Drive sharing update",
+                    "To": "receiver@example.com Receiver Example",
+                    "CC": "",
+                    "BCC": "",
+                    "DateSent": "2026-04-14T10:00:00Z",
+                    "DateReceived": "2026-04-14T10:00:05Z",
+                    "SubjectAtStart": "",
+                    "SubjectAtEnd": "",
+                    "DateFirstMessageSent": "",
+                    "DateLastMessageSent": "",
+                    "DateFirstMessageReceived": "",
+                    "DateLastMessageReceived": "",
+                    "ThreadedMessageCount": "1",
+                }
+            )
+            writer.writerow(
+                {
+                    "Rfc822MessageId": "gmail-msg-002@example.com",
+                    "GmailMessageId": "1767000000000000002",
+                    "FileName": "1767000000000000002-1685123312000",
+                    "Account": "owner@example.com",
+                    "Labels": "^INBOX",
+                    "From": "sender@example.com Sender Example",
+                    "Subject": "Plain Gmail export message",
+                    "To": "receiver@example.com Receiver Example",
+                    "CC": "",
+                    "BCC": "",
+                    "DateSent": "2026-04-14T11:00:00Z",
+                    "DateReceived": "2026-04-14T11:00:03Z",
+                    "SubjectAtStart": "",
+                    "SubjectAtEnd": "",
+                    "DateFirstMessageSent": "",
+                    "DateLastMessageSent": "",
+                    "DateFirstMessageReceived": "",
+                    "DateLastMessageReceived": "",
+                    "ThreadedMessageCount": "1",
+                }
+            )
+
+        with (export_root / "Export-drive-links.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["Account", "Rfc822MessageId", "GmailMessageId", "DriveUrl", "DriveItemId"],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "Account": "owner@example.com",
+                    "Rfc822MessageId": "gmail-msg-001@example.com",
+                    "GmailMessageId": "1767000000000000001",
+                    "DriveUrl": "https://docs.google.com/document/d/drive-doc-001/edit",
+                    "DriveItemId": "drive-doc-001",
+                }
+            )
+
+        drive_export_dir = export_root / "Export_Drive_Link_Export_0"
+        drive_export_dir.mkdir()
+        drive_file = drive_export_dir / "Linked notes_drive-doc-001.txt"
+        drive_file.write_text("Drive export body text.\n", encoding="utf-8")
+
+        (export_root / "archive_browser.html").write_text("<html><body>Archive browser</body></html>\n", encoding="utf-8")
+        (export_root / "Export-metadata.xml").write_text("<Root><Documents/></Root>\n", encoding="utf-8")
+        (export_root / "Export-errors.xml").write_text("<Errors/>\n", encoding="utf-8")
+        (export_root / "Export-result-counts.csv").write_text(
+            "Email,AccountStatus,SuccessCount,MessageErrorCount,ChatErrorCount\nTotals,,2,0,0\n",
+            encoding="utf-8",
+        )
+        (export_root / "Export.md5").write_text("deadbeef\n", encoding="utf-8")
+        (export_root / "Export Drive Link Export.md5").write_text("deadbeef\n", encoding="utf-8")
+        (export_root / "Export_Drive_Link_Export-errors.csv").write_text(
+            "Document ID,Document type,File type,Title,Size,Creator,Collaborators,Viewers,Others,Creation time,Last modified time,Error Description,Drive Document ID\n"
+            "missing-doc,,,,,,,,,,,Document not found,missing-doc\n",
+            encoding="utf-8",
+        )
+        (export_root / "Export_Drive_Link_Export-metadata.xml").write_text(
+            """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Root DataInterchangeType='Update' Description='Test'>
+  <Batch name='New Batch'>
+    <Documents>
+      <Document DocID='drive-doc-001'>
+        <Tags>
+          <Tag TagName='#Author' TagDataType='Text' TagValue='owner@example.com'/>
+          <Tag TagName='Collaborators' TagDataType='Text' TagValue='reviewer@example.com'/>
+          <Tag TagName='Viewers' TagDataType='Text' TagValue='observer@example.com'/>
+          <Tag TagName='Others' TagDataType='Text' TagValue=''/>
+          <Tag TagName='#DateCreated' TagDataType='DateTime' TagValue='2026-04-13T08:30:00Z'/>
+          <Tag TagName='#DateModified' TagDataType='DateTime' TagValue='2026-04-14T09:45:00Z'/>
+          <Tag TagName='#Title' TagDataType='Text' TagValue='Linked notes from metadata'/>
+          <Tag TagName='DocumentType' TagDataType='Text' TagValue='DOCUMENT'/>
+        </Tags>
+        <Files>
+          <File FileType='Native'>
+            <ExternalFile FileName='Linked notes_drive-doc-001.txt' FileSize='24' Hash='abc123'/>
+          </File>
+        </Files>
+      </Document>
+    </Documents>
+  </Batch>
+</Root>
+""",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["gmail_exports_detected"], 1)
+        self.assertEqual(ingest_result["mbox_messages_created"], 2)
+        self.assertEqual(ingest_result["gmail_linked_documents_created"], 0)
+        self.assertEqual(ingest_result["workspace_parent_documents"], 2)
+        self.assertEqual(ingest_result["workspace_attachment_children"], 1)
+        self.assertEqual(ingest_result["workspace_documents_total"], 3)
+
+        email_rel_path = retriever_tools.mbox_message_rel_path(
+            "gmail-export/Export.mbox",
+            "<gmail-msg-001@example.com>",
+        )
+        email_row = self.fetch_document_row(email_rel_path)
+        child_rows = self.fetch_child_rows(int(email_row["id"]))
+        self.assertEqual(len(child_rows), 1)
+        drive_attachment_row = child_rows[0]
+
+        self.assertEqual(drive_attachment_row["parent_document_id"], email_row["id"])
+        self.assertEqual(email_row["dataset_id"], drive_attachment_row["dataset_id"])
+        self.assertEqual(drive_attachment_row["dataset_id"], self.fetch_dataset_row(int(drive_attachment_row["dataset_id"]))["id"])
+        self.assertEqual(drive_attachment_row["source_kind"], retriever_tools.EMAIL_ATTACHMENT_SOURCE_KIND)
+        self.assertEqual(drive_attachment_row["title"], "Linked notes from metadata")
+        self.assertEqual(drive_attachment_row["author"], "owner@example.com")
+        self.assertIn("reviewer@example.com", str(drive_attachment_row["participants"]))
+        self.assertEqual(drive_attachment_row["date_created"], "2026-04-13T08:30:00Z")
+        self.assertEqual(drive_attachment_row["date_modified"], "2026-04-14T09:45:00Z")
+
+        label_search = retriever_tools.search(self.root, "projectalpha", None, None, None, 1, 20)
+        self.assertEqual(label_search["total_hits"], 1)
+        self.assertEqual(label_search["results"][0]["id"], email_row["id"])
+        self.assertEqual(label_search["results"][0]["attachment_count"], 1)
+
+        linked_title_search = retriever_tools.search(self.root, "Linked notes from metadata", None, None, None, 1, 20)
+        returned_ids = {item["id"] for item in linked_title_search["results"]}
+        self.assertIn(email_row["id"], returned_ids)
+        self.assertIn(drive_attachment_row["id"], returned_ids)
+        drive_result = next(item for item in linked_title_search["results"] if item["id"] == drive_attachment_row["id"])
+        self.assertEqual(drive_result["dataset_name"], "Export.mbox")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            parent_rel_paths = {
+                str(row["rel_path"])
+                for row in connection.execute(
+                    """
+                    SELECT rel_path
+                    FROM documents
+                    WHERE parent_document_id IS NULL
+                    ORDER BY rel_path ASC
+                    """
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+
+        self.assertNotIn("gmail-export/archive_browser.html", parent_rel_paths)
+        self.assertNotIn("gmail-export/Export-metadata.csv", parent_rel_paths)
+        self.assertNotIn("gmail-export/Export-metadata.xml", parent_rel_paths)
+        self.assertNotIn("gmail-export/Export-drive-links.csv", parent_rel_paths)
+        self.assertNotIn("gmail-export/Export-errors.xml", parent_rel_paths)
+        self.assertNotIn("gmail-export/Export-result-counts.csv", parent_rel_paths)
+        self.assertNotIn("gmail-export/Export_Drive_Link_Export_0/Linked notes_drive-doc-001.txt", parent_rel_paths)
+        self.assertNotIn("gmail-export/Export_Drive_Link_Export-errors.csv", parent_rel_paths)
+        self.assertNotIn("gmail-export/Export_Drive_Link_Export-metadata.xml", parent_rel_paths)
+
+    def test_ingest_gmail_export_with_mbox_file_filter_preserves_sidecar_enrichment(self) -> None:
+        export_root = self.root / "gmail-filtered"
+        export_root.mkdir()
+
+        mbox_path = export_root / "Filtered.mbox"
+        archive = mailbox.mbox(str(mbox_path), create=True)
+        try:
+            archive.add(
+                self.build_fake_mbox_message(
+                    subject="Drive sharing update",
+                    body_text="Email body that references a linked Drive document.",
+                    message_id="<gmail-filter-001@example.com>",
+                    author="Sender Example <sender@example.com>",
+                    recipients="Receiver Example <receiver@example.com>",
+                )
+            )
+            archive.flush()
+        finally:
+            archive.close()
+
+        with (export_root / "Filtered-metadata.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "Rfc822MessageId",
+                    "GmailMessageId",
+                    "Account",
+                    "Labels",
+                    "Subject",
+                    "From",
+                    "To",
+                    "DateSent",
+                    "DateReceived",
+                    "ThreadedMessageCount",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "Rfc822MessageId": "gmail-filter-001@example.com",
+                    "GmailMessageId": "1767000000000000003",
+                    "Account": "owner@example.com",
+                    "Labels": "^INBOX,projectalpha",
+                    "Subject": "Drive sharing update",
+                    "From": "sender@example.com Sender Example",
+                    "To": "receiver@example.com Receiver Example",
+                    "DateSent": "2026-04-14T10:00:00Z",
+                    "DateReceived": "2026-04-14T10:00:05Z",
+                    "ThreadedMessageCount": "1",
+                }
+            )
+
+        with (export_root / "Filtered-drive-links.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["Account", "Rfc822MessageId", "GmailMessageId", "DriveUrl", "DriveItemId"],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "Account": "owner@example.com",
+                    "Rfc822MessageId": "gmail-filter-001@example.com",
+                    "GmailMessageId": "1767000000000000003",
+                    "DriveUrl": "https://docs.google.com/document/d/drive-doc-001/edit",
+                    "DriveItemId": "drive-doc-001",
+                }
+            )
+
+        drive_export_dir = export_root / "Filtered_Drive_Link_Export_0"
+        drive_export_dir.mkdir()
+        drive_file = drive_export_dir / "Linked notes_drive-doc-001.txt"
+        drive_file.write_text("Drive export body text.\n", encoding="utf-8")
+        (export_root / "Filtered_Drive_Link_Export-metadata.xml").write_text(
+            """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Root DataInterchangeType='Update' Description='Test'>
+  <Batch name='New Batch'>
+    <Documents>
+      <Document DocID='drive-doc-001'>
+        <Tags>
+          <Tag TagName='#Author' TagDataType='Text' TagValue='owner@example.com'/>
+          <Tag TagName='#Title' TagDataType='Text' TagValue='Linked notes from metadata'/>
+        </Tags>
+        <Files>
+          <File FileType='Native'>
+            <ExternalFile FileName='Linked notes_drive-doc-001.txt' FileSize='24' Hash='abc123'/>
+          </File>
+        </Files>
+      </Document>
+    </Documents>
+  </Batch>
+</Root>
+""",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types="mbox")
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["gmail_exports_detected"], 1)
+        self.assertEqual(ingest_result["mbox_messages_created"], 1)
+        self.assertEqual(ingest_result["gmail_linked_documents_created"], 0)
+        self.assertEqual(ingest_result["workspace_parent_documents"], 1)
+        self.assertEqual(ingest_result["workspace_attachment_children"], 1)
+        self.assertEqual(ingest_result["workspace_documents_total"], 2)
+
+        email_rel_path = retriever_tools.mbox_message_rel_path(
+            "gmail-filtered/Filtered.mbox",
+            "<gmail-filter-001@example.com>",
+        )
+        email_row = self.fetch_document_row(email_rel_path)
+        child_rows = self.fetch_child_rows(int(email_row["id"]))
+        self.assertEqual(len(child_rows), 1)
+        self.assertEqual(child_rows[0]["title"], "Linked notes from metadata")
+        self.assertEqual(child_rows[0]["source_kind"], retriever_tools.EMAIL_ATTACHMENT_SOURCE_KIND)
+
+        label_search = retriever_tools.search(self.root, "projectalpha", None, None, None, 1, 20)
+        self.assertEqual(label_search["total_hits"], 1)
+        self.assertEqual(label_search["results"][0]["id"], email_row["id"])
+        self.assertEqual(label_search["results"][0]["attachment_count"], 1)
+
+        linked_title_search = retriever_tools.search(self.root, "Linked notes from metadata", None, None, None, 1, 20)
+        self.assertEqual(linked_title_search["total_hits"], 2)
+        returned_ids = {item["id"] for item in linked_title_search["results"]}
+        self.assertIn(email_row["id"], returned_ids)
+        self.assertIn(child_rows[0]["id"], returned_ids)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            parent_rel_paths = {
+                str(row["rel_path"])
+                for row in connection.execute(
+                    """
+                    SELECT rel_path
+                    FROM documents
+                    WHERE parent_document_id IS NULL
+                    ORDER BY rel_path ASC
+                    """
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+
+        self.assertNotIn(
+            "gmail-filtered/Filtered_Drive_Link_Export_0/Linked notes_drive-doc-001.txt",
+            parent_rel_paths,
+        )
+        self.assertNotIn("gmail-filtered/Filtered-metadata.csv", parent_rel_paths)
+        self.assertNotIn("gmail-filtered/Filtered-drive-links.csv", parent_rel_paths)
+        self.assertNotIn("gmail-filtered/Filtered_Drive_Link_Export-metadata.xml", parent_rel_paths)
+
     def test_ingest_mbox_without_message_id_uses_stable_fallback_source_item_id(self) -> None:
         first_messages = [
             self.build_fake_mbox_message(

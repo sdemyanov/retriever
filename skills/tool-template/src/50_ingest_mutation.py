@@ -38,11 +38,23 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         production_root_paths = [Path(signature["root"]).resolve() for signature in production_signatures]
         slack_export_descriptors = find_slack_export_roots(root, recursive, allowed_types)
         slack_export_root_paths = [Path(descriptor["root"]).resolve() for descriptor in slack_export_descriptors]
+        gmail_export_descriptors = find_gmail_export_roots(root, recursive, allowed_types)
+        gmail_owned_paths = {
+            Path(path).resolve()
+            for descriptor in gmail_export_descriptors
+            for path in list(descriptor.get("owned_paths") or [])
+        }
+        gmail_owned_rel_paths = {
+            relative_document_path(root, owned_path)
+            for owned_path in gmail_owned_paths
+            if root.resolve() == owned_path.resolve() or root.resolve() in owned_path.resolve().parents
+        }
         scanned_files = [
             path
             for path in collect_files(root, recursive, allowed_types)
             if not any(production_root == path.resolve() or production_root in path.resolve().parents for production_root in production_root_paths)
             and not any(slack_root == path.resolve() or slack_root in path.resolve().parents for slack_root in slack_export_root_paths)
+            and path.resolve() not in gmail_owned_paths
         ]
         scanned_rel_paths: set[str] = set()
         scanned_pst_source_rel_paths: set[str] = set()
@@ -87,6 +99,10 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             "mbox_messages_deleted": 0,
             "mbox_sources_missing": 0,
             "mbox_documents_missing": 0,
+            "gmail_exports_detected": len(gmail_export_descriptors),
+            "gmail_linked_documents_created": 0,
+            "gmail_linked_documents_updated": 0,
+            "gmail_documents_scanned": 0,
             "slack_exports_detected": len(slack_export_descriptors),
             "slack_day_documents_scanned": 0,
             "slack_documents_created": 0,
@@ -112,6 +128,40 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         ingested_production_roots: list[str] = []
         skipped_production_roots: list[str] = []
         warnings: list[str] = []
+
+        for descriptor in gmail_export_descriptors:
+            export_root = Path(descriptor["root"])
+            try:
+                gmail_result = ingest_gmail_export_root(
+                    connection,
+                    paths,
+                    root,
+                    descriptor,
+                    allowed_file_types=allowed_types,
+                )
+                stats["new"] += int(gmail_result["new"])
+                stats["updated"] += int(gmail_result["updated"])
+                stats["failed"] += int(gmail_result["failed"])
+                stats["gmail_documents_scanned"] += int(gmail_result["scanned_files"])
+                stats["mbox_sources_skipped"] += int(gmail_result["mbox_sources_skipped"])
+                stats["mbox_messages_created"] += int(gmail_result["mbox_messages_created"])
+                stats["mbox_messages_updated"] += int(gmail_result["mbox_messages_updated"])
+                stats["mbox_messages_deleted"] += int(gmail_result["mbox_messages_deleted"])
+                stats["gmail_linked_documents_created"] += int(gmail_result["gmail_linked_documents_created"])
+                stats["gmail_linked_documents_updated"] += int(gmail_result["gmail_linked_documents_updated"])
+                scanned_rel_paths.update(str(rel_path) for rel_path in list(gmail_result.get("scanned_filesystem_rel_paths", [])))
+                scanned_mbox_source_rel_paths.update(
+                    str(rel_path) for rel_path in list(gmail_result.get("scanned_mbox_source_rel_paths", []))
+                )
+                failures.extend(list(gmail_result.get("failures", [])))
+            except Exception as exc:
+                stats["failed"] += 1
+                failures.append(
+                    {
+                        "rel_path": relative_document_path(root, export_root),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
 
         for descriptor in slack_export_descriptors:
             export_root = Path(descriptor["root"])
@@ -206,6 +256,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
               AND COALESCE(source_kind, ?) = ?
             """
         , (FILESYSTEM_SOURCE_KIND, FILESYSTEM_SOURCE_KIND)).fetchall()
+        existing_rows = [row for row in existing_rows if str(row["rel_path"]) not in gmail_owned_rel_paths]
         existing_by_rel = {row["rel_path"]: row for row in existing_rows}
         unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
         for row in existing_rows:
@@ -385,8 +436,8 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
         workspace_inventory = document_inventory_counts(connection)
         result = dict(stats)
         result["failures"] = failures
-        result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"]
-        result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"]
+        result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
+        result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
         result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
         result["ingested_production_roots"] = ingested_production_roots
         result["skipped_production_roots"] = skipped_production_roots

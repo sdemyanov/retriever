@@ -904,3 +904,759 @@ def ingest_slack_export_root(
         "ingestion_batch_number": current_batch,
         "failures": failures,
     }
+
+
+GMAIL_EXPORT_ARCHIVE_BROWSER_FILE = "archive_browser.html"
+GMAIL_EXPORT_DRIVE_FOLDER_PATTERN = re.compile(r"_Drive_Link_Export_\d+$", re.IGNORECASE)
+GMAIL_EXPORT_FILE_DRIVE_ID_PATTERN = re.compile(r"^(?P<base>.+)_(?P<drive_id>[A-Za-z0-9_-]{10,})$")
+GMAIL_METADATA_REQUIRED_HEADERS = {
+    "Rfc822MessageId",
+    "GmailMessageId",
+    "Labels",
+    "Account",
+    "Subject",
+}
+GMAIL_DRIVE_LINKS_REQUIRED_HEADERS = {
+    "Rfc822MessageId",
+    "DriveUrl",
+    "DriveItemId",
+}
+
+
+def load_gmail_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    try:
+        decoded, _, _ = decode_bytes(path.read_bytes())
+    except OSError:
+        return [], []
+    try:
+        reader = csv.DictReader(io.StringIO(decoded))
+    except csv.Error:
+        return [], []
+    headers = [normalize_inline_whitespace(str(header or "")) for header in (reader.fieldnames or []) if header]
+    rows: list[dict[str, str]] = []
+    for raw_row in reader:
+        if not isinstance(raw_row, dict):
+            continue
+        normalized_row: dict[str, str] = {}
+        for key, value in raw_row.items():
+            normalized_key = normalize_inline_whitespace(str(key or ""))
+            if not normalized_key:
+                continue
+            normalized_row[normalized_key] = normalize_whitespace(str(value or "")) if value is not None else ""
+        if normalized_row:
+            rows.append(normalized_row)
+    return headers, rows
+
+
+def gmail_csv_has_required_headers(path: Path, required_headers: set[str]) -> bool:
+    headers, _ = load_gmail_csv_rows(path)
+    return required_headers.issubset(set(headers))
+
+
+def gmail_metadata_csv_valid(path: Path) -> bool:
+    return path.is_file() and gmail_csv_has_required_headers(path, GMAIL_METADATA_REQUIRED_HEADERS)
+
+
+def gmail_drive_links_csv_valid(path: Path) -> bool:
+    return path.is_file() and gmail_csv_has_required_headers(path, GMAIL_DRIVE_LINKS_REQUIRED_HEADERS)
+
+
+def gmail_csv_list_values(value: object) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw_part in str(value or "").split(","):
+        normalized = normalize_whitespace(raw_part)
+        if not normalized or normalized in seen:
+            continue
+        values.append(normalized)
+        seen.add(normalized)
+    return values
+
+
+def gmail_normalized_message_lookup_key(value: object) -> str | None:
+    return normalize_email_message_id(value)
+
+
+def gmail_normalized_drive_item_id(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or ""))
+    return normalized or None
+
+
+def gmail_drive_item_id_from_export_file_name(path: Path) -> str | None:
+    stem = normalize_whitespace(path.stem)
+    if "_" not in stem:
+        return None
+    match = GMAIL_EXPORT_FILE_DRIVE_ID_PATTERN.fullmatch(stem)
+    if match is None:
+        return None
+    return gmail_normalized_drive_item_id(match.group("drive_id"))
+
+
+def gmail_drive_export_files(export_dirs: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for export_dir in export_dirs:
+        try:
+            iterator = export_dir.rglob("*")
+        except OSError:
+            continue
+        for path in iterator:
+            if path.is_dir() or ".retriever" in path.parts:
+                continue
+            file_type = normalize_extension(path)
+            if not file_type or file_type not in SUPPORTED_FILE_TYPES:
+                continue
+            files.append(path)
+    return sorted(files)
+
+
+def parse_gmail_metadata_csv(paths: list[Path]) -> dict[str, dict[str, object]]:
+    metadata_by_message_id: dict[str, dict[str, object]] = {}
+    for path in paths:
+        _, rows = load_gmail_csv_rows(path)
+        for row in rows:
+            message_id = gmail_normalized_message_lookup_key(row.get("Rfc822MessageId"))
+            if not message_id:
+                continue
+            recipients = ", ".join(
+                part
+                for part in [row.get("To"), row.get("CC"), row.get("BCC")]
+                if normalize_whitespace(str(part or ""))
+            )
+            metadata_by_message_id[message_id] = {
+                "account": normalize_whitespace(str(row.get("Account") or "")) or None,
+                "bcc": normalize_whitespace(str(row.get("BCC") or "")) or None,
+                "cc": normalize_whitespace(str(row.get("CC") or "")) or None,
+                "date_received": normalize_date_field_value(row.get("DateReceived")),
+                "date_sent": normalize_date_field_value(row.get("DateSent")),
+                "file_name": normalize_whitespace(str(row.get("FileName") or "")) or None,
+                "from": normalize_whitespace(str(row.get("From") or "")) or None,
+                "gmail_message_id": gmail_normalized_drive_item_id(row.get("GmailMessageId")),
+                "labels": gmail_csv_list_values(row.get("Labels")),
+                "subject": normalize_generated_document_title(row.get("Subject")),
+                "threaded_message_count": normalize_whitespace(str(row.get("ThreadedMessageCount") or "")) or None,
+                "to": normalize_whitespace(str(row.get("To") or "")) or None,
+                "recipients": recipients or None,
+            }
+    return metadata_by_message_id
+
+
+def parse_gmail_drive_links_csv(paths: list[Path]) -> dict[str, list[dict[str, str]]]:
+    links_by_message_id: dict[str, list[dict[str, str]]] = defaultdict(list)
+    seen: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    for path in paths:
+        _, rows = load_gmail_csv_rows(path)
+        for row in rows:
+            message_id = gmail_normalized_message_lookup_key(row.get("Rfc822MessageId"))
+            drive_item_id = gmail_normalized_drive_item_id(row.get("DriveItemId"))
+            if not message_id or not drive_item_id:
+                continue
+            drive_url = html.unescape(normalize_whitespace(str(row.get("DriveUrl") or ""))) or ""
+            marker = (drive_item_id, drive_url)
+            if marker in seen[message_id]:
+                continue
+            links_by_message_id[message_id].append(
+                {
+                    "drive_item_id": drive_item_id,
+                    "drive_url": drive_url,
+                }
+            )
+            seen[message_id].add(marker)
+    return links_by_message_id
+
+
+def parse_gmail_drive_export_metadata(
+    paths: list[Path],
+    *,
+    file_paths_by_name: dict[str, Path],
+) -> dict[str, dict[str, object]]:
+    metadata_by_drive_item_id: dict[str, dict[str, object]] = {}
+    for path in paths:
+        try:
+            root = parse_xml_document(path.read_bytes())
+        except (OSError, ET.ParseError):
+            continue
+        for document in root.findall(".//Document"):
+            drive_item_id = gmail_normalized_drive_item_id(document.attrib.get("DocID"))
+            if not drive_item_id:
+                continue
+            tag_values: dict[str, str] = {}
+            for tag in document.findall("./Tags/Tag"):
+                tag_name = normalize_inline_whitespace(str(tag.attrib.get("TagName") or ""))
+                if not tag_name:
+                    continue
+                tag_values[tag_name] = normalize_whitespace(str(tag.attrib.get("TagValue") or ""))
+            external_file = document.find(".//ExternalFile")
+            file_name = normalize_whitespace(str(external_file.attrib.get("FileName") or "")) if external_file is not None else ""
+            file_path = file_paths_by_name.get(file_name)
+            metadata_by_drive_item_id[drive_item_id] = {
+                "author": normalize_whitespace(str(tag_values.get("#Author") or "")) or None,
+                "collaborators": gmail_csv_list_values(tag_values.get("Collaborators")),
+                "date_created": normalize_date_field_value(tag_values.get("#DateCreated")),
+                "date_modified": normalize_date_field_value(tag_values.get("#DateModified")),
+                "document_type": normalize_whitespace(str(tag_values.get("DocumentType") or "")) or None,
+                "drive_item_id": drive_item_id,
+                "file_name": file_name or (file_path.name if file_path is not None else None),
+                "file_path": file_path,
+                "others": gmail_csv_list_values(tag_values.get("Others")),
+                "source_hash": normalize_whitespace(str(tag_values.get("SourceHash") or "")) or None,
+                "title": normalize_generated_document_title(tag_values.get("#Title")) or None,
+                "viewers": gmail_csv_list_values(tag_values.get("Viewers")),
+            }
+    return metadata_by_drive_item_id
+
+
+def parse_gmail_drive_export_errors(paths: list[Path]) -> dict[str, str]:
+    errors_by_drive_item_id: dict[str, str] = {}
+    for path in paths:
+        _, rows = load_gmail_csv_rows(path)
+        for row in rows:
+            drive_item_id = (
+                gmail_normalized_drive_item_id(row.get("Drive Document ID"))
+                or gmail_normalized_drive_item_id(row.get("Document ID"))
+            )
+            if not drive_item_id:
+                continue
+            description = normalize_whitespace(str(row.get("Error Description") or ""))
+            if description:
+                errors_by_drive_item_id[drive_item_id] = description
+    return errors_by_drive_item_id
+
+
+def gmail_drive_document_participants(record: dict[str, object]) -> list[str]:
+    values: list[str] = []
+    for value in [
+        record.get("author"),
+        *list(record.get("collaborators") or []),
+        *list(record.get("viewers") or []),
+        *list(record.get("others") or []),
+    ]:
+        normalized = normalize_whitespace(str(value or ""))
+        if normalized:
+            values.append(normalized)
+    return sorted_unique_display_names(values)
+
+
+def gmail_drive_document_title(record: dict[str, object]) -> str | None:
+    for value in (
+        record.get("title"),
+        record.get("file_name"),
+    ):
+        normalized = normalize_generated_document_title(value)
+        if normalized:
+            return normalized
+    return None
+
+
+def gmail_drive_document_link_summary(record: dict[str, object]) -> dict[str, object]:
+    return {
+        "author": normalize_whitespace(str(record.get("author") or "")) or None,
+        "drive_item_id": gmail_normalized_drive_item_id(record.get("drive_item_id")),
+        "error": normalize_whitespace(str(record.get("error") or "")) or None,
+        "file_name": normalize_whitespace(str(record.get("file_name") or "")) or None,
+        "title": gmail_drive_document_title(record),
+    }
+
+
+def gmail_drive_attachment_payload(record: dict[str, object]) -> dict[str, object] | None:
+    file_path = record.get("file_path")
+    if not isinstance(file_path, Path) or not file_path.exists() or file_path.is_dir():
+        return None
+    try:
+        payload = file_path.read_bytes()
+    except OSError:
+        return None
+    file_name = normalize_whitespace(str(record.get("file_name") or "")) or file_path.name
+    return {
+        "file_name": file_name,
+        "payload": payload,
+        "file_hash": sha256_bytes(payload),
+        "gmail_drive_record": dict(record),
+    }
+
+
+def gmail_drive_record_preference_key(record: dict[str, object]) -> tuple[int, int, int, int, int, int]:
+    drive_item_id = normalize_whitespace(str(record.get("drive_item_id") or ""))
+    return (
+        1 if list(record.get("linked_message_ids") or []) else 0,
+        1 if gmail_drive_document_title(record) else 0,
+        1 if normalize_whitespace(str(record.get("author") or "")) else 0,
+        1 if normalize_whitespace(str(record.get("date_created") or "")) else 0,
+        1 if normalize_whitespace(str(record.get("date_modified") or "")) else 0,
+        len(drive_item_id),
+    )
+
+
+def gmail_append_search_context(
+    extracted: dict[str, object],
+    extra_sections: list[str],
+) -> dict[str, object]:
+    normalized_sections = [
+        normalize_whitespace(section)
+        for section in extra_sections
+        if normalize_whitespace(section)
+    ]
+    if not normalized_sections:
+        return dict(extracted)
+    merged = dict(extracted)
+    chunks = list(extracted_search_chunks(merged))
+    next_chunk_index = max((int(chunk["chunk_index"]) for chunk in chunks), default=-1) + 1
+    for section in normalized_sections:
+        chunks.append(
+            {
+                "chunk_index": next_chunk_index,
+                "char_start": 0,
+                "char_end": len(section),
+                "token_estimate": token_estimate(section),
+                "text_content": section,
+            }
+        )
+        next_chunk_index += 1
+    merged["chunks"] = chunks
+    if merged.get("text_status") == "empty":
+        merged["text_status"] = "ok"
+    return merged
+
+
+def gmail_email_metadata_search_text(
+    message_metadata: dict[str, object] | None,
+    linked_drive_records: list[dict[str, object]],
+) -> str | None:
+    lines: list[str] = []
+    if message_metadata:
+        lines.append("Gmail export metadata")
+        account = normalize_whitespace(str(message_metadata.get("account") or ""))
+        if account:
+            lines.append(f"Account: {account}")
+        gmail_message_id = normalize_whitespace(str(message_metadata.get("gmail_message_id") or ""))
+        if gmail_message_id:
+            lines.append(f"Gmail message ID: {gmail_message_id}")
+        labels = [label for label in list(message_metadata.get("labels") or []) if normalize_whitespace(str(label or ""))]
+        if labels:
+            lines.append(f"Labels: {', '.join(labels)}")
+        date_received = normalize_whitespace(str(message_metadata.get("date_received") or ""))
+        if date_received:
+            lines.append(f"Date received: {date_received}")
+        threaded_count = normalize_whitespace(str(message_metadata.get("threaded_message_count") or ""))
+        if threaded_count:
+            lines.append(f"Threaded message count: {threaded_count}")
+    if linked_drive_records:
+        lines.append("Linked Google Drive items")
+        for record in linked_drive_records[:20]:
+            title = normalize_whitespace(str(record.get("title") or record.get("file_name") or record.get("drive_item_id") or ""))
+            if not title:
+                continue
+            details = [
+                f"Drive ID: {record['drive_item_id']}"
+                for _ in [record.get("drive_item_id")]
+                if normalize_whitespace(str(record.get("drive_item_id") or ""))
+            ]
+            author = normalize_whitespace(str(record.get("author") or ""))
+            if author:
+                details.append(f"Author: {author}")
+            error_text = normalize_whitespace(str(record.get("error") or ""))
+            if error_text:
+                details.append(f"Export error: {error_text}")
+            lines.append(f"- {title}" + (f" ({'; '.join(details)})" if details else ""))
+    normalized = normalize_whitespace("\n".join(lines))
+    return normalized or None
+
+
+def gmail_drive_document_search_text(record: dict[str, object]) -> str | None:
+    lines: list[str] = ["Gmail Drive export metadata"]
+    drive_item_id = normalize_whitespace(str(record.get("drive_item_id") or ""))
+    if drive_item_id:
+        lines.append(f"Drive item ID: {drive_item_id}")
+    title = gmail_drive_document_title(record)
+    if title:
+        lines.append(f"Title: {title}")
+    author = normalize_whitespace(str(record.get("author") or ""))
+    if author:
+        lines.append(f"Author: {author}")
+    collaborators = [value for value in list(record.get("collaborators") or []) if normalize_whitespace(str(value or ""))]
+    if collaborators:
+        lines.append(f"Collaborators: {', '.join(collaborators)}")
+    viewers = [value for value in list(record.get("viewers") or []) if normalize_whitespace(str(value or ""))]
+    if viewers:
+        lines.append(f"Viewers: {', '.join(viewers)}")
+    others = [value for value in list(record.get("others") or []) if normalize_whitespace(str(value or ""))]
+    if others:
+        lines.append(f"Others: {', '.join(others)}")
+    linked_subjects = [
+        normalize_generated_document_title(subject)
+        for subject in list(record.get("linked_subjects") or [])
+        if normalize_generated_document_title(subject)
+    ]
+    if linked_subjects:
+        lines.append("Linked from Gmail messages")
+        for subject in linked_subjects[:20]:
+            lines.append(f"- {subject}")
+    error_text = normalize_whitespace(str(record.get("error") or ""))
+    if error_text:
+        lines.append(f"Export error: {error_text}")
+    normalized = normalize_whitespace("\n".join(lines))
+    return normalized or None
+
+
+def apply_gmail_email_export_metadata(
+    extracted: dict[str, object],
+    *,
+    message_metadata: dict[str, object] | None,
+    linked_drive_records: list[dict[str, object]],
+) -> dict[str, object]:
+    enriched = dict(extracted)
+    if message_metadata:
+        if not normalize_whitespace(str(enriched.get("date_created") or "")) and message_metadata.get("date_sent"):
+            enriched["date_created"] = message_metadata.get("date_sent")
+        subject = normalize_generated_document_title(message_metadata.get("subject"))
+        if subject and not normalize_whitespace(str(enriched.get("title") or "")):
+            enriched["title"] = subject
+        if subject and not normalize_whitespace(str(enriched.get("subject") or "")):
+            enriched["subject"] = subject
+        author = normalize_whitespace(str(message_metadata.get("from") or ""))
+        if author and not normalize_whitespace(str(enriched.get("author") or "")):
+            enriched["author"] = author
+        recipients = normalize_whitespace(str(message_metadata.get("recipients") or ""))
+        if recipients and not normalize_whitespace(str(enriched.get("recipients") or "")):
+            enriched["recipients"] = recipients
+    search_text = gmail_email_metadata_search_text(message_metadata, linked_drive_records)
+    return gmail_append_search_context(enriched, [search_text] if search_text else [])
+
+
+def apply_gmail_drive_export_metadata(
+    extracted: dict[str, object],
+    *,
+    drive_record: dict[str, object],
+) -> dict[str, object]:
+    enriched = dict(extracted)
+    title = gmail_drive_document_title(drive_record)
+    if title:
+        enriched["title"] = title
+    author = normalize_whitespace(str(drive_record.get("author") or ""))
+    if author:
+        enriched["author"] = author
+    date_created = normalize_whitespace(str(drive_record.get("date_created") or ""))
+    if date_created:
+        enriched["date_created"] = date_created
+    date_modified = normalize_whitespace(str(drive_record.get("date_modified") or ""))
+    if date_modified:
+        enriched["date_modified"] = date_modified
+    participants = gmail_drive_document_participants(drive_record)
+    if participants:
+        enriched["participants"] = "; ".join(participants)
+    search_text = gmail_drive_document_search_text(drive_record)
+    return gmail_append_search_context(enriched, [search_text] if search_text else [])
+
+
+def gmail_enriched_message_file_hash(
+    base_hash: object,
+    *,
+    message_metadata: dict[str, object] | None,
+    linked_drive_records: list[dict[str, object]],
+    linked_drive_attachment_records: list[dict[str, object]] | None = None,
+) -> str:
+    return sha256_json_value(
+        {
+            "base_hash": normalize_whitespace(str(base_hash or "")) or None,
+            "message_metadata": message_metadata or {},
+            "linked_drive_records": linked_drive_records,
+            "linked_drive_attachments": [
+                {
+                    "drive_item_id": gmail_normalized_drive_item_id(record.get("drive_item_id")),
+                    "file_name": normalize_whitespace(str(record.get("file_name") or "")) or None,
+                    "file_hash": (
+                        gmail_drive_document_file_hash(file_path, record)
+                        if isinstance(file_path := record.get("file_path"), Path) and file_path.exists()
+                        else None
+                    ),
+                    "title": gmail_drive_document_title(record),
+                }
+                for record in list(linked_drive_attachment_records or [])
+            ],
+        }
+    )
+
+
+def gmail_drive_document_file_hash(path: Path, drive_record: dict[str, object]) -> str:
+    return sha256_json_value(
+        {
+            "file_hash": sha256_file(path),
+            "drive_record": {
+                "author": drive_record.get("author"),
+                "collaborators": list(drive_record.get("collaborators") or []),
+                "date_created": drive_record.get("date_created"),
+                "date_modified": drive_record.get("date_modified"),
+                "drive_item_id": drive_record.get("drive_item_id"),
+                "error": drive_record.get("error"),
+                "linked_message_ids": list(drive_record.get("linked_message_ids") or []),
+                "linked_subjects": list(drive_record.get("linked_subjects") or []),
+                "others": list(drive_record.get("others") or []),
+                "title": drive_record.get("title"),
+                "viewers": list(drive_record.get("viewers") or []),
+            },
+        }
+    )
+
+
+def detect_gmail_export_root(candidate_root: Path) -> dict[str, object] | None:
+    if not candidate_root.is_dir() or ".retriever" in candidate_root.parts:
+        return None
+    archive_browser_path = candidate_root / GMAIL_EXPORT_ARCHIVE_BROWSER_FILE
+    try:
+        mbox_paths = sorted(
+            path
+            for path in candidate_root.rglob("*.mbox")
+            if ".retriever" not in path.parts
+        )
+    except OSError:
+        return None
+    if not mbox_paths:
+        return None
+
+    try:
+        metadata_csv_paths = sorted(path for path in candidate_root.rglob("*.csv") if gmail_metadata_csv_valid(path))
+        drive_links_paths = sorted(path for path in candidate_root.rglob("*.csv") if gmail_drive_links_csv_valid(path))
+        drive_export_dirs = sorted(
+            path
+            for path in candidate_root.rglob("*")
+            if path.is_dir() and GMAIL_EXPORT_DRIVE_FOLDER_PATTERN.search(path.name)
+        )
+        drive_export_metadata_paths = sorted(
+            path
+            for path in candidate_root.rglob("*-metadata.xml")
+            if "Drive_Link_Export" in path.name
+        )
+        drive_export_error_paths = sorted(
+            path
+            for path in candidate_root.rglob("*-errors.csv")
+            if "Drive_Link_Export" in path.name
+        )
+        auxiliary_metadata_xml_paths = sorted(
+            path
+            for path in candidate_root.rglob("*-metadata.xml")
+            if "Drive_Link_Export" not in path.name
+        )
+        auxiliary_error_xml_paths = sorted(path for path in candidate_root.rglob("*-errors.xml"))
+        result_count_paths = sorted(path for path in candidate_root.rglob("*-result-counts.csv"))
+        md5_paths = sorted(path for path in candidate_root.rglob("*.md5"))
+    except OSError:
+        return None
+
+    if not (
+        archive_browser_path.exists()
+        or metadata_csv_paths
+        or drive_links_paths
+        or drive_export_dirs
+        or drive_export_metadata_paths
+    ):
+        return None
+
+    email_metadata_by_message_id = parse_gmail_metadata_csv(metadata_csv_paths)
+    drive_links_by_message_id = parse_gmail_drive_links_csv(drive_links_paths)
+    drive_export_files = gmail_drive_export_files(drive_export_dirs)
+    file_paths_by_name = {path.name: path for path in drive_export_files}
+    drive_records_by_item_id: dict[str, dict[str, object]] = {}
+    drive_documents: list[dict[str, object]] = []
+    for export_path in drive_export_files:
+        drive_item_id = gmail_normalized_drive_item_id(gmail_drive_item_id_from_export_file_name(export_path))
+        record = {
+            "author": None,
+            "collaborators": [],
+            "date_created": None,
+            "date_modified": None,
+            "document_type": None,
+            "drive_item_id": drive_item_id,
+            "error": None,
+            "file_name": export_path.name,
+            "file_path": export_path,
+            "linked_message_ids": [],
+            "linked_subjects": [],
+            "others": [],
+            "source_hash": None,
+            "title": normalize_generated_document_title(export_path.stem.rsplit("_", 1)[0]) or None,
+            "viewers": [],
+        }
+        drive_documents.append(record)
+        if drive_item_id:
+            drive_records_by_item_id[drive_item_id] = record
+
+    parsed_drive_metadata = parse_gmail_drive_export_metadata(
+        drive_export_metadata_paths,
+        file_paths_by_name=file_paths_by_name,
+    )
+    for drive_item_id, metadata in parsed_drive_metadata.items():
+        record = drive_records_by_item_id.get(drive_item_id)
+        if record is None:
+            record = {
+                "author": None,
+                "collaborators": [],
+                "date_created": None,
+                "date_modified": None,
+                "document_type": None,
+                "drive_item_id": drive_item_id,
+                "error": None,
+                "file_name": metadata.get("file_name"),
+                "file_path": metadata.get("file_path"),
+                "linked_message_ids": [],
+                "linked_subjects": [],
+                "others": [],
+                "source_hash": None,
+                "title": None,
+                "viewers": [],
+            }
+            drive_records_by_item_id[drive_item_id] = record
+            if record.get("file_path") is not None:
+                drive_documents.append(record)
+        record.update(
+            {
+                "author": metadata.get("author"),
+                "collaborators": list(metadata.get("collaborators") or []),
+                "date_created": metadata.get("date_created"),
+                "date_modified": metadata.get("date_modified"),
+                "document_type": metadata.get("document_type"),
+                "file_name": metadata.get("file_name"),
+                "file_path": metadata.get("file_path"),
+                "others": list(metadata.get("others") or []),
+                "source_hash": metadata.get("source_hash"),
+                "title": metadata.get("title"),
+                "viewers": list(metadata.get("viewers") or []),
+            }
+        )
+
+    drive_errors_by_item_id = parse_gmail_drive_export_errors(drive_export_error_paths)
+    linked_drive_records_by_message_id: dict[str, list[dict[str, object]]] = defaultdict(list)
+    linked_drive_attachment_records_by_message_id: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for message_id, link_rows in drive_links_by_message_id.items():
+        seen_drive_items: set[str] = set()
+        for link_row in link_rows:
+            drive_item_id = gmail_normalized_drive_item_id(link_row.get("drive_item_id"))
+            if not drive_item_id or drive_item_id in seen_drive_items:
+                continue
+            seen_drive_items.add(drive_item_id)
+            drive_record = drive_records_by_item_id.get(drive_item_id)
+            summary = gmail_drive_document_link_summary(
+                {
+                    **dict(drive_record or {}),
+                    "drive_item_id": drive_item_id,
+                    "error": drive_errors_by_item_id.get(drive_item_id),
+                }
+            )
+            linked_drive_records_by_message_id[message_id].append(summary)
+            if drive_record is not None:
+                if message_id not in drive_record["linked_message_ids"]:
+                    drive_record["linked_message_ids"].append(message_id)
+                subject = normalize_generated_document_title(
+                    (email_metadata_by_message_id.get(message_id) or {}).get("subject")
+                )
+                if subject and subject not in drive_record["linked_subjects"]:
+                    drive_record["linked_subjects"].append(subject)
+                drive_record["error"] = drive_errors_by_item_id.get(drive_item_id)
+                if isinstance(drive_record.get("file_path"), Path):
+                    linked_drive_attachment_records_by_message_id[message_id].append(drive_record)
+
+    deduplicated_drive_documents: dict[str, dict[str, object]] = {}
+    for record in drive_documents:
+        file_path = record.get("file_path")
+        drive_item_id = gmail_normalized_drive_item_id(record.get("drive_item_id"))
+        if isinstance(file_path, Path):
+            key = f"path:{file_path.resolve().as_posix()}"
+        elif drive_item_id:
+            key = f"drive:{drive_item_id}"
+        else:
+            key = f"file:{normalize_whitespace(str(record.get('file_name') or ''))}"
+        current = deduplicated_drive_documents.get(key)
+        if current is None or gmail_drive_record_preference_key(record) > gmail_drive_record_preference_key(current):
+            deduplicated_drive_documents[key] = record
+    drive_documents = sorted(
+        deduplicated_drive_documents.values(),
+        key=lambda record: (
+            str(record.get("file_path") or ""),
+            str(record.get("file_name") or ""),
+            str(record.get("drive_item_id") or ""),
+        ),
+    )
+
+    owned_paths = {
+        *(path.resolve() for path in mbox_paths),
+        *(path.resolve() for path in metadata_csv_paths),
+        *(path.resolve() for path in drive_links_paths),
+        *(path.resolve() for path in auxiliary_metadata_xml_paths),
+        *(path.resolve() for path in auxiliary_error_xml_paths),
+        *(path.resolve() for path in drive_export_metadata_paths),
+        *(path.resolve() for path in drive_export_error_paths),
+        *(path.resolve() for path in result_count_paths),
+        *(path.resolve() for path in md5_paths),
+        *(path.resolve() for path in drive_export_files),
+    }
+    if archive_browser_path.exists():
+        owned_paths.add(archive_browser_path.resolve())
+
+    message_sidecar_paths = [
+        *metadata_csv_paths,
+        *drive_links_paths,
+        *drive_export_metadata_paths,
+        *drive_export_error_paths,
+        *drive_export_files,
+    ]
+    message_sidecar_hash = sha256_json_value(
+        {
+            "files": {
+                path.resolve().as_posix(): sha256_file(path)
+                for path in sorted(message_sidecar_paths, key=lambda item: item.resolve().as_posix())
+            }
+        }
+    )
+
+    return {
+        "drive_documents": drive_documents,
+        "drive_records_by_item_id": drive_records_by_item_id,
+        "email_metadata_by_message_id": email_metadata_by_message_id,
+        "linked_drive_attachment_records_by_message_id": linked_drive_attachment_records_by_message_id,
+        "linked_drive_records_by_message_id": linked_drive_records_by_message_id,
+        "mbox_paths": mbox_paths,
+        "message_sidecar_hash": message_sidecar_hash,
+        "owned_paths": owned_paths,
+        "root": candidate_root,
+    }
+
+
+def find_gmail_export_roots(
+    root: Path,
+    recursive: bool,
+    allowed_file_types: set[str] | None,
+) -> list[dict[str, object]]:
+    candidates: set[Path] = set()
+    if recursive:
+        try:
+            for archive_browser_path in root.rglob(GMAIL_EXPORT_ARCHIVE_BROWSER_FILE):
+                if ".retriever" in archive_browser_path.parts:
+                    continue
+                candidates.add(archive_browser_path.parent)
+            for metadata_path in root.rglob("*-metadata.csv"):
+                if ".retriever" in metadata_path.parts:
+                    continue
+                candidates.add(metadata_path.parent)
+            for drive_links_path in root.rglob("*-drive-links.csv"):
+                if ".retriever" in drive_links_path.parts:
+                    continue
+                candidates.add(drive_links_path.parent)
+            for export_dir in root.rglob("*"):
+                if not export_dir.is_dir() or ".retriever" in export_dir.parts:
+                    continue
+                if GMAIL_EXPORT_DRIVE_FOLDER_PATTERN.search(export_dir.name):
+                    candidates.add(export_dir.parent)
+        except OSError:
+            return []
+    else:
+        candidates.add(root)
+
+    descriptors: list[dict[str, object]] = []
+    accepted_roots: list[Path] = []
+    for candidate in sorted(candidates, key=lambda path: (len(path.parts), path.as_posix())):
+        if any(parent == candidate or parent in candidate.parents for parent in accepted_roots):
+            continue
+        descriptor = detect_gmail_export_root(candidate)
+        if descriptor is None:
+            continue
+        descriptors.append(descriptor)
+        accepted_roots.append(candidate)
+    return descriptors
