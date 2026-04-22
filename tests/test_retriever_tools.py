@@ -7396,8 +7396,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(sort_payload["header"]["sort"], "Sort: file_name asc")
 
         session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertEqual(session_payload["browsing"]["sort"], [["file_name", "asc"]])
-        self.assertEqual(session_payload["browsing"]["offset"], 0)
+        self.assertEqual(
+            session_payload["browsing"]["documents"]["sort"],
+            [["file_name", "asc"]],
+        )
+        self.assertEqual(session_payload["browsing"]["documents"]["offset"], 0)
 
         next_exit, next_stdout, next_stderr = self.run_cli_raw("slash", str(self.root), "/next")
         page_exit, page_payload, _, _ = self.run_cli("slash", str(self.root), "/page", "last")
@@ -7426,8 +7429,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(default_payload["offset"], 0)
 
         final_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertNotIn("sort", final_session_payload["browsing"])
-        self.assertEqual(final_session_payload["browsing"]["offset"], 0)
+        self.assertNotIn("sort", final_session_payload["browsing"]["documents"])
+        self.assertEqual(final_session_payload["browsing"]["documents"]["offset"], 0)
 
     def test_slash_sort_page_page_size_and_columns_show_current_and_available_state(self) -> None:
         for index in range(25):
@@ -7488,6 +7491,103 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("- dataset_name", columns_list_stdout)
         self.assertNotIn("- has_attachments", columns_list_stdout)
 
+    def test_slash_conversations_uses_conversation_defaults_and_full_preview_target(self) -> None:
+        self.write_email_message(
+            self.root / "root.eml",
+            subject="Status Update",
+            body_text="Root message body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            cc=None,
+            message_id="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            self.root / "reply.eml",
+            subject="Re: Status Update",
+            body_text="Reply message body",
+            author="Bob Example <bob@example.com>",
+            recipients="Alice Example <alice@example.com>",
+            cc=None,
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        payload = retriever_tools.run_slash_command(self.root, "/conversations")
+        self.assertEqual(payload["browse_mode"], retriever_tools.BROWSE_MODE_CONVERSATIONS)
+        self.assertEqual(
+            payload["display"]["columns"],
+            list(retriever_tools.DEFAULT_CONVERSATION_DISPLAY_COLUMNS),
+        )
+        self.assertEqual(payload["total_hits"], 1)
+        result = payload["results"][0]
+        self.assertEqual(result["conversation_type"], "email")
+        self.assertEqual(result["title"], "Status Update")
+        self.assertEqual(result["document_count"], 2)
+        self.assertEqual(result["matching_document_count"], 2)
+        self.assertIn("Alice Example", str(result["participants"]))
+        self.assertTrue(result["preview_rel_path"].endswith("/conversation.html"))
+        preview_path = Path(str(result["preview_abs_path"]).split("#", 1)[0])
+        self.assertTrue(preview_path.exists())
+        preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn("Root message body", preview_html)
+        self.assertIn("Reply message body", preview_html)
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(session_payload["browse_mode"], retriever_tools.BROWSE_MODE_CONVERSATIONS)
+        self.assertEqual(session_payload["browsing"]["conversations"]["offset"], 0)
+        self.assertEqual(session_payload["browsing"]["conversations"]["total_known"], 1)
+
+    def test_slash_conversation_columns_are_separate_from_document_columns(self) -> None:
+        self.write_email_message(
+            self.root / "message.eml",
+            subject="Status Update",
+            body_text="Root message body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            cc=None,
+            message_id="<root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        (self.root / "sample.txt").write_text("sample display body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        self.assertEqual(self.run_cli("slash", str(self.root), "/conversations")[0], 0)
+        set_exit, set_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/columns set title, document_count",
+        )
+        self.assertEqual(set_exit, 0)
+        self.assertIsNotNone(set_payload)
+        assert set_payload is not None
+        self.assertEqual(set_payload["display"]["columns"], ["title", "document_count"])
+
+        self.assertEqual(self.run_cli("slash", str(self.root), "/documents")[0], 0)
+        columns_exit, columns_stdout, columns_stderr = self.run_cli_raw("slash", str(self.root), "/columns")
+        self.assertEqual(columns_exit, 0)
+        self.assertEqual(columns_stderr, "")
+        self.assertEqual(
+            columns_stdout,
+            "Columns: content_type, title, author, date_created, control_number\nPage size: 10",
+        )
+
+        session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
+        self.assertEqual(
+            session_payload["display"]["conversations"]["columns"],
+            ["title", "document_count"],
+        )
+        self.assertNotIn("columns", session_payload["display"]["documents"])
+
     def test_slash_columns_commands_persist_display_preferences_and_render_custom_fields(self) -> None:
         (self.root / "sample.txt").write_text("sample display body\n", encoding="utf-8")
 
@@ -7530,7 +7630,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(set_payload["display"]["columns"], ["title", "review_score", "control_number"])
         self.assertEqual(set_payload["results"][0]["display_values"]["review_score"], 7)
         session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertEqual(session_payload["display"]["columns"], ["title", "review_score", "control_number"])
+        self.assertEqual(
+            session_payload["display"]["documents"]["columns"],
+            ["title", "review_score", "control_number"],
+        )
 
         add_exit, add_payload, _, _ = self.run_cli("slash", str(self.root), "/columns add dataset_name")
         self.assertEqual(add_exit, 0)
@@ -7551,7 +7654,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ["content_type", "title", "author", "date_created", "control_number"],
         )
         final_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertNotIn("columns", final_session_payload["display"])
+        self.assertNotIn("columns", final_session_payload["display"]["documents"])
 
     def test_slash_page_size_persists_display_preferences(self) -> None:
         for index in range(12):
@@ -7571,15 +7674,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(len(size_payload["results"]), 5)
 
         session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertEqual(session_payload["display"]["page_size"], 5)
+        self.assertEqual(session_payload["display"]["documents"]["page_size"], 5)
 
         self.assertEqual(next_exit, 0)
         self.assertEqual(next_stderr, "")
         self.assertIn("Page: 2 of 3  (docs 6-10 of 12)", next_stdout)
         self.assertIn("doc-05.txt", next_stdout)
         session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertEqual(session_payload["display"]["page_size"], 5)
-        self.assertEqual(session_payload["browsing"]["offset"], 5)
+        self.assertEqual(session_payload["display"]["documents"]["page_size"], 5)
+        self.assertEqual(session_payload["browsing"]["documents"]["offset"], 5)
 
     def test_view_search_persists_browse_page_size_for_followup_slash_navigation(self) -> None:
         for index in range(25):
@@ -7607,7 +7710,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(len(search_payload["results"]), 5)
 
         session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertEqual(session_payload["display"]["page_size"], 5)
+        self.assertEqual(session_payload["display"]["documents"]["page_size"], 5)
         self.assertEqual(session_payload["scope"]["keyword"], "document")
 
         self.assertEqual(next_exit, 0)
@@ -7615,9 +7718,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Page: 2 of 5  (docs 6-10 of 25)", next_stdout)
         self.assertIn("doc-05.txt", next_stdout)
         session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertEqual(session_payload["display"]["page_size"], 5)
+        self.assertEqual(session_payload["display"]["documents"]["page_size"], 5)
         self.assertEqual(session_payload["scope"]["keyword"], "document")
-        self.assertEqual(session_payload["browsing"]["offset"], 5)
+        self.assertEqual(session_payload["browsing"]["documents"]["offset"], 5)
 
     def test_view_search_uses_saved_page_size_when_per_page_is_omitted(self) -> None:
         for index in range(25):
@@ -7696,7 +7799,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("warnings", search_payload)
         self.assertIn("missing_column", search_payload["warnings"][0])
         persisted_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
-        self.assertEqual(persisted_session_payload["display"]["columns"], ["title"])
+        self.assertEqual(
+            persisted_session_payload["display"]["documents"]["columns"],
+            ["title"],
+        )
 
     def test_deleting_source_backed_dataset_hides_documents_until_reingest(self) -> None:
         document_path = self.root / "sample.txt"

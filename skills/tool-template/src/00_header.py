@@ -69,7 +69,7 @@ except Exception:  # pragma: no cover - platform-specific locking
 
 TOOL_VERSION = "0.18.0"
 SCHEMA_VERSION = 21
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/retriever_tools.py"
 MANUAL_FIELD_LOCKS_COLUMN = "manual_field_locks_json"
@@ -79,12 +79,23 @@ CHUNK_OVERLAP_CHARS = 250
 CONVERSATION_PREVIEW_MAX_CHARS = 180000
 DEFAULT_PAGE_SIZE = 10
 MAX_PAGE_SIZE = 100
-DEFAULT_DISPLAY_COLUMNS = (
+BROWSE_MODE_DOCUMENTS = "documents"
+BROWSE_MODE_CONVERSATIONS = "conversations"
+DEFAULT_BROWSE_MODE = BROWSE_MODE_DOCUMENTS
+DEFAULT_DOCUMENT_DISPLAY_COLUMNS = (
     "content_type",
     "title",
     "author",
     "date_created",
     "control_number",
+)
+DEFAULT_DISPLAY_COLUMNS = DEFAULT_DOCUMENT_DISPLAY_COLUMNS
+DEFAULT_CONVERSATION_DISPLAY_COLUMNS = (
+    "conversation_type",
+    "title",
+    "participants",
+    "last_activity",
+    "document_count",
 )
 MAX_SCOPE_DATASETS = 999
 MAX_FILTER_EXPRESSION_LENGTH = 8192

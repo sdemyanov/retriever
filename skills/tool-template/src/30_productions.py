@@ -3408,6 +3408,11 @@ def build_conversation_preview_head_html() -> str:
         ".conversation-segment-card a, .conversation-nav a, .conversation-document-meta a, .retriever-attachments a { color: #0b63ce; text-decoration: none; }"
         ".conversation-nav { margin-bottom: 1rem; }"
         ".conversation-nav-links { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; color: #516072; }"
+        ".conversation-full-segments, .conversation-segment-group { display: grid; gap: 0.9rem; }"
+        ".conversation-segment-banner { background: rgba(255,255,255,0.9); border: 1px solid #d7e0ea; border-radius: 18px; padding: 1rem 1.1rem; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.04); }"
+        ".conversation-segment-banner-kicker { margin: 0 0 0.35rem; color: #607080; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }"
+        ".conversation-segment-banner-title { margin: 0; font-size: 1.2rem; line-height: 1.2; }"
+        ".conversation-segment-banner-meta { margin: 0.45rem 0 0; color: #516072; }"
         ".conversation-document { padding: 1.1rem 1.15rem 1.15rem; margin-bottom: 1rem; scroll-margin-top: 1rem; }"
         ".conversation-document-header { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 0.9rem; }"
         ".conversation-document-header h2 { margin: 0.2rem 0 0; font-size: 1.15rem; }"
@@ -3428,6 +3433,32 @@ def build_conversation_preview_head_html() -> str:
         ".conversation-raw-text { margin-top: 0.85rem; }"
         ".conversation-raw-text summary { cursor: pointer; color: #516072; }"
         "</style>"
+    )
+
+
+def conversation_segment_position_label(segment_index: int, segment_count: int) -> str | None:
+    if segment_count <= 1:
+        return None
+    return f"Segment {segment_index + 1} of {segment_count}"
+
+
+def build_conversation_segment_banner_html(
+    *,
+    segment_label: str,
+    segment_index: int,
+    segment_count: int,
+    document_count: int,
+) -> str:
+    position_label = conversation_segment_position_label(segment_index, segment_count)
+    if position_label is None:
+        return ""
+    document_label = f"{document_count} document{'s' if document_count != 1 else ''} in this segment"
+    return (
+        '<section class="conversation-segment-banner">'
+        f'<p class="conversation-segment-banner-kicker">{html.escape(position_label)}</p>'
+        f'<h2 class="conversation-segment-banner-title">{html.escape(segment_label)}</h2>'
+        f'<p class="conversation-segment-banner-meta">{html.escape(document_label)}</p>'
+        "</section>"
     )
 
 
@@ -3487,7 +3518,11 @@ def build_conversation_segment_html(
             thread_title=thread_title,
             documents=segment_documents,
             page_title=f"{thread_title} - {segment_label}",
-            segment_label=segment_label,
+            segment_label=(
+                f"{segment_label} ({conversation_segment_position_label(segment_index, segment_count)})"
+                if conversation_segment_position_label(segment_index, segment_count)
+                else segment_label
+            ),
             segment_count=segment_count,
             attachment_links_by_document_id=attachment_links_by_document_id,
             strip_quoted_history=True,
@@ -3507,9 +3542,15 @@ def build_conversation_segment_html(
         )
         for document in segment_documents
     )
+    segment_banner_html = build_conversation_segment_banner_html(
+        segment_label=segment_label,
+        segment_index=segment_index,
+        segment_count=segment_count,
+        document_count=len(segment_documents),
+    )
     return build_html_preview(
         headers,
-        body_html=f"<main>{sections}</main>",
+        body_html=f"<main>{segment_banner_html}{sections}</main>",
         document_title=f"{headers['Conversation']} - {segment_label}",
         head_html=build_conversation_preview_head_html(),
         heading=segment_label,
@@ -3555,6 +3596,125 @@ def build_conversation_entry_html(
         document_title=document_heading or conversation_name or "Conversation document",
         head_html=build_conversation_preview_head_html(),
         heading=document_heading or "Conversation document",
+    )
+
+
+def build_email_conversation_full_html(
+    conversation_row: sqlite3.Row,
+    *,
+    documents: list[dict[str, object]],
+    segment_items: list[dict[str, object]],
+    attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
+) -> str:
+    thread_title = (
+        normalize_whitespace(str(conversation_row["display_name"] or ""))
+        or f"Conversation {int(conversation_row['id'])}"
+    )
+    if len(segment_items) <= 1:
+        return build_email_thread_preview_html(
+            thread_title=thread_title,
+            documents=documents,
+            page_title=thread_title,
+            attachment_links_by_document_id=attachment_links_by_document_id,
+            strip_quoted_history=True,
+        )
+    segment_sections: list[str] = []
+    for index, segment in enumerate(segment_items):
+        segment_documents = list(segment["documents"])
+        message_cards = "".join(
+            build_email_message_card_html(
+                document,
+                attachment_links=(attachment_links_by_document_id or {}).get(int(document["id"]), []),
+                strip_quoted_history=True,
+            )
+            for document in segment_documents
+        )
+        segment_sections.append(
+            '<section class="gmail-thread-segment">'
+            '<header class="gmail-thread-segment-header">'
+            f'<p class="gmail-thread-kicker">{html.escape(conversation_segment_position_label(index, len(segment_items)) or "")}</p>'
+            f'<h2 class="gmail-thread-segment-title">{html.escape(str(segment["label"]))}</h2>'
+            f"{build_email_thread_summary_html(segment_documents)}"
+            "</header>"
+            f'<div class="gmail-thread-messages">{message_cards}</div>'
+            "</section>"
+        )
+    return (
+        "<!DOCTYPE html>"
+        "<html><head>"
+        '<meta charset="utf-8"/>'
+        f"<title>{html.escape(thread_title)}</title>"
+        f"{build_email_preview_head_html()}"
+        "<style>"
+        ".gmail-thread-segments { display: grid; gap: 1.25rem; margin-top: 1.25rem; }"
+        ".gmail-thread-segment { display: grid; gap: 0.85rem; padding-top: 0.2rem; }"
+        ".gmail-thread-segment + .gmail-thread-segment { border-top: 1px solid #e0e3e7; padding-top: 1.35rem; }"
+        ".gmail-thread-segment-header { margin-bottom: 0.15rem; }"
+        ".gmail-thread-segment-title { margin: 0; font-size: 1.28rem; line-height: 1.15; font-weight: 500; color: #202124; }"
+        "</style>"
+        "</head><body>"
+        '<main class="gmail-thread-page">'
+        '<header class="gmail-thread-header">'
+        f'<h1 class="gmail-thread-title">{html.escape(thread_title)}</h1>'
+        f"{build_email_thread_summary_html(documents)}"
+        "</header>"
+        f'<section class="gmail-thread-segments">{"".join(segment_sections)}</section>'
+        "</main>"
+        "</body></html>"
+    )
+
+
+def build_conversation_full_html(
+    conversation_row: sqlite3.Row,
+    *,
+    documents: list[dict[str, object]],
+    segment_items: list[dict[str, object]],
+    attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
+) -> str:
+    if normalize_whitespace(str(conversation_row["conversation_type"] or "")).lower() == "email":
+        return build_email_conversation_full_html(
+            conversation_row,
+            documents=documents,
+            segment_items=segment_items,
+            attachment_links_by_document_id=attachment_links_by_document_id,
+        )
+    conversation_name = (
+        normalize_whitespace(str(conversation_row["display_name"] or ""))
+        or f"Conversation {int(conversation_row['id'])}"
+    )
+    headers = {
+        "Conversation": conversation_name,
+        "Type": normalize_whitespace(str(conversation_row["conversation_type"] or "")),
+        "Documents": str(len(documents)),
+        "Segments": str(len(segment_items)),
+    }
+    doc_target_hrefs = {
+        int(document["id"]): f"#{conversation_preview_anchor(int(document['id']))}"
+        for document in documents
+    }
+    segment_sections = "".join(
+        (
+            '<section class="conversation-segment-group">'
+            f"{build_conversation_segment_banner_html(segment_label=str(segment['label']), segment_index=index, segment_count=len(segment_items), document_count=len(segment['documents']))}"
+            + "".join(
+                render_conversation_document_section(
+                    document,
+                    current_segment_href="conversation",
+                    doc_target_hrefs=doc_target_hrefs,
+                    attachment_links_by_document_id=attachment_links_by_document_id,
+                )
+                for document in segment["documents"]
+            )
+            + "</section>"
+        )
+        for index, segment in enumerate(segment_items)
+    )
+    return build_html_preview(
+        headers,
+        body_html=f'<main><div class="conversation-full-segments">{segment_sections}</div></main>',
+        document_title=conversation_name,
+        head_html=build_conversation_preview_head_html(),
+        heading=conversation_name,
     )
 
 
@@ -3737,6 +3897,9 @@ def refresh_conversation_previews(
         toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
         toc_abs_path = paths["state_dir"] / toc_rel_path
         toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        full_rel_path = conversation_preview_full_rel_path(conversation_id)
+        full_abs_path = paths["state_dir"] / full_rel_path
+        full_abs_path.parent.mkdir(parents=True, exist_ok=True)
         doc_target_hrefs = {
             int(document["id"]): f"{Path(str(segment['segment_rel_path'])).name}#{conversation_preview_anchor(int(document['id']))}"
             for segment in segment_items
@@ -3753,6 +3916,21 @@ def refresh_conversation_previews(
                 conversation_row,
                 documents=documents,
                 segment_items=segment_items,
+            ),
+            encoding="utf-8",
+        )
+        full_attachment_links = conversation_attachment_links_by_document_id(
+            connection,
+            paths,
+            segment_preview_path=full_abs_path,
+            documents=documents,
+        )
+        full_abs_path.write_text(
+            build_conversation_full_html(
+                conversation_row,
+                documents=documents,
+                segment_items=segment_items,
+                attachment_links_by_document_id=full_attachment_links,
             ),
             encoding="utf-8",
         )
