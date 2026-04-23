@@ -4971,6 +4971,10 @@ def format_dataset_size_summary(item: dict[str, object]) -> str:
         precision = 1 if display_value < 10 else 0
         size_text = f"{display_value:.{precision}f}".rstrip("0").rstrip(".") + f" {units[unit_index]}"
 
+    size_basis = normalize_inline_whitespace(str(item.get("size_basis") or "")).lower()
+    if size_basis == "container":
+        return size_text
+
     document_count = int(item.get("document_count") or 0)
     sized_document_count = int(item.get("sized_document_count") or 0)
     if document_count > 0 and 0 < sized_document_count < document_count:
@@ -6462,7 +6466,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
             if dataset_args and dataset_args[0] == "list":
                 if len(dataset_args) != 1:
                     raise RetrieverError("Usage: /dataset list")
-                return {"status": "ok", "datasets": list_dataset_summaries(connection)}
+                return {"status": "ok", "datasets": list_dataset_summaries(connection, root=root)}
             if dataset_args and dataset_args[0] == "clear":
                 scope.pop("dataset", None)
                 return run_scope_search_from_session(root, paths, scope)

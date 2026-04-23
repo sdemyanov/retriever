@@ -2317,7 +2317,7 @@ def list_datasets(root: Path) -> dict[str, object]:
         apply_schema(connection, root)
         return {
             "status": "ok",
-            "datasets": list_dataset_summaries(connection),
+            "datasets": list_dataset_summaries(connection, root=root),
         }
     finally:
         connection.close()
@@ -2348,7 +2348,7 @@ def create_dataset(root: Path, dataset_name: str) -> dict[str, object]:
             raise
         return {
             "status": "ok",
-            "dataset": dataset_summary_by_id(connection, dataset_id),
+            "dataset": dataset_summary_by_id(connection, dataset_id, root=root),
         }
     finally:
         connection.close()
@@ -2382,7 +2382,7 @@ def add_to_dataset(
             "status": "ok",
             "requested_document_ids": sorted(dict.fromkeys(int(document_id) for document_id in document_ids)),
             **result,
-            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"])),
+            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"]), root=root),
         }
     finally:
         connection.close()
@@ -2416,7 +2416,7 @@ def remove_from_dataset(
             "status": "ok",
             "requested_document_ids": sorted(dict.fromkeys(int(document_id) for document_id in document_ids)),
             **result,
-            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"])),
+            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"]), root=root),
         }
     finally:
         connection.close()
@@ -2436,7 +2436,7 @@ def delete_dataset(
         dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
         connection.execute("BEGIN")
         try:
-            result = delete_dataset_row(connection, int(dataset_row["id"]))
+            result = delete_dataset_row(connection, int(dataset_row["id"]), root=root)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -2458,7 +2458,7 @@ def rename_dataset(root: Path, old_name: str, new_name: str) -> dict[str, object
         dataset_row = resolve_dataset_row(connection, dataset_name=old_name)
         connection.execute("BEGIN")
         try:
-            renamed_summary = rename_dataset_row(connection, int(dataset_row["id"]), new_name)
+            renamed_summary = rename_dataset_row(connection, int(dataset_row["id"]), new_name, root=root)
             connection.commit()
         except Exception:
             connection.rollback()

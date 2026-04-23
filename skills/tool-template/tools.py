@@ -2569,6 +2569,13 @@ def production_dataset_name(rel_root: str, production_name: str | None = None) -
     return candidate or normalize_whitespace(rel_root) or "Production Dataset"
 
 
+def dataset_source_absolute_path(root: Path, source_locator: str | None) -> Path | None:
+    normalized_source_locator = normalize_whitespace(str(source_locator or ""))
+    if not normalized_source_locator or normalized_source_locator == filesystem_dataset_locator():
+        return None
+    return root / normalized_source_locator
+
+
 def manual_dataset_locator(dataset_name: str | None = None) -> str:
     seed = normalize_whitespace(str(dataset_name or "")) or "dataset"
     return f"manual:{sha256_text(f'{seed}:{utc_now()}')[:16]}"
@@ -2931,7 +2938,12 @@ def resolve_dataset_row(
     return matches[0]
 
 
-def rename_dataset_row(connection: sqlite3.Connection, dataset_id: int, new_dataset_name: str) -> dict[str, object]:
+def rename_dataset_row(
+    connection: sqlite3.Connection,
+    dataset_id: int,
+    new_dataset_name: str,
+    root: Path | None = None,
+) -> dict[str, object]:
     dataset_row = get_dataset_row_by_id(connection, dataset_id)
     if dataset_row is None:
         raise RetrieverError(f"Unknown dataset id: {dataset_id}")
@@ -2961,7 +2973,7 @@ def rename_dataset_row(connection: sqlite3.Connection, dataset_id: int, new_data
         """,
         (normalized_name, normalized_compare_name, now, dataset_id),
     )
-    return dataset_summary_by_id(connection, dataset_id)
+    return dataset_summary_by_id(connection, dataset_id, root=root)
 
 
 def refresh_document_dataset_cache(connection: sqlite3.Connection, document_id: int) -> int | None:
@@ -2986,7 +2998,37 @@ def refresh_document_dataset_cache(connection: sqlite3.Connection, document_id: 
     return cached_dataset_id
 
 
-def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, object]]:
+def dataset_container_size_bytes(
+    root: Path | None,
+    dataset_row: sqlite3.Row,
+    source_bindings: list[dict[str, object]],
+) -> int | None:
+    if root is None:
+        return None
+    normalized_source_kind = normalize_whitespace(str(dataset_row["source_kind"] or "")).lower()
+    if normalized_source_kind not in {MBOX_SOURCE_KIND, PST_SOURCE_KIND}:
+        return None
+
+    candidate_locators: list[str] = []
+    dataset_locator = normalize_whitespace(str(dataset_row["dataset_locator"] or ""))
+    if dataset_locator:
+        candidate_locators.append(dataset_locator)
+    for binding in source_bindings:
+        source_locator = normalize_whitespace(str(binding.get("source_locator") or ""))
+        if source_locator and source_locator not in candidate_locators:
+            candidate_locators.append(source_locator)
+
+    for source_locator in candidate_locators:
+        source_path = dataset_source_absolute_path(root, source_locator)
+        if source_path is None:
+            continue
+        size_bytes = file_size_bytes(source_path)
+        if size_bytes is not None:
+            return size_bytes
+    return None
+
+
+def list_dataset_summaries(connection: sqlite3.Connection, root: Path | None = None) -> list[dict[str, object]]:
     dataset_rows = connection.execute(
         """
         SELECT *
@@ -3117,6 +3159,7 @@ def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, obj
         if dataset_stats is None:
             size_bytes = None
             sized_document_count = 0
+            size_basis = None
             content_types: list[dict[str, object]] = []
             custodians: list[str] = []
             time_range_start = None
@@ -3124,6 +3167,7 @@ def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, obj
         else:
             sized_document_count = int(dataset_stats["sized_document_count"] or 0)
             size_bytes = int(dataset_stats["size_bytes"] or 0) if sized_document_count else None
+            size_basis = "documents" if size_bytes is not None else None
             content_types = [
                 {"name": name, "count": count}
                 for name, count in sorted(
@@ -3137,6 +3181,10 @@ def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, obj
             )
             time_range_start = dataset_stats["time_range_start"]
             time_range_end = dataset_stats["time_range_end"]
+        container_size_bytes = dataset_container_size_bytes(root, row, source_bindings)
+        if container_size_bytes is not None:
+            size_bytes = container_size_bytes
+            size_basis = "container"
         summaries.append(
             {
                 "id": dataset_id,
@@ -3149,6 +3197,7 @@ def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, obj
                 "manual_document_count": counts["manual_document_count"],
                 "source_document_count": counts["source_document_count"],
                 "size_bytes": size_bytes,
+                "size_basis": size_basis,
                 "sized_document_count": sized_document_count,
                 "custodians": custodians,
                 "content_types": content_types,
@@ -3161,8 +3210,8 @@ def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, obj
     return summaries
 
 
-def dataset_summary_by_id(connection: sqlite3.Connection, dataset_id: int) -> dict[str, object]:
-    for summary in list_dataset_summaries(connection):
+def dataset_summary_by_id(connection: sqlite3.Connection, dataset_id: int, root: Path | None = None) -> dict[str, object]:
+    for summary in list_dataset_summaries(connection, root=root):
         if int(summary["id"]) == dataset_id:
             return summary
     raise RetrieverError(f"Unknown dataset id: {dataset_id}")
@@ -3319,7 +3368,7 @@ def remove_documents_from_dataset(
     }
 
 
-def delete_dataset_row(connection: sqlite3.Connection, dataset_id: int) -> dict[str, object]:
+def delete_dataset_row(connection: sqlite3.Connection, dataset_id: int, root: Path | None = None) -> dict[str, object]:
     dataset_row = get_dataset_row_by_id(connection, dataset_id)
     if dataset_row is None:
         raise RetrieverError(f"Unknown dataset id: {dataset_id}")
@@ -3333,7 +3382,7 @@ def delete_dataset_row(connection: sqlite3.Connection, dataset_id: int) -> dict[
         (dataset_id,),
     ).fetchall()
     affected_document_ids = [int(row["document_id"]) for row in affected_rows]
-    summary = dataset_summary_by_id(connection, dataset_id)
+    summary = dataset_summary_by_id(connection, dataset_id, root=root)
     connection.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
 
     documents_without_dataset_memberships: list[int] = []
@@ -29247,7 +29296,7 @@ def list_datasets(root: Path) -> dict[str, object]:
         apply_schema(connection, root)
         return {
             "status": "ok",
-            "datasets": list_dataset_summaries(connection),
+            "datasets": list_dataset_summaries(connection, root=root),
         }
     finally:
         connection.close()
@@ -29278,7 +29327,7 @@ def create_dataset(root: Path, dataset_name: str) -> dict[str, object]:
             raise
         return {
             "status": "ok",
-            "dataset": dataset_summary_by_id(connection, dataset_id),
+            "dataset": dataset_summary_by_id(connection, dataset_id, root=root),
         }
     finally:
         connection.close()
@@ -29312,7 +29361,7 @@ def add_to_dataset(
             "status": "ok",
             "requested_document_ids": sorted(dict.fromkeys(int(document_id) for document_id in document_ids)),
             **result,
-            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"])),
+            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"]), root=root),
         }
     finally:
         connection.close()
@@ -29346,7 +29395,7 @@ def remove_from_dataset(
             "status": "ok",
             "requested_document_ids": sorted(dict.fromkeys(int(document_id) for document_id in document_ids)),
             **result,
-            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"])),
+            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"]), root=root),
         }
     finally:
         connection.close()
@@ -29366,7 +29415,7 @@ def delete_dataset(
         dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
         connection.execute("BEGIN")
         try:
-            result = delete_dataset_row(connection, int(dataset_row["id"]))
+            result = delete_dataset_row(connection, int(dataset_row["id"]), root=root)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -29388,7 +29437,7 @@ def rename_dataset(root: Path, old_name: str, new_name: str) -> dict[str, object
         dataset_row = resolve_dataset_row(connection, dataset_name=old_name)
         connection.execute("BEGIN")
         try:
-            renamed_summary = rename_dataset_row(connection, int(dataset_row["id"]), new_name)
+            renamed_summary = rename_dataset_row(connection, int(dataset_row["id"]), new_name, root=root)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -36975,6 +37024,10 @@ def format_dataset_size_summary(item: dict[str, object]) -> str:
         precision = 1 if display_value < 10 else 0
         size_text = f"{display_value:.{precision}f}".rstrip("0").rstrip(".") + f" {units[unit_index]}"
 
+    size_basis = normalize_inline_whitespace(str(item.get("size_basis") or "")).lower()
+    if size_basis == "container":
+        return size_text
+
     document_count = int(item.get("document_count") or 0)
     sized_document_count = int(item.get("sized_document_count") or 0)
     if document_count > 0 and 0 < sized_document_count < document_count:
@@ -38466,7 +38519,7 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
             if dataset_args and dataset_args[0] == "list":
                 if len(dataset_args) != 1:
                     raise RetrieverError("Usage: /dataset list")
-                return {"status": "ok", "datasets": list_dataset_summaries(connection)}
+                return {"status": "ok", "datasets": list_dataset_summaries(connection, root=root)}
             if dataset_args and dataset_args[0] == "clear":
                 scope.pop("dataset", None)
                 return run_scope_search_from_session(root, paths, scope)

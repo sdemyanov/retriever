@@ -38,7 +38,9 @@ Retriever treats the selected folder as the workspace root. All persistent state
 .retriever/
 ├── retriever.db
 ├── previews/
+├── text-revisions/
 ├── jobs/
+├── locks/
 ├── logs/
 └── runtime.json
 ```
@@ -48,7 +50,8 @@ Important consequences:
 - your original documents stay in place and are not rewritten
 - document paths in the database are workspace-relative
 - the workspace carries its own Retriever state, so browsing, datasets, and exports stay tied to that folder
-- the workspace records which canonical Retriever bundle last touched it, but commands run through the canonical plugin tool directly
+- the workspace records which canonical Retriever bundle last touched it, but commands run through the canonical plugin tool directly — there is no longer a per-workspace copy of the tool in `.retriever/bin/`
+- heavy parser dependencies live in the shared plugin runtime (`<plugin-root>/.retriever-plugin-runtime/...`), not under `.retriever/`; see *Runtime and dependencies* for details
 
 ### Document model
 
@@ -107,12 +110,32 @@ Retriever can ingest these important source types today:
 - Slack export roots
 - processed productions such as Concordance-style `DAT` + `OPT` with `TEXT/`, `IMAGES/`, and optional `NATIVES/`
 
-Current limitations that matter in practice:
+Ingest-path behaviors worth knowing:
 
-- no OCR for scanned PDFs or image files
-- images are previewable but not text-searchable unless text already exists elsewhere
-- archive contents such as `.zip` are not unpacked or indexed automatically
-- Retriever does not rely on semantic ranking or OCR-based enrichment in the default ingest/search path
+- calendar invites (`.ics`/`.ifb`/`.vcal`/`.vcs`) that arrive as email attachments are promoted into the parent email — the invite's organizer, attendees, when, location, join URL, UID, and sequence are rolled into the email's indexed text and rendered as a structured invite header in the preview, instead of just being opaque attachment blobs
+- standalone calendar files still ingest as their own documents
+- no OCR for scanned PDFs or image files in the default path (OCR is available as a processing job that writes text back through `activate-text-revision`)
+- images are previewable but not text-searchable by default (image descriptions can likewise be generated through a processing job)
+- archive contents such as `.zip`, `.rar`, `.7z` are not unpacked or indexed automatically
+- Retriever does not rely on semantic ranking in the default ingest/search path
+
+## Runtime and dependencies
+
+Retriever maintains a **shared plugin runtime** under the plugin directory rather than a per-workspace virtualenv:
+
+```text
+<plugin-root>/.retriever-plugin-runtime/<system>-<machine>-pyX.Y/venv/
+```
+
+Heavy parser dependencies (`pdfplumber`, `python-docx`, `openpyxl`, `xlrd`, `extract-msg`, `libpff-python`, `striprtf`, `Pillow`, `charset-normalizer`) are **lazy-installed** into that shared venv the first time a command actually needs them. Non-parsing commands do not pay that cost.
+
+Consequences:
+
+- the workspace's `.retriever/` folder stays lightweight — it holds data, state, and logs, not Python packages
+- multiple workspaces on the same machine share one parser install
+- parser installs are keyed by platform and Python version, so swapping Python versions triggers a fresh install
+- first use of a new parser type (for example, the first PST ingest) can briefly block while the dependency installs; `workspace status` will report the runtime state and warn if something needed is missing
+- the runtime is advisory — if you prefer to manage Python yourself, the tool still falls back to whatever is importable in the active interpreter
 
 ## Loading Retriever
 
@@ -124,28 +147,34 @@ claude --plugin-dir /path/to/retriever-plugin
 
 Once loaded:
 
-- use natural-language requests such as "index this workspace" or "run retriever doctor" for setup, ingest, exports, and job operations
+- use natural-language requests such as "index this workspace" or "run retriever workspace status" for setup, ingest, exports, and job operations
 - use Retriever's persistent slash commands for day-to-day browsing and narrowing once a workspace is active
 
 ## Typical workflows
 
-### 1. Bootstrap and index a workspace
+### 1. Initialize and index a workspace
 
 Use this when you are starting with a new folder of files.
 
 In conversation:
 
-- ask Retriever to check the runtime
-- ask it to bootstrap the workspace if needed
+- ask Retriever to run `workspace status` to check the runtime
+- ask it to run `workspace init` to set up the folder
 - ask it to ingest the folder, usually recursively
 
 Direct CLI equivalents:
 
 ```bash
-python3 skills/tool-template/tools.py doctor .
-python3 skills/tool-template/tools.py bootstrap .
+python3 skills/tool-template/tools.py workspace status .
+python3 skills/tool-template/tools.py workspace init .
 python3 skills/tool-template/tools.py ingest . --recursive
 ```
+
+The `workspace` command groups runtime/schema maintenance into subcommands:
+
+- `workspace init` prepares or repairs `.retriever/` state and runtime metadata (the old `bootstrap`).
+- `workspace status` reports runtime readiness and schema state without rewriting anything (the old `doctor`).
+- `workspace update` refreshes runtime metadata from the canonical `tools.py` bundle after a plugin upgrade.
 
 Use `ingest-production` when you want to target a processed production root explicitly:
 
@@ -246,6 +275,8 @@ Interactive scoping:
 /dataset clear
 ```
 
+`/dataset list` renders as a compact stats table so you can see each dataset's document count, top custodians, and activity range at a glance without drilling in.
+
 Power-user CLI lifecycle:
 
 ```bash
@@ -277,17 +308,36 @@ Use cases:
 
 Retriever supports user-managed custom fields plus manual corrections to editable built-in fields.
 
-Examples:
+The interactive path uses the `/field` and `/fill` slash commands:
+
+```text
+/field add privilege_status text
+/field describe privilege_status "Privilege designation"
+/fill privilege_status privileged on DOC001.00000042
+/fill privilege_status clear on DOC001.00000042
+```
+
+`/fill` can also populate a value across the active scope — those bulk forms require `--confirm`:
+
+```text
+/search privileged
+/filter content_type = 'Email' AND custodian = 'Garcia'
+/fill privilege_status privileged --confirm
+```
+
+Direct CLI equivalents (useful for scripts and non-interactive work):
 
 ```bash
 python3 skills/tool-template/tools.py add-field . privilege_status text --instruction "Privilege designation"
-python3 skills/tool-template/tools.py set-field . --doc-id 42 --field privilege_status --value "privileged"
+python3 skills/tool-template/tools.py fill-field . --doc-id 42 --field privilege_status --value "privileged"
 python3 skills/tool-template/tools.py set-field . --doc-id 42 --field title --value "Board Minutes"
 ```
 
-Important detail:
+Important details:
 
-- manual `set-field` edits are locked and preserved on later ingest or review passes until you explicitly overwrite them
+- manual fills on custom fields and manual corrections to editable built-ins are locked and preserved on later ingest or review passes until you explicitly overwrite them
+- `/fill` refuses to target derived or system-managed fields (`custodian`, `dataset_name`, `production_name`, hashes, ids, ingest timestamps); correct those through the appropriate ingest or conversation command instead
+- `/field delete` is permanent; the slash surface previews the removal and requires `--confirm` before actually dropping the field
 
 ### 8. Run structured processing jobs
 
@@ -337,12 +387,16 @@ Retriever's persistent browse surface consists of these commands.
 | `/page-size` | Show or set rows per page | `/page-size`, `/page-size 25` |
 | `/columns` | Show, list, set, add, remove, or reset visible columns | `/columns`, `/columns list`, `/columns set title, control_number`, `/columns add dataset_name`, `/columns remove author`, `/columns default` |
 | `/from-run` | Show, set, or clear a prior run selector | `/from-run`, `/from-run 42`, `/from-run clear` |
+| `/field` | Inspect or manage the custom-field schema | `/field`, `/field list`, `/field add privilege_status text`, `/field rename old_tag new_tag`, `/field describe privilege_status "Privilege designation"`, `/field type issue_tag text`, `/field delete old_tag --confirm` |
+| `/fill` | Set or clear a field value on one document or a scoped result set | `/fill privilege_status privileged on DOC001.00000042`, `/fill privilege_status clear on DOC001.00000042`, `/fill reviewer "J. Doe" --confirm` (bulk fill against the active scope) |
 
 Notes:
 
-- bare forms such as `/scope`, `/dataset`, `/sort`, `/page`, `/page-size`, and `/columns` are read-only state inspection
+- bare forms such as `/scope`, `/dataset`, `/sort`, `/page`, `/page-size`, `/columns`, and `/field` are read-only state inspection
 - `/next` is equivalent to `/page next`
 - `/previous` is equivalent to `/page previous`
+- `/field delete` and any bulk `/fill` (one that targets the active scope rather than explicit `on <doc-ref>` documents) require `--confirm` as a safety rail
+- `/fill` will not target derived or system-managed fields such as `custodian`, `dataset_name`, `production_name`, hashes, ids, or ingest timestamps; use the appropriate ingest or conversation command instead
 - values with spaces should be quoted
 - comma-separated lists are supported for commands such as `/dataset`, `/columns set`, and `/sort`
 
@@ -552,10 +606,11 @@ Examples:
 ### Health and setup
 
 ```bash
-python3 skills/tool-template/tools.py doctor .
-python3 skills/tool-template/tools.py doctor . --quick
-python3 skills/tool-template/tools.py bootstrap .
-python3 skills/tool-template/tools.py schema-version .
+python3 skills/tool-template/tools.py workspace status .
+python3 skills/tool-template/tools.py workspace status . --quick
+python3 skills/tool-template/tools.py workspace init .
+python3 skills/tool-template/tools.py workspace update .
+python3 skills/tool-template/tools.py schema-version
 ```
 
 ### Search and retrieval
@@ -579,18 +634,25 @@ python3 skills/tool-template/tools.py export-archive . review.zip --select-from-
 ### Metadata and review operations
 
 ```bash
+python3 skills/tool-template/tools.py list-fields .
 python3 skills/tool-template/tools.py add-field . privilege_status text
-python3 skills/tool-template/tools.py set-field . --doc-id 42 --field privilege_status --value privileged
+python3 skills/tool-template/tools.py rename-field . old_tag new_tag
+python3 skills/tool-template/tools.py describe-field . privilege_status --description "Privilege designation"
+python3 skills/tool-template/tools.py change-field-type . issue_tag text
+python3 skills/tool-template/tools.py delete-field . old_tag --confirm
+python3 skills/tool-template/tools.py fill-field . --doc-id 42 --field privilege_status --value privileged
+python3 skills/tool-template/tools.py set-field . --doc-id 42 --field title --value "Board Minutes"
 python3 skills/tool-template/tools.py merge-into-conversation . --doc-id 42 --target-doc-id 17
 python3 skills/tool-template/tools.py split-from-conversation . --doc-id 42
 python3 skills/tool-template/tools.py clear-conversation-assignment . --doc-id 42
+python3 skills/tool-template/tools.py reconcile-duplicates .
 ```
 
 ## Important details to remember
 
 - Retriever is workspace-local. Changing workspaces means changing the database, browse state, datasets, and saved scopes you are working against.
 - Re-ingest updates changed files in place, preserves stable document identity where possible, and marks missing items instead of silently forgetting them.
-- PST support depends on the required `pypff` backend being available. Use `doctor` if PST ingest is not ready.
+- PST support depends on the required `pypff` backend being available. Use `workspace status` if PST ingest is not ready; parser dependencies are lazy-installed into the shared plugin runtime (see *Runtime and dependencies* below), so the status check will also tell you if the runtime needs to be (re)populated.
 - Production ingest is not the same as loose-file ingest. Use `ingest-production` when you want to target a production root explicitly.
 - Manual field edits are protected from later automated overwrite.
 - Results stay grounded in the active scope. If something looks missing, check `/scope`, `/dataset`, `/from-run`, `/sort`, and `/page-size` before assuming the underlying data is gone.
@@ -600,7 +662,7 @@ python3 skills/tool-template/tools.py clear-conversation-assignment . --doc-id 4
 If you are trying Retriever for the first time, this sequence is a good starting point:
 
 ```text
-1. Run retriever doctor
+1. Run retriever workspace status (and workspace init if needed)
 2. Ask Retriever to index the workspace
 3. /search <your first keyword>
 4. /filter content_type = 'Email'
