@@ -1,4 +1,4 @@
-# Workspace Bootstrap Contract
+# Workspace Initialization Contract
 
 ## Purpose
 
@@ -36,23 +36,23 @@ Create this structure under the selected workspace root:
 - `logs/`: structured logs and diagnostics
 - `runtime.json`: local installation metadata
 
-## First-run bootstrap
+## First-run initialization
 
 Follow this order:
 
 1. Confirm the workspace root.
-2. Run the runtime check.
+2. Run `workspace status`.
 3. Create the `.retriever/` directory tree.
 4. Install pinned dependencies from [requirements.lock.md](requirements.lock.md), including the required PST backend.
 5. Materialize `retriever_tools.py` from the canonical template in [../tool-template/tool-template.md](../tool-template/tool-template.md).
-6. Run the tool's `bootstrap` command to create or upgrade schema v9.
+6. Run `workspace init` to create or upgrade schema v9.
 7. Write `runtime.json`.
 
 ## Subsequent sessions
 
 On every later session:
 
-1. Run a quick runtime check.
+1. Run `workspace status --quick`.
 2. Inspect `.retriever/runtime.json` if present.
 3. Confirm the tool exists at `.retriever/bin/retriever_tools.py`.
 4. Compare the current tool checksum to the stored checksum.
@@ -67,21 +67,21 @@ Treat the workspace tool as plugin-managed but user-modifiable.
 
 A reinstall with a changed canonical template is still an upgrade, even if the plugin version string stayed the same.
 
-The workspace tool enforces these rules itself on every non-exempt command. The runner is still free to call `upgrade-workspace` explicitly; the auto-upgrade path just removes the need to remember to do it.
+The workspace tool enforces these rules itself on every non-exempt command. The runner is still free to call `workspace update` explicitly; the auto-upgrade path just removes the need to remember to do it.
 
 ### Ingest command preflight
 
 Use this as the shared preflight contract for runners that are about to call `ingest` or `ingest-production`.
 
-- Confirm or infer the workspace root first, and run `doctor --quick` if runtime state is unclear.
-- If `.retriever/bin/retriever_tools.py` or `.retriever/runtime.json` is missing, materialize the canonical workspace tool and run `bootstrap` before continuing.
+- Confirm or infer the workspace root first, and run `workspace status --quick` if runtime state is unclear.
+- If `.retriever/bin/retriever_tools.py` or `.retriever/runtime.json` is missing, materialize the canonical workspace tool and run `workspace init` before continuing.
 - Otherwise, run the intended workspace-local command through the existing workspace tool and rely on the dispatcher's auto-upgrade path for clean-but-stale copies.
-- If the dispatcher reports `retriever-auto-upgrade: {"status": "blocked", ...}` because the workspace tool is user-modified, stop and ask before `upgrade-workspace --force`.
-- After bootstrap or an explicit forced upgrade, resume the original intended command. Do not swap `ingest` for `ingest-production`, or vice versa, just because the workspace tool was refreshed.
+- If the dispatcher reports `retriever-auto-upgrade: {"status": "blocked", ...}` because the workspace tool is user-modified, stop and ask before `workspace update --force`.
+- After `workspace init` or an explicit forced update, resume the original intended command. Do not swap `ingest` for `ingest-production`, or vice versa, just because the workspace tool was refreshed.
 
 ### Auto-upgrade dispatch hook
 
-Before executing any command other than `schema-version`, `bootstrap`, `doctor`, or `upgrade-workspace`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper. This includes user-facing slash commands such as `/dataset list` and `/search`.
+Before executing any command other than `schema-version` or `workspace`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper. This includes user-facing slash commands such as `/dataset list` and `/search`.
 
 The helper:
 
@@ -92,9 +92,9 @@ The helper:
 - if the workspace sha differs from `runtime.template_sha256` (user-modified), refuses to touch the file, writes a `retriever-auto-upgrade: {"status": "blocked", ...}` line to stderr, and lets the current command continue to run from the user's modified tool
 - emits a single `retriever-auto-upgrade: <json>` line to stderr describing the outcome so automation can observe it without polluting the JSON payload on stdout
 
-### Explicit upgrade command
+### Explicit update command
 
-`retriever_tools.py upgrade-workspace <workspace> [--from <path>] [--force]`
+`retriever_tools.py workspace update <workspace> [--from <path>] [--force]`
 
 - default is to auto-discover the canonical tool the same way the auto path does
 - `--force` is required to overwrite a user-modified workspace tool (it adds a `.user-modified` suffix to the backup name so the edit is recoverable)
@@ -126,7 +126,7 @@ Then:
 - the dispatcher refuses to replace it
 - it emits a `retriever-auto-upgrade: {"status": "blocked", ...}` warning on stderr
 - the current command still runs (from the user's modified copy)
-- an explicit `upgrade-workspace --force` is the documented recovery path
+- an explicit `workspace update --force` is the documented recovery path
 
 ## runtime.json contract
 
@@ -150,13 +150,13 @@ Notes:
 - `template_sha256` should reflect the materialized workspace copy
 - timestamps must be UTC ISO 8601 with `Z`
 - `schema_version` tracks the actual database schema, not the plugin version
-- a successful workspace bootstrap does not require loading optional parser backends up front; `doctor` should probe `pst_backend` explicitly while ordinary non-PST commands remain ready
+- a successful `workspace init` does not require loading optional parser backends up front; `workspace status` should probe `pst_backend` explicitly while ordinary non-PST commands remain ready
 - for future schema changes with real migration vs. reindex tradeoffs, stop and ask the user before assuming migration is preferred
 - schema v7 renames `display_id` to `control_number`, renames the related helper columns and batch table, and keeps one-level email attachment families; existing workspaces should reindex parent emails to populate child attachment rows and preserve family numbering
 
 ## Failure behavior
 
-If bootstrap cannot complete:
+If `workspace init` cannot complete:
 
 - do not leave a half-written `runtime.json` claiming success
 - preserve any valid files already created

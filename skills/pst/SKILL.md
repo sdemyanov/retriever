@@ -27,7 +27,7 @@ Use this skill when the user says things like:
 ## Execution rules
 
 - Confirm or infer the workspace root.
-- Run `doctor` and inspect `pst_backend` before attempting PST ingest.
+- Run `workspace status` and inspect `pst_backend` before attempting PST ingest.
 - If `pst_backend.status` is not `pass`, stop and explain that the required `libpff-python` / `pypff` PST backend is unavailable for PST ingest in the current runtime.
 - Use regular `ingest` for PST sources, not `ingest-production`.
 - Treat a `.pst` file as a container source that expands into one logical parent document per message, with one level of attachment child documents.

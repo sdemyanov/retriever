@@ -85,7 +85,7 @@
 - Retriever treats a `.pst` file as a container source rather than as one flat document.
 - One logical parent document row is created per PST message.
 - One level of PST attachment payloads may be materialized as child attachment documents, just like EML/MSG attachment families.
-- `doctor` probes PST backend readiness under `pst_backend`, while ordinary non-PST commands still avoid loading optional parsers up front.
+- `workspace status` probes PST backend readiness under `pst_backend`, while ordinary non-PST commands still avoid loading optional parsers up front.
 - Unchanged PST sources skip reparsing and refresh seen timestamps instead.
 - Changed PST sources update matching message rows in place and retire removed messages.
 

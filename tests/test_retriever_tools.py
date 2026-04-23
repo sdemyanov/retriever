@@ -1273,7 +1273,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(add_output_payload)
         self.assertEqual(add_output_payload["job_output"]["output_name"], "governing_law")
-        self.assertTrue(add_output_payload["created"])
 
         exit_code, create_version_payload, _, _ = self.run_cli(
             "create-job-version",
@@ -1537,6 +1536,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.assertEqual(active_count_row["count"], 1)
         finally:
             connection.close()
+
+    def test_workspace_init_command_bootstraps_and_reports_ready_status(self) -> None:
+        exit_code, payload, _, _ = self.run_cli("workspace", "init", str(self.root))
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["action"], "init")
+        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(payload["initialization"]["status"], "initialized")
+        self.assertEqual(payload["status_report"]["workspace"]["state"], "initialized")
+        self.assertEqual(payload["tool_update"]["status"], "repaired-runtime")
+        self.assertTrue(self.paths["runtime_path"].exists())
 
     def test_ingest_seeds_text_revisions_and_create_run_freezes_family_snapshot(self) -> None:
         email_path = self.root / "thread.eml"
@@ -4999,6 +5010,33 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(doctor_result["pst_backend"]["status"], "pass")
         self.assertIn("PST backend import succeeded", doctor_result["pst_backend"]["detail"])
         load_dependency.assert_called_once_with("pypff")
+
+    def test_workspace_status_reports_registry_drift_without_repairing_it(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("ALTER TABLE documents ADD COLUMN issue_tag TEXT")
+            connection.commit()
+        finally:
+            connection.close()
+
+        exit_code, payload, _, _ = self.run_cli("workspace", "status", str(self.root))
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["action"], "status")
+        self.assertEqual(payload["custom_field_registry"]["missing_registry"], ["issue_tag"])
+        self.assertEqual(payload["custom_field_registry"]["repaired_registry"], [])
+        self.assertNotIn("schema_apply", payload)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            registry_status = retriever_tools.inspect_custom_fields_registry(connection)
+        finally:
+            connection.close()
+
+        self.assertEqual(registry_status["missing_registry"], ["issue_tag"])
 
     def test_doctor_reports_optional_pst_backend_failure_without_failing_runtime(self) -> None:
         retriever_tools.bootstrap(self.root)

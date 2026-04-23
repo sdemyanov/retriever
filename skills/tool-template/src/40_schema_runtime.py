@@ -1481,6 +1481,23 @@ def read_runtime(path: Path) -> dict[str, object] | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_workspace_meta(connection: sqlite3.Connection) -> dict[str, object] | None:
+    if not table_exists(connection, "workspace_meta"):
+        return None
+    row = connection.execute(
+        """
+        SELECT
+          id, schema_version, tool_version, requirements_version,
+          template_source, template_sha256, created_at, updated_at
+        FROM workspace_meta
+        WHERE id = 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    return {key: row[key] for key in row.keys()}
+
+
 def write_runtime(paths: dict[str, Path], tool_sha256: str | None) -> dict[str, object]:
     now = utc_now()
     runtime = {
@@ -1576,6 +1593,125 @@ def determine_workspace_state(paths: dict[str, Path]) -> str:
     if any((state_dir, tool_path, db_path, runtime_path)):
         return "partial"
     return "missing"
+
+
+def workspace_status(root: Path, quick: bool) -> dict[str, object]:
+    paths = workspace_paths(root)
+    fts5 = probe_fts5()
+    pip_ok, pip_version = run_command([sys.executable, "-m", "pip", "--version"])
+    pst_backend = dependency_status(
+        "pypff",
+        package_name="libpff-python",
+        import_name="pypff",
+        detail_label="PST backend",
+        probe_if_unloaded=True,
+    )
+    runtime = read_runtime(paths["runtime_path"])
+    current_sha = sha256_file(paths["tool_path"])
+    stored_sha = None if runtime is None else runtime.get("template_sha256")
+    workspace_state = determine_workspace_state(paths)
+    registry_status = None
+    workspace_inventory = None
+    processing_providers = probe_processing_providers(None)
+    journal_mode = None
+    db_error = None
+    workspace_meta = None
+    actual_schema_version = None
+    schema_needs_migration = None
+    workspace_inventory_error = None
+    registry_error = None
+
+    if paths["db_path"].exists() and (file_size_bytes(paths["db_path"]) or 0) > 0:
+        try:
+            connection = connect_db(paths["db_path"])
+            try:
+                journal_mode = current_journal_mode(connection)
+                workspace_meta = read_workspace_meta(connection)
+                if workspace_meta is not None and workspace_meta.get("schema_version") is not None:
+                    actual_schema_version = int(workspace_meta["schema_version"])
+                    schema_needs_migration = actual_schema_version < SCHEMA_VERSION
+                elif workspace_state != "missing":
+                    schema_needs_migration = True
+
+                if schema_needs_migration is not True:
+                    if table_exists(connection, "documents"):
+                        try:
+                            workspace_inventory = document_inventory_counts(connection)
+                        except Exception as exc:
+                            workspace_inventory_error = f"{type(exc).__name__}: {exc}"
+                    if table_exists(connection, "documents") and table_exists(connection, "custom_fields_registry"):
+                        try:
+                            registry_status = reconcile_custom_fields_registry(connection, repair=False)
+                        except Exception as exc:
+                            registry_error = f"{type(exc).__name__}: {exc}"
+
+                processing_providers = probe_processing_providers(connection)
+            finally:
+                connection.close()
+        except Exception as exc:
+            db_error = f"{type(exc).__name__}: {exc}"
+
+    overall = "pass"
+    if fts5["status"] != "pass":
+        overall = "fail"
+    elif db_error is not None:
+        overall = "fail"
+    elif (
+        workspace_state == "partial"
+        or schema_needs_migration is True
+        or workspace_inventory_error is not None
+        or registry_error is not None
+    ):
+        overall = "partial"
+
+    result: dict[str, object] = {
+        "overall": overall,
+        "tool_version": TOOL_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "workspace_schema_version": actual_schema_version,
+        "schema_needs_migration": schema_needs_migration,
+        "python_version": platform.python_version(),
+        "pip_version": pip_version if pip_ok else None,
+        "pip_status": "pass" if pip_ok else "fail",
+        "sqlite_version": sqlite3.sqlite_version,
+        "fts5": fts5,
+        "pst_backend": pst_backend,
+        "processing_providers": processing_providers,
+        "platform": detect_platform(),
+        "workspace": {
+            "root": str(root.resolve()),
+            "state": workspace_state,
+            "db_present": paths["db_path"].exists(),
+            "db_size_bytes": file_size_bytes(paths["db_path"]),
+            "runtime_present": paths["runtime_path"].exists(),
+            "tool_present": paths["tool_path"].exists(),
+        },
+        "tool_integrity": {
+            "current_sha256": current_sha,
+            "runtime_sha256": stored_sha,
+            "matches_runtime": current_sha == stored_sha if current_sha and stored_sha else None,
+        },
+    }
+    if journal_mode is not None:
+        result["sqlite_journal_mode"] = journal_mode
+    if db_error is not None:
+        result["db_error"] = db_error
+    if workspace_inventory is not None:
+        result["workspace_inventory"] = workspace_inventory
+    if workspace_inventory_error is not None:
+        result["workspace_inventory_error"] = workspace_inventory_error
+    if registry_error is not None:
+        result["custom_field_registry_error"] = registry_error
+
+    if not quick:
+        result["paths"] = {key: str(value) for key, value in paths.items()}
+        if runtime is not None:
+            result["runtime"] = runtime
+        if workspace_meta is not None:
+            result["workspace_meta"] = workspace_meta
+        if registry_status is not None:
+            result["custom_field_registry"] = registry_status
+    return result
 
 
 def doctor(root: Path, quick: bool) -> dict[str, object]:
@@ -1706,26 +1842,28 @@ def bootstrap(root: Path) -> dict[str, object]:
                             recovered_sqlite_artifacts.append(artifact)
                     continue
             break
-    detail = f"{type(last_error).__name__}: {last_error}" if last_error is not None else "unknown bootstrap failure"
+    detail = (
+        f"{type(last_error).__name__}: {last_error}"
+        if last_error is not None
+        else "unknown workspace initialization failure"
+    )
     if recovered_sqlite_artifacts:
         detail = (
             f"{detail}. Removed stale SQLite artifacts before retry: "
             f"{', '.join(recovered_sqlite_artifacts)}"
         )
-    raise RetrieverError(f"Bootstrap failed for {paths['db_path']}: {detail}") from last_error
+    raise RetrieverError(f"Workspace initialization failed for {paths['db_path']}: {detail}") from last_error
 
 
 # Commands that must not trigger an auto-upgrade. `schema-version` needs to
-# work even when a workspace does not exist yet. `bootstrap` installs the
-# runtime; running the upgrade before it would be meaningless. `doctor`
-# reports on the workspace and should not mutate it. `upgrade-workspace`
-# performs the upgrade explicitly.
+# work even when a workspace does not exist yet. `workspace` owns the
+# explicit init/status/update flows, so it should not transparently rewrite
+# itself before dispatch. `slash` is intentionally not exempt so user-facing
+# slash commands also benefit from clean-but-stale auto-upgrades.
 AUTO_UPGRADE_EXEMPT_COMMANDS = frozenset(
     {
         "schema-version",
-        "bootstrap",
-        "doctor",
-        "upgrade-workspace",
+        "workspace",
     }
 )
 
@@ -1786,6 +1924,25 @@ def locate_canonical_plugin_tool(current_file: str | None = None) -> Path | None
     return None
 
 
+def locate_canonical_plugin_tool_or_self(current_file: str | None = None) -> Path | None:
+    located = locate_canonical_plugin_tool(current_file)
+    if located is not None:
+        return located
+
+    candidate_path = current_file or __file__
+    try:
+        candidate = Path(candidate_path).resolve()
+    except OSError:
+        return None
+    if (
+        candidate.is_file()
+        and candidate.parent.name == "tool-template"
+        and candidate.parent.parent.name == "skills"
+    ):
+        return candidate
+    return None
+
+
 def _upgrade_backup_name(runtime_version: str | None, user_modified: bool) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     previous_version = runtime_version or "unknown"
@@ -1817,15 +1974,46 @@ def upgrade_workspace_tool(
         raise RetrieverError(f"Canonical tool not readable at {canonical_path}")
 
     if workspace_sha == canonical_sha:
-        return {
-            "status": "no-op",
-            "reason": "already current",
-            "canonical_sha256": canonical_sha,
+        if isinstance(runtime, dict):
+            return {
+                "status": "no-op",
+                "reason": "already current",
+                "canonical_sha256": canonical_sha,
+                "canonical_path": str(canonical_path),
+                "tool_path": str(paths["tool_path"]),
+                "workspace_tool_version": runtime_version,
+                "canonical_tool_version": TOOL_VERSION,
+            }
+
+        write_runtime(paths, canonical_sha)
+        meta_updated = False
+        meta_error: str | None = None
+        try:
+            connection = connect_db(paths["db_path"])
+            try:
+                write_workspace_meta(connection, canonical_sha)
+                meta_updated = True
+            finally:
+                connection.close()
+        except Exception as exc:  # pragma: no cover - best-effort path
+            meta_error = f"{type(exc).__name__}: {exc}"
+        result = {
+            "status": "repaired-runtime",
+            "reason": reason,
+            "force": force,
+            "was_user_modified": False,
+            "previous_tool_sha256": workspace_sha,
+            "previous_tool_version": runtime_version,
+            "new_tool_sha256": canonical_sha,
+            "new_tool_version": TOOL_VERSION,
             "canonical_path": str(canonical_path),
             "tool_path": str(paths["tool_path"]),
-            "workspace_tool_version": runtime_version,
-            "canonical_tool_version": TOOL_VERSION,
+            "backup_path": None,
+            "workspace_meta_updated": meta_updated,
         }
+        if meta_error is not None:
+            result["workspace_meta_error"] = meta_error
+        return result
 
     user_modified = (
         workspace_sha is not None
@@ -1836,7 +2024,7 @@ def upgrade_workspace_tool(
         raise RetrieverError(
             "Workspace tool has been modified in place "
             f"(workspace sha {workspace_sha}, runtime sha {runtime_sha}). "
-            "Re-run upgrade-workspace --force to overwrite the modified tool."
+            "Re-run `workspace update <workspace> --force` to overwrite the modified tool."
         )
 
     backup_path: Path | None = None
@@ -1852,7 +2040,7 @@ def upgrade_workspace_tool(
     write_runtime(paths, new_sha)
 
     # Best-effort: keep workspace_meta in sync. If the database is missing
-    # or unreadable we leave it to the next bootstrap/doctor run rather
+    # or unreadable we leave it to the next workspace init/status run rather
     # than failing the upgrade.
     meta_updated = False
     meta_error: str | None = None
@@ -1937,8 +2125,8 @@ def maybe_upgrade_workspace_tool(root: Path) -> dict[str, object] | None:
             "workspace_tool_version": runtime_version,
             "canonical_tool_version": TOOL_VERSION,
             "hint": (
-                "Run `upgrade-workspace --force` to overwrite the modified "
-                "tool, or revert your local edits."
+                "Run `workspace update <workspace> --force` to overwrite "
+                "the modified tool, or revert your local edits."
             ),
         }
 
@@ -1960,6 +2148,52 @@ def maybe_upgrade_workspace_tool(root: Path) -> dict[str, object] | None:
             "workspace_tool_version": runtime_version,
             "canonical_tool_version": TOOL_VERSION,
         }
+
+
+def init_workspace(root: Path, quick: bool = False) -> dict[str, object]:
+    paths = workspace_paths(root)
+    tool_update: dict[str, object] | None = None
+    canonical_path = locate_canonical_plugin_tool_or_self()
+
+    if canonical_path is not None:
+        if not paths["tool_path"].exists() or not paths["runtime_path"].exists():
+            tool_update = upgrade_workspace_tool(
+                root,
+                canonical_path,
+                force=False,
+                reason="workspace-init",
+            )
+        else:
+            maybe_update = maybe_upgrade_workspace_tool(root)
+            if maybe_update is not None:
+                if maybe_update.get("status") == "blocked":
+                    raise RetrieverError(
+                        "Workspace tool has been modified in place "
+                        f"(workspace sha {maybe_update.get('workspace_tool_sha256')}, "
+                        f"runtime sha {maybe_update.get('workspace_runtime_sha256')}). "
+                        "Run `workspace update <workspace> --force` to overwrite the modified tool."
+                    )
+                if maybe_update.get("status") == "error":
+                    raise RetrieverError(str(maybe_update.get("detail") or "Workspace update failed."))
+                tool_update = maybe_update
+    elif not paths["tool_path"].exists():
+        raise RetrieverError(
+            "Could not auto-discover the canonical retriever_tools.py. "
+            "Run this command from the plugin source checkout, or use "
+            "`workspace update <workspace> --from <path>` first."
+        )
+
+    initialization_payload = bootstrap(root)
+    result: dict[str, object] = {
+        "action": "init",
+        "status": "ready",
+        "workspace_root": str(root.resolve()),
+        "initialization": initialization_payload,
+        "status_report": workspace_status(root, quick=quick),
+    }
+    if tool_update is not None:
+        result["tool_update"] = tool_update
+    return result
 
 
 def write_workspace_meta(connection: sqlite3.Connection, tool_sha256: str | None) -> None:

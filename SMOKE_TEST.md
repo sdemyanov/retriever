@@ -8,8 +8,7 @@ For the full end-to-end manual pass, see [MANUAL_TEST_PLAN.md](/Users/sergey/Pro
 
 - plugin manifest: [.claude-plugin/plugin.json](/Users/sergey/Projects/retriever-plugin/.claude-plugin/plugin.json)
 - smoke-test skill: [skills/ping/SKILL.md](/Users/sergey/Projects/retriever-plugin/skills/ping/SKILL.md)
-- Phase 0 runtime check skill: [skills/doctor/SKILL.md](/Users/sergey/Projects/retriever-plugin/skills/doctor/SKILL.md)
-- Phase 1 workspace skill: [skills/workspace/SKILL.md](/Users/sergey/Projects/retriever-plugin/skills/workspace/SKILL.md)
+- Phase 0/1 workspace skill: [skills/workspace/SKILL.md](/Users/sergey/Projects/retriever-plugin/skills/workspace/SKILL.md)
 - Phase 1 schema skill: [skills/schema/SKILL.md](/Users/sergey/Projects/retriever-plugin/skills/schema/SKILL.md)
 - Phase 1 tool template skill: [skills/tool-template/SKILL.md](/Users/sergey/Projects/retriever-plugin/skills/tool-template/SKILL.md)
 - local test marketplace: [test-marketplace/.claude-plugin/marketplace.json](/Users/sergey/Projects/retriever-plugin/test-marketplace/.claude-plugin/marketplace.json)
@@ -90,7 +89,7 @@ Optional:
 Once the smoke test is working, run:
 
 ```text
-/retriever:doctor
+/retriever:workspace status
 ```
 
 This checks the active plugin runtime for:
@@ -104,7 +103,7 @@ This checks the active plugin runtime for:
 Or invoke it in plain language:
 
 ```text
-retriever doctor
+retriever workspace status
 ```
 
 Use it as the first real runtime check inside Cowork before moving deeper into Phase 0.

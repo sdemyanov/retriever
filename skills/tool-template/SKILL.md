@@ -29,7 +29,7 @@ Use this skill when a task needs the exact workspace tool bundle.
 - Keep the repo-local source fragments and generated bundled `retriever_tools.py` in sync.
 - Keep `TOOL_VERSION`, schema version, and documented checksum aligned.
 - Treat the documented SHA256 checksum as the authoritative upgrade signal for the canonical tool source.
-- If the canonical checksum changes, replace the unmodified workspace copy and run `bootstrap` before any ingest, even if the version string is unchanged.
+- If the canonical checksum changes, replace the unmodified workspace copy and run `workspace init` before any ingest, even if the version string is unchanged.
 - Bump version metadata when releasing schema or tool changes, but do not rely on version alone to trigger workspace upgrades.
 - If the source changes, update `tool-template.md` and the workspace skill references too.
 - When multiple Retriever tool calls are already independent, emit them in one assistant turn rather than serializing them across turns.

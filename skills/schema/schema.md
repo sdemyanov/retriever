@@ -20,7 +20,7 @@ Journal mode policy:
 
 - prefer `WAL` on normal local workspaces
 - if the filesystem or mount rejects `WAL`, fall back to `DELETE`
-- `bootstrap` may remove obviously stale zero-byte SQLite artifacts and retry once before surfacing an error
+- `workspace init` may remove obviously stale zero-byte SQLite artifacts and retry once before surfacing an error
 
 ## Table definitions
 
@@ -563,15 +563,18 @@ CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id
 
 ## JSON contracts
 
-### `doctor`
+### `workspace status`
 
 Expected JSON shape:
 
 ```json
 {
+  "action": "status",
   "overall": "pass",
-  "tool_version": "0.9.4",
-  "schema_version": 12,
+  "tool_version": "0.19.0",
+  "schema_version": 22,
+  "workspace_schema_version": 22,
+  "schema_needs_migration": false,
   "python_version": "3.10.12",
   "pip_version": "25.3",
   "sqlite_version": "3.37.2",
@@ -592,6 +595,11 @@ Expected JSON shape:
     "runtime_present": true,
     "tool_present": true
   },
+  "tool_integrity": {
+    "current_sha256": "<sha256 of workspace tool file>",
+    "runtime_sha256": "<sha256 recorded in runtime.json>",
+    "matches_runtime": true
+  },
   "workspace_inventory": {
     "parent_documents": 11,
     "missing_parent_documents": 0,
@@ -601,18 +609,49 @@ Expected JSON shape:
 }
 ```
 
-### `bootstrap`
+### `workspace init`
 
 Expected JSON shape:
 
 ```json
 {
-  "status": "initialized",
+  "action": "init",
+  "status": "ready",
   "workspace_root": "/path/to/workspace",
-  "schema_version": 12,
-  "tool_version": "0.9.4",
-  "requirements_version": "2026-04-16-phase4-pst",
-  "journal_mode": "wal"
+  "initialization": {
+    "status": "initialized",
+    "workspace_root": "/path/to/workspace",
+    "schema_version": 22,
+    "tool_version": "0.19.0",
+    "requirements_version": "2026-04-21-phase11-document-deduplication",
+    "journal_mode": "wal"
+  },
+  "status_report": {
+    "overall": "pass",
+    "workspace": {
+      "state": "initialized"
+    }
+  },
+  "tool_update": {
+    "status": "upgraded",
+    "reason": "workspace-init"
+  }
+}
+```
+
+### `workspace update`
+
+Expected JSON shape:
+
+```json
+{
+  "action": "update",
+  "status": "upgraded",
+  "reason": "manual",
+  "force": false,
+  "was_user_modified": false,
+  "new_tool_version": "0.19.0",
+  "tool_path": "/path/to/workspace/.retriever/bin/retriever_tools.py"
 }
 ```
 

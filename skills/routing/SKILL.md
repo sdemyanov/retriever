@@ -29,7 +29,7 @@ If a `retriever:*` skill covers the intent, invoke it instead of the underlying 
 - Populate, tag, mark, label, classify, annotate, flag, or clear values on one document or a filtered result set → `retriever:fill`
 - Execute a planned processing run → `retriever:run-job`
 - Inspect the SQLite schema or the current tool/schema version → `retriever:schema`, `retriever:schema-version`
-- Bootstrap, check, or upgrade a workspace → `retriever:workspace`, `retriever:doctor`
+- Initialize, check, or update a workspace → `retriever:workspace`
 - Confirm the plugin is installed and responding → `retriever:ping`
 - Understand file-type support and preview rules → `retriever:parsing`
 - Understand result presentation and paging defaults → `retriever:search-strategy`
@@ -79,10 +79,8 @@ The authoritative current list of subcommands is regenerated at build time into 
 <!-- BEGIN: tool-subcommands -->
 ### Workspace & maintenance
 
-- you need to initialize a fresh workspace → `bootstrap` — create workspace layout and schema
-- you need to diagnose runtime, workspace readiness, or install integrity → `doctor` — check runtime and workspace readiness
 - you need the current schema/tool version string → `schema-version` — report the current schema/tool version
-- the schema version is behind the bundled tool → `upgrade-workspace` — upgrade the workspace schema
+- you need to initialize a fresh workspace, diagnose runtime or install integrity, or refresh the workspace tool → `workspace` — initialize, inspect, or update workspace installation and schema
 
 ### Datasets
 
@@ -174,11 +172,6 @@ The authoritative current list of subcommands is regenerated at build time into 
 ### Results
 
 - you need stored processing results for inspection → `list-results` — list stored processing results
-
-
-
-
-
 
 
 
