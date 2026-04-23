@@ -169,6 +169,7 @@ The authoritative current list of subcommands is regenerated at build time into 
 - you need stored processing results for inspection → `list-results` — list stored processing results
 
 
+
 <!-- END: tool-subcommands -->
 
 ## Tier 4 — direct SQLite access (last resort only)
