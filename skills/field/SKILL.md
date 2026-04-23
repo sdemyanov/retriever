@@ -9,7 +9,7 @@ metadata:
   version: "0.19.0"
 ---
 
-> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
 
 # Retriever /field
 
@@ -22,9 +22,9 @@ For the exact read-only forms `/field` and `/field list`:
 - Do not read [../schema/schema.md](../schema/schema.md).
 - Do not read other Retriever skills.
 - Run exactly one Bash command from the workspace root:
-  - `/field`: `python3 .retriever/bin/retriever_tools.py slash . /field`
-  - `/field list`: `python3 .retriever/bin/retriever_tools.py slash . /field list`
-- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+  - `/field`: `python3 skills/tool-template/tools.py slash . /field`
+  - `/field list`: `python3 skills/tool-template/tools.py slash . /field list`
+- If canonical tool auto-discovery fails, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/tools.py](../tool-template/tools.py).
 - Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
 
 ## Other forms

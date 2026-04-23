@@ -716,9 +716,6 @@ def workspace_paths(root: Path) -> dict[str, Path]:
         "saved_scopes_path": state_dir / "saved_scopes.json",
         "previews_dir": state_dir / "previews",
         "text_revisions_dir": state_dir / "text-revisions",
-        "bin_dir": state_dir / "bin",
-        "tool_path": state_dir / "bin" / "retriever_tools.py",
-        "backups_dir": state_dir / "bin" / "backups",
         "jobs_dir": state_dir / "jobs",
         "logs_dir": state_dir / "logs",
         "runtime_path": state_dir / "runtime.json",
@@ -734,8 +731,6 @@ def ensure_layout(paths: dict[str, Path]) -> None:
     for key in (
         "previews_dir",
         "text_revisions_dir",
-        "bin_dir",
-        "backups_dir",
         "jobs_dir",
         "logs_dir",
         "tmp_dir",

@@ -14,7 +14,7 @@ metadata:
   version: "0.9.8"
 ---
 
-> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
 
 # Retriever Search
 
@@ -36,18 +36,18 @@ For exact slash forms that begin with `/search`:
 - Do not read [../search-strategy/search-strategy.md](../search-strategy/search-strategy.md).
 - Do not read schema docs.
 - Run exactly one Bash command from the workspace root that passes the slash command through unchanged. Common examples:
-  - `/search`: `python3 .retriever/bin/retriever_tools.py slash . /search`
-  - `/search clear`: `python3 .retriever/bin/retriever_tools.py slash . '/search clear'`
-  - `/search --within indemnification`: `python3 .retriever/bin/retriever_tools.py slash . '/search --within indemnification'`
-  - `/search --fts ABC000123`: `python3 .retriever/bin/retriever_tools.py slash . '/search --fts ABC000123'`
-- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+  - `/search`: `python3 skills/tool-template/tools.py slash . /search`
+  - `/search clear`: `python3 skills/tool-template/tools.py slash . '/search clear'`
+  - `/search --within indemnification`: `python3 skills/tool-template/tools.py slash . '/search --within indemnification'`
+  - `/search --fts ABC000123`: `python3 skills/tool-template/tools.py slash . '/search --fts ABC000123'`
+- If canonical tool auto-discovery fails, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/tools.py](../tool-template/tools.py).
 - Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
 
 ## Load order
 
 1. Read [../search-strategy/search-strategy.md](../search-strategy/search-strategy.md).
 2. Read [../schema/schema.md](../schema/schema.md) if field names or operators are unclear.
-3. Use [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py) as the command source if workspace materialization is needed.
+3. Use [../tool-template/tools.py](../tool-template/tools.py) as the canonical command source.
 
 ## View vs compose
 

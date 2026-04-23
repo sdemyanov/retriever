@@ -7,8 +7,6 @@ metadata:
   version: "0.9.4"
 ---
 
-> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
-
 # Retriever Schema Version
 
 Use this skill when the user says things like:
@@ -20,11 +18,10 @@ Use this skill when the user says things like:
 ## Load order
 
 1. Read [../workspace/workspace.md](../workspace/workspace.md).
-2. Use [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py) as the canonical workspace tool bundle if the workspace-local tool is missing.
+2. Use [../tool-template/tools.py](../tool-template/tools.py) as the canonical tool entrypoint.
 
 ## Execution rules
 
 - Confirm or infer the workspace root.
-- If `.retriever/bin/retriever_tools.py` exists, use the workspace-local tool first.
-- Otherwise run the canonical bundled tool against the workspace root.
+- Run the canonical bundled tool against the workspace root.
 - Report the returned `schema_version` and `tool_version` faithfully.

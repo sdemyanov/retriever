@@ -1584,13 +1584,12 @@ def probe_processing_providers(connection: sqlite3.Connection | None) -> dict[st
 
 def determine_workspace_state(paths: dict[str, Path]) -> str:
     state_dir = paths["state_dir"].exists()
-    tool_path = paths["tool_path"].exists()
     db_path = paths["db_path"].exists()
     db_usable = db_path and (file_size_bytes(paths["db_path"]) or 0) > 0
     runtime_path = paths["runtime_path"].exists()
-    if all((state_dir, tool_path, db_usable, runtime_path)):
+    if all((state_dir, db_usable, runtime_path)):
         return "initialized"
-    if any((state_dir, tool_path, db_path, runtime_path)):
+    if any((state_dir, db_path, runtime_path)):
         return "partial"
     return "missing"
 
@@ -1607,7 +1606,8 @@ def workspace_status(root: Path, quick: bool) -> dict[str, object]:
         probe_if_unloaded=True,
     )
     runtime = read_runtime(paths["runtime_path"])
-    current_sha = sha256_file(paths["tool_path"])
+    canonical_tool_path = locate_canonical_plugin_tool_or_self()
+    current_sha = sha256_file(canonical_tool_path) if canonical_tool_path is not None else None
     stored_sha = None if runtime is None else runtime.get("template_sha256")
     workspace_state = determine_workspace_state(paths)
     registry_status = None
@@ -1684,7 +1684,7 @@ def workspace_status(root: Path, quick: bool) -> dict[str, object]:
             "db_present": paths["db_path"].exists(),
             "db_size_bytes": file_size_bytes(paths["db_path"]),
             "runtime_present": paths["runtime_path"].exists(),
-            "tool_present": paths["tool_path"].exists(),
+            "canonical_tool_present": canonical_tool_path is not None,
         },
         "tool_integrity": {
             "current_sha256": current_sha,
@@ -1726,7 +1726,8 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
         probe_if_unloaded=True,
     )
     runtime = read_runtime(paths["runtime_path"])
-    current_sha = sha256_file(paths["tool_path"])
+    canonical_tool_path = locate_canonical_plugin_tool_or_self()
+    current_sha = sha256_file(canonical_tool_path) if canonical_tool_path is not None else None
     stored_sha = None if runtime is None else runtime.get("template_sha256")
     workspace_state = determine_workspace_state(paths)
     registry_status = None
@@ -1776,7 +1777,7 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
             "db_present": paths["db_path"].exists(),
             "db_size_bytes": file_size_bytes(paths["db_path"]),
             "runtime_present": paths["runtime_path"].exists(),
-            "tool_present": paths["tool_path"].exists(),
+            "canonical_tool_present": canonical_tool_path is not None,
         },
         "tool_integrity": {
             "current_sha256": current_sha,
@@ -1805,6 +1806,12 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
 def bootstrap(root: Path) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
+    canonical_tool_path = locate_canonical_plugin_tool_or_self()
+    tool_sha = (
+        sha256_file(canonical_tool_path)
+        if canonical_tool_path is not None
+        else sha256_file(Path(__file__).resolve())
+    )
     recovered_sqlite_artifacts = remove_stale_sqlite_artifacts(paths["db_path"])
     last_error: Exception | None = None
     for attempt in range(2):
@@ -1814,11 +1821,10 @@ def bootstrap(root: Path) -> dict[str, object]:
                 journal_mode = current_journal_mode(connection)
                 apply_schema(connection, root)
                 registry_status = reconcile_custom_fields_registry(connection, repair=True)
-                tool_sha = sha256_file(paths["tool_path"])
                 write_workspace_meta(connection, tool_sha)
             finally:
                 connection.close()
-            write_runtime(paths, sha256_file(paths["tool_path"]))
+            write_runtime(paths, tool_sha)
             result = {
                 "status": "initialized" if paths["runtime_path"].exists() else "failed",
                 "workspace_root": str(root.resolve()),
@@ -1842,17 +1848,13 @@ def bootstrap(root: Path) -> dict[str, object]:
                             recovered_sqlite_artifacts.append(artifact)
                     continue
             break
-    detail = (
-        f"{type(last_error).__name__}: {last_error}"
-        if last_error is not None
-        else "unknown workspace initialization failure"
-    )
+    detail = f"{type(last_error).__name__}: {last_error}" if last_error is not None else "unknown bootstrap failure"
     if recovered_sqlite_artifacts:
         detail = (
             f"{detail}. Removed stale SQLite artifacts before retry: "
             f"{', '.join(recovered_sqlite_artifacts)}"
         )
-    raise RetrieverError(f"Workspace initialization failed for {paths['db_path']}: {detail}") from last_error
+    raise RetrieverError(f"Bootstrap failed for {paths['db_path']}: {detail}") from last_error
 
 
 # Commands that must not trigger an auto-upgrade. `schema-version` needs to
@@ -1869,18 +1871,7 @@ AUTO_UPGRADE_EXEMPT_COMMANDS = frozenset(
 
 
 def locate_canonical_plugin_tool(current_file: str | None = None) -> Path | None:
-    """Find the plugin's canonical ``skills/tool-template/retriever_tools.py``.
-
-    Resolution order:
-
-    1. ``RETRIEVER_CANONICAL_TOOL_PATH`` environment variable (absolute path).
-    2. Walk ancestors of ``current_file`` (defaults to ``__file__``) looking
-       for ``skills/tool-template/retriever_tools.py``.
-
-    The search always skips ``current_file`` itself, which prevents
-    self-upgrades when the workspace tool happens to live in a path that
-    superficially matches the canonical layout.
-    """
+    """Find the canonical ``skills/tool-template/tools.py`` bundle."""
 
     def _safe_resolve(path: Path) -> Path | None:
         try:
@@ -1888,39 +1879,32 @@ def locate_canonical_plugin_tool(current_file: str | None = None) -> Path | None
         except OSError:
             return None
 
-    running_path: Path | None = None
-    if current_file is None:
-        current_file = __file__
-    if current_file:
-        try:
-            running_path = Path(current_file).resolve()
-        except OSError:
-            running_path = None
-
     env_path = os.environ.get("RETRIEVER_CANONICAL_TOOL_PATH")
     if env_path:
         candidate = Path(env_path).expanduser()
         if candidate.is_file():
-            resolved = _safe_resolve(candidate) or candidate
-            if running_path is None or resolved != running_path:
+            resolved = _safe_resolve(candidate)
+            if resolved is not None:
                 return resolved
 
-    if current_file:
-        try:
-            start = Path(current_file).resolve()
-        except OSError:
-            start = None
-        if start is not None:
-            for parent in [start.parent, *start.parents]:
-                candidate = parent / "skills" / "tool-template" / "retriever_tools.py"
-                if not candidate.is_file():
-                    continue
-                resolved = _safe_resolve(candidate)
-                if resolved is None:
-                    continue
-                if running_path is not None and resolved == running_path:
-                    continue
-                return resolved
+    candidate_path = current_file or __file__
+    try:
+        start = Path(candidate_path).resolve()
+    except OSError:
+        start = None
+    if start is None:
+        return None
+
+    sibling_candidate = start.with_name("tools.py")
+    sibling_resolved = _safe_resolve(sibling_candidate)
+    if sibling_resolved is not None and sibling_resolved.is_file():
+        return sibling_resolved
+
+    for parent in [start.parent, *start.parents]:
+        candidate = parent / "skills" / "tool-template" / "tools.py"
+        resolved = _safe_resolve(candidate)
+        if resolved is not None and resolved.is_file():
+            return resolved
     return None
 
 
@@ -1938,16 +1922,17 @@ def locate_canonical_plugin_tool_or_self(current_file: str | None = None) -> Pat
         candidate.is_file()
         and candidate.parent.name == "tool-template"
         and candidate.parent.parent.name == "skills"
+        and candidate.name == "tools.py"
     ):
         return candidate
     return None
-
-
-def _upgrade_backup_name(runtime_version: str | None, user_modified: bool) -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    previous_version = runtime_version or "unknown"
-    suffix = ".user-modified" if user_modified else ""
-    return f"retriever_tools.py.{timestamp}.pre-{previous_version}{suffix}"
+    if (
+        candidate.is_file()
+        and candidate.parent.name == "tool-template"
+        and candidate.parent.parent.name == "skills"
+    ):
+        return candidate
+    return None
 
 
 def upgrade_workspace_tool(
@@ -1957,97 +1942,25 @@ def upgrade_workspace_tool(
     force: bool = False,
     reason: str = "manual",
 ) -> dict[str, object]:
-    """Replace the workspace tool with the canonical plugin copy.
-
-    Writes happen via ``Path.write_bytes`` (open-with-O_TRUNC), so this
-    works under Cowork sandboxes that block explicit ``unlink``/``rm``.
-    """
+    """Refresh workspace runtime metadata from the canonical tool bundle."""
+    del force
     paths = workspace_paths(root)
     ensure_layout(paths)
     runtime = read_runtime(paths["runtime_path"])
     runtime_sha = runtime.get("template_sha256") if isinstance(runtime, dict) else None
     runtime_version = runtime.get("tool_version") if isinstance(runtime, dict) else None
-    workspace_sha = sha256_file(paths["tool_path"])
     canonical_sha = sha256_file(canonical_path)
-
     if canonical_sha is None:
         raise RetrieverError(f"Canonical tool not readable at {canonical_path}")
 
-    if workspace_sha == canonical_sha:
-        if isinstance(runtime, dict):
-            return {
-                "status": "no-op",
-                "reason": "already current",
-                "canonical_sha256": canonical_sha,
-                "canonical_path": str(canonical_path),
-                "tool_path": str(paths["tool_path"]),
-                "workspace_tool_version": runtime_version,
-                "canonical_tool_version": TOOL_VERSION,
-            }
+    write_runtime(paths, canonical_sha)
 
-        write_runtime(paths, canonical_sha)
-        meta_updated = False
-        meta_error: str | None = None
-        try:
-            connection = connect_db(paths["db_path"])
-            try:
-                write_workspace_meta(connection, canonical_sha)
-                meta_updated = True
-            finally:
-                connection.close()
-        except Exception as exc:  # pragma: no cover - best-effort path
-            meta_error = f"{type(exc).__name__}: {exc}"
-        result = {
-            "status": "repaired-runtime",
-            "reason": reason,
-            "force": force,
-            "was_user_modified": False,
-            "previous_tool_sha256": workspace_sha,
-            "previous_tool_version": runtime_version,
-            "new_tool_sha256": canonical_sha,
-            "new_tool_version": TOOL_VERSION,
-            "canonical_path": str(canonical_path),
-            "tool_path": str(paths["tool_path"]),
-            "backup_path": None,
-            "workspace_meta_updated": meta_updated,
-        }
-        if meta_error is not None:
-            result["workspace_meta_error"] = meta_error
-        return result
-
-    user_modified = (
-        workspace_sha is not None
-        and runtime_sha is not None
-        and workspace_sha != runtime_sha
-    )
-    if user_modified and not force:
-        raise RetrieverError(
-            "Workspace tool has been modified in place "
-            f"(workspace sha {workspace_sha}, runtime sha {runtime_sha}). "
-            "Re-run `workspace update <workspace> --force` to overwrite the modified tool."
-        )
-
-    backup_path: Path | None = None
-    if paths["tool_path"].exists():
-        paths["backups_dir"].mkdir(parents=True, exist_ok=True)
-        backup_path = paths["backups_dir"] / _upgrade_backup_name(runtime_version, user_modified)
-        backup_path.write_bytes(paths["tool_path"].read_bytes())
-
-    paths["bin_dir"].mkdir(parents=True, exist_ok=True)
-    paths["tool_path"].write_bytes(canonical_path.read_bytes())
-
-    new_sha = sha256_file(paths["tool_path"])
-    write_runtime(paths, new_sha)
-
-    # Best-effort: keep workspace_meta in sync. If the database is missing
-    # or unreadable we leave it to the next workspace init/status run rather
-    # than failing the upgrade.
     meta_updated = False
     meta_error: str | None = None
     try:
         connection = connect_db(paths["db_path"])
         try:
-            write_workspace_meta(connection, new_sha)
+            write_workspace_meta(connection, canonical_sha)
             meta_updated = True
         finally:
             connection.close()
@@ -2055,17 +1968,13 @@ def upgrade_workspace_tool(
         meta_error = f"{type(exc).__name__}: {exc}"
 
     result: dict[str, object] = {
-        "status": "upgraded",
+        "status": "no-op" if runtime_sha == canonical_sha else "updated-runtime",
         "reason": reason,
-        "force": force,
-        "was_user_modified": user_modified,
-        "previous_tool_sha256": workspace_sha,
+        "previous_tool_sha256": runtime_sha,
         "previous_tool_version": runtime_version,
-        "new_tool_sha256": new_sha,
+        "new_tool_sha256": canonical_sha,
         "new_tool_version": TOOL_VERSION,
         "canonical_path": str(canonical_path),
-        "tool_path": str(paths["tool_path"]),
-        "backup_path": str(backup_path) if backup_path else None,
         "workspace_meta_updated": meta_updated,
     }
     if meta_error is not None:
@@ -2074,80 +1983,23 @@ def upgrade_workspace_tool(
 
 
 def maybe_upgrade_workspace_tool(root: Path) -> dict[str, object] | None:
-    """Auto-upgrade the workspace tool if it is cleanly stale.
-
-    Returns ``None`` when no action is needed or the situation is ambiguous.
-    Returns a result dict when an upgrade was performed OR explicitly
-    blocked because the workspace tool looks user-modified.
-
-    Rules:
-
-    * No ``.retriever`` directory, no runtime, or no workspace tool -> no-op.
-    * Cannot locate a canonical plugin copy -> no-op (e.g., workspace
-      was copied to a machine without the plugin source).
-    * Workspace tool sha already matches canonical -> no-op.
-    * Workspace tool sha matches ``runtime.template_sha256`` but differs
-      from canonical -> clean-but-stale, upgrade in place.
-    * Workspace tool sha differs from ``runtime.template_sha256`` ->
-      user modified, refuse and return a block result.
-    """
+    """Best-effort runtime metadata refresh for a workspace."""
     paths = workspace_paths(root)
     if not paths["state_dir"].exists():
-        return None
-    if not paths["tool_path"].exists():
         return None
     runtime = read_runtime(paths["runtime_path"])
     if not isinstance(runtime, dict):
         return None
 
-    canonical_path = locate_canonical_plugin_tool()
+    canonical_path = locate_canonical_plugin_tool_or_self()
     if canonical_path is None:
         return None
-
-    workspace_sha = sha256_file(paths["tool_path"])
     canonical_sha = sha256_file(canonical_path)
-    if workspace_sha is None or canonical_sha is None:
+    if canonical_sha is None:
         return None
-    if workspace_sha == canonical_sha:
+    if runtime.get("template_sha256") == canonical_sha and runtime.get("template_source") == TEMPLATE_SOURCE:
         return None
-
-    recorded_sha = runtime.get("template_sha256")
-    runtime_version = runtime.get("tool_version")
-
-    if recorded_sha and workspace_sha != recorded_sha:
-        return {
-            "status": "blocked",
-            "reason": "workspace tool has been modified in place",
-            "workspace_tool_sha256": workspace_sha,
-            "workspace_runtime_sha256": recorded_sha,
-            "canonical_sha256": canonical_sha,
-            "canonical_path": str(canonical_path),
-            "workspace_tool_version": runtime_version,
-            "canonical_tool_version": TOOL_VERSION,
-            "hint": (
-                "Run `workspace update <workspace> --force` to overwrite "
-                "the modified tool, or revert your local edits."
-            ),
-        }
-
-    try:
-        return upgrade_workspace_tool(
-            root,
-            canonical_path,
-            force=False,
-            reason="auto-stale",
-        )
-    except RetrieverError as exc:
-        return {
-            "status": "error",
-            "reason": "auto-upgrade failed",
-            "detail": str(exc),
-            "canonical_path": str(canonical_path),
-            "canonical_sha256": canonical_sha,
-            "workspace_tool_sha256": workspace_sha,
-            "workspace_tool_version": runtime_version,
-            "canonical_tool_version": TOOL_VERSION,
-        }
+    return upgrade_workspace_tool(root, canonical_path, reason="auto-runtime-sync")
 
 
 def init_workspace(root: Path, quick: bool = False) -> dict[str, object]:
@@ -2156,7 +2008,7 @@ def init_workspace(root: Path, quick: bool = False) -> dict[str, object]:
     canonical_path = locate_canonical_plugin_tool_or_self()
 
     if canonical_path is not None:
-        if not paths["tool_path"].exists() or not paths["runtime_path"].exists():
+        if not paths["runtime_path"].exists():
             tool_update = upgrade_workspace_tool(
                 root,
                 canonical_path,
@@ -2166,22 +2018,7 @@ def init_workspace(root: Path, quick: bool = False) -> dict[str, object]:
         else:
             maybe_update = maybe_upgrade_workspace_tool(root)
             if maybe_update is not None:
-                if maybe_update.get("status") == "blocked":
-                    raise RetrieverError(
-                        "Workspace tool has been modified in place "
-                        f"(workspace sha {maybe_update.get('workspace_tool_sha256')}, "
-                        f"runtime sha {maybe_update.get('workspace_runtime_sha256')}). "
-                        "Run `workspace update <workspace> --force` to overwrite the modified tool."
-                    )
-                if maybe_update.get("status") == "error":
-                    raise RetrieverError(str(maybe_update.get("detail") or "Workspace update failed."))
                 tool_update = maybe_update
-    elif not paths["tool_path"].exists():
-        raise RetrieverError(
-            "Could not auto-discover the canonical retriever_tools.py. "
-            "Run this command from the plugin source checkout, or use "
-            "`workspace update <workspace> --from <path>` first."
-        )
 
     initialization_payload = bootstrap(root)
     result: dict[str, object] = {

@@ -50,14 +50,14 @@ Additional conversation-fixture gaps still open:
 
 ## Corpus Diff
 
-Use [ingest_corpus_diff.py](../ingest_corpus_diff.py) to run two `retriever_tools.py` builds against the same fixed corpus and compare normalized ingest state.
+Use [ingest_corpus_diff.py](../ingest_corpus_diff.py) to run two `tools.py` builds against the same fixed corpus and compare normalized ingest state.
 
 Example:
 
 ```bash
 python3 phase0/ingest_corpus_diff.py \
-  --baseline-tool /path/to/baseline/skills/tool-template/retriever_tools.py \
-  --candidate-tool /path/to/candidate/skills/tool-template/retriever_tools.py
+  --baseline-tool /path/to/baseline/skills/tool-template/tools.py \
+  --candidate-tool /path/to/candidate/skills/tool-template/tools.py
 ```
 
 By default the script:

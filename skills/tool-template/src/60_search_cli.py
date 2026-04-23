@@ -9082,7 +9082,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     workspace_init_parser = workspace_subparsers.add_parser(
         "init",
-        help="Materialize the workspace tool and initialize or repair schema state",
+        help="Initialize or repair workspace schema state and runtime metadata",
     )
     workspace_init_parser.add_argument("workspace", help="Workspace root path")
     workspace_init_parser.add_argument(
@@ -9093,7 +9093,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     workspace_status_parser = workspace_subparsers.add_parser(
         "status",
-        help="Check runtime and workspace readiness without auto-upgrading the tool",
+        help="Check runtime and workspace readiness without refreshing runtime metadata",
     )
     workspace_status_parser.add_argument("workspace", help="Workspace root path")
     workspace_status_parser.add_argument(
@@ -9104,19 +9104,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     workspace_update_parser = workspace_subparsers.add_parser(
         "update",
-        help="Replace the workspace's retriever_tools.py with the canonical plugin copy",
+        help="Refresh workspace runtime metadata from the canonical tools.py bundle",
     )
     workspace_update_parser.add_argument("workspace", help="Workspace root path")
     workspace_update_parser.add_argument(
         "--from",
         dest="canonical_source",
         default=None,
-        help="Path to the canonical retriever_tools.py (defaults to auto-discovery)",
+        help="Path to the canonical tools.py bundle (defaults to auto-discovery)",
     )
     workspace_update_parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite the workspace tool even when it differs from runtime.json",
+        help="Ignored compatibility flag retained for older callers",
     )
 
     ingest_parser = subparsers.add_parser("ingest", help="Index documents in the workspace")
@@ -9782,13 +9782,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _auto_upgrade_and_maybe_reexec(root: Path, command: str) -> None:
-    """Auto-upgrade the workspace tool if it is cleanly stale.
-
-    Writes one ``retriever-auto-upgrade: <json>`` line to stderr describing
-    the outcome. When an upgrade actually happened, re-exec the freshly
-    installed workspace tool so it handles the current command with its
-    own code (not the currently-running, now-replaced image).
-    """
+    """Best-effort runtime metadata refresh for older workspaces."""
     if command in AUTO_UPGRADE_EXEMPT_COMMANDS:
         return
     result = maybe_upgrade_workspace_tool(root)
@@ -9796,33 +9790,11 @@ def _auto_upgrade_and_maybe_reexec(root: Path, command: str) -> None:
         return
     try:
         print(
-            "retriever-auto-upgrade: " + json.dumps(result, sort_keys=True),
+            "retriever-runtime-sync: " + json.dumps(result, sort_keys=True),
             file=sys.stderr,
         )
     except Exception:  # pragma: no cover - never fail dispatch over logging
         pass
-
-    if result.get("status") != "upgraded":
-        return
-
-    tool_path = result.get("tool_path")
-    if not tool_path:
-        return
-    tool_path_obj = Path(str(tool_path))
-
-    env = os.environ.copy()
-    env["RETRIEVER_AUTO_UPGRADE_REEXEC"] = "1"
-    try:
-        # Re-exec even when the upgraded tool path matches ``__file__``.
-        # The file was replaced in place, but the current interpreter image
-        # is still executing the old code until a new process starts.
-        os.execve(sys.executable, [sys.executable, str(tool_path_obj), *sys.argv[1:]], env)
-    except OSError as exc:
-        print(
-            "retriever-auto-upgrade-reexec-failed: "
-            + json.dumps({"error": f"{type(exc).__name__}: {exc}"}, sort_keys=True),
-            file=sys.stderr,
-        )
 
 
 def main() -> int:
@@ -9861,7 +9833,7 @@ def main() -> int:
                     canonical_path = locate_canonical_plugin_tool_or_self()
                 if canonical_path is None:
                     raise RetrieverError(
-                        "Could not auto-discover the canonical retriever_tools.py. "
+                        "Could not auto-discover the canonical tools.py bundle. "
                         "Pass --from <path> or set RETRIEVER_CANONICAL_TOOL_PATH."
                     )
                 update_payload = upgrade_workspace_tool(

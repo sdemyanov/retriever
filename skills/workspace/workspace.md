@@ -1,8 +1,8 @@
-# Workspace Initialization Contract
+# Workspace Bootstrap Contract
 
 ## Purpose
 
-This file defines how Retriever initializes and maintains a workspace-local installation.
+This file defines how Retriever initializes and maintains workspace-local state.
 
 Retriever is local-first:
 
@@ -18,9 +18,6 @@ Create this structure under the selected workspace root:
 .retriever/
 ├── retriever.db
 ├── previews/
-├── bin/
-│   ├── retriever_tools.py
-│   └── backups/
 ├── jobs/
 ├── logs/
 └── runtime.json
@@ -30,103 +27,52 @@ Create this structure under the selected workspace root:
 
 - `retriever.db`: primary SQLite database
 - `previews/`: generated preview artifacts for unsupported native formats
-- `bin/retriever_tools.py`: workspace-local tool copy
-- `bin/backups/`: preserved copies of previously materialized tool versions
 - `jobs/`: reserved workspace state for future bounded or background workflows
 - `logs/`: structured logs and diagnostics
 - `runtime.json`: local installation metadata
 
-## First-run initialization
+## First-run bootstrap
 
 Follow this order:
 
 1. Confirm the workspace root.
-2. Run `workspace status`.
+2. Run the runtime check.
 3. Create the `.retriever/` directory tree.
 4. Install pinned dependencies from [requirements.lock.md](requirements.lock.md), including the required PST backend.
-5. Materialize `retriever_tools.py` from the canonical template in [../tool-template/tool-template.md](../tool-template/tool-template.md).
-6. Run `workspace init` to create or upgrade schema v9.
+5. Resolve the canonical [../tool-template/tools.py](../tool-template/tools.py) bundle that will manage the workspace.
+6. Run the tool's `bootstrap` command to create or upgrade schema v9.
 7. Write `runtime.json`.
 
 ## Subsequent sessions
 
 On every later session:
 
-1. Run `workspace status --quick`.
+1. Run a quick runtime check.
 2. Inspect `.retriever/runtime.json` if present.
-3. Confirm the tool exists at `.retriever/bin/retriever_tools.py`.
-4. Compare the current tool checksum to the stored checksum.
-5. Compare the installed plugin's canonical template checksum to `runtime.json.template_sha256`.
-6. Reuse the existing tool only when the workspace checksum matches `runtime.json` and the canonical template checksum still matches the current workspace tool checksum.
-7. If the canonical template checksum changed, treat that as an upgrade signal even when the plugin version string did not change.
-8. The workspace tool's own dispatcher performs the auto-upgrade on the next non-exempt command (see below), so the runner does not need an out-of-band upgrade step before `ingest` or reindex; running any ordinary command from a stale-but-clean workspace will upgrade it and re-exec the command transparently.
+3. Confirm the canonical tool exists at `skills/tool-template/tools.py`.
+4. Compare the current canonical tool checksum to the stored checksum in `runtime.json.template_sha256`.
+5. If the canonical template checksum changed, treat that as a runtime refresh signal even when the plugin version string did not change.
+6. The canonical tool refreshes `runtime.json` / `workspace_meta` on the next non-exempt command when the recorded checksum is stale.
 
-## Upgrade rules
+## Runtime refresh rules
 
-Treat the workspace tool as plugin-managed but user-modifiable.
+Retriever now runs the canonical [../tool-template/tools.py](../tool-template/tools.py) bundle directly instead of copying a tool snapshot into each workspace.
 
 A reinstall with a changed canonical template is still an upgrade, even if the plugin version string stayed the same.
 
-The workspace tool enforces these rules itself on every non-exempt command. The runner is still free to call `workspace update` explicitly; the auto-upgrade path just removes the need to remember to do it.
+Before executing any command other than `schema-version`, `bootstrap`, `doctor`, `upgrade-workspace`, or `slash`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper. That helper no longer replaces files inside the workspace. It only refreshes `runtime.json` / `workspace_meta` when:
 
-### Ingest command preflight
+- `.retriever/` exists
+- `runtime.json` exists
+- the canonical `skills/tool-template/tools.py` bundle can be located
+- the recorded checksum differs from the current canonical bundle checksum
 
-Use this as the shared preflight contract for runners that are about to call `ingest` or `ingest-production`.
+### Explicit runtime refresh command
 
-- Confirm or infer the workspace root first, and run `workspace status --quick` if runtime state is unclear.
-- If `.retriever/bin/retriever_tools.py` or `.retriever/runtime.json` is missing, materialize the canonical workspace tool and run `workspace init` before continuing.
-- Otherwise, run the intended workspace-local command through the existing workspace tool and rely on the dispatcher's auto-upgrade path for clean-but-stale copies.
-- If the dispatcher reports `retriever-auto-upgrade: {"status": "blocked", ...}` because the workspace tool is user-modified, stop and ask before `workspace update --force`.
-- After `workspace init` or an explicit forced update, resume the original intended command. Do not swap `ingest` for `ingest-production`, or vice versa, just because the workspace tool was refreshed.
+`tools.py upgrade-workspace <workspace> [--from <path>] [--force]`
 
-### Auto-upgrade dispatch hook
-
-Before executing any command other than `schema-version` or `workspace`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper. This includes user-facing slash commands such as `/dataset list` and `/search`.
-
-The helper:
-
-- no-ops when `.retriever/` is absent, when `runtime.json` is missing, when the workspace tool is missing, or when the plugin's canonical copy cannot be located (e.g., on a portable workspace without the plugin installed)
-- finds the plugin's canonical `skills/tool-template/retriever_tools.py` via the `RETRIEVER_CANONICAL_TOOL_PATH` environment variable, then by walking the parents of the currently running tool
-- compares workspace sha vs. canonical sha; if equal, no-op
-- if the workspace sha equals `runtime.template_sha256` (clean-but-stale), upgrades in place: backs up the old copy to `bin/backups/`, replaces the tool via `pathlib.Path.write_bytes` (open-with-O_TRUNC, so no `unlink` in Cowork sandboxes), re-runs `write_runtime` / `write_workspace_meta`, and re-execs the new tool so the current command is handled by the new code
-- if the workspace sha differs from `runtime.template_sha256` (user-modified), refuses to touch the file, writes a `retriever-auto-upgrade: {"status": "blocked", ...}` line to stderr, and lets the current command continue to run from the user's modified tool
-- emits a single `retriever-auto-upgrade: <json>` line to stderr describing the outcome so automation can observe it without polluting the JSON payload on stdout
-
-### Explicit update command
-
-`retriever_tools.py workspace update <workspace> [--from <path>] [--force]`
-
-- default is to auto-discover the canonical tool the same way the auto path does
-- `--force` is required to overwrite a user-modified workspace tool (it adds a `.user-modified` suffix to the backup name so the edit is recoverable)
-
-### Unmodified tool
-
-If:
-
-- the tool file exists
-- the checksum matches `runtime.json`
-- the canonical template checksum differs
-
-Then the dispatcher auto-upgrades:
-
-- back up the old copy to `bin/backups/`
-- replace it with the canonical template via open-with-O_TRUNC (no `rm`, no `mv`)
-- re-run `write_runtime` / `write_workspace_meta`
-- re-exec the command in the new tool
-
-### Modified tool
-
-If:
-
-- the tool file exists
-- the checksum does not match `runtime.json`
-
-Then:
-
-- the dispatcher refuses to replace it
-- it emits a `retriever-auto-upgrade: {"status": "blocked", ...}` warning on stderr
-- the current command still runs (from the user's modified copy)
-- an explicit `workspace update --force` is the documented recovery path
+- default is to auto-discover the canonical tool
+- `--force` is accepted for backward compatibility but ignored
 
 ## runtime.json contract
 
@@ -137,8 +83,8 @@ Write a JSON object with these fields:
   "tool_version": "0.9.4",
   "schema_version": 9,
   "requirements_version": "2026-04-16-phase4-pst",
-  "template_source": "skills/tool-template/retriever_tools.py",
-  "template_sha256": "<sha256 of workspace tool file>",
+  "template_source": "skills/tool-template/tools.py",
+  "template_sha256": "<sha256 of canonical tools.py bundle>",
   "python_version": "3.10.12",
   "generated_at": "2026-04-14T00:00:00Z",
   "last_verified_at": "2026-04-14T00:00:00Z"
@@ -147,16 +93,16 @@ Write a JSON object with these fields:
 
 Notes:
 
-- `template_sha256` should reflect the materialized workspace copy
+- `template_sha256` should reflect the canonical `tools.py` bundle used most recently for the workspace
 - timestamps must be UTC ISO 8601 with `Z`
 - `schema_version` tracks the actual database schema, not the plugin version
-- a successful `workspace init` does not require loading optional parser backends up front; `workspace status` should probe `pst_backend` explicitly while ordinary non-PST commands remain ready
+- a successful workspace bootstrap implies the pinned PST backend imports cleanly; `doctor` should fail until `pst_backend.status` is `pass`
 - for future schema changes with real migration vs. reindex tradeoffs, stop and ask the user before assuming migration is preferred
 - schema v7 renames `display_id` to `control_number`, renames the related helper columns and batch table, and keeps one-level email attachment families; existing workspaces should reindex parent emails to populate child attachment rows and preserve family numbering
 
 ## Failure behavior
 
-If `workspace init` cannot complete:
+If bootstrap cannot complete:
 
 - do not leave a half-written `runtime.json` claiming success
 - preserve any valid files already created

@@ -55,13 +55,7 @@ ping_skill_path.write_text(ping_text, encoding="utf-8")' \
 
 python3 skills/tool-template/bundle_retriever_tools.py
 
-python3 generate_routing_reference.py
-
-# Diagnostic: allow excluding specific skills from the archive via env var,
-# e.g. RETRIEVER_EXCLUDE_SKILLS=foo,bar
-
-
-TOOL_PATH="skills/tool-template/retriever_tools.py"
+TOOL_PATH="skills/tool-template/tools.py"
 DOC_PATH="skills/tool-template/tool-template.md"
 
 # Compute the bundled-tool checksum and splice it into tool-template.md in
@@ -90,13 +84,10 @@ doc_path.write_text(new_text, encoding="utf-8")' \
 # Build the plugin zip in place. zipfile opens the destination with O_TRUNC,
 # which does not require file-deletion permissions the way `rm -f` does, so
 # rebuilds work in Cowork without granting allow_cowork_file_delete first.
-python3 -c 'import os, pathlib, zipfile
+python3 -c 'import pathlib, zipfile
 
 out = pathlib.Path("retriever.plugin")
 include_roots = [".claude-plugin", "skills"]
-excluded_skills = set(filter(None, os.environ.get("RETRIEVER_EXCLUDE_SKILLS", "").split(",")))
-if excluded_skills:
-    print("Excluding skills: " + ", ".join(sorted(excluded_skills)))
 
 
 def should_skip(path: pathlib.Path) -> bool:
@@ -106,25 +97,6 @@ def should_skip(path: pathlib.Path) -> bool:
     return name == ".DS_Store" or name.endswith(".pyc")
 
 
-def is_empty_skill_dir(path: pathlib.Path) -> bool:
-    # Skill subdirectories under skills/ must contain a SKILL.md. Empty
-    # leftover directories (e.g. from renames) would otherwise ship as
-    # invalid skills and fail plugin validation.
-    if not path.is_dir():
-        return False
-    parts = path.parts
-    if len(parts) != 2 or parts[0] != "skills":
-        return False
-    return not (path / "SKILL.md").exists()
-
-
-def is_excluded_skill_path(path: pathlib.Path) -> bool:
-    if not excluded_skills:
-        return False
-    parts = path.parts
-    return len(parts) >= 2 and parts[0] == "skills" and parts[1] in excluded_skills
-
-
 added = 0
 with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
     for base in include_roots:
@@ -132,17 +104,8 @@ with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         if not base_path.exists():
             raise SystemExit("Missing required source directory: " + base)
         zf.writestr(zipfile.ZipInfo(base + "/"), "")
-        skipped_skills = []
         for path in sorted(base_path.rglob("*")):
             if should_skip(path):
-                continue
-            if is_empty_skill_dir(path):
-                skipped_skills.append(path.name)
-                continue
-            if is_excluded_skill_path(path):
-                continue
-            # Skip anything nested under an empty skill dir.
-            if any(is_empty_skill_dir(pathlib.Path(*path.parts[:i+1])) for i in range(len(path.parts))):
                 continue
             arcname = str(path)
             if path.is_dir():
@@ -150,8 +113,6 @@ with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             else:
                 zf.write(path, arcname=arcname)
                 added += 1
-        if skipped_skills:
-            print("Skipped empty skill dirs: " + ", ".join(skipped_skills))
 print("Packed " + str(added) + " files into " + str(out))'
 
 echo "Updated tool-template checksum to $TOOL_SHA"

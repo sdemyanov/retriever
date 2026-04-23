@@ -34,7 +34,7 @@ def bundle_source(fragment_dir: Path) -> str:
 def main() -> int:
     tool_dir = Path(__file__).parent
     fragment_dir = tool_dir / "src"
-    target_path = tool_dir / "retriever_tools.py"
+    target_path = tool_dir / "tools.py"
     bundled = bundle_source(fragment_dir)
     current = target_path.read_text(encoding="utf-8") if target_path.exists() else None
     if bundled != current:

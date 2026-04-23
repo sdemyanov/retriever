@@ -9,7 +9,7 @@ metadata:
   version: "0.17.3"
 ---
 
-> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
 
 # Retriever /dataset
 
@@ -21,12 +21,12 @@ For the exact read-only forms `/dataset` and `/dataset list`:
 
 - Do not read [../search/SKILL.md](../search/SKILL.md).
 - Do not read schema docs.
-- Use the canonical plugin tool at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py), not `.retriever/bin/retriever_tools.py`, for these read-only forms. Older workspace-local tools may still exempt `slash` from auto-upgrade and keep rendering stale output.
+- Use the canonical plugin tool at [../tool-template/tools.py](../tool-template/tools.py) for these read-only forms.
 - Run exactly one Bash command from the workspace root:
-  - `/dataset`: `python3 <resolved path to ../tool-template/retriever_tools.py> slash . /dataset`
-  - `/dataset list`: `python3 <resolved path to ../tool-template/retriever_tools.py> slash . /dataset list`
-- `/dataset list` renders a dataset stats table with `Dataset`, `Docs`, `Size`, `Custodians`, `Types`, and `Time Range` columns.
-- Only if the canonical plugin tool path is unavailable, fall back once to `.retriever/bin/retriever_tools.py`.
+  - `/dataset`: `python3 <resolved path to ../tool-template/tools.py> slash . /dataset`
+  - `/dataset list`: `python3 <resolved path to ../tool-template/tools.py> slash . /dataset list`
+- `/dataset list` renders a dataset stats table with `Dataset`, `Docs`, `Size`, and `Custodians` columns.
+- Do not fall back to a workspace-local tool copy.
 - Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
 
 ## Other forms

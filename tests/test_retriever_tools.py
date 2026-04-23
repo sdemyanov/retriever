@@ -27,7 +27,7 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "retriever_tools.py"
+TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "tools.py"
 BUNDLER_PATH = REPO_ROOT / "skills" / "tool-template" / "bundle_retriever_tools.py"
 TOOL_TEMPLATE_PATH = REPO_ROOT / "skills" / "tool-template" / "tool-template.md"
 SOURCE_HEADER_PATH = REPO_ROOT / "skills" / "tool-template" / "src" / "00_header.py"
@@ -103,7 +103,7 @@ def assert_bundled_tooling_current() -> None:
     current_text = TOOL_PATH.read_text(encoding="utf-8")
     if current_text != expected_text:
         raise AssertionError(
-            "Generated retriever_tools.py is stale relative to skills/tool-template/src. "
+            "Generated tools.py is stale relative to skills/tool-template/src. "
             "Run ./build.sh to regenerate the bundle and checksum before running tests."
         )
 
@@ -167,10 +167,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.root = Path(self.tempdir.name)
         self.paths = retriever_tools.workspace_paths(self.root)
         retriever_tools.ensure_layout(self.paths)
-        self.materialize_workspace_tool()
-
-    def materialize_workspace_tool(self) -> None:
-        self.paths["tool_path"].write_bytes(TOOL_BYTES)
 
     def run_cli(self, *args: str) -> tuple[int, dict[str, object] | None, str, str]:
         stdout = io.StringIO()
@@ -178,7 +174,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         with (
             redirect_stdout(stdout),
             redirect_stderr(stderr),
-            mock.patch.object(retriever_tools.sys, "argv", ["retriever_tools.py", *args]),
+            mock.patch.object(retriever_tools.sys, "argv", ["tools.py", *args]),
         ):
             exit_code = retriever_tools.main()
         stdout_text = stdout.getvalue().strip()
@@ -197,7 +193,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         with (
             redirect_stdout(stdout),
             redirect_stderr(stderr),
-            mock.patch.object(retriever_tools.sys, "argv", ["retriever_tools.py", *args]),
+            mock.patch.object(retriever_tools.sys, "argv", ["tools.py", *args]),
         ):
             exit_code = retriever_tools.main()
         return exit_code, stdout.getvalue().strip(), stderr.getvalue().strip()
@@ -1243,7 +1239,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         runtime = json.loads(self.paths["runtime_path"].read_text(encoding="utf-8"))
         self.assertEqual(runtime["tool_version"], retriever_tools.TOOL_VERSION)
         self.assertEqual(runtime["schema_version"], retriever_tools.SCHEMA_VERSION)
-        self.assertEqual(runtime["template_sha256"], retriever_tools.sha256_file(self.paths["tool_path"]))
+        self.assertEqual(runtime["template_sha256"], retriever_tools.sha256_file(TOOL_PATH))
 
     def test_bootstrap_initializes_processing_schema_and_job_crud(self) -> None:
         result = retriever_tools.bootstrap(self.root)
@@ -1546,7 +1542,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["status"], "ready")
         self.assertEqual(payload["initialization"]["status"], "initialized")
         self.assertEqual(payload["status_report"]["workspace"]["state"], "initialized")
-        self.assertEqual(payload["tool_update"]["status"], "repaired-runtime")
+        self.assertEqual(payload["tool_update"]["status"], "updated-runtime")
         self.assertTrue(self.paths["runtime_path"].exists())
 
     def test_ingest_seeds_text_revisions_and_create_run_freezes_family_snapshot(self) -> None:
@@ -7484,65 +7480,36 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             dataset_list_stdout,
         )
 
-    def test_slash_list_commands_auto_upgrade_clean_but_stale_workspace_tool(self) -> None:
+    def test_slash_list_commands_auto_refresh_stale_workspace_runtime_metadata(self) -> None:
         retriever_tools.bootstrap(self.root)
 
-        stale_tool_bytes = TOOL_BYTES + b"\n# clean-but-stale test workspace copy\n"
-        stale_sha = hashlib.sha256(stale_tool_bytes).hexdigest()
-        self.paths["tool_path"].write_bytes(stale_tool_bytes)
-
         runtime = json.loads(self.paths["runtime_path"].read_text(encoding="utf-8"))
-        runtime["template_sha256"] = stale_sha
+        runtime["template_sha256"] = "0" * 64
         runtime["tool_version"] = "0.0-test-stale"
+        runtime["template_source"] = "skills/tool-template/retriever_tools.py"
         self.paths["runtime_path"].write_text(
             json.dumps(runtime, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
 
-        workspace_tool = load_python_module(
-            self.paths["tool_path"],
-            "retriever_tools_workspace_stale_under_test",
+        dataset_list_exit, dataset_list_stdout, dataset_list_stderr = self.run_cli_raw(
+            "slash",
+            str(self.root),
+            "/dataset",
+            "list",
         )
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with (
-            redirect_stdout(stdout),
-            redirect_stderr(stderr),
-            mock.patch.object(
-                workspace_tool.sys,
-                "argv",
-                ["retriever_tools.py", "slash", str(self.root), "/dataset", "list"],
-            ),
-            mock.patch.object(workspace_tool.os, "execve", return_value=None) as execve_mock,
-            mock.patch.dict(
-                workspace_tool.os.environ,
-                {"RETRIEVER_CANONICAL_TOOL_PATH": str(TOOL_PATH)},
-                clear=False,
-            ),
-        ):
-            dataset_list_exit = workspace_tool.main()
-        dataset_list_stdout = stdout.getvalue().strip()
-        dataset_list_stderr = stderr.getvalue().strip()
 
         self.assertEqual(dataset_list_exit, 0)
         self.assertIn("Datasets:", dataset_list_stdout)
-        self.assertTrue(dataset_list_stderr.startswith("retriever-auto-upgrade: "))
-        auto_upgrade_payload = json.loads(dataset_list_stderr.removeprefix("retriever-auto-upgrade: "))
-        self.assertEqual(auto_upgrade_payload["status"], "upgraded")
-        self.assertEqual(auto_upgrade_payload["reason"], "auto-stale")
-        self.assertEqual(retriever_tools.sha256_file(self.paths["tool_path"]), hashlib.sha256(TOOL_BYTES).hexdigest())
+        self.assertTrue(dataset_list_stderr.startswith("retriever-runtime-sync: "))
+        runtime_sync_payload = json.loads(dataset_list_stderr.removeprefix("retriever-runtime-sync: "))
+        self.assertEqual(runtime_sync_payload["status"], "updated-runtime")
+        self.assertEqual(runtime_sync_payload["reason"], "auto-runtime-sync")
 
         refreshed_runtime = json.loads(self.paths["runtime_path"].read_text(encoding="utf-8"))
         self.assertEqual(refreshed_runtime["tool_version"], retriever_tools.TOOL_VERSION)
         self.assertEqual(refreshed_runtime["template_sha256"], hashlib.sha256(TOOL_BYTES).hexdigest())
-
-        execve_mock.assert_called_once()
-        execve_executable, execve_argv, execve_env = execve_mock.call_args.args
-        self.assertEqual(execve_executable, retriever_tools.sys.executable)
-        self.assertEqual(execve_argv[0], retriever_tools.sys.executable)
-        self.assertEqual(Path(execve_argv[1]).resolve(), self.paths["tool_path"].resolve())
-        self.assertEqual(execve_argv[2:], ["slash", str(self.root), "/dataset", "list"])
-        self.assertEqual(execve_env["RETRIEVER_AUTO_UPGRADE_REEXEC"], "1")
+        self.assertEqual(refreshed_runtime["template_source"], retriever_tools.TEMPLATE_SOURCE)
 
     def test_slash_bates_within_intersects_ranges_and_rejects_cross_slot_and_mixed_prefix(self) -> None:
         retriever_tools.bootstrap(self.root)
@@ -11108,8 +11075,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             shutil.copytree(production_root, auto_root / production_root.name)
             auto_paths = retriever_tools.workspace_paths(auto_root)
             retriever_tools.ensure_layout(auto_paths)
-            auto_paths["tool_path"].write_bytes(TOOL_BYTES)
-
             retriever_tools.bootstrap(auto_root)
             auto_result = retriever_tools.ingest(auto_root, recursive=True, raw_file_types=None)
             auto_documents, auto_source_parts = production_snapshot(auto_root)
