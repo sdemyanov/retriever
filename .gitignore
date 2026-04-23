@@ -6,6 +6,7 @@ __pycache__/
 /plans/
 /backups/
 /test-marketplace/plugins/
+/.retriever/
 /.retriever-plugin-runtime/
 /skills/tool-template/retriever_tools.py
 /retriever.plugin
