@@ -7,7 +7,11 @@
 - requirements version: `2026-04-20-phase10-conversations-and-export-previews`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `6d210e7f4284ea71218241df73fae2042a9a4e206b2bc098f9a0add830cdb23c`
+<<<<<<< HEAD
+- source checksum (SHA256): `adaa4c48fef584791430c9c964bb0eaa42c5b9ffbebde0af0d0f74816a51009b`
+=======
+- source checksum (SHA256): `362d415ce8ed65d1a7abef427230bad2240568d1c7428bda93043fb5cca472fa`
+>>>>>>> 31fb22d (Shrink TIFF production preview payloads)
 
 ## Current command surface
 
