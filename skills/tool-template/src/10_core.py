@@ -3774,6 +3774,390 @@ def extract_email_chain_participants(
     return ", ".join(participants) or None
 
 
+ICALENDAR_FILE_TYPES = {"ics", "ifb", "vcal", "vcs"}
+ICALENDAR_URL_PATTERN = re.compile(r"https?://[^\s<>'\"]+")
+
+
+def unfold_icalendar_lines(text: str) -> list[str]:
+    unfolded: list[str] = []
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw_line.startswith((" ", "\t")) and unfolded:
+            unfolded[-1] += raw_line[1:]
+        else:
+            unfolded.append(raw_line)
+    return unfolded
+
+
+def split_icalendar_property_line(line: str) -> tuple[str, str] | None:
+    in_quotes = False
+    escaped = False
+    for index, char in enumerate(line):
+        if char == '"' and not escaped:
+            in_quotes = not in_quotes
+        elif char == ":" and not in_quotes:
+            return line[:index], line[index + 1 :]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+    return None
+
+
+def split_icalendar_parameter_values(raw_value: str) -> list[str]:
+    values: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    escaped = False
+    for char in raw_value:
+        if char == '"' and not escaped:
+            in_quotes = not in_quotes
+            current.append(char)
+        elif char == "," and not in_quotes:
+            values.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+    values.append("".join(current))
+    return values
+
+
+def unescape_icalendar_text(value: object) -> str | None:
+    normalized = str(value or "")
+    if not normalized:
+        return None
+    return (
+        normalized
+        .replace("\\N", "\n")
+        .replace("\\n", "\n")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .replace("\\\\", "\\")
+    ) or None
+
+
+def parse_icalendar_parameters(raw_segments: list[str]) -> dict[str, list[str]]:
+    parameters: dict[str, list[str]] = {}
+    for raw_segment in raw_segments:
+        if "=" not in raw_segment:
+            continue
+        raw_key, raw_value = raw_segment.split("=", 1)
+        key = normalize_whitespace(raw_key).upper()
+        if not key:
+            continue
+        values = [
+            normalize_whitespace(str(unescape_icalendar_text(part.strip().strip('"')) or ""))
+            for part in split_icalendar_parameter_values(raw_value)
+        ]
+        values = [value for value in values if value]
+        if values:
+            parameters[key] = values
+    return parameters
+
+
+def parse_icalendar_property_line(line: str) -> dict[str, object] | None:
+    split_line = split_icalendar_property_line(line)
+    if split_line is None:
+        return None
+    raw_head, raw_value = split_line
+    head_parts = raw_head.split(";")
+    name = normalize_whitespace(head_parts[0]).upper()
+    if not name:
+        return None
+    return {
+        "name": name,
+        "params": parse_icalendar_parameters(head_parts[1:]),
+        "value": raw_value,
+    }
+
+
+def parse_icalendar_datetime_value(
+    value: object,
+    *,
+    tzid: object = None,
+    value_type: object = None,
+) -> dict[str, object]:
+    raw = normalize_whitespace(str(value or ""))
+    if not raw:
+        return {}
+    normalized_value_type = normalize_whitespace(str(value_type or "")).upper() or None
+    normalized_tzid = normalize_whitespace(str(tzid or "")) or None
+    if normalized_value_type == "DATE" or re.fullmatch(r"\d{8}", raw):
+        try:
+            parsed_date = date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+        except ValueError:
+            return {"raw": raw}
+        return {
+            "raw": raw,
+            "date": parsed_date,
+            "all_day": True,
+            "iso": parsed_date.isoformat(),
+            "tz_label": normalized_tzid,
+        }
+
+    candidate = raw[:-1] if raw.endswith("Z") else raw
+    parsed_dt = None
+    for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
+        try:
+            parsed_dt = datetime.strptime(candidate, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed_dt is None:
+        return {"raw": raw}
+
+    tz_label = normalized_tzid
+    if raw.endswith("Z"):
+        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        tz_label = parsed_dt.tzname() or "UTC"
+    elif normalized_tzid:
+        try:
+            parsed_dt = parsed_dt.replace(tzinfo=ZoneInfo(normalized_tzid))
+            tz_label = parsed_dt.tzname() or normalized_tzid
+        except Exception:
+            tz_label = normalized_tzid
+
+    return {
+        "raw": raw,
+        "datetime": parsed_dt,
+        "all_day": False,
+        "iso": (
+            normalize_datetime(parsed_dt)
+            if isinstance(parsed_dt, datetime) and parsed_dt.tzinfo is not None
+            else parsed_dt.replace(microsecond=0).isoformat()
+        ),
+        "tz_label": tz_label,
+        "tzid": normalized_tzid,
+    }
+
+
+def format_calendar_preview_date(value: date) -> str:
+    return value.strftime("%b %d, %Y").replace(" 0", " ")
+
+
+def format_calendar_preview_datetime(value: datetime) -> str:
+    return value.strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
+
+
+def format_calendar_preview_time(value: datetime) -> str:
+    return value.strftime("%I:%M %p").lstrip("0")
+
+
+def format_icalendar_event_range(
+    start_info: dict[str, object] | None,
+    end_info: dict[str, object] | None = None,
+) -> str | None:
+    if not start_info:
+        return None
+    if start_info.get("all_day"):
+        start_date = start_info.get("date")
+        if not isinstance(start_date, date):
+            return normalize_whitespace(str(start_info.get("raw") or "")) or None
+        end_date = end_info.get("date") if isinstance(end_info, dict) else None
+        if isinstance(end_date, date) and end_date > start_date:
+            inclusive_end = end_date - timedelta(days=1)
+            if inclusive_end != start_date:
+                return (
+                    f"{format_calendar_preview_date(start_date)} - "
+                    f"{format_calendar_preview_date(inclusive_end)} (all day)"
+                )
+        return f"{format_calendar_preview_date(start_date)} (all day)"
+
+    start_dt = start_info.get("datetime")
+    if not isinstance(start_dt, datetime):
+        return normalize_whitespace(str(start_info.get("raw") or "")) or None
+
+    end_dt = end_info.get("datetime") if isinstance(end_info, dict) else None
+    if isinstance(end_dt, datetime) and start_dt.tzinfo is not None and end_dt.tzinfo is not None:
+        end_dt = end_dt.astimezone(start_dt.tzinfo)
+    label = format_calendar_preview_datetime(start_dt)
+    if isinstance(end_dt, datetime):
+        if start_dt.date() == end_dt.date():
+            label = f"{label} - {format_calendar_preview_time(end_dt)}"
+        else:
+            label = f"{label} - {format_calendar_preview_datetime(end_dt)}"
+    tz_label = normalize_whitespace(str(start_info.get("tz_label") or "")) or (
+        start_dt.tzname() if start_dt.tzinfo is not None else None
+    )
+    if tz_label:
+        label = f"{label} {tz_label}"
+    return label
+
+
+def humanize_icalendar_enum(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or "")).upper()
+    if not normalized:
+        return None
+    mapping = {
+        "ACCEPTED": "Accepted",
+        "CANCEL": "Canceled",
+        "CANCELLED": "Canceled",
+        "CANCELED": "Canceled",
+        "CONFIRMED": "Confirmed",
+        "COUNTER": "Counter",
+        "DECLINED": "Declined",
+        "DECLINECOUNTER": "Declined Counter",
+        "NEEDS-ACTION": "Needs Action",
+        "PUBLISH": "Published",
+        "REQUEST": "Request",
+        "TENTATIVE": "Tentative",
+    }
+    return mapping.get(normalized) or normalized.replace("-", " ").replace("_", " ").title()
+
+
+def format_icalendar_participant(value: object, params: dict[str, list[str]] | None = None) -> str | None:
+    normalized_value = normalize_participant_token(unescape_icalendar_text(value))
+    if normalized_value and normalized_value.lower().startswith("mailto:"):
+        normalized_value = normalize_participant_token(normalized_value[7:])
+    if normalized_value and "@" in normalized_value:
+        normalized_value = normalized_value.lower()
+    cn_values = params.get("CN") if isinstance(params, dict) else None
+    common_name = normalize_participant_token(unescape_icalendar_text(cn_values[0])) if cn_values else None
+    if common_name and normalized_value and common_name.lower() != normalized_value.lower():
+        return f"{common_name} <{normalized_value}>"
+    return common_name or normalized_value
+
+
+def first_icalendar_url(text: object) -> str | None:
+    normalized = str(text or "")
+    if not normalized:
+        return None
+    candidates = [
+        match.group(0).rstrip(").,;")
+        for match in ICALENDAR_URL_PATTERN.finditer(normalized)
+    ]
+    if not candidates:
+        return None
+    preferred_domains = ("meet.google.com", "zoom.us", "teams.microsoft.com", "webex.com")
+    for candidate in candidates:
+        if any(domain in candidate for domain in preferred_domains):
+            return candidate
+    return candidates[0]
+
+
+def summarize_icalendar_invite_status(metadata: dict[str, object] | None) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    parts = [
+        humanize_icalendar_enum(metadata.get("method")),
+        humanize_icalendar_enum(metadata.get("status")),
+    ]
+    parts = [part for part in parts if part]
+    return " · ".join(parts) if parts else None
+
+
+def parse_icalendar_event_metadata(text: object) -> dict[str, object] | None:
+    normalized_text = str(text or "")
+    if not normalized_text:
+        return None
+    upper_text = normalized_text.upper()
+    if "BEGIN:VCALENDAR" not in upper_text and "BEGIN:VEVENT" not in upper_text:
+        return None
+
+    calendar_properties: dict[str, list[dict[str, object]]] = defaultdict(list)
+    event_properties: dict[str, list[dict[str, object]]] | None = None
+    for raw_line in unfold_icalendar_lines(normalized_text):
+        normalized_line = normalize_whitespace(raw_line)
+        if not normalized_line:
+            continue
+        upper_line = normalized_line.upper()
+        if upper_line == "BEGIN:VEVENT":
+            if event_properties is None:
+                event_properties = defaultdict(list)
+            continue
+        if upper_line == "END:VEVENT":
+            break
+        parsed = parse_icalendar_property_line(raw_line)
+        if parsed is None:
+            continue
+        target = event_properties if event_properties is not None else calendar_properties
+        target[str(parsed["name"])].append(parsed)
+    if not event_properties:
+        return None
+
+    def _first_property(
+        properties: dict[str, list[dict[str, object]]],
+        name: str,
+    ) -> dict[str, object] | None:
+        values = properties.get(name) or []
+        return values[0] if values else None
+
+    def _first_text(
+        properties: dict[str, list[dict[str, object]]],
+        name: str,
+    ) -> str | None:
+        prop = _first_property(properties, name)
+        if prop is None:
+            return None
+        return normalize_whitespace(str(unescape_icalendar_text(prop.get("value")) or "")) or None
+
+    summary = normalize_generated_document_title(_first_text(event_properties, "SUMMARY"))
+    description = _first_text(event_properties, "DESCRIPTION")
+    organizer_prop = _first_property(event_properties, "ORGANIZER")
+    organizer = (
+        format_icalendar_participant(organizer_prop.get("value"), organizer_prop.get("params"))
+        if organizer_prop is not None
+        else None
+    )
+    attendees: list[str] = []
+    seen_attendees: set[str] = set()
+    for attendee_prop in event_properties.get("ATTENDEE") or []:
+        formatted = format_icalendar_participant(attendee_prop.get("value"), attendee_prop.get("params"))
+        if not formatted:
+            continue
+        key = formatted.lower()
+        if key in seen_attendees:
+            continue
+        seen_attendees.add(key)
+        attendees.append(formatted)
+    start_prop = _first_property(event_properties, "DTSTART")
+    end_prop = _first_property(event_properties, "DTEND")
+    start_info = (
+        parse_icalendar_datetime_value(
+            start_prop.get("value"),
+            tzid=(start_prop.get("params") or {}).get("TZID", [None])[0],
+            value_type=(start_prop.get("params") or {}).get("VALUE", [None])[0],
+        )
+        if start_prop is not None
+        else {}
+    )
+    end_info = (
+        parse_icalendar_datetime_value(
+            end_prop.get("value"),
+            tzid=(end_prop.get("params") or {}).get("TZID", [None])[0],
+            value_type=(end_prop.get("params") or {}).get("VALUE", [None])[0],
+        )
+        if end_prop is not None
+        else {}
+    )
+    conference_url = (
+        _first_text(event_properties, "X-GOOGLE-CONFERENCE")
+        or _first_text(event_properties, "URL")
+        or first_icalendar_url(description)
+    )
+    return {
+        "summary": summary,
+        "description": description,
+        "organizer": organizer,
+        "attendees": attendees,
+        "attendees_display": ", ".join(attendees) or None,
+        "location": _first_text(event_properties, "LOCATION"),
+        "conference_url": conference_url,
+        "start": start_info,
+        "end": end_info,
+        "start_iso": start_info.get("iso"),
+        "end_iso": end_info.get("iso"),
+        "when": format_icalendar_event_range(start_info, end_info),
+        "method": _first_text(calendar_properties, "METHOD"),
+        "status": _first_text(event_properties, "STATUS"),
+        "uid": _first_text(event_properties, "UID"),
+        "sequence": _first_text(event_properties, "SEQUENCE"),
+    }
+
+
 CHAT_SPEAKER_BLOCKLIST = {
     "agenda",
     "answer",
@@ -4355,22 +4739,99 @@ def filter_html_preview_embedded_image_attachments(
     return filtered
 
 
+def render_html_preview_calendar_invite_cards(links: list[dict[str, str]]) -> str:
+    if not links:
+        return ""
+    cards: list[str] = []
+    for link in links:
+        title = normalize_whitespace(str(link.get("title") or link.get("label") or "Calendar invite")) or "Calendar invite"
+        href = normalize_whitespace(str(link.get("href") or "")) or None
+        title_html = (
+            f'<a href="{html.escape(href)}">{html.escape(title)}</a>'
+            if href
+            else html.escape(title)
+        )
+        metadata_items: list[str] = []
+        for label, key in (
+            ("When", "when"),
+            ("Organizer", "organizer"),
+            ("Attendees", "attendees"),
+            ("Location", "location"),
+            ("Status", "status"),
+        ):
+            value = normalize_whitespace(str(link.get(key) or ""))
+            if not value:
+                continue
+            metadata_items.append(
+                f"<div><dt>{html.escape(label)}</dt><dd>{html.escape(value)}</dd></div>"
+            )
+        join_href = normalize_whitespace(str(link.get("join_href") or "")) or None
+        if join_href:
+            metadata_items.append(
+                "<div><dt>Join</dt>"
+                f'<dd><a href="{html.escape(join_href)}">{html.escape(join_href)}</a></dd></div>'
+            )
+        detail = normalize_whitespace(str(link.get("detail") or ""))
+        detail_html = (
+            f'<p class="retriever-calendar-invite-detail">{html.escape(detail)}</p>'
+            if detail
+            else ""
+        )
+        cards.append(
+            '<article class="retriever-calendar-invite">'
+            '<div class="retriever-calendar-invite-header">'
+            "<div>"
+            '<p class="retriever-calendar-invite-kicker">Calendar invite</p>'
+            f'<h3 class="retriever-calendar-invite-title">{title_html}</h3>'
+            "</div>"
+            f"{detail_html}"
+            "</div>"
+            + (
+                f'<dl class="retriever-calendar-invite-meta">{"".join(metadata_items)}</dl>'
+                if metadata_items
+                else ""
+            )
+            + "</article>"
+        )
+    return '<section class="retriever-calendar-invites">' + "".join(cards) + "</section>"
+
+
 def render_html_preview_attachment_links(links: list[dict[str, str]]) -> str:
     if not links:
         return ""
+    calendar_links = [
+        link
+        for link in links
+        if normalize_whitespace(str(link.get("kind") or "")).lower() == "calendar_invite"
+    ]
+    file_links = [
+        link
+        for link in links
+        if normalize_whitespace(str(link.get("kind") or "")).lower() != "calendar_invite"
+    ]
+    sections: list[str] = []
+    calendar_section = render_html_preview_calendar_invite_cards(calendar_links)
+    if calendar_section:
+        sections.append(calendar_section)
     items: list[str] = []
-    for link in links:
+    for link in file_links:
         href = html.escape(str(link.get("href") or ""))
         label = html.escape(str(link.get("label") or "Attachment"))
         detail = normalize_whitespace(str(link.get("detail") or ""))
         detail_html = f' <span class="retriever-attachment-meta">({html.escape(detail)})</span>' if detail else ""
         items.append(f'<li><a href="{href}">{label}</a>{detail_html}</li>')
+    if items:
+        sections.append(
+            '<section class="retriever-attachments"><h2>Attachments</h2><ul>'
+            + "".join(items)
+            + "</ul></section>"
+        )
+    if not sections:
+        return ""
     return (
         "<!-- RETRIEVER_ATTACHMENT_LINKS_START -->"
-        '<section class="retriever-attachments"><h2>Attachments</h2><ul>'
-        + "".join(items)
-        + "</ul></section>"
-        "<!-- RETRIEVER_ATTACHMENT_LINKS_END -->"
+        + "".join(sections)
+        + "<!-- RETRIEVER_ATTACHMENT_LINKS_END -->"
     )
 
 
