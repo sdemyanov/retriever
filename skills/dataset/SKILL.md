@@ -21,11 +21,12 @@ For the exact read-only forms `/dataset` and `/dataset list`:
 
 - Do not read [../search/SKILL.md](../search/SKILL.md).
 - Do not read schema docs.
+- Use the canonical plugin tool at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py), not `.retriever/bin/retriever_tools.py`, for these read-only forms. Older workspace-local tools may still exempt `slash` from auto-upgrade and keep rendering stale output.
 - Run exactly one Bash command from the workspace root:
-  - `/dataset`: `python3 .retriever/bin/retriever_tools.py slash . /dataset`
-  - `/dataset list`: `python3 .retriever/bin/retriever_tools.py slash . /dataset list`
+  - `/dataset`: `python3 <resolved path to ../tool-template/retriever_tools.py> slash . /dataset`
+  - `/dataset list`: `python3 <resolved path to ../tool-template/retriever_tools.py> slash . /dataset list`
 - `/dataset list` renders a dataset stats table with `Dataset`, `Docs`, `Size`, `Custodians`, `Types`, and `Time Range` columns.
-- If the workspace tool is stale or missing, retry once with `RETRIEVER_CANONICAL_TOOL_PATH` pointed at [../tool-template/retriever_tools.py](../tool-template/retriever_tools.py).
+- Only if the canonical plugin tool path is unavailable, fall back once to `.retriever/bin/retriever_tools.py`.
 - Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.
 
 ## Other forms
