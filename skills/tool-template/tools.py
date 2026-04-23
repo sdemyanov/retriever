@@ -36998,46 +36998,6 @@ def format_dataset_custodian_summary(item: dict[str, object]) -> str:
     return ", ".join(values[:2]) + f" +{len(values) - 2}"
 
 
-def format_dataset_type_summary(item: dict[str, object]) -> str:
-    raw_values = item.get("content_types")
-    if not isinstance(raw_values, list) or not raw_values:
-        return "—"
-    parts: list[str] = []
-    for entry in raw_values[:3]:
-        if not isinstance(entry, dict):
-            continue
-        name = normalize_inline_whitespace(str(entry.get("name") or ""))
-        if not name:
-            continue
-        count = int(entry.get("count") or 0)
-        parts.append(f"{name} ({count})" if count > 0 else name)
-    extra_count = len(raw_values) - len(parts)
-    if extra_count > 0:
-        parts.append(f"+{extra_count}")
-    return ", ".join(parts) if parts else "—"
-
-
-def format_dataset_date_endpoint(value: object) -> str | None:
-    normalized = normalize_datetime(value)
-    if normalized is None:
-        return None
-    return normalized[:10]
-
-
-def format_dataset_time_range_summary(item: dict[str, object]) -> str:
-    start_value = format_dataset_date_endpoint(item.get("time_range_start"))
-    end_value = format_dataset_date_endpoint(item.get("time_range_end"))
-    if start_value is None and end_value is None:
-        return "—"
-    if start_value is None:
-        start_value = end_value
-    if end_value is None:
-        end_value = start_value
-    if start_value == end_value:
-        return start_value or "—"
-    return f"{start_value} to {end_value}"
-
-
 def escape_markdown_table_cell(value: object) -> str:
     text = normalize_inline_whitespace(str(value or ""))
     if not text:
@@ -37166,8 +37126,8 @@ def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) 
             lines = [
                 "Datasets:",
                 "",
-                "| Dataset | Docs | Size | Custodians | Types | Time Range |",
-                "| --- | ---: | --- | --- | --- | --- |",
+                "| Dataset | Docs | Size | Custodians |",
+                "| --- | ---: | --- | --- |",
             ]
             for item in datasets:
                 if not isinstance(item, dict):
@@ -37184,8 +37144,6 @@ def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) 
                             escape_markdown_table_cell(document_count),
                             escape_markdown_table_cell(format_dataset_size_summary(item)),
                             escape_markdown_table_cell(format_dataset_custodian_summary(item)),
-                            escape_markdown_table_cell(format_dataset_type_summary(item)),
-                            escape_markdown_table_cell(format_dataset_time_range_summary(item)),
                         ]
                     )
                     + " |"
