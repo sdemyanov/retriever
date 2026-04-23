@@ -434,6 +434,118 @@ FIELD_NAME_ALIASES = {
     "created_date": "date_created",
     "modified_date": "date_modified",
 }
+PASSIVE_FIELD_LABELS = {
+    "active_search_text_revision_id": "Active Search Revision ID",
+    "active_text_language": "Active Text Language",
+    "active_text_quality_score": "Active Text Quality Score",
+    "active_text_source_kind": "Active Text Source",
+    "author": "Author",
+    "begin_attachment": "Begin Attachment",
+    "begin_bates": "Begin Bates",
+    "canonical_kind": "Family",
+    "canonical_status": "Record Status",
+    "child_document_kind": "Document Role",
+    "content_hash": "Content Hash",
+    "content_type": "Type",
+    "control_number": "Control #",
+    "control_number_attachment_sequence": "Attachment Seq.",
+    "control_number_batch": "Batch",
+    "control_number_family_sequence": "Family Seq.",
+    "conversation_assignment_mode": "Assignment Mode",
+    "conversation_id": "Conversation ID",
+    "conversation_type": "Type",
+    "custodian": "Custodian",
+    "dataset_id": "Dataset ID",
+    "dataset_name": "Dataset",
+    "date_created": "Created",
+    "date_modified": "Modified",
+    "document_count": "Documents",
+    "end_attachment": "End Attachment",
+    "end_bates": "End Bates",
+    "file_hash": "File Hash",
+    "file_name": "File",
+    "file_size": "Size",
+    "file_type": "File Type",
+    "first_activity": "Started",
+    "has_attachments": "Has Attachments",
+    "id": "ID",
+    "ingested_at": "Ingested",
+    "is_attachment": "Attachment",
+    "last_activity": "Last Activity",
+    "last_seen_at": "Last Seen",
+    "lifecycle_status": "File Status",
+    "matching_document_count": "Matches",
+    "merged_into_document_id": "Merged Into ID",
+    "page_count": "Pages",
+    "parent_document_id": "Parent ID",
+    "participants": "Participants",
+    "production_id": "Production ID",
+    "production_name": "Production",
+    "recipients": "Recipients",
+    "rel_path": "Path",
+    "root_message_key": "Root Message Key",
+    "source_folder_path": "Source Folder",
+    "source_item_id": "Source Item ID",
+    "source_kind": "Source",
+    "source_rel_path": "Source Path",
+    "source_text_revision_id": "Source Text Revision ID",
+    "subject": "Subject",
+    "text_status": "Text Status",
+    "title": "Title",
+    "updated_at": "Updated",
+}
+PASSIVE_MIXED_CONTEXT_FIELD_LABELS = {
+    "content_type": "Document Type",
+    "conversation_type": "Conversation Type",
+}
+PASSIVE_FIELD_LABEL_UPPERCASE_TOKENS = {
+    "api",
+    "csv",
+    "eml",
+    "fts",
+    "html",
+    "id",
+    "json",
+    "mbox",
+    "msg",
+    "ocr",
+    "pdf",
+    "pst",
+    "sql",
+    "tsv",
+    "uri",
+    "url",
+    "utc",
+    "xml",
+}
+
+
+def passive_field_label(field_name: object, *, mixed_context: bool = False) -> str:
+    normalized_name = str(field_name or "").strip()
+    if not normalized_name:
+        return ""
+    canonical_name = FIELD_NAME_ALIASES.get(normalized_name, normalized_name)
+    if mixed_context:
+        mixed_context_label = PASSIVE_MIXED_CONTEXT_FIELD_LABELS.get(canonical_name)
+        if mixed_context_label:
+            return mixed_context_label
+    label = PASSIVE_FIELD_LABELS.get(canonical_name)
+    if label:
+        return label
+    words: list[str] = []
+    for token in re.split(r"[_\s]+", canonical_name):
+        if not token:
+            continue
+        lower_token = token.lower()
+        if lower_token in PASSIVE_FIELD_LABEL_UPPERCASE_TOKENS:
+            words.append(lower_token.upper())
+        elif token.isupper():
+            words.append(token)
+        else:
+            words.append(token[:1].upper() + token[1:])
+    return " ".join(words)
+
+
 REGISTRY_FIELD_TYPES = {
     "boolean": "INTEGER",
     "date": "TEXT",
