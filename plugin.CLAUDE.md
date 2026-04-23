@@ -11,4 +11,4 @@ When working in a Retriever workspace (a directory containing `.retriever/`), pr
 
 Do not skip tiers. Do not drop to a lower tier because it is more familiar or convenient.
 
-For the authoritative intent-to-skill table and the current inventory of slash commands and subcommands, see `skills/routing/SKILL.md`.
+For the authoritative intent-to-skill table and the current inventory of slash commands and subcommands, see `CLAUDE.md`.
