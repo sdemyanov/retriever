@@ -2129,6 +2129,70 @@ def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, obj
         }
         for row in membership_rows
     }
+    document_rows = connection.execute(
+        f"""
+        WITH distinct_dataset_documents AS (
+            SELECT DISTINCT dataset_id, document_id
+            FROM dataset_documents
+            WHERE dataset_id IN ({placeholders})
+        )
+        SELECT
+          distinct_dataset_documents.dataset_id,
+          d.id AS document_id,
+          d.file_size,
+          d.content_type,
+          d.custodians_json,
+          d.date_created,
+          d.date_modified
+        FROM distinct_dataset_documents
+        JOIN documents d ON d.id = distinct_dataset_documents.document_id
+        ORDER BY distinct_dataset_documents.dataset_id ASC, d.id ASC
+        """,
+        dataset_ids,
+    ).fetchall()
+    stats_by_dataset: dict[int, dict[str, object]] = defaultdict(
+        lambda: {
+            "size_bytes": 0,
+            "sized_document_count": 0,
+            "content_type_counts": defaultdict(int),
+            "custodians": set(),
+            "time_range_start": None,
+            "time_range_end": None,
+        }
+    )
+    for row in document_rows:
+        dataset_id = int(row["dataset_id"])
+        stats = stats_by_dataset[dataset_id]
+
+        file_size_value: int | None = None
+        if row["file_size"] is not None:
+            try:
+                file_size_value = int(row["file_size"])
+            except (TypeError, ValueError):
+                file_size_value = None
+        if file_size_value is not None and file_size_value >= 0:
+            stats["size_bytes"] = int(stats["size_bytes"]) + file_size_value
+            stats["sized_document_count"] = int(stats["sized_document_count"]) + 1
+
+        content_type = normalize_whitespace(str(row["content_type"] or "")) or "Unknown"
+        content_type_counts = stats["content_type_counts"]
+        content_type_counts[content_type] += 1
+
+        custodians = stats["custodians"]
+        custodians.update(parse_document_custodians_json(row["custodians_json"]))
+
+        start_candidate = normalize_datetime(row["date_created"]) or normalize_datetime(row["date_modified"])
+        if start_candidate is not None:
+            current_start = stats["time_range_start"]
+            if current_start is None or start_candidate < current_start:
+                stats["time_range_start"] = start_candidate
+
+        end_candidate = normalize_datetime(row["date_modified"]) or normalize_datetime(row["date_created"])
+        if end_candidate is not None:
+            current_end = stats["time_range_end"]
+            if current_end is None or end_candidate > current_end:
+                stats["time_range_end"] = end_candidate
+
     source_rows = connection.execute(
         f"""
         SELECT *
@@ -2157,7 +2221,31 @@ def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, obj
             dataset_id,
             {"document_count": 0, "manual_document_count": 0, "source_document_count": 0},
         )
+        dataset_stats = stats_by_dataset.get(dataset_id)
         source_bindings = sources_by_dataset.get(dataset_id, [])
+        if dataset_stats is None:
+            size_bytes = None
+            sized_document_count = 0
+            content_types: list[dict[str, object]] = []
+            custodians: list[str] = []
+            time_range_start = None
+            time_range_end = None
+        else:
+            sized_document_count = int(dataset_stats["sized_document_count"] or 0)
+            size_bytes = int(dataset_stats["size_bytes"] or 0) if sized_document_count else None
+            content_types = [
+                {"name": name, "count": count}
+                for name, count in sorted(
+                    dataset_stats["content_type_counts"].items(),
+                    key=lambda item: (-int(item[1]), str(item[0]).lower(), str(item[0])),
+                )
+            ]
+            custodians = sorted(
+                [str(value) for value in dataset_stats["custodians"]],
+                key=lambda value: (value.lower(), value),
+            )
+            time_range_start = dataset_stats["time_range_start"]
+            time_range_end = dataset_stats["time_range_end"]
         summaries.append(
             {
                 "id": dataset_id,
@@ -2169,6 +2257,12 @@ def list_dataset_summaries(connection: sqlite3.Connection) -> list[dict[str, obj
                 "document_count": counts["document_count"],
                 "manual_document_count": counts["manual_document_count"],
                 "source_document_count": counts["source_document_count"],
+                "size_bytes": size_bytes,
+                "sized_document_count": sized_document_count,
+                "custodians": custodians,
+                "content_types": content_types,
+                "time_range_start": time_range_start,
+                "time_range_end": time_range_end,
                 "source_binding_count": len(source_bindings),
                 "source_bindings": source_bindings,
             }
