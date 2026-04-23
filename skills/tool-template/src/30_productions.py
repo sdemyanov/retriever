@@ -2822,8 +2822,11 @@ def build_email_message_body_content_html(
     body_html: str | None = None,
     strip_quoted_history: bool = False,
 ) -> str:
-    text_content = str(document.get("text_content") or "")
+    text_content, calendar_invites = extract_calendar_invites_from_text_content(
+        str(document.get("text_content") or "")
+    )
     visible_text, quoted_text = split_email_preview_text_content(text_content)
+    calendar_invites_html = render_html_preview_calendar_invite_cards(calendar_invites)
     preferred_body_html = body_html
     if preferred_body_html is None:
         stored_body_html = document.get("standalone_preview_body_html")
@@ -2840,17 +2843,28 @@ def build_email_message_body_content_html(
                 normalized_html = stripped_html
             elif quoted_text and visible_text:
                 normalized_html = ""
+        normalized_html = HTML_PREVIEW_CALENDAR_INVITES_PATTERN.sub("", normalized_html).strip()
         if normalized_html and any(
             token in normalized_html
             for token in ('class="gmail-message-rendered-html"', 'class="gmail-message-plain"', 'class="gmail-message-quoted"')
         ):
-            return normalized_html
+            return f"{calendar_invites_html}{normalized_html}" if calendar_invites_html else normalized_html
         normalized_html = re.sub(r"(?is)<!doctype[^>]*>\s*", "", normalized_html).strip()
         if normalized_html:
-            return f'<div class="gmail-message-rendered-html">{normalized_html}</div>'
-    body_parts = [
-        f'<div class="gmail-message-plain">{html.escape(visible_text or "No extracted text available.")}</div>'
-    ]
+            rendered_html = f'<div class="gmail-message-rendered-html">{normalized_html}</div>'
+            return f"{calendar_invites_html}{rendered_html}" if calendar_invites_html else rendered_html
+    body_parts: list[str] = []
+    if calendar_invites_html:
+        body_parts.append(calendar_invites_html)
+    plain_text = visible_text or ("No extracted text available." if not body_parts else "")
+    if plain_text:
+        body_parts.append(
+            f'<div class="gmail-message-plain">{html.escape(plain_text)}</div>'
+        )
+    elif not body_parts:
+        body_parts.append(
+            '<div class="gmail-message-plain">No extracted text available.</div>'
+        )
     if quoted_text and not strip_quoted_history:
         body_parts.append(
             "<details class=\"gmail-message-quoted\">"
@@ -3232,6 +3246,7 @@ def rewrite_preserved_email_message_preview(
 
 def extract_standalone_preview_body_html(preview_html: str) -> str | None:
     cleaned_preview_html = HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN.sub("", preview_html or "")
+    cleaned_preview_html = HTML_PREVIEW_CALENDAR_INVITES_PATTERN.sub("", cleaned_preview_html)
     source_match = EMAIL_PREVIEW_BODY_SOURCE_PATTERN.search(cleaned_preview_html)
     if source_match is not None:
         normalized_source = source_match.group(1).strip()

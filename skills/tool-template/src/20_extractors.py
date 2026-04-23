@@ -2087,6 +2087,24 @@ def build_email_extracted_payload(
         normalized_html,
         normalized_attachments,
     )
+    calendar_invites, document_attachments = partition_calendar_invite_attachments(document_attachments)
+    if calendar_invites:
+        merged_participants: list[str] = []
+        seen_participants: set[str] = set()
+        append_unique_participants(merged_participants, seen_participants, [participants])
+        for invite in calendar_invites:
+            append_unique_participants(
+                merged_participants,
+                seen_participants,
+                [invite.get("organizer"), invite.get("attendees")],
+            )
+        participants = ", ".join(merged_participants) or None
+    calendar_invite_search_text = build_calendar_invite_search_text(calendar_invites)
+    indexed_text_content = "\n\n".join(
+        part
+        for part in (normalized_text, calendar_invite_search_text)
+        if part
+    )
     preview = build_email_message_preview_html(
         {
             "id": 0,
@@ -2095,7 +2113,7 @@ def build_email_extracted_payload(
             "date_created": date_created,
             "subject": resolved_subject,
             "title": resolved_subject,
-            "text_content": normalized_text,
+            "text_content": indexed_text_content,
             "standalone_preview_body_html": preview_html_body,
         },
         body_html=preview_html_body,
@@ -2110,8 +2128,8 @@ def build_email_extracted_payload(
         "title": resolved_subject,
         "subject": resolved_subject,
         "recipients": recipients or None,
-        "text_content": normalized_text,
-        "text_status": "empty" if not normalized_text else "ok",
+        "text_content": indexed_text_content,
+        "text_status": "empty" if not indexed_text_content else "ok",
         "attachments": document_attachments,
         "email_threading": dict(email_threading or {}),
         "preview_artifacts": [
