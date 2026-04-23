@@ -7160,7 +7160,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(first_exit, 0)
         self.assertIsNotNone(first_payload)
         self.assertEqual(first_payload["scope"]["keyword"], "alpha")
-        self.assertIn("keyword='alpha'", first_payload["header"]["scope"])
+        self.assertEqual(first_payload["header"]["keyword"], "Keyword: 'alpha'")
 
         session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
         self.assertEqual(session_payload["schema_version"], retriever_tools.SESSION_SCHEMA_VERSION)
@@ -7784,7 +7784,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(search_payload["page"], 1)
         self.assertEqual(search_payload["per_page"], 5)
         self.assertEqual(len(search_payload["results"]), 5)
-        self.assertIn("Documents 1–5 of 25. Ask for the next page to see more.", str(search_payload["rendered_markdown"]))
+        rendered = str(search_payload["rendered_markdown"])
+        self.assertIn("Documents 1–5 of 25.", rendered)
+        self.assertIn("Navigate: `/retriever:next` for the next page.", rendered)
 
     def test_compose_search_uses_saved_page_size_when_per_page_is_omitted(self) -> None:
         for index in range(12):
@@ -7806,7 +7808,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         assert search_payload is not None
         self.assertEqual(search_payload["per_page"], 5)
         self.assertEqual(len(search_payload["results"]), 5)
-        self.assertIn("Documents 1–5 of 12. Ask for the next page to see more.", str(search_payload["rendered_markdown"]))
+        rendered = str(search_payload["rendered_markdown"])
+        self.assertIn("Documents 1–5 of 12.", rendered)
+        self.assertIn("Navigate: `/retriever:next` for the next page.", rendered)
 
     def test_slash_search_drops_stale_display_columns_with_warning(self) -> None:
         (self.root / "sample.txt").write_text("sample body\n", encoding="utf-8")
