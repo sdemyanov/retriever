@@ -6768,7 +6768,7 @@ def build_export_preview_unit_html(
         "Selected": str(len(selected_document_ids)),
     }
     if unit.get("conversation_type"):
-        headers["Conversation type"] = str(unit["conversation_type"])
+        headers[passive_field_label("conversation_type", mixed_context=True)] = str(unit["conversation_type"])
 
     doc_target_hrefs = {
         int(document["id"]): f"#{conversation_preview_anchor(int(document['id']))}"
@@ -8767,7 +8767,7 @@ def graph_metadata_for_buckets(group_defs: list[dict[str, object]], buckets: lis
         graph_type = "line"
     elif len(group_defs) == 1 and len(buckets) <= 6:
         graph_type = "pie"
-    description = "Count by " + ", ".join(str(group_def["output_name"]).replace("_", " ") for group_def in group_defs)
+    description = "Count by " + ", ".join(passive_field_label(group_def["output_name"]) for group_def in group_defs)
     graph: dict[str, object] = {
         "type": graph_type,
         "x_axis": group_defs[0]["output_name"] if group_defs else None,

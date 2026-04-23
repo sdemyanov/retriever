@@ -7005,7 +7005,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertNotIn("documents", search_payload)
         self.assertIn("rendered_markdown", search_payload)
         rendered = str(search_payload["rendered_markdown"])
-        self.assertIn("Scope: keyword='sample'", rendered)
+        self.assertIn("Keyword: 'sample'", rendered)
         self.assertIn("| title | control_number |", rendered)
         self.assertIn("](computer://", rendered)
         self.assertIn("Documents 1–1 of 1.", rendered)
@@ -7031,7 +7031,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         assert search_payload is not None
         self.assertIn("rendered_markdown", search_payload)
         rendered = str(search_payload["rendered_markdown"])
-        self.assertIn("Scope: keyword='sample'", rendered)
+        self.assertIn("Keyword: 'sample'", rendered)
         self.assertIn("| title | control_number |", rendered)
         self.assertIn("](computer://", rendered)
         self.assertIn("Documents 1–1 of 1.", rendered)
@@ -7679,6 +7679,21 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         final_session_payload = json.loads(self.paths["session_path"].read_text(encoding="utf-8"))
         self.assertNotIn("columns", final_session_payload["display"]["documents"])
+
+    def test_passive_field_label_uses_friendly_aliases_and_custom_fallbacks(self) -> None:
+        self.assertEqual(retriever_tools.passive_field_label("content_type"), "Type")
+        self.assertEqual(retriever_tools.passive_field_label("conversation_type"), "Type")
+        self.assertEqual(
+            retriever_tools.passive_field_label("conversation_type", mixed_context=True),
+            "Conversation Type",
+        )
+        self.assertEqual(retriever_tools.passive_field_label("first_activity"), "Started")
+        self.assertEqual(retriever_tools.passive_field_label("last_activity"), "Last Activity")
+        self.assertEqual(retriever_tools.passive_field_label("control_number"), "Control #")
+        self.assertEqual(retriever_tools.passive_field_label("dataset"), "Dataset")
+        self.assertEqual(retriever_tools.passive_field_label("review_score"), "Review Score")
+        self.assertEqual(retriever_tools.passive_field_label("ocr_score"), "OCR Score")
+        self.assertEqual(retriever_tools.passive_field_label("pst_owner"), "PST Owner")
 
     def test_slash_page_size_persists_display_preferences(self) -> None:
         for index in range(12):
@@ -11039,6 +11054,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         preview_html = Path(html_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
         self.assertIn("<title>Attachment Handling</title>", preview_html)
         self.assertIn("<h1>Attachment Handling</h1>", preview_html)
+        self.assertIn("<th>Control #</th>", preview_html)
+        self.assertNotIn("<th>Control Number</th>", preview_html)
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
             child_preview_target = retriever_tools.default_preview_target(self.paths, child_row, connection)
@@ -11584,6 +11601,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         unit_html = unit_path.read_text(encoding="utf-8")
         document_html = document_path.read_text(encoding="utf-8")
         index_html = index_path.read_text(encoding="utf-8")
+        self.assertIn("<th>Conversation Type</th>", unit_html)
+        self.assertNotIn("<th>Conversation type</th>", unit_html)
         self.assertIn("Root message body", unit_html)
         self.assertIn("Reply message body", unit_html)
         self.assertIn(f'id="doc-{root_row["id"]}"', unit_html)
@@ -12692,6 +12711,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         bucket_map = {item["dataset_name"]: item["count"] for item in payload["buckets"]}
         self.assertEqual(bucket_map[self.root.name], 2)
         self.assertEqual(bucket_map["Review Set"], 1)
+        self.assertEqual(payload["graph"]["description"], "Count by Dataset")
         self.assertIn("sql", payload)
         self.assertIn("COUNT(DISTINCT d.id)", payload["sql"])
         self.assertIn("JOIN datasets ds", payload["sql"])

@@ -310,12 +310,12 @@ def build_production_preview_html(
     page_images: list[dict[str, object]],
 ) -> str:
     headers = {
-        "Production": production_name,
-        "Control Number": control_number,
-        "Begin Bates": begin_bates,
-        "End Bates": end_bates,
-        "Begin Attachment": begin_attachment or "",
-        "End Attachment": end_attachment or "",
+        passive_field_label("production_name"): production_name,
+        passive_field_label("control_number"): control_number,
+        passive_field_label("begin_bates"): begin_bates,
+        passive_field_label("end_bates"): end_bates,
+        passive_field_label("begin_attachment"): begin_attachment or "",
+        passive_field_label("end_attachment"): end_attachment or "",
     }
     sections: list[str] = []
     if text_content.strip():

@@ -4875,10 +4875,10 @@ def build_pptx_preview_html(
             "</section>"
         )
     metadata_rows = {
-        "Title": deck_title,
-        "Author": author or "",
-        "Created": date_created or "",
-        "Modified": date_modified or "",
+        passive_field_label("title"): deck_title,
+        passive_field_label("author"): author or "",
+        passive_field_label("date_created"): date_created or "",
+        passive_field_label("date_modified"): date_modified or "",
     }
     return build_html_preview(
         metadata_rows,
