@@ -8,9 +8,11 @@ metadata:
   version: "0.19.0"
 ---
 
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+
 # Retriever Ping
 
-Reply in plain text with exactly this structure:
+Reply in plain text with exactly this structure, substituting `<version>` with the value of `metadata.version` from this skill's frontmatter:
 
 ```
 Retriever plugin smoke test OK.

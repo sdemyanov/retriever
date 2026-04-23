@@ -8,6 +8,8 @@ metadata:
   version: "0.9.5"
 ---
 
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+
 # Retriever Parsing
 
 Use this skill whenever a task changes or depends on document extraction behavior.
@@ -15,8 +17,8 @@ Use this skill whenever a task changes or depends on document extraction behavio
 ## Required reference
 
 Read [parsing.md](parsing.md) before changing ingest logic or parser dependencies.
-For spreadsheet parser redesign work, also read [spreadsheet-parsing-plan.md](spreadsheet-parsing-plan.md).
-For ingest execution-model redesign, also read [PARALLEL_INGEST_PLAN.md](/Users/sergey/Projects/retriever-plugin/plans/parallel-ingest-plan.md).
+For spreadsheet parser redesign work, also read [SPREADSHEET_PARSING_PLAN.md](../../plans/SPREADSHEET_PARSING_PLAN.md).
+For ingest execution-model redesign, also read [parallel-ingest-plan.md](../../plans/parallel-ingest-plan.md).
 
 ## Rules
 

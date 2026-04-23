@@ -9,6 +9,8 @@ metadata:
   version: "0.17.2"
 ---
 
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+
 # Retriever /columns
 
 Use this skill for `/columns`, `/columns list`, `/columns set ...`, `/columns add ...`, `/columns remove ...`, and `/columns default`.

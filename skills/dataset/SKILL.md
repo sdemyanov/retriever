@@ -2,12 +2,14 @@
 name: dataset
 description: >
   This skill should be used when the user types "/dataset", "/dataset list",
-  "/dataset production", "/dataset production, priority", or "/dataset clear".
-  It exposes Retriever's visible slash-command surface for dataset scoping and
-  discovery.
+  "/dataset production", "/dataset production, priority", "/dataset clear",
+  or "/dataset rename <old-name> <new-name>". It exposes Retriever's visible
+  slash-command surface for dataset scoping, discovery, and renaming.
 metadata:
   version: "0.17.3"
 ---
+
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
 
 # Retriever /dataset
 

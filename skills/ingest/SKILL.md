@@ -1,12 +1,18 @@
 ---
 name: ingest
 description: >
-  Use this skill when the user wants Retriever to index a folder, refresh changed files,
-  ingest a processed production, or explain what was ingested. It bootstraps the workspace
-  if needed, chooses between ingest and ingest-production, and summarizes the results.
+  Use this skill when the user wants to ingest, index, import, load, add, upload,
+  or process files or folders into Retriever, or to refresh changed files, ingest a
+  processed production, or explain what was ingested — including phrasings like
+  "index this folder", "import these files", "load the Downloads directory",
+  "add this PST to the collection", "upload and process this batch", "re-index the
+  gmail-max mbox", or "what did you ingest". It bootstraps the workspace if needed,
+  chooses between ingest and ingest-production, and summarizes the results.
 metadata:
   version: "0.9.4"
 ---
+
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
 
 # Retriever Ingest
 
@@ -31,13 +37,7 @@ Use this skill when the user says things like:
 
 - Confirm or infer the workspace root.
 - Run `doctor --quick` if runtime state is unclear.
-- Inspect `.retriever/runtime.json` when it exists.
-- Compare the installed plugin's canonical template checksum from `../tool-template/tool-template.md` to `runtime.json.template_sha256`.
-- If `.retriever/bin/retriever_tools.py` is missing, materialize it from the canonical template before running workspace-local commands.
-- If the canonical checksum changed and the workspace tool still matches `runtime.json`, back up the old workspace tool, replace it with the canonical template, run `bootstrap`, and only then continue to `ingest`.
-- If the workspace tool checksum differs from `runtime.json`, treat it as user-modified and require explicit approval before replacement.
-- Never run `ingest` against a stale workspace tool after reinstall. Schema and tool upgrades happen before reindexing.
-- Run `bootstrap` before the first ingest or after any schema/tool upgrade.
+- Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, and user-modified tool protection without changing the intended `ingest` vs. `ingest-production` command.
 - For `.pst` sources, use regular `ingest`, not `ingest-production`.
 - If `doctor` reports `pst_backend.status == fail`, explain that PST ingest needs the required `libpff-python` / `pypff` backend installed.
 - If the user target is a processed production root, or the user explicitly asks for production ingest, run `ingest-production` instead of plain `ingest`.
