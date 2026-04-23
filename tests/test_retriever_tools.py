@@ -4763,19 +4763,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         message_preview_html = self.preview_target_file_path(
             self.preview_target_by_label(parent_result["preview_targets"], "message")
         ).read_text(encoding="utf-8")
-        segment_preview_html = self.preview_target_file_path(
-            self.preview_target_by_label(parent_result["preview_targets"], "segment")
-        ).read_text(encoding="utf-8")
-
-        for preview_html in (message_preview_html, segment_preview_html):
-            self.assertIn("Calendar invite", preview_html)
-            self.assertIn("Discuss Relativity", preview_html)
-            self.assertIn("Jun 1, 2023 3:00 PM - 3:30 PM EDT", preview_html)
-            self.assertIn("Sergey Demyanov &lt;sergey@discoverbeagle.com&gt;", preview_html)
-            self.assertIn("Max Faleev &lt;max@discoverbeagle.com&gt;", preview_html)
-            self.assertIn("meet.google.com/fps-qara-aie", preview_html)
-            self.assertIn("notes.txt", preview_html)
-            self.assertNotIn(">invite.ics<", preview_html)
+        self.assertEqual([target.get("label") for target in parent_result["preview_targets"]], ["message"])
+        self.assertIn("Calendar invite", message_preview_html)
+        self.assertIn("Discuss Relativity", message_preview_html)
+        self.assertIn("Jun 1, 2023 3:00 PM - 3:30 PM EDT", message_preview_html)
+        self.assertIn("Sergey Demyanov &lt;sergey@discoverbeagle.com&gt;", message_preview_html)
+        self.assertIn("Max Faleev &lt;max@discoverbeagle.com&gt;", message_preview_html)
+        self.assertIn("meet.google.com/fps-qara-aie", message_preview_html)
+        self.assertIn("notes.txt", message_preview_html)
+        self.assertNotIn(">invite.ics<", message_preview_html)
 
     def test_ingest_email_inline_html_image_stays_in_preview_without_attachment_child(self) -> None:
         email_path = self.root / "inline.eml"
@@ -4868,20 +4864,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-        segment_preview_path = self.preview_target_file_path(
-            self.preview_target_by_label(parent_preview_targets, "segment")
+        self.assertEqual([target.get("label") for target in parent_preview_targets], ["message"])
+        preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(parent_preview_targets, "message")
         )
-        preview_html = segment_preview_path.read_text(encoding="utf-8")
-        expected_href = retriever_tools.urllib_request.pathname2url(
-            os.path.relpath(child_preview_abs_path, start=str(segment_preview_path.parent))
-        )
+        preview_html = preview_path.read_text(encoding="utf-8")
 
-        self.assertIn("<title>Energy Balance Revenue Summary - All messages</title>", preview_html)
+        self.assertIn("<title>Energy Balance Revenue Summary</title>", preview_html)
         self.assertIn('class="gmail-thread-title">Energy Balance Revenue Summary</h1>', preview_html)
         self.assertNotIn("Back Up Attachments:", preview_html)
         self.assertIn("<h2>Attachments</h2>", preview_html)
         self.assertIn(">notes.txt<", preview_html)
-        self.assertIn(f'href="{expected_href}"', preview_html)
+        self.assertRegex(preview_html, r'href="[^"]*notes\.txt"')
 
         with mock.patch.object(retriever_tools, "pypff", object()):
             doctor_result = retriever_tools.doctor(self.root, quick=False)
@@ -6027,12 +6021,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.preview_target_by_label(reply_result["preview_targets"], "message")["rel_path"],
         )
         self.assertIsNone(reply_result["preview_target_fragment"])
-        self.assertEqual(len(reply_result["preview_targets"]), 3)
+        self.assertEqual(len(reply_result["preview_targets"]), 2)
         self.assertEqual(reply_result["preview_targets"][0]["label"], "message")
         self.assertEqual(reply_result["preview_targets"][1]["label"], "segment")
         self.assertFalse(any(target.get("label") == "entry" for target in reply_result["preview_targets"]))
+        self.assertFalse(any(target.get("label") == "contents" for target in reply_result["preview_targets"]))
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "segment")["target_fragment"], f"doc-{reply_row['id']}")
-        self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "contents")["label"], "contents")
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "message")["label"], "message")
         self.assertEqual(
             self.preview_target_file_path(self.preview_target_by_label(root_result["preview_targets"], "segment")),
@@ -6056,7 +6050,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.paths["state_dir"]
             / retriever_tools.conversation_preview_entry_rel_path(root_row["conversation_id"], reply_row["id"])
         )
+        conversation_preview_dir = (
+            self.paths["state_dir"]
+            / retriever_tools.conversation_preview_base_path(root_row["conversation_id"])
+        )
         self.assertFalse(expected_entry_path.exists())
+        self.assertTrue((conversation_preview_dir / "conversation.html").exists())
+        self.assertFalse((conversation_preview_dir / "index.html").exists())
+        self.assertEqual(list(conversation_preview_dir.glob("segment-*.html")), [])
         self.assertIn("<title>Status Update (2/2 in thread)</title>", message_preview_html)
         self.assertIn('class="gmail-thread-title-link"', message_preview_html)
         self.assertIn('class="gmail-thread-title-meta">(2/2 in thread)</span>', message_preview_html)
@@ -6065,6 +6066,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Created Apr 14, 2026 10:00 AM UTC", message_preview_html)
         self.assertIn("Last modified Apr 14, 2026 11:00 AM UTC", message_preview_html)
         self.assertIn("Viewing message 2 of 2", message_preview_html)
+        self.assertNotIn("data-retriever-email-body-source", message_preview_html)
+        self.assertNotIn("data-retriever-email-body-source", root_message_preview_html)
         self.assertIn("<title>Status Update (1/2 in thread)</title>", root_message_preview_html)
         self.assertIn("Viewing message 1 of 2", root_message_preview_html)
         self.assertIn("Root message body", root_message_preview_html)
@@ -6076,9 +6079,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn('class="gmail-message-card gmail-message-card--selected"', message_preview_html)
         self.assertIn('class="reply-rich-email"', message_preview_html)
         segment_html = segment_preview_path.read_text(encoding="utf-8")
-        toc_html = self.preview_target_file_path(
-            self.preview_target_by_label(reply_result["preview_targets"], "contents")
-        ).read_text(encoding="utf-8")
         self.assertIn(f'id="doc-{root_row["id"]}"', segment_html)
         self.assertIn(f'id="doc-{reply_row["id"]}"', segment_html)
         self.assertIn("Root message body", segment_html)
@@ -6090,8 +6090,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertNotIn("<dt>Author</dt>", segment_html)
         self.assertNotIn("<dt>Recipients</dt>", segment_html)
         self.assertNotIn("&lt;div class=&quot;reply-rich-email&quot;&gt;", segment_html)
-        self.assertIn("Status Update", toc_html)
-        self.assertNotIn("<a href=", toc_html)
+        self.assertTrue(segment_preview_path.name == "conversation.html")
         self.assertTrue(
             self.preview_target_file_path(self.preview_target_by_label(root_result["preview_targets"], "message")).exists()
         )
@@ -9254,8 +9253,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             parent_result["preview_rel_path"],
             self.preview_target_by_label(parent_result["preview_targets"], "message")["rel_path"],
         )
+        self.assertEqual([target.get("label") for target in parent_result["preview_targets"]], ["message"])
         parent_preview_html = self.preview_target_file_path(
-            self.preview_target_by_label(parent_result["preview_targets"], "segment")
+            self.preview_target_by_label(parent_result["preview_targets"], "message")
         ).read_text(encoding="utf-8")
         self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
         self.assertIn("MBOX Parent", parent_preview_html)
@@ -10015,8 +10015,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Parent message body", message_preview_html)
         self.assertNotIn("Viewing message", message_preview_html)
         self.assertNotIn("2 messages", message_preview_html)
+        self.assertEqual([target.get("label") for target in parent_result["preview_targets"]], ["message"])
         parent_preview_html = self.preview_target_file_path(
-            self.preview_target_by_label(parent_result["preview_targets"], "segment")
+            self.preview_target_by_label(parent_result["preview_targets"], "message")
         ).read_text(encoding="utf-8")
         self.assertIn("Apr 14, 2026 10:00 AM UTC", parent_preview_html)
         self.assertIn("PST Parent", parent_preview_html)
@@ -10374,9 +10375,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertTrue(result["preview_rel_path"].endswith(f"doc-{row['id']}.html"))
         self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
-        preview_html = self.preview_target_file_path(
-            self.preview_target_by_label(result["preview_targets"], "segment")
-        ).read_text(encoding="utf-8")
+        preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
         self.assertIn("Alice Example", preview_html)
         self.assertIn("Bob Example", preview_html)
         self.assertIn("Kickoff thread for launch planning.", preview_html)
@@ -10584,9 +10583,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             )
         )
         self.assertTrue(result["preview_rel_path"].endswith(f"doc-{chat_row['id']}.html"))
-        preview_html = self.preview_target_file_path(
-            self.preview_target_by_label(result["preview_targets"], "segment")
-        ).read_text(encoding="utf-8")
+        preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
         self.assertIn("Conversation document", preview_html)
         self.assertIn("Sergey Demyanov", preview_html)
         self.assertIn("hey there", preview_html)

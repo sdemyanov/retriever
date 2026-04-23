@@ -2585,11 +2585,8 @@ def conversation_preview_writes_aggregate_artifacts(
     *,
     segment_mode: str,
 ) -> bool:
-    if len(documents) != 1:
-        return True
-    if normalize_whitespace(str(conversation_type or "")).lower() != "email":
-        return True
-    return segment_mode == "single"
+    _ = (conversation_type, segment_mode)
+    return len(documents) > 1
 
 
 def conversation_preview_document_heading(document: dict[str, object]) -> str:
@@ -2670,6 +2667,99 @@ EMAIL_HTML_QUOTED_REPLY_START_PATTERNS = (
     ),
     re.compile(r"(?is)<blockquote\b"),
 )
+
+
+class EmailPreviewBodyHTMLExtractor(HTMLParser):
+    def __init__(self, *, require_selected_card: bool) -> None:
+        super().__init__(convert_charrefs=False)
+        self.require_selected_card = require_selected_card
+        self.card_depth: int | None = None
+        self.body_depth: int | None = None
+        self.parts: list[str] = []
+        self.extracted_html: str | None = None
+
+    @staticmethod
+    def classes(attrs: list[tuple[str, str | None]]) -> set[str]:
+        class_value = next(
+            (
+                str(value or "")
+                for key, value in attrs
+                if normalize_whitespace(str(key or "")).lower() == "class"
+            ),
+            "",
+        )
+        return {token for token in normalize_whitespace(class_value).split(" ") if token}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.extracted_html is not None:
+            return
+        if self.body_depth is not None:
+            self.parts.append(self.get_starttag_text())
+            self.body_depth += 1
+            return
+        classes = self.classes(attrs)
+        if self.card_depth is None:
+            if tag == "article" and "gmail-message-card" in classes and (
+                not self.require_selected_card or "gmail-message-card--selected" in classes
+            ):
+                self.card_depth = 1
+            return
+        self.card_depth += 1
+        if tag == "div" and "gmail-message-body" in classes:
+            self.body_depth = 0
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.body_depth is not None:
+            self.parts.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.extracted_html is None and self.body_depth is not None:
+            if self.body_depth == 0:
+                extracted = "".join(self.parts).strip()
+                self.extracted_html = extracted or None
+                self.parts.clear()
+                self.body_depth = None
+            else:
+                self.parts.append(f"</{tag}>")
+                self.body_depth -= 1
+        if self.card_depth is not None:
+            self.card_depth -= 1
+            if self.card_depth <= 0:
+                self.card_depth = None
+
+    def handle_data(self, data: str) -> None:
+        if self.body_depth is not None:
+            self.parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if self.body_depth is not None:
+            self.parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if self.body_depth is not None:
+            self.parts.append(f"&#{name};")
+
+    def handle_comment(self, data: str) -> None:
+        if self.body_depth is not None:
+            self.parts.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl: str) -> None:
+        if self.body_depth is not None:
+            self.parts.append(f"<!{decl}>")
+
+    def handle_pi(self, data: str) -> None:
+        if self.body_depth is not None:
+            self.parts.append(f"<?{data}>")
+
+
+def extract_visible_email_preview_body_html(preview_html: str) -> str | None:
+    for require_selected_card in (True, False):
+        parser = EmailPreviewBodyHTMLExtractor(require_selected_card=require_selected_card)
+        parser.feed(preview_html)
+        parser.close()
+        if parser.extracted_html:
+            return parser.extracted_html
+    return None
 
 
 def build_email_preview_head_html() -> str:
@@ -3064,13 +3154,6 @@ def build_email_thread_preview_html(
                 strip_quoted_history=strip_quoted_history,
             )
         )
-    body_source_template = ""
-    if body_source_document is not None:
-        body_source_template = (
-            '<template data-retriever-email-body-source>'
-            f"{build_email_message_body_content_html(body_source_document, body_html=body_source_html)}"
-            "</template>"
-        )
     header_kicker = (
         f'<p class="gmail-thread-kicker">{html.escape(segment_label)}</p>'
         if segment_label and (segment_count or 0) > 1
@@ -3091,7 +3174,6 @@ def build_email_thread_preview_html(
         "</header>"
         f'<section class="gmail-thread-messages">{"".join(message_cards)}</section>'
         "</main>"
-        f"{body_source_template}"
         f"{selected_card_script}"
         "</body></html>"
     )
@@ -3260,6 +3342,9 @@ def rewrite_preserved_email_message_preview(
 def extract_standalone_preview_body_html(preview_html: str) -> str | None:
     cleaned_preview_html = HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN.sub("", preview_html or "")
     cleaned_preview_html = HTML_PREVIEW_CALENDAR_INVITES_PATTERN.sub("", cleaned_preview_html)
+    visible_body_html = extract_visible_email_preview_body_html(cleaned_preview_html)
+    if visible_body_html is not None:
+        return visible_body_html
     source_match = EMAIL_PREVIEW_BODY_SOURCE_PATTERN.search(cleaned_preview_html)
     if source_match is not None:
         normalized_source = source_match.group(1).strip()
@@ -4014,6 +4099,7 @@ def refresh_conversation_previews(
             paths,
             document_ids,
         )
+        writes_segment_artifacts = writes_aggregate_artifacts and len(segment_items) > 1
         entry_document_ids = [
             int(document["id"])
             for document in documents
@@ -4026,8 +4112,10 @@ def refresh_conversation_previews(
         toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
         full_rel_path = conversation_preview_full_rel_path(conversation_id)
         full_preview_existed_before = (paths["state_dir"] / full_rel_path).exists()
+        def aggregate_preview_rel_path(segment: dict[str, object]) -> str:
+            return str(segment["segment_rel_path"]) if writes_segment_artifacts else full_rel_path
         doc_target_hrefs = {
-            int(document["id"]): f"{Path(str(segment['segment_rel_path'])).name}#{conversation_preview_anchor(int(document['id']))}"
+            int(document["id"]): f"{Path(aggregate_preview_rel_path(segment)).name}#{conversation_preview_anchor(int(document['id']))}"
             for segment in segment_items
             for document in segment["documents"]
         }
@@ -4038,18 +4126,8 @@ def refresh_conversation_previews(
             )
         }
         if writes_aggregate_artifacts:
-            toc_abs_path = paths["state_dir"] / toc_rel_path
-            toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
             full_abs_path = paths["state_dir"] / full_rel_path
             full_abs_path.parent.mkdir(parents=True, exist_ok=True)
-            toc_abs_path.write_text(
-                build_conversation_toc_html(
-                    conversation_row,
-                    documents=documents,
-                    segment_items=segment_items,
-                ),
-                encoding="utf-8",
-            )
             full_attachment_links = conversation_attachment_links_by_document_id(
                 connection,
                 paths,
@@ -4065,28 +4143,39 @@ def refresh_conversation_previews(
                 ),
                 encoding="utf-8",
             )
-            for index, segment in enumerate(segment_items):
-                segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
-                segment_abs_path.parent.mkdir(parents=True, exist_ok=True)
-                attachment_links = conversation_attachment_links_by_document_id(
-                    connection,
-                    paths,
-                    segment_preview_path=segment_abs_path,
-                    documents=list(segment["documents"]),
-                )
-                segment_abs_path.write_text(
-                    build_conversation_segment_html(
+            if writes_segment_artifacts:
+                toc_abs_path = paths["state_dir"] / toc_rel_path
+                toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
+                toc_abs_path.write_text(
+                    build_conversation_toc_html(
                         conversation_row,
-                        segment_label=str(segment["label"]),
-                        segment_index=index,
-                        segment_count=len(segment_items),
+                        documents=documents,
                         segment_items=segment_items,
-                        current_segment_rel_path=str(segment["segment_rel_path"]),
-                        doc_target_hrefs=doc_target_hrefs,
-                        attachment_links_by_document_id=attachment_links,
                     ),
                     encoding="utf-8",
                 )
+                for index, segment in enumerate(segment_items):
+                    segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
+                    segment_abs_path.parent.mkdir(parents=True, exist_ok=True)
+                    attachment_links = conversation_attachment_links_by_document_id(
+                        connection,
+                        paths,
+                        segment_preview_path=segment_abs_path,
+                        documents=list(segment["documents"]),
+                    )
+                    segment_abs_path.write_text(
+                        build_conversation_segment_html(
+                            conversation_row,
+                            segment_label=str(segment["label"]),
+                            segment_index=index,
+                            segment_count=len(segment_items),
+                            segment_items=segment_items,
+                            current_segment_rel_path=str(segment["segment_rel_path"]),
+                            doc_target_hrefs=doc_target_hrefs,
+                            attachment_links_by_document_id=attachment_links,
+                        ),
+                        encoding="utf-8",
+                    )
         created_at = utc_now()
         document_ids = [int(document["id"]) for document in documents]
         previous_preview_paths = [
@@ -4103,7 +4192,8 @@ def refresh_conversation_previews(
         if full_preview_existed_before:
             previous_preview_paths.append(full_rel_path)
         for segment in segment_items:
-            segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
+            segment_rel_path = aggregate_preview_rel_path(segment)
+            segment_abs_path = paths["state_dir"] / segment_rel_path
             entry_attachment_links = conversation_attachment_links_by_document_id(
                 connection,
                 paths,
@@ -4126,7 +4216,7 @@ def refresh_conversation_previews(
                             else None
                         ),
                         thread_rel_path=(
-                            str(segment["segment_rel_path"])
+                            segment_rel_path
                             if writes_aggregate_artifacts
                             else None
                         ),
@@ -4163,7 +4253,7 @@ def refresh_conversation_previews(
                         segment_ordinal = len(preview_rows)
                         preview_rows.append(
                             {
-                                "rel_preview_path": str(segment["segment_rel_path"]),
+                                "rel_preview_path": segment_rel_path,
                                 "preview_type": "html",
                                 "target_fragment": conversation_preview_anchor(int(document["id"])),
                                 "label": "segment",
@@ -4171,16 +4261,17 @@ def refresh_conversation_previews(
                                 "created_at": created_at,
                             }
                         )
-                        preview_rows.append(
-                            {
-                                "rel_preview_path": toc_rel_path,
-                                "preview_type": "html",
-                                "target_fragment": None,
-                                "label": "contents",
-                                "ordinal": len(preview_rows),
-                                "created_at": created_at,
-                            }
-                        )
+                        if writes_segment_artifacts:
+                            preview_rows.append(
+                                {
+                                    "rel_preview_path": toc_rel_path,
+                                    "preview_type": "html",
+                                    "target_fragment": None,
+                                    "label": "contents",
+                                    "ordinal": len(preview_rows),
+                                    "created_at": created_at,
+                                }
+                            )
                     rebased_preview_rows = rebase_preserved_preview_rows(
                         preserved_preview_rows,
                         start_ordinal=len(preview_rows),
@@ -4196,7 +4287,7 @@ def refresh_conversation_previews(
                     if writes_aggregate_artifacts:
                         preview_rows.append(
                             {
-                                "rel_preview_path": str(segment["segment_rel_path"]),
+                                "rel_preview_path": segment_rel_path,
                                 "preview_type": "html",
                                 "target_fragment": conversation_preview_anchor(int(document["id"])),
                                 "label": "segment",
@@ -4204,16 +4295,17 @@ def refresh_conversation_previews(
                                 "created_at": created_at,
                             }
                         )
-                        preview_rows.append(
-                            {
-                                "rel_preview_path": toc_rel_path,
-                                "preview_type": "html",
-                                "target_fragment": None,
-                                "label": "contents",
-                                "ordinal": len(preview_rows),
-                                "created_at": created_at,
-                            }
-                        )
+                        if writes_segment_artifacts:
+                            preview_rows.append(
+                                {
+                                    "rel_preview_path": toc_rel_path,
+                                    "preview_type": "html",
+                                    "target_fragment": None,
+                                    "label": "contents",
+                                    "ordinal": len(preview_rows),
+                                    "created_at": created_at,
+                                }
+                            )
                 replace_document_preview_rows(
                     connection,
                     int(document["id"]),

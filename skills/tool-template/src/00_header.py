@@ -37,6 +37,7 @@ from datetime import date, datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterator
 from urllib import error as urllib_error
