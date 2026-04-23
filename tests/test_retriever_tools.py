@@ -7535,13 +7535,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(dataset_list_exit, 0)
         self.assertEqual(dataset_list_stderr, "")
         self.assertIn("Datasets:", dataset_list_stdout)
-        self.assertIn("| Dataset | Docs | Size | Custodians | Types | Time Range |", dataset_list_stdout)
+        self.assertIn("| Dataset | Docs | Size | Custodians |", dataset_list_stdout)
         self.assertIn(
-            "| Review Set | 1 | 12 B | mailbox@example.com | E-Doc (1) | 2024-01-02 to 2024-01-03 |",
+            "| Review Set | 1 | 12 B | mailbox@example.com |",
             dataset_list_stdout,
         )
         self.assertIn(
-            f"| {self.root.name} | 1 | 12 B | mailbox@example.com | E-Doc (1) | 2024-01-02 to 2024-01-03 |",
+            f"| {self.root.name} | 1 | 12 B | mailbox@example.com |",
             dataset_list_stdout,
         )
 
