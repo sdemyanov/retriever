@@ -8,7 +8,7 @@
 - workspace output path: `.retriever/bin/retriever_tools.py`
 - canonical bundled output file: [retriever_tools.py](retriever_tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `9cc24ba19c8d6bab239bf91f5a695f4b7ef66d213379f923959fec960a8e069d`
+- source checksum (SHA256): `cf0bcb9cdad152ab109a5f84caa2b8bf71a0656015ef235c72226b1314f07a66`
 
 ## Current command surface
 
@@ -92,7 +92,7 @@ For Cowork-agent execution, prefer the queue path:
 
 ## Auto-upgrade dispatch
 
-The tool's `main()` calls `maybe_upgrade_workspace_tool(root)` before any command outside the exempt set `{schema-version, bootstrap, doctor, upgrade-workspace, slash}`. If the workspace copy is clean-but-stale relative to the plugin's canonical template, it is backed up to `.retriever/bin/backups/`, replaced via `pathlib.Path.write_bytes` (open-with-O_TRUNC, so no `unlink` is needed in Cowork sandboxes), and the tool re-execs so the current command runs from the new code. A user-modified copy is refused and a `retriever-auto-upgrade: {"status": "blocked", ...}` line is written to stderr; the current command still runs in that case.
+The tool's `main()` calls `maybe_upgrade_workspace_tool(root)` before any command outside the exempt set `{schema-version, bootstrap, doctor, upgrade-workspace}`. That includes user-facing slash commands such as `/dataset list` and `/search`. If the workspace copy is clean-but-stale relative to the plugin's canonical template, it is backed up to `.retriever/bin/backups/`, replaced via `pathlib.Path.write_bytes` (open-with-O_TRUNC, so no `unlink` is needed in Cowork sandboxes), and the tool re-execs so the current command runs from the new code. A user-modified copy is refused and a `retriever-auto-upgrade: {"status": "blocked", ...}` line is written to stderr; the current command still runs in that case.
 
 The canonical plugin template is discovered via:
 

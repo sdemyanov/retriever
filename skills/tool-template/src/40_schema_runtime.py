@@ -1719,15 +1719,13 @@ def bootstrap(root: Path) -> dict[str, object]:
 # work even when a workspace does not exist yet. `bootstrap` installs the
 # runtime; running the upgrade before it would be meaningless. `doctor`
 # reports on the workspace and should not mutate it. `upgrade-workspace`
-# performs the upgrade explicitly. `slash` delegates to sub-commands that
-# already go through the dispatcher.
+# performs the upgrade explicitly.
 AUTO_UPGRADE_EXEMPT_COMMANDS = frozenset(
     {
         "schema-version",
         "bootstrap",
         "doctor",
         "upgrade-workspace",
-        "slash",
     }
 )
 

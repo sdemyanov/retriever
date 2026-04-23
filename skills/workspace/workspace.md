@@ -81,7 +81,7 @@ Use this as the shared preflight contract for runners that are about to call `in
 
 ### Auto-upgrade dispatch hook
 
-Before executing any command other than `schema-version`, `bootstrap`, `doctor`, `upgrade-workspace`, or `slash`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper.
+Before executing any command other than `schema-version`, `bootstrap`, `doctor`, or `upgrade-workspace`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper. This includes user-facing slash commands such as `/dataset list` and `/search`.
 
 The helper:
 

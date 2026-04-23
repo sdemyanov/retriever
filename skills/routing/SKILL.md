@@ -193,6 +193,11 @@ The authoritative current list of subcommands is regenerated at build time into 
 
 
 
+
+
+
+
+
 <!-- END: tool-subcommands -->
 
 ## Tier 4 — direct SQLite access (last resort only)

@@ -7407,6 +7407,66 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Review Set: 1 docs (manual 1, source 0)", dataset_list_stdout)
         self.assertIn(f"{self.root.name}:", dataset_list_stdout)
 
+    def test_slash_list_commands_auto_upgrade_clean_but_stale_workspace_tool(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        stale_tool_bytes = TOOL_BYTES + b"\n# clean-but-stale test workspace copy\n"
+        stale_sha = hashlib.sha256(stale_tool_bytes).hexdigest()
+        self.paths["tool_path"].write_bytes(stale_tool_bytes)
+
+        runtime = json.loads(self.paths["runtime_path"].read_text(encoding="utf-8"))
+        runtime["template_sha256"] = stale_sha
+        runtime["tool_version"] = "0.0-test-stale"
+        self.paths["runtime_path"].write_text(
+            json.dumps(runtime, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        workspace_tool = load_python_module(
+            self.paths["tool_path"],
+            "retriever_tools_workspace_stale_under_test",
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+            mock.patch.object(
+                workspace_tool.sys,
+                "argv",
+                ["retriever_tools.py", "slash", str(self.root), "/dataset", "list"],
+            ),
+            mock.patch.object(workspace_tool.os, "execve", return_value=None) as execve_mock,
+            mock.patch.dict(
+                workspace_tool.os.environ,
+                {"RETRIEVER_CANONICAL_TOOL_PATH": str(TOOL_PATH)},
+                clear=False,
+            ),
+        ):
+            dataset_list_exit = workspace_tool.main()
+        dataset_list_stdout = stdout.getvalue().strip()
+        dataset_list_stderr = stderr.getvalue().strip()
+
+        self.assertEqual(dataset_list_exit, 0)
+        self.assertIn("Datasets:", dataset_list_stdout)
+        self.assertTrue(dataset_list_stderr.startswith("retriever-auto-upgrade: "))
+        auto_upgrade_payload = json.loads(dataset_list_stderr.removeprefix("retriever-auto-upgrade: "))
+        self.assertEqual(auto_upgrade_payload["status"], "upgraded")
+        self.assertEqual(auto_upgrade_payload["reason"], "auto-stale")
+        self.assertEqual(retriever_tools.sha256_file(self.paths["tool_path"]), hashlib.sha256(TOOL_BYTES).hexdigest())
+
+        refreshed_runtime = json.loads(self.paths["runtime_path"].read_text(encoding="utf-8"))
+        self.assertEqual(refreshed_runtime["tool_version"], retriever_tools.TOOL_VERSION)
+        self.assertEqual(refreshed_runtime["template_sha256"], hashlib.sha256(TOOL_BYTES).hexdigest())
+
+        execve_mock.assert_called_once()
+        execve_executable, execve_argv, execve_env = execve_mock.call_args.args
+        self.assertEqual(execve_executable, retriever_tools.sys.executable)
+        self.assertEqual(execve_argv[0], retriever_tools.sys.executable)
+        self.assertEqual(Path(execve_argv[1]).resolve(), self.paths["tool_path"].resolve())
+        self.assertEqual(execve_argv[2:], ["slash", str(self.root), "/dataset", "list"])
+        self.assertEqual(execve_env["RETRIEVER_AUTO_UPGRADE_REEXEC"], "1")
+
     def test_slash_bates_within_intersects_ranges_and_rejects_cross_slot_and_mixed_prefix(self) -> None:
         retriever_tools.bootstrap(self.root)
 
