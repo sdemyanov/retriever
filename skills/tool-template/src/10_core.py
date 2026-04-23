@@ -18,6 +18,10 @@ HTML_PREVIEW_ATTACHMENT_LINKS_PATTERN = re.compile(
     r"<!-- RETRIEVER_ATTACHMENT_LINKS_START -->.*?<!-- RETRIEVER_ATTACHMENT_LINKS_END -->",
     re.DOTALL,
 )
+HTML_PREVIEW_CALENDAR_INVITES_PATTERN = re.compile(
+    r"<!-- RETRIEVER_CALENDAR_INVITES_START -->.*?<!-- RETRIEVER_CALENDAR_INVITES_END -->",
+    re.DOTALL,
+)
 
 SCHEMA_STATEMENTS = [
     """
@@ -3776,6 +3780,15 @@ def extract_email_chain_participants(
 
 ICALENDAR_FILE_TYPES = {"ics", "ifb", "vcal", "vcs"}
 ICALENDAR_URL_PATTERN = re.compile(r"https?://[^\s<>'\"]+")
+CALENDAR_INVITE_TEXT_BLOCK_START = "[[RETRIEVER_CALENDAR_INVITE]]"
+CALENDAR_INVITE_TEXT_BLOCK_END = "[[/RETRIEVER_CALENDAR_INVITE]]"
+CALENDAR_INVITE_TEXT_BLOCK_PATTERN = re.compile(
+    re.escape(CALENDAR_INVITE_TEXT_BLOCK_START)
+    + r"\n(.*?)"
+    + re.escape(CALENDAR_INVITE_TEXT_BLOCK_END)
+    + r"\s*",
+    re.DOTALL,
+)
 
 
 def unfold_icalendar_lines(text: str) -> list[str]:
@@ -4156,6 +4169,137 @@ def parse_icalendar_event_metadata(text: object) -> dict[str, object] | None:
         "uid": _first_text(event_properties, "UID"),
         "sequence": _first_text(event_properties, "SEQUENCE"),
     }
+
+
+def build_calendar_invite_summary(
+    metadata: dict[str, object] | None,
+    *,
+    file_name: object = None,
+    href: object = None,
+    detail: object = None,
+) -> dict[str, str] | None:
+    if not isinstance(metadata, dict):
+        return None
+    title = (
+        normalize_generated_document_title(metadata.get("summary"))
+        or normalize_generated_document_title(file_name)
+        or "Calendar invite"
+    )
+    summary = {
+        "kind": "calendar_invite",
+        "label": normalize_whitespace(str(file_name or title or "Calendar invite")) or "Calendar invite",
+        "title": title,
+        "when": normalize_whitespace(str(metadata.get("when") or "")) or "",
+        "organizer": normalize_whitespace(str(metadata.get("organizer") or "")) or "",
+        "attendees": normalize_whitespace(str(metadata.get("attendees_display") or "")) or "",
+        "location": normalize_whitespace(str(metadata.get("location") or "")) or "",
+        "join_href": normalize_whitespace(str(metadata.get("conference_url") or "")) or "",
+        "status": normalize_whitespace(str(summarize_icalendar_invite_status(metadata) or "")) or "",
+        "uid": normalize_whitespace(str(metadata.get("uid") or "")) or "",
+        "sequence": normalize_whitespace(str(metadata.get("sequence") or "")) or "",
+        "href": normalize_whitespace(str(href or "")) or "",
+        "detail": normalize_whitespace(str(detail or "")) or "",
+        "file_name": normalize_whitespace(str(file_name or "")) or "",
+    }
+    if not any(summary.get(key) for key in ("title", "when", "organizer", "attendees", "location", "join_href", "status")):
+        return None
+    return summary
+
+
+def extract_calendar_invite_summary_from_attachment(attachment: dict[str, object]) -> dict[str, str] | None:
+    payload = attachment.get("payload")
+    if not isinstance(payload, (bytes, bytearray)):
+        return None
+    file_name = normalize_whitespace(str(attachment.get("file_name") or "")) or None
+    content_type = normalize_mime_type(attachment.get("content_type"))
+    file_type = infer_attachment_file_type(
+        file_name=file_name,
+        payload=bytes(payload),
+        content_type=content_type,
+    )
+    if content_type != "text/calendar" and file_type not in ICALENDAR_FILE_TYPES:
+        return None
+    decoded, _, _ = decode_bytes(bytes(payload))
+    return build_calendar_invite_summary(
+        parse_icalendar_event_metadata(decoded),
+        file_name=file_name,
+    )
+
+
+def partition_calendar_invite_attachments(
+    attachments: list[dict[str, object]] | None,
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+    invite_summaries: list[dict[str, str]] = []
+    retained_attachments: list[dict[str, object]] = []
+    for attachment in list(attachments or []):
+        invite_summary = extract_calendar_invite_summary_from_attachment(attachment)
+        if invite_summary is None:
+            retained_attachments.append(attachment)
+            continue
+        invite_summaries.append(invite_summary)
+    return invite_summaries, retained_attachments
+
+
+def build_calendar_invite_search_text(invites: list[dict[str, str]] | None) -> str:
+    if not invites:
+        return ""
+    blocks: list[str] = []
+    for invite in invites:
+        lines = [CALENDAR_INVITE_TEXT_BLOCK_START]
+        for label, key in (
+            ("Title", "title"),
+            ("When", "when"),
+            ("Organizer", "organizer"),
+            ("Attendees", "attendees"),
+            ("Location", "location"),
+            ("Join", "join_href"),
+            ("Status", "status"),
+            ("UID", "uid"),
+            ("Sequence", "sequence"),
+            ("Attachment", "file_name"),
+        ):
+            value = normalize_whitespace(str(invite.get(key) or "")) or None
+            if value:
+                lines.append(f"{label}: {value}")
+        lines.append(CALENDAR_INVITE_TEXT_BLOCK_END)
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def extract_calendar_invites_from_text_content(text: str) -> tuple[str, list[dict[str, str]]]:
+    invites: list[dict[str, str]] = []
+    normalized_text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    label_map = {
+        "title": "title",
+        "when": "when",
+        "organizer": "organizer",
+        "attendees": "attendees",
+        "location": "location",
+        "join": "join_href",
+        "status": "status",
+        "uid": "uid",
+        "sequence": "sequence",
+        "attachment": "file_name",
+    }
+
+    def _replace(match: re.Match[str]) -> str:
+        invite: dict[str, str] = {"kind": "calendar_invite"}
+        for raw_line in match.group(1).splitlines():
+            if ":" not in raw_line:
+                continue
+            raw_label, raw_value = raw_line.split(":", 1)
+            key = label_map.get(normalize_whitespace(raw_label).lower())
+            value = normalize_whitespace(raw_value)
+            if key and value:
+                invite[key] = value
+        if invite.get("title") or invite.get("when") or invite.get("join_href"):
+            invite.setdefault("label", invite.get("file_name") or invite.get("title") or "Calendar invite")
+            invites.append(invite)
+        return ""
+
+    cleaned = CALENDAR_INVITE_TEXT_BLOCK_PATTERN.sub(_replace, normalized_text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip("\n")
+    return cleaned, invites
 
 
 CHAT_SPEAKER_BLOCKLIST = {
@@ -4793,7 +4937,13 @@ def render_html_preview_calendar_invite_cards(links: list[dict[str, str]]) -> st
             )
             + "</article>"
         )
-    return '<section class="retriever-calendar-invites">' + "".join(cards) + "</section>"
+    return (
+        "<!-- RETRIEVER_CALENDAR_INVITES_START -->"
+        + '<section class="retriever-calendar-invites">'
+        + "".join(cards)
+        + "</section>"
+        + "<!-- RETRIEVER_CALENDAR_INVITES_END -->"
+    )
 
 
 def render_html_preview_attachment_links(links: list[dict[str, str]]) -> str:

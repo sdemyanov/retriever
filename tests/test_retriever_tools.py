@@ -4735,11 +4735,30 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         parent_row = self.fetch_document_row("thread.eml")
         child_rows = self.fetch_child_rows(parent_row["id"])
-        self.assertEqual(len(child_rows), 2)
+        self.assertEqual(len(child_rows), 1)
+        child_row = child_rows[0]
+        self.assertEqual(child_row["file_name"], "notes.txt")
 
         search_result = retriever_tools.search(self.root, "Invitation from Google Calendar", None, None, None, 1, 20)
         parent_result = next(item for item in search_result["results"] if item["id"] == parent_row["id"])
-        self.assertEqual(parent_result["attachment_count"], 2)
+        self.assertEqual(parent_result["attachment_count"], 1)
+        self.assertEqual(parent_result["attachments"][0]["file_name"], "notes.txt")
+
+        invite_search = retriever_tools.search(self.root, "qara", None, None, None, 1, 20)
+        self.assertEqual(invite_search["total_hits"], 1)
+        self.assertEqual(invite_search["results"][0]["id"], parent_row["id"])
+
+        attachments_only = retriever_tools.search(
+            self.root,
+            "",
+            [["is_attachment", "eq", "true"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(attachments_only["total_hits"], 1)
+        self.assertEqual(attachments_only["results"][0]["id"], child_row["id"])
 
         message_preview_html = self.preview_target_file_path(
             self.preview_target_by_label(parent_result["preview_targets"], "message")
@@ -12990,6 +13009,60 @@ class CidInliningTests(unittest.TestCase):
         self.assertIn("<title>Legalweek 2023 Mobile App Now Available</title>", preview_content)
         self.assertIn('class="gmail-thread-title">Legalweek 2023 Mobile App Now Available</h1>', preview_content)
         self.assertNotIn("Attachments: agenda.pdf", preview_content)
+
+    def test_build_email_extracted_payload_promotes_calendar_invites_into_parent_text(self) -> None:
+        payload = retriever_tools.build_email_extracted_payload(
+            subject="Discuss Relativity",
+            author="Sergey Demyanov <sergey@discoverbeagle.com>",
+            recipients="Max Faleev <max@discoverbeagle.com>",
+            date_created="2023-06-01T00:31:26Z",
+            text_body="Invitation from Google Calendar",
+            html_body=None,
+            attachments=[
+                {
+                    "file_name": "invite.ics",
+                    "ordinal": 1,
+                    "payload": "\r\n".join(
+                        [
+                            "BEGIN:VCALENDAR",
+                            "VERSION:2.0",
+                            "METHOD:REQUEST",
+                            "BEGIN:VEVENT",
+                            "SUMMARY:Discuss Relativity",
+                            "DTSTART;TZID=America/New_York:20230601T150000",
+                            "DTEND;TZID=America/New_York:20230601T153000",
+                            "ORGANIZER;CN=Sergey Demyanov:mailto:sergey@discoverbeagle.com",
+                            "ATTENDEE;CN=Max Faleev:mailto:max@discoverbeagle.com",
+                            "STATUS:CONFIRMED",
+                            "X-GOOGLE-CONFERENCE:https://meet.google.com/fps-qara-aie",
+                            "END:VEVENT",
+                            "END:VCALENDAR",
+                            "",
+                        ]
+                    ).encode("utf-8"),
+                    "file_hash": "invite-hash",
+                    "content_type": "text/calendar",
+                },
+                {
+                    "file_name": "notes.txt",
+                    "ordinal": 2,
+                    "payload": b"Agenda note",
+                    "file_hash": "notes-hash",
+                    "content_type": "text/plain",
+                },
+            ],
+            preview_file_name="msg.html",
+        )
+
+        self.assertEqual([attachment["file_name"] for attachment in payload["attachments"]], ["notes.txt"])
+        self.assertIn("[[RETRIEVER_CALENDAR_INVITE]]", payload["text_content"])
+        self.assertIn("Join: https://meet.google.com/fps-qara-aie", payload["text_content"])
+        self.assertIn("Sergey Demyanov <sergey@discoverbeagle.com>", str(payload["participants"]))
+
+        preview_content = payload["preview_artifacts"][0]["content"]
+        self.assertIn("Calendar invite", preview_content)
+        self.assertIn("Discuss Relativity", preview_content)
+        self.assertNotIn(">invite.ics<", preview_content)
 
 
 class CalendarInviteParsingTests(unittest.TestCase):
