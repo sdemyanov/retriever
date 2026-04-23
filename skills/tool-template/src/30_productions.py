@@ -2579,6 +2579,19 @@ def conversation_preview_segment_label(segment_key: str, *, segment_mode: str) -
         return segment_key
 
 
+def conversation_preview_writes_aggregate_artifacts(
+    conversation_type: object,
+    documents: list[dict[str, object]],
+    *,
+    segment_mode: str,
+) -> bool:
+    if len(documents) != 1:
+        return True
+    if normalize_whitespace(str(conversation_type or "")).lower() != "email":
+        return True
+    return segment_mode == "single"
+
+
 def conversation_preview_document_heading(document: dict[str, object]) -> str:
     for value in (
         document.get("title"),
@@ -3978,6 +3991,11 @@ def refresh_conversation_previews(
         if not documents:
             continue
         segment_mode = conversation_preview_segment_mode(conversation_row["conversation_type"], documents)
+        writes_aggregate_artifacts = conversation_preview_writes_aggregate_artifacts(
+            conversation_row["conversation_type"],
+            documents,
+            segment_mode=segment_mode,
+        )
         segment_documents: dict[str, list[dict[str, object]]] = defaultdict(list)
         for document in documents:
             segment_documents[conversation_preview_segment_key(document, segment_mode=segment_mode)].append(document)
@@ -4006,11 +4024,8 @@ def refresh_conversation_previews(
             for index, document_id in enumerate(entry_document_ids)
         }
         toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
-        toc_abs_path = paths["state_dir"] / toc_rel_path
-        toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
         full_rel_path = conversation_preview_full_rel_path(conversation_id)
-        full_abs_path = paths["state_dir"] / full_rel_path
-        full_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        full_preview_existed_before = (paths["state_dir"] / full_rel_path).exists()
         doc_target_hrefs = {
             int(document["id"]): f"{Path(str(segment['segment_rel_path'])).name}#{conversation_preview_anchor(int(document['id']))}"
             for segment in segment_items
@@ -4022,51 +4037,56 @@ def refresh_conversation_previews(
                 [document for document in documents if normalize_whitespace(str(document.get("content_type") or "")).lower() == "email"]
             )
         }
-        toc_abs_path.write_text(
-            build_conversation_toc_html(
-                conversation_row,
-                documents=documents,
-                segment_items=segment_items,
-            ),
-            encoding="utf-8",
-        )
-        full_attachment_links = conversation_attachment_links_by_document_id(
-            connection,
-            paths,
-            segment_preview_path=full_abs_path,
-            documents=documents,
-        )
-        full_abs_path.write_text(
-            build_conversation_full_html(
-                conversation_row,
-                documents=documents,
-                segment_items=segment_items,
-                attachment_links_by_document_id=full_attachment_links,
-            ),
-            encoding="utf-8",
-        )
-        for index, segment in enumerate(segment_items):
-            segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
-            segment_abs_path.parent.mkdir(parents=True, exist_ok=True)
-            attachment_links = conversation_attachment_links_by_document_id(
-                connection,
-                paths,
-                segment_preview_path=segment_abs_path,
-                documents=list(segment["documents"]),
-            )
-            segment_abs_path.write_text(
-                build_conversation_segment_html(
+        if writes_aggregate_artifacts:
+            toc_abs_path = paths["state_dir"] / toc_rel_path
+            toc_abs_path.parent.mkdir(parents=True, exist_ok=True)
+            full_abs_path = paths["state_dir"] / full_rel_path
+            full_abs_path.parent.mkdir(parents=True, exist_ok=True)
+            toc_abs_path.write_text(
+                build_conversation_toc_html(
                     conversation_row,
-                    segment_label=str(segment["label"]),
-                    segment_index=index,
-                    segment_count=len(segment_items),
+                    documents=documents,
                     segment_items=segment_items,
-                    current_segment_rel_path=str(segment["segment_rel_path"]),
-                    doc_target_hrefs=doc_target_hrefs,
-                    attachment_links_by_document_id=attachment_links,
                 ),
                 encoding="utf-8",
             )
+            full_attachment_links = conversation_attachment_links_by_document_id(
+                connection,
+                paths,
+                segment_preview_path=full_abs_path,
+                documents=documents,
+            )
+            full_abs_path.write_text(
+                build_conversation_full_html(
+                    conversation_row,
+                    documents=documents,
+                    segment_items=segment_items,
+                    attachment_links_by_document_id=full_attachment_links,
+                ),
+                encoding="utf-8",
+            )
+            for index, segment in enumerate(segment_items):
+                segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
+                segment_abs_path.parent.mkdir(parents=True, exist_ok=True)
+                attachment_links = conversation_attachment_links_by_document_id(
+                    connection,
+                    paths,
+                    segment_preview_path=segment_abs_path,
+                    documents=list(segment["documents"]),
+                )
+                segment_abs_path.write_text(
+                    build_conversation_segment_html(
+                        conversation_row,
+                        segment_label=str(segment["label"]),
+                        segment_index=index,
+                        segment_count=len(segment_items),
+                        segment_items=segment_items,
+                        current_segment_rel_path=str(segment["segment_rel_path"]),
+                        doc_target_hrefs=doc_target_hrefs,
+                        attachment_links_by_document_id=attachment_links,
+                    ),
+                    encoding="utf-8",
+                )
         created_at = utc_now()
         document_ids = [int(document["id"]) for document in documents]
         previous_preview_paths = [
@@ -4080,6 +4100,8 @@ def refresh_conversation_previews(
                 document_ids,
             ).fetchall()
         ]
+        if full_preview_existed_before:
+            previous_preview_paths.append(full_rel_path)
         for segment in segment_items:
             segment_abs_path = paths["state_dir"] / str(segment["segment_rel_path"])
             entry_attachment_links = conversation_attachment_links_by_document_id(
@@ -4103,7 +4125,11 @@ def refresh_conversation_previews(
                             if len(documents) > 1
                             else None
                         ),
-                        thread_rel_path=str(segment["segment_rel_path"]),
+                        thread_rel_path=(
+                            str(segment["segment_rel_path"])
+                            if writes_aggregate_artifacts
+                            else None
+                        ),
                         attachment_links=entry_attachment_links.get(document_id) or [],
                     )
                 preview_rows: list[dict[str, object]] = []
@@ -4133,27 +4159,28 @@ def refresh_conversation_previews(
                             "created_at": created_at,
                         }
                     )
-                    segment_ordinal = len(preview_rows)
-                    preview_rows.append(
-                        {
-                            "rel_preview_path": str(segment["segment_rel_path"]),
-                            "preview_type": "html",
-                            "target_fragment": conversation_preview_anchor(int(document["id"])),
-                            "label": "segment",
-                            "ordinal": segment_ordinal,
-                            "created_at": created_at,
-                        }
-                    )
-                    preview_rows.append(
-                        {
-                            "rel_preview_path": toc_rel_path,
-                            "preview_type": "html",
-                            "target_fragment": None,
-                            "label": "contents",
-                            "ordinal": len(preview_rows),
-                            "created_at": created_at,
-                        }
-                    )
+                    if writes_aggregate_artifacts:
+                        segment_ordinal = len(preview_rows)
+                        preview_rows.append(
+                            {
+                                "rel_preview_path": str(segment["segment_rel_path"]),
+                                "preview_type": "html",
+                                "target_fragment": conversation_preview_anchor(int(document["id"])),
+                                "label": "segment",
+                                "ordinal": segment_ordinal,
+                                "created_at": created_at,
+                            }
+                        )
+                        preview_rows.append(
+                            {
+                                "rel_preview_path": toc_rel_path,
+                                "preview_type": "html",
+                                "target_fragment": None,
+                                "label": "contents",
+                                "ordinal": len(preview_rows),
+                                "created_at": created_at,
+                            }
+                        )
                     rebased_preview_rows = rebase_preserved_preview_rows(
                         preserved_preview_rows,
                         start_ordinal=len(preview_rows),
@@ -4166,26 +4193,27 @@ def refresh_conversation_previews(
                         created_at=created_at,
                     )
                     preview_rows.extend(rebased_preview_rows)
-                    preview_rows.append(
-                        {
-                            "rel_preview_path": str(segment["segment_rel_path"]),
-                            "preview_type": "html",
-                            "target_fragment": conversation_preview_anchor(int(document["id"])),
-                            "label": "segment",
-                            "ordinal": len(preview_rows),
-                            "created_at": created_at,
-                        }
-                    )
-                    preview_rows.append(
-                        {
-                            "rel_preview_path": toc_rel_path,
-                            "preview_type": "html",
-                            "target_fragment": None,
-                            "label": "contents",
-                            "ordinal": len(preview_rows),
-                            "created_at": created_at,
-                        }
-                    )
+                    if writes_aggregate_artifacts:
+                        preview_rows.append(
+                            {
+                                "rel_preview_path": str(segment["segment_rel_path"]),
+                                "preview_type": "html",
+                                "target_fragment": conversation_preview_anchor(int(document["id"])),
+                                "label": "segment",
+                                "ordinal": len(preview_rows),
+                                "created_at": created_at,
+                            }
+                        )
+                        preview_rows.append(
+                            {
+                                "rel_preview_path": toc_rel_path,
+                                "preview_type": "html",
+                                "target_fragment": None,
+                                "label": "contents",
+                                "ordinal": len(preview_rows),
+                                "created_at": created_at,
+                            }
+                        )
                 replace_document_preview_rows(
                     connection,
                     int(document["id"]),
