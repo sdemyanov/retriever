@@ -8,6 +8,7 @@ __pycache__/
 /plans/
 /backups/
 /phase0/
+/phase0/regression_corpus/
 /test-marketplace/
 /.retriever/
 /.retriever-plugin-runtime/

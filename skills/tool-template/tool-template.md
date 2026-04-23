@@ -2,16 +2,12 @@
 
 ## Template metadata
 
-- tool version: `0.17.2`
-- schema version: `20`
-- requirements version: `2026-04-20-phase10-conversations-and-export-previews`
+- tool version: `1.0.3`
+- schema version: `22`
+- requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-<<<<<<< HEAD
-- source checksum (SHA256): `b23a6a579d2bc340fba9b3297a04bbd5e2e4c0c3968c2dbc31d747221eb293b9`
-=======
-- source checksum (SHA256): `362d415ce8ed65d1a7abef427230bad2240568d1c7428bda93043fb5cca472fa`
->>>>>>> 31fb22d (Shrink TIFF production preview payloads)
+- source checksum (SHA256): `96d05136ef7e7b6871df63ecaf3bb8fe270829a381eb19aeb380f12a588fd6da`
 
 ## Current command surface
 

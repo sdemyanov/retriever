@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover - platform-specific locking
     msvcrt = None
 
 
-TOOL_VERSION = "1.0.2"
+TOOL_VERSION = "1.0.3"
 SCHEMA_VERSION = 22
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
