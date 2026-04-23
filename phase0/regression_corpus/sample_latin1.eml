@@ -1,8 +1,0 @@
-From: alice@example.com
-To: bob@example.com
-Subject: Latin-1 EML probe
-Content-Type: text/plain; charset="iso-8859-1"
-Content-Transfer-Encoding: 8bit
-MIME-Version: 1.0
-
-Bonjour de café et München.
