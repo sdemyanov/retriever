@@ -32,12 +32,32 @@ If a `retriever:*` skill covers the intent, invoke it instead of the underlying 
 
 If the user's intent maps to one of the rows above, stop. Use that skill.
 
+## Python runtime (applies to Tiers 2–4)
+
+Retriever maintains a shared plugin runtime venv under
+`.retriever-plugin-runtime/<platform>/venv/`.
+
+For Retriever commands, bare `python3` is acceptable. The tool can activate the
+shared plugin runtime for optional dependencies and may provision it during
+`workspace init` or first dependency use.
+
+Do not install Retriever dependencies into system Python or user-site. If
+manual interpreter or `pip` access is needed, resolve
+`plugin_runtime.python_executable` from `.retriever/runtime.json` and use that
+interpreter.
+
+If a Retriever command fails with `ModuleNotFoundError`, `ImportError`, or
+`Missing dependency for .<ext> parsing: install <package>`, do not install into
+system Python. Prefer `workspace init`; if manual installation is truly needed,
+use the shared plugin runtime venv.
+
 ## Tier 2 — `retriever_tools.py slash` commands
 
-If no Tier 1 skill exists for the intent, use a slash command via the workspace tool. Run exactly one command from the workspace root:
+If no Tier 1 skill exists for the intent, use a slash command via the canonical
+plugin tool. Run exactly one command from the repo root:
 
 ````
-python3 .retriever/bin/retriever_tools.py slash . /<command> [args]
+python3 skills/tool-template/tools.py slash . /<command> [args]
 ````
 
 Return the resulting Retriever state or table. The authoritative current list of slash commands is regenerated at build time into the section below.
@@ -63,10 +83,11 @@ Return the resulting Retriever state or table. The authoritative current list of
 
 ## Tier 3 — `retriever_tools.py` subcommands
 
-If no slash form covers the intent, use a named subcommand of the workspace tool:
+If no slash form covers the intent, use a named subcommand of the canonical
+plugin tool:
 
 ````
-python3 .retriever/bin/retriever_tools.py <subcommand> . [flags]
+python3 skills/tool-template/tools.py <subcommand> . [flags]
 ````
 
 The authoritative current list of subcommands is regenerated at build time into the section below.

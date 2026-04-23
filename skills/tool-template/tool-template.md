@@ -7,7 +7,7 @@
 - requirements version: `2026-04-20-phase10-conversations-and-export-previews`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `98c3886743ebd433c314196f40634fd80f162076952414dccd010b7241d259a8`
+- source checksum (SHA256): `04c3e21658f41b9370228ac58ad0e2a7c41bf54884a5230806f08566a92e26f0`
 
 ## Current command surface
 

@@ -56,6 +56,15 @@ def source_file_snapshot(path: Path) -> tuple[int | None, int | None]:
     return stat.st_size, stat.st_mtime_ns
 
 
+def rollback_open_transaction(connection: sqlite3.Connection) -> None:
+    if not connection.in_transaction:
+        return
+    try:
+        connection.rollback()
+    except sqlite3.Error:
+        return
+
+
 def refresh_ingest_item_filesystem_facts(item: dict[str, object]) -> dict[str, object]:
     refreshed_item = dict(item)
     path = Path(refreshed_item["path"])
@@ -205,6 +214,7 @@ def ingest_serial_special_sources(
             )
             failures.extend(list(gmail_result.get("failures", [])))
         except Exception as exc:
+            rollback_open_transaction(connection)
             stats["failed"] += 1
             failures.append(
                 {
@@ -241,6 +251,7 @@ def ingest_serial_special_sources(
             slack_day_documents_missing += int(slack_result["missing"])
             failures.extend(list(slack_result.get("failures", [])))
         except Exception as exc:
+            rollback_open_transaction(connection)
             stats["failed"] += 1
             failures.append(
                 {
@@ -292,6 +303,7 @@ def ingest_serial_special_sources(
                     failures.append(failure_entry)
                 stats["failed"] += len(list(production_result.get("failures", [])))
             except Exception as exc:
+                rollback_open_transaction(connection)
                 stats["failed"] += 1
                 failures.append(
                     {
@@ -1126,6 +1138,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                         container_prepare_wait_ms += float(pst_result.get("pst_prepare_wait_ms") or 0.0)
                         container_commit_ms += float(pst_result.get("pst_commit_ms") or 0.0)
                     except Exception as exc:
+                        rollback_open_transaction(connection)
                         stats["failed"] += 1
                         failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
                     finally:
@@ -1150,6 +1163,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                         container_prepare_wait_ms += float(mbox_result.get("mbox_prepare_wait_ms") or 0.0)
                         container_commit_ms += float(mbox_result.get("mbox_commit_ms") or 0.0)
                     except Exception as exc:
+                        rollback_open_transaction(connection)
                         stats["failed"] += 1
                         failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
                     finally:
