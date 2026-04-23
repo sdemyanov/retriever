@@ -8,7 +8,7 @@
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
 <<<<<<< HEAD
-- source checksum (SHA256): `adaa4c48fef584791430c9c964bb0eaa42c5b9ffbebde0af0d0f74816a51009b`
+- source checksum (SHA256): `f8531e08c2794f446ea225c993114a62bc480c78bf15e39ba3394c98e71a9341`
 =======
 - source checksum (SHA256): `362d415ce8ed65d1a7abef427230bad2240568d1c7428bda93043fb5cca472fa`
 >>>>>>> 31fb22d (Shrink TIFF production preview payloads)

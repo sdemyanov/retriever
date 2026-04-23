@@ -5,7 +5,7 @@ description: >
   "test retriever", "is retriever installed", or "check retriever".
   Confirms the Retriever plugin is installed and responding.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 > Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
@@ -16,7 +16,7 @@ Reply in plain text with exactly this structure, substituting `<version>` with t
 
 ```
 Retriever plugin smoke test OK.
-Version: 1.0.0
+Version: 1.0.1
 Skill: ping
 ```
 
