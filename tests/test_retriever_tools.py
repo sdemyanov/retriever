@@ -6280,6 +6280,44 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Root message body", refreshed_message_preview_html)
         self.assertIn('class="gmail-thread-title-link"', refreshed_message_preview_html)
 
+    def test_single_large_email_conversation_skips_redundant_conversation_artifacts(self) -> None:
+        single_path = self.root / "single.eml"
+        huge_body = "A" * (retriever_tools.CONVERSATION_PREVIEW_MAX_CHARS + 1024)
+        self.write_email_message(
+            single_path,
+            subject="Large Single Message",
+            body_text=huge_body,
+            message_id="<single@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["email_conversations"], 1)
+
+        single_row = self.fetch_document_row("single.eml")
+        search_result = retriever_tools.search(self.root, "Large Single Message", None, None, None, 1, 20)
+        single_result = next(item for item in search_result["results"] if item["id"] == single_row["id"])
+
+        self.assertEqual(single_result["preview_rel_path"], single_result["preview_targets"][0]["rel_path"])
+        self.assertEqual([target.get("label") for target in single_result["preview_targets"]], ["message"])
+
+        conversation_preview_dir = (
+            self.paths["state_dir"]
+            / retriever_tools.conversation_preview_base_path(single_row["conversation_id"])
+        )
+        self.assertFalse((conversation_preview_dir / "conversation.html").exists())
+        self.assertFalse((conversation_preview_dir / "index.html").exists())
+        self.assertEqual(list(conversation_preview_dir.glob("segment-*.html")), [])
+
+        conversations_payload = retriever_tools.run_slash_command(self.root, "/conversations")
+        self.assertEqual(conversations_payload["total_hits"], 1)
+        conversation_result = conversations_payload["results"][0]
+        self.assertFalse(conversation_result["preview_rel_path"].endswith("/conversation.html"))
+        self.assertTrue(Path(str(conversation_result["preview_abs_path"]).split("#", 1)[0]).exists())
+
     def test_ingest_groups_loose_eml_messages_without_thread_headers_using_heuristics(self) -> None:
         first_path = self.root / "first.eml"
         second_path = self.root / "second.eml"

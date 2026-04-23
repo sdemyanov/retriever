@@ -1070,21 +1070,55 @@ def resolve_conversation_preview_rel_path(paths: dict[str, Path], conversation_i
     return preferred_rel_path
 
 
+def single_document_conversation_preview_target(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    conversation_id: int,
+) -> dict[str, object] | None:
+    documents = load_preview_documents(connection, paths, conversation_id=conversation_id)
+    if len(documents) != 1:
+        return None
+    document_row = connection.execute(
+        "SELECT * FROM documents WHERE id = ?",
+        (int(documents[0]["id"]),),
+    ).fetchone()
+    if document_row is None:
+        return None
+    preview_target = dict(default_preview_target(paths, document_row, connection))
+    preview_target["label"] = "conversation"
+    preview_target["ordinal"] = 0
+    return preview_target
+
+
 def conversation_path_payload(
     paths: dict[str, Path],
+    connection: sqlite3.Connection,
     conversation_id: int,
     *,
     include_preview_targets: bool = True,
 ) -> dict[str, object]:
     rel_preview_path = resolve_conversation_preview_rel_path(paths, conversation_id)
-    abs_preview_path = str(paths["state_dir"] / rel_preview_path)
-    preview_target = build_preview_target_payload(
-        rel_path=str(Path(INTERNAL_REL_PATH_PREFIX) / rel_preview_path),
-        abs_path=abs_preview_path,
-        preview_type="html",
-        label="conversation",
-        ordinal=0,
-    )
+    abs_preview_path = paths["state_dir"] / rel_preview_path
+    if abs_preview_path.exists():
+        preview_target = build_preview_target_payload(
+            rel_path=str(Path(INTERNAL_REL_PATH_PREFIX) / rel_preview_path),
+            abs_path=str(abs_preview_path),
+            preview_type="html",
+            label="conversation",
+            ordinal=0,
+        )
+    else:
+        preview_target = single_document_conversation_preview_target(
+            paths,
+            connection,
+            conversation_id,
+        ) or build_preview_target_payload(
+            rel_path=str(Path(INTERNAL_REL_PATH_PREFIX) / rel_preview_path),
+            abs_path=str(abs_preview_path),
+            preview_type="html",
+            label="conversation",
+            ordinal=0,
+        )
     payload = {
         "rel_path": preview_target["rel_path"],
         "abs_path": preview_target["abs_path"],
@@ -4411,7 +4445,7 @@ def resolve_paged_scope_conversation_search(
             "document_count": item.get("document_count"),
             "source_kind": item.get("source_kind"),
         }
-        item.update(conversation_path_payload(paths, int(item["id"])))
+        item.update(conversation_path_payload(paths, connection, int(item["id"])))
         item.pop("_bates_sort_key", None)
 
     return {
