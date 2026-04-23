@@ -18,7 +18,7 @@ from pathlib import Path
 PHASE0_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PHASE0_ROOT.parent
 DEFAULT_CORPUS = PHASE0_ROOT / "regression_corpus"
-DEFAULT_TOOL = REPO_ROOT / "skills" / "tool-template" / "retriever_tools.py"
+DEFAULT_TOOL = REPO_ROOT / "skills" / "tool-template" / "tools.py"
 DOC_ID_PATTERN = re.compile(r"doc-\d+")
 CONVERSATION_ID_PATTERN = re.compile(r"conversation-\d+")
 PREVIEW_UPDATED_CELL_PATTERN = re.compile(r"(<th>Updated</th><td>).*?(</td>)", re.DOTALL)
@@ -40,13 +40,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline-tool",
         type=Path,
-        help="Baseline retriever_tools.py path. Defaults to the candidate tool path.",
+        help="Baseline tools.py path. Defaults to the candidate tool path.",
     )
     parser.add_argument(
         "--candidate-tool",
         type=Path,
         default=DEFAULT_TOOL,
-        help="Candidate retriever_tools.py path.",
+        help="Candidate tools.py path.",
     )
     parser.add_argument(
         "--baseline-label",

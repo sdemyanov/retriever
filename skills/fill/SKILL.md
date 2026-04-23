@@ -9,7 +9,7 @@ metadata:
   version: "0.19.0"
 ---
 
-> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
 
 # Retriever /fill
 
@@ -17,7 +17,7 @@ Use this skill for `/fill <field> <value>`, `/fill <field> clear`, `/fill ... on
 
 ## Execution rules
 
-1. Prefer the slash surface: `python3 .retriever/bin/retriever_tools.py slash . /fill ...`.
+1. Prefer the slash surface: `python3 skills/tool-template/tools.py slash . /fill ...`.
 2. If you need to establish or inspect the active browse state first, read [../search/SKILL.md](../search/SKILL.md).
 3. If the user supplied explicit document references, preserve them and pass them through the `on <doc-ref[,doc-ref,...]>` form.
 4. If there is no explicit `on ...`, rely on the active browse state. If no active selection exists yet, narrow it first with `retriever:search`, `retriever:dataset`, `retriever:filter`, `retriever:bates`, `retriever:from-run`, or by asking the user for the target documents.

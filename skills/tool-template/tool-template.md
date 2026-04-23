@@ -2,19 +2,19 @@
 
 ## Template metadata
 
-- tool version: `0.19.0`
-- schema version: `22`
-- requirements version: `2026-04-21-phase11-document-deduplication`
-- workspace output path: `.retriever/bin/retriever_tools.py`
-- canonical bundled output file: [retriever_tools.py](retriever_tools.py)
+- tool version: `0.17.2`
+- schema version: `20`
+- requirements version: `2026-04-20-phase10-conversations-and-export-previews`
+- canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `8a51ce2550027fbf37b6c836817f548b08f625da7858384111a79cf061767d41`
+- source checksum (SHA256): `33cd4b90a964bc638f2f7b65c13026525de59e4c524cae689284b50a48a86f0a`
 
 ## Current command surface
 
 The current template implements:
 
-- `workspace` (`init`, `status`, `update`)
+- `doctor`
+- `bootstrap`
 - `schema-version`
 - `ingest`
 - `ingest-production`
@@ -35,6 +35,7 @@ The current template implements:
 - `merge-into-conversation`
 - `split-from-conversation`
 - `clear-conversation-assignment`
+- `upgrade-workspace`
 - `list-datasets`
 - `create-dataset`
 - `add-to-dataset`
@@ -81,26 +82,26 @@ For Cowork-agent execution, prefer the queue path:
   - email export units expand to the full conversation chain
   - chat export units merge contiguous selected documents inside the conversation timeline
 
-## Materialization rules
+## Runtime usage rules
 
-- Copy [retriever_tools.py](retriever_tools.py) byte-for-byte into `.retriever/bin/retriever_tools.py`
-- Mark it executable
-- Record the copied file checksum in `.retriever/runtime.json`
-- Do not overwrite a modified workspace copy without backup and explicit user approval
+- Run [tools.py](tools.py) directly against the target workspace
+- Record the canonical bundle checksum in `.retriever/runtime.json`
+- Do not create any workspace-local tool snapshot during normal bootstrap or ingest
 
-## Auto-upgrade dispatch
+## Runtime refresh dispatch
 
-The tool's `main()` calls `maybe_upgrade_workspace_tool(root)` before any command outside the exempt set `{schema-version, workspace}`. That includes user-facing slash commands such as `/dataset list` and `/search`. If the workspace copy is clean-but-stale relative to the plugin's canonical template, it is backed up to `.retriever/bin/backups/`, replaced via `pathlib.Path.write_bytes` (open-with-O_TRUNC, so no `unlink` is needed in Cowork sandboxes), and the tool re-execs so the current command runs from the new code. A user-modified copy is refused and a `retriever-auto-upgrade: {"status": "blocked", ...}` line is written to stderr; the current command still runs in that case.
+The tool's `main()` calls `maybe_upgrade_workspace_tool(root)` before any command outside the exempt set `{schema-version, bootstrap, doctor, upgrade-workspace, slash}`. In the current design that helper only refreshes workspace runtime metadata when the canonical bundle checksum has changed; it does not replace files inside `.retriever/` and it does not re-exec the process.
 
 The canonical plugin template is discovered via:
 
 1. `RETRIEVER_CANONICAL_TOOL_PATH` (environment variable)
-2. Parent-walk from the currently running tool looking for `skills/tool-template/retriever_tools.py`
+2. Prefer a sibling `tools.py` when running from `skills/tool-template/`
+3. Parent-walk from the currently running file looking for `skills/tool-template/tools.py`
 
-`workspace update <workspace> [--from <path>] [--force]` is the explicit equivalent of the auto path.
+`upgrade-workspace <workspace> [--from <path>] [--force]` is the explicit equivalent of the runtime metadata refresh path. `--force` is accepted for compatibility but no longer changes behavior.
 
 ## Implementation note
 
-The canonical bundled workspace tool still lives in [retriever_tools.py](retriever_tools.py) so the plugin can carry an exact file and checksum together.
+The canonical bundled tool lives in [tools.py](tools.py).
 
-Within the repo, `retriever_tools.py` is a generated artifact, not the authored source of truth. It is built from the ordered source fragments under [`src/`](src/) by [bundle_retriever_tools.py](bundle_retriever_tools.py) during `build.sh`.
+Within the repo, `tools.py` is a generated artifact, not the authored source of truth. It is built from the ordered source fragments under [`src/`](src/) by [bundle_retriever_tools.py](bundle_retriever_tools.py) during `build.sh`.
