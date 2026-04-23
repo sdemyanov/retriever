@@ -51,7 +51,7 @@ If a Retriever command fails with `ModuleNotFoundError`, `ImportError`, or
 system Python. Prefer `workspace init`; if manual installation is truly needed,
 use the shared plugin runtime venv.
 
-## Tier 2 — `retriever_tools.py slash` commands
+## Tier 2 — `tools.py slash` commands
 
 If no Tier 1 skill exists for the intent, use a slash command via the canonical
 plugin tool. Run exactly one command from the repo root:
@@ -81,7 +81,7 @@ Return the resulting Retriever state or table. The authoritative current list of
 - `/sort [list|<field> <asc|desc>|default]` — inspect or change sort order. **Use when:** the user asks to change or reset the order of results — phrasings like "newest first", "oldest first", "sort by date", "order by file name", "alphabetical", "by size", or "reset sort".
 <!-- END: slash-commands -->
 
-## Tier 3 — `retriever_tools.py` subcommands
+## Tier 3 — `tools.py` subcommands
 
 If no slash form covers the intent, use a named subcommand of the canonical
 plugin tool:
@@ -188,9 +188,6 @@ The authoritative current list of subcommands is regenerated at build time into 
 ### Results
 
 - you need stored processing results for inspection → `list-results` — list stored processing results
-
-
-
 
 
 

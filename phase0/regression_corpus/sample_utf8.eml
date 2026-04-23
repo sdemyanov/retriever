@@ -1,8 +1,0 @@
-From: alice@example.com
-To: bob@example.com
-Subject: UTF-8 EML probe
-Content-Type: text/plain; charset="utf-8"
-Content-Transfer-Encoding: 7bit
-MIME-Version: 1.0
-
-Hello from the UTF-8 message body.
