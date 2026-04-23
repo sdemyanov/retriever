@@ -4694,6 +4694,70 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parents_with_attachments["total_hits"], 1)
         self.assertEqual(parents_with_attachments["results"][0]["id"], parent_row["id"])
 
+    def test_email_preview_promotes_calendar_attachments_into_invite_cards(self) -> None:
+        email_path = self.root / "thread.eml"
+        message = EmailMessage()
+        message["From"] = "Sergey Demyanov <sergey@discoverbeagle.com>"
+        message["To"] = "Max Faleev <max@discoverbeagle.com>"
+        message["Subject"] = "Discuss Relativity"
+        message["Date"] = "Thu, 01 Jun 2023 00:31:26 +0000"
+        message["Message-ID"] = "<invite@example.com>"
+        message.set_content("Invitation from Google Calendar")
+        message.add_attachment(
+            "\r\n".join(
+                [
+                    "BEGIN:VCALENDAR",
+                    "VERSION:2.0",
+                    "METHOD:REQUEST",
+                    "BEGIN:VEVENT",
+                    "SUMMARY:Discuss Relativity",
+                    "DTSTART;TZID=America/New_York:20230601T150000",
+                    "DTEND;TZID=America/New_York:20230601T153000",
+                    "ORGANIZER;CN=Sergey Demyanov:mailto:sergey@discoverbeagle.com",
+                    "ATTENDEE;CN=Max Faleev:mailto:max@discoverbeagle.com",
+                    "STATUS:CONFIRMED",
+                    "X-GOOGLE-CONFERENCE:https://meet.google.com/fps-qara-aie",
+                    "END:VEVENT",
+                    "END:VCALENDAR",
+                    "",
+                ]
+            ),
+            subtype="calendar",
+            filename="invite.ics",
+        )
+        message.add_attachment("Agenda note", subtype="plain", filename="notes.txt")
+        email_path.write_bytes(message.as_bytes(policy=policy.default))
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+
+        parent_row = self.fetch_document_row("thread.eml")
+        child_rows = self.fetch_child_rows(parent_row["id"])
+        self.assertEqual(len(child_rows), 2)
+
+        search_result = retriever_tools.search(self.root, "Invitation from Google Calendar", None, None, None, 1, 20)
+        parent_result = next(item for item in search_result["results"] if item["id"] == parent_row["id"])
+        self.assertEqual(parent_result["attachment_count"], 2)
+
+        message_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(parent_result["preview_targets"], "message")
+        ).read_text(encoding="utf-8")
+        segment_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(parent_result["preview_targets"], "segment")
+        ).read_text(encoding="utf-8")
+
+        for preview_html in (message_preview_html, segment_preview_html):
+            self.assertIn("Calendar invite", preview_html)
+            self.assertIn("Discuss Relativity", preview_html)
+            self.assertIn("Jun 1, 2023 3:00 PM - 3:30 PM EDT", preview_html)
+            self.assertIn("Sergey Demyanov &lt;sergey@discoverbeagle.com&gt;", preview_html)
+            self.assertIn("Max Faleev &lt;max@discoverbeagle.com&gt;", preview_html)
+            self.assertIn("meet.google.com/fps-qara-aie", preview_html)
+            self.assertIn("notes.txt", preview_html)
+            self.assertNotIn(">invite.ics<", preview_html)
+
     def test_ingest_email_inline_html_image_stays_in_preview_without_attachment_child(self) -> None:
         email_path = self.root / "inline.eml"
         png_pixel = base64.b64decode(
@@ -12926,6 +12990,44 @@ class CidInliningTests(unittest.TestCase):
         self.assertIn("<title>Legalweek 2023 Mobile App Now Available</title>", preview_content)
         self.assertIn('class="gmail-thread-title">Legalweek 2023 Mobile App Now Available</h1>', preview_content)
         self.assertNotIn("Attachments: agenda.pdf", preview_content)
+
+
+class CalendarInviteParsingTests(unittest.TestCase):
+    def test_parse_icalendar_event_metadata_extracts_invite_fields(self) -> None:
+        metadata = retriever_tools.parse_icalendar_event_metadata(
+            "\r\n".join(
+                [
+                    "BEGIN:VCALENDAR",
+                    "VERSION:2.0",
+                    "METHOD:REQUEST",
+                    "BEGIN:VEVENT",
+                    "SUMMARY:Discuss Relativity",
+                    "DTSTART;TZID=America/New_York:20230601T150000",
+                    "DTEND;TZID=America/New_York:20230601T153000",
+                    "ORGANIZER;CN=Sergey Demyanov:mailto:sergey@discoverbeagle.com",
+                    "ATTENDEE;CN=Max Faleev:mailto:max@discoverbeagle.com",
+                    "STATUS:CONFIRMED",
+                    "X-GOOGLE-CONFERENCE:https://meet.google.com/fps-qara-aie",
+                    "UID:4742uqv7uab4rpn1fmps1bqvs5@google.com",
+                    "END:VEVENT",
+                    "END:VCALENDAR",
+                    "",
+                ]
+            )
+        )
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["summary"], "Discuss Relativity")
+        self.assertEqual(metadata["when"], "Jun 1, 2023 3:00 PM - 3:30 PM EDT")
+        self.assertEqual(metadata["organizer"], "Sergey Demyanov <sergey@discoverbeagle.com>")
+        self.assertEqual(metadata["attendees_display"], "Max Faleev <max@discoverbeagle.com>")
+        self.assertEqual(metadata["conference_url"], "https://meet.google.com/fps-qara-aie")
+        self.assertEqual(metadata["method"], "REQUEST")
+        self.assertEqual(metadata["status"], "CONFIRMED")
+        self.assertEqual(
+            retriever_tools.summarize_icalendar_invite_status(metadata),
+            "Request · Confirmed",
+        )
 
 
 class AttachmentResolutionTests(unittest.TestCase):

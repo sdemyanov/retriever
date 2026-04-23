@@ -366,6 +366,63 @@ def relative_preview_href(path: Path, parent_preview_path: Path, target_fragment
     return append_preview_fragment(href, target_fragment)
 
 
+def parse_calendar_attachment_metadata(paths: dict[str, Path], child_row: sqlite3.Row) -> dict[str, object] | None:
+    content_type = normalize_whitespace(str(child_row["content_type"] or ""))
+    file_type = normalize_whitespace(str(child_row["file_type"] or "")).lower()
+    if not file_type:
+        file_type = normalize_extension(Path(str(child_row["file_name"] or child_row["rel_path"] or "")))
+    if content_type != "Calendar" and file_type not in ICALENDAR_FILE_TYPES:
+        return None
+    rel_path = normalize_whitespace(str(child_row["rel_path"] or ""))
+    if not rel_path:
+        return None
+    attachment_path = document_absolute_path(paths, rel_path)
+    if not attachment_path.exists():
+        return None
+    try:
+        decoded, _, _ = decode_bytes(attachment_path.read_bytes())
+    except OSError:
+        return None
+    metadata = parse_icalendar_event_metadata(decoded)
+    if not metadata:
+        return None
+    if not any(metadata.get(key) for key in ("summary", "when", "organizer", "attendees_display", "conference_url")):
+        return None
+    return metadata
+
+
+def build_calendar_attachment_preview_link(
+    *,
+    paths: dict[str, Path],
+    child_row: sqlite3.Row,
+    child_preview_path: Path,
+    parent_preview_path: Path,
+) -> dict[str, str] | None:
+    metadata = parse_calendar_attachment_metadata(paths, child_row)
+    if metadata is None:
+        return None
+    title = (
+        normalize_generated_document_title(metadata.get("summary"))
+        or normalize_generated_document_title(child_row["title"])
+        or attachment_preview_link_label(child_row)
+    )
+    organizer = metadata.get("organizer") or normalize_whitespace(str(child_row["author"] or "")) or None
+    attendees = metadata.get("attendees_display") or normalize_whitespace(str(child_row["recipients"] or "")) or None
+    return {
+        "kind": "calendar_invite",
+        "href": relative_preview_href(child_preview_path, parent_preview_path),
+        "label": attachment_preview_link_label(child_row),
+        "detail": normalize_whitespace(str(child_row["control_number"] or "")),
+        "title": str(title or "Calendar invite"),
+        "when": str(metadata.get("when") or ""),
+        "organizer": str(organizer or ""),
+        "attendees": str(attendees or ""),
+        "location": str(metadata.get("location") or ""),
+        "join_href": str(metadata.get("conference_url") or ""),
+        "status": str(summarize_icalendar_invite_status(metadata) or ""),
+    }
+
+
 def build_document_attachment_preview_links(
     paths: dict[str, Path],
     connection: sqlite3.Connection,
@@ -382,6 +439,15 @@ def build_document_attachment_preview_links(
         ).split("#", 1)[0]
         child_preview_path = Path(child_preview_abs_path)
         if not child_preview_path.exists():
+            continue
+        calendar_link = build_calendar_attachment_preview_link(
+            paths=paths,
+            child_row=child_row,
+            child_preview_path=child_preview_path,
+            parent_preview_path=parent_preview_path,
+        )
+        if calendar_link is not None:
+            links.append(calendar_link)
             continue
         detail = normalize_whitespace(str(child_row["control_number"] or ""))
         links.append(
@@ -2627,6 +2693,20 @@ def build_email_preview_head_html() -> str:
         ".gmail-message-quoted { margin-top: 1rem; }"
         ".gmail-message-quoted summary { cursor: pointer; color: #5f6368; font-weight: 500; }"
         ".gmail-message-quoted pre { white-space: pre-wrap; word-break: break-word; margin: 0.72rem 0 0; padding: 0.85rem 1rem; background: #f8fafc; border: 1px solid #e4e7eb; border-radius: 14px; font: inherit; color: #5f6368; }"
+        ".retriever-calendar-invites { margin: 0 0 1rem; display: grid; gap: 0.8rem; }"
+        ".retriever-calendar-invite { padding: 0.95rem 1rem; border: 1px solid #c6dafc; border-radius: 16px; background: linear-gradient(180deg, #eef4ff 0%, #f7fbff 100%); }"
+        ".retriever-calendar-invite-header { display: flex; justify-content: space-between; gap: 0.75rem; align-items: flex-start; }"
+        ".retriever-calendar-invite-kicker { margin: 0 0 0.25rem; color: #4a6488; font-size: 0.76rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }"
+        ".retriever-calendar-invite-title { margin: 0; font-size: 1rem; line-height: 1.3; }"
+        ".retriever-calendar-invite-title a { color: #174ea6; text-decoration: none; }"
+        ".retriever-calendar-invite-title a:hover { text-decoration: underline; }"
+        ".retriever-calendar-invite-detail { margin: 0; color: #5f6368; font-size: 0.84rem; white-space: nowrap; }"
+        ".retriever-calendar-invite-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.6rem 0.75rem; margin: 0.85rem 0 0; }"
+        ".retriever-calendar-invite-meta div { background: rgba(255,255,255,0.82); border: 1px solid #d7e6ff; border-radius: 12px; padding: 0.6rem 0.7rem; }"
+        ".retriever-calendar-invite-meta dt { font-size: 0.78rem; font-weight: 700; color: #516072; margin-bottom: 0.18rem; letter-spacing: 0.04em; text-transform: uppercase; }"
+        ".retriever-calendar-invite-meta dd { margin: 0; }"
+        ".retriever-calendar-invite-meta a { color: #174ea6; text-decoration: none; word-break: break-all; }"
+        ".retriever-calendar-invite-meta a:hover { text-decoration: underline; }"
         ".retriever-attachments { margin-top: 1rem; padding-top: 0.8rem; border-top: 1px solid #eceff3; }"
         ".retriever-attachments h3 { margin: 0 0 0.5rem; font-size: 0.86rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #5f6368; }"
         ".retriever-attachments ul { margin: 0; padding-left: 1.1rem; }"
@@ -2998,9 +3078,15 @@ def build_email_message_preview_html(
     conversation_documents: list[dict[str, object]] | None = None,
     position_index: int | None = None,
     thread_link_href: str | None = None,
+    attachment_links: list[dict[str, str]] | None = None,
 ) -> str:
     document_title = conversation_preview_document_heading(document) or "Retriever Email Preview"
     document_id = email_preview_document_id(document)
+    attachment_links_by_document_id = (
+        {document_id: attachment_links}
+        if document_id is not None and attachment_links
+        else None
+    )
     if conversation_row is not None and conversation_documents is not None and len(conversation_documents) > 1:
         email_documents = [
             item
@@ -3050,6 +3136,7 @@ def build_email_message_preview_html(
             body_source_html=body_html,
             thread_link_href=thread_link_href,
             thread_position_label=thread_position_label,
+            attachment_links_by_document_id=attachment_links_by_document_id,
             strip_quoted_history=True,
             newest_first=True,
         )
@@ -3061,6 +3148,7 @@ def build_email_message_preview_html(
         selected_document_id=document_id,
         body_source_document=document,
         body_source_html=body_html,
+        attachment_links_by_document_id=attachment_links_by_document_id,
     )
 
 
@@ -3087,6 +3175,7 @@ def rewrite_preserved_email_message_preview(
     conversation_documents: list[dict[str, object]] | None = None,
     position_index: int | None = None,
     thread_rel_path: str | None = None,
+    attachment_links: list[dict[str, str]] | None = None,
 ) -> None:
     preferred_rows = sorted(
         preview_rows,
@@ -3135,6 +3224,7 @@ def rewrite_preserved_email_message_preview(
             conversation_documents=conversation_documents,
             position_index=position_index,
             thread_link_href=thread_link_href,
+            attachment_links=attachment_links,
         ),
         encoding="utf-8",
     )
@@ -3413,6 +3503,20 @@ def build_conversation_preview_head_html() -> str:
         ".conversation-document-meta div { background: #f8fafc; border: 1px solid #e3e8ef; border-radius: 14px; padding: 0.65rem 0.75rem; }"
         ".conversation-document-meta dt { font-size: 0.8rem; font-weight: 600; color: #607080; margin-bottom: 0.18rem; }"
         ".conversation-document-meta dd { margin: 0; }"
+        ".retriever-calendar-invites { margin: 0 0 1rem; display: grid; gap: 0.8rem; }"
+        ".retriever-calendar-invite { padding: 0.95rem 1rem; border: 1px solid #cfe0fb; border-radius: 16px; background: linear-gradient(180deg, #edf4ff 0%, #f8fbff 100%); }"
+        ".retriever-calendar-invite-header { display: flex; justify-content: space-between; gap: 0.75rem; align-items: flex-start; }"
+        ".retriever-calendar-invite-kicker { margin: 0 0 0.25rem; color: #4a6488; font-size: 0.76rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }"
+        ".retriever-calendar-invite-title { margin: 0; font-size: 1rem; line-height: 1.3; }"
+        ".retriever-calendar-invite-title a { color: #174ea6; text-decoration: none; }"
+        ".retriever-calendar-invite-title a:hover { text-decoration: underline; }"
+        ".retriever-calendar-invite-detail { margin: 0; color: #5f6368; font-size: 0.84rem; white-space: nowrap; }"
+        ".retriever-calendar-invite-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.6rem 0.75rem; margin: 0.85rem 0 0; }"
+        ".retriever-calendar-invite-meta div { background: rgba(255,255,255,0.82); border: 1px solid #d7e6ff; border-radius: 12px; padding: 0.6rem 0.7rem; }"
+        ".retriever-calendar-invite-meta dt { font-size: 0.78rem; font-weight: 700; color: #516072; margin-bottom: 0.18rem; letter-spacing: 0.04em; text-transform: uppercase; }"
+        ".retriever-calendar-invite-meta dd { margin: 0; }"
+        ".retriever-calendar-invite-meta a { color: #174ea6; text-decoration: none; word-break: break-all; }"
+        ".retriever-calendar-invite-meta a:hover { text-decoration: underline; }"
         ".conversation-document-body pre { white-space: pre-wrap; word-break: break-word; margin: 0; background: #f8fafc; border: 1px solid #d7e0ea; border-radius: 14px; padding: 0.9rem 1rem; font-family: inherit; font-size: 1rem; }"
         ".conversation-chat-transcript { display: grid; gap: 0.75rem; }"
         ".conversation-chat-message { display: flex; gap: 0.75rem; align-items: flex-start; border: 1px solid #d0d7de; border-radius: 14px; padding: 0.85rem 0.95rem; background: #f6f8fa; }"
@@ -3985,6 +4089,7 @@ def refresh_conversation_previews(
                             else None
                         ),
                         thread_rel_path=str(segment["segment_rel_path"]),
+                        attachment_links=entry_attachment_links.get(document_id) or [],
                     )
                 preview_rows: list[dict[str, object]] = []
                 if conversation_document_uses_entry_preview(document):
