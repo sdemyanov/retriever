@@ -50,7 +50,7 @@ Important consequences:
 - your original documents stay in place and are not rewritten
 - document paths in the database are workspace-relative
 - the workspace carries its own Retriever state, so browsing, datasets, and exports stay tied to that folder
-- the workspace records which canonical Retriever bundle last touched it, but commands run through the canonical plugin tool directly — there is no longer a per-workspace copy of the tool in `.retriever/bin/`
+- the workspace records which canonical Retriever bundle last touched it, and commands run directly through the plugin's canonical tool
 - heavy parser dependencies live in the shared plugin runtime (`<plugin-root>/.retriever-plugin-runtime/...`), not under `.retriever/`; see *Runtime and dependencies* for details
 
 ### Document model
@@ -95,7 +95,7 @@ Default behavior:
 
 ## Supported content
 
-Retriever can ingest these important source types today:
+Retriever can ingest these source types:
 
 - PDFs
 - DOCX
@@ -112,8 +112,8 @@ Retriever can ingest these important source types today:
 
 Ingest-path behaviors worth knowing:
 
-- calendar invites (`.ics`/`.ifb`/`.vcal`/`.vcs`) that arrive as email attachments are promoted into the parent email — the invite's organizer, attendees, when, location, join URL, UID, and sequence are rolled into the email's indexed text and rendered as a structured invite header in the preview, instead of just being opaque attachment blobs
-- standalone calendar files still ingest as their own documents
+- calendar invites (`.ics`/`.ifb`/`.vcal`/`.vcs`) that arrive as email attachments are promoted into the parent email — the invite's organizer, attendees, when, location, join URL, UID, and sequence are rolled into the email's indexed text and rendered as a structured invite header in the preview
+- standalone calendar files ingest as their own documents
 - no OCR for scanned PDFs or image files in the default path (OCR is available as a processing job that writes text back through `activate-text-revision`)
 - images are previewable but not text-searchable by default (image descriptions can likewise be generated through a processing job)
 - archive contents such as `.zip`, `.rar`, `.7z` are not unpacked or indexed automatically
@@ -121,7 +121,7 @@ Ingest-path behaviors worth knowing:
 
 ## Runtime and dependencies
 
-Retriever maintains a **shared plugin runtime** under the plugin directory rather than a per-workspace virtualenv:
+Retriever maintains a **shared plugin runtime** under the plugin directory:
 
 ```text
 <plugin-root>/.retriever-plugin-runtime/<system>-<machine>-pyX.Y/venv/
@@ -170,10 +170,10 @@ python3 skills/tool-template/tools.py workspace init .
 python3 skills/tool-template/tools.py ingest . --recursive
 ```
 
-The `workspace` command groups runtime/schema maintenance into subcommands:
+The `workspace` command groups runtime and schema maintenance into subcommands:
 
-- `workspace init` prepares or repairs `.retriever/` state and runtime metadata (the old `bootstrap`).
-- `workspace status` reports runtime readiness and schema state without rewriting anything (the old `doctor`).
+- `workspace init` prepares or repairs `.retriever/` state and runtime metadata for a folder.
+- `workspace status` reports runtime readiness and schema state without rewriting anything.
 - `workspace update` refreshes runtime metadata from the canonical `tools.py` bundle after a plugin upgrade.
 
 Use `ingest-production` when you want to target a processed production root explicitly:
