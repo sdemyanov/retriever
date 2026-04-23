@@ -7545,6 +7545,49 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             dataset_list_stdout,
         )
 
+    def test_dataset_list_prefers_container_file_size_for_mbox_sources(self) -> None:
+        mbox_path = self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Container-backed dataset",
+                    body_text="Message body for the mailbox dataset.",
+                    message_id="<mbox-size@example.com>",
+                    attachment_name="notes.txt",
+                    attachment_text="attachment bytes",
+                )
+            ]
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["mbox_messages_created"], 1)
+
+        list_exit, list_payload, _, _ = self.run_cli("list-datasets", str(self.root))
+        dataset_list_exit, dataset_list_stdout, dataset_list_stderr = self.run_cli_raw(
+            "slash",
+            str(self.root),
+            "/dataset",
+            "list",
+        )
+
+        self.assertEqual(list_exit, 0)
+        self.assertIsNotNone(list_payload)
+        mailbox_dataset = next(item for item in list_payload["datasets"] if item["dataset_name"] == "mailbox.mbox")
+        self.assertEqual(mailbox_dataset["size_bytes"], mbox_path.stat().st_size)
+        self.assertEqual(mailbox_dataset["size_basis"], "container")
+        self.assertEqual(mailbox_dataset["document_count"], 2)
+        self.assertEqual(mailbox_dataset["sized_document_count"], 1)
+
+        self.assertEqual(dataset_list_exit, 0)
+        self.assertEqual(dataset_list_stderr, "")
+        self.assertIn(
+            f"| mailbox.mbox | 2 | {retriever_tools.format_dataset_size_summary(mailbox_dataset)} | mailbox |",
+            dataset_list_stdout,
+        )
+        self.assertNotIn("(1/2 sized)", dataset_list_stdout)
+
     def test_slash_list_commands_auto_refresh_stale_workspace_runtime_metadata(self) -> None:
         retriever_tools.bootstrap(self.root)
 
