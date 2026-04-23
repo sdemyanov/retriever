@@ -22,12 +22,14 @@ import re
 import secrets
 import shlex
 import shutil
+import site
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unicodedata
+import venv
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -45,6 +47,8 @@ from urllib import request as urllib_request
 from zoneinfo import ZoneInfo
 
 _UNLOADED_DEPENDENCY = object()
+ACTIVE_WORKSPACE_ROOT: Path | None = None
+ACTIVATED_PLUGIN_SITE_PACKAGES: set[str] = set()
 
 # Third-party parsing dependencies load on demand so ordinary commands do not
 # depend on every parser being importable up front.
@@ -74,6 +78,17 @@ SCHEMA_VERSION = 22
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/tools.py"
+PINNED_RUNTIME_REQUIREMENTS = (
+    "pdfplumber==0.11.9",
+    "python-docx==1.2.0",
+    "openpyxl==3.1.5",
+    "xlrd==2.0.1",
+    "extract-msg==0.55.0",
+    "libpff-python==20231205",
+    "striprtf==0.0.26",
+    "Pillow==10.3.0",
+    "charset-normalizer==3.4.7",
+)
 MANUAL_FIELD_LOCKS_COLUMN = "manual_field_locks_json"
 LEGACY_METADATA_LOCKS_COLUMN = "locked_metadata_fields_json"
 CHUNK_TARGET_CHARS = 3200
