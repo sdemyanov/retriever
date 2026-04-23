@@ -927,6 +927,7 @@ def finalize_ingest_postpass(
 
 
 def ingest_production(root: Path, production_root: Path | str) -> dict[str, object]:
+    set_active_workspace_root(root)
     paths = workspace_paths(root)
     ensure_layout(paths)
     total_started = time.perf_counter()
@@ -972,6 +973,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
 
 
 def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str, object]:
+    set_active_workspace_root(root)
     paths = workspace_paths(root)
     ensure_layout(paths)
     allowed_types = parse_file_types(raw_file_types)

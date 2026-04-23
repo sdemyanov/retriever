@@ -1534,7 +1534,22 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             connection.close()
 
     def test_workspace_init_command_bootstraps_and_reports_ready_status(self) -> None:
-        exit_code, payload, _, _ = self.run_cli("workspace", "init", str(self.root))
+        runtime_paths = retriever_tools.plugin_runtime_paths(root=self.root)
+        self.assertIsNotNone(runtime_paths)
+
+        with mock.patch.object(
+            retriever_tools,
+            "ensure_plugin_runtime",
+            return_value={
+                "status": "pass",
+                "detail": "Shared plugin runtime and pinned requirements are ready.",
+                "venv_created": True,
+                "requirements_installed": True,
+                "requirements_version": retriever_tools.REQUIREMENTS_VERSION,
+                "python_executable": str(runtime_paths["venv_python_path"]),
+            },
+        ) as ensure_plugin_runtime:
+            exit_code, payload, _, _ = self.run_cli("workspace", "init", str(self.root))
 
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(payload)
@@ -1543,7 +1558,55 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["initialization"]["status"], "initialized")
         self.assertEqual(payload["status_report"]["workspace"]["state"], "initialized")
         self.assertEqual(payload["tool_update"]["status"], "updated-runtime")
+        self.assertEqual(payload["runtime_init"]["status"], "pass")
+        self.assertEqual(payload["status_report"]["plugin_runtime"]["plugin_root"], str(REPO_ROOT))
         self.assertTrue(self.paths["runtime_path"].exists())
+        ensure_plugin_runtime.assert_called_once_with(
+            runtime_paths,
+            install_requirements=True,
+            force_requirements_install=False,
+            reason="init",
+        )
+
+    def test_plugin_runtime_paths_live_under_plugin_root_not_workspace(self) -> None:
+        runtime_paths = retriever_tools.plugin_runtime_paths(root=self.root)
+        self.assertIsNotNone(runtime_paths)
+        self.assertEqual(runtime_paths["plugin_root"], REPO_ROOT)
+        self.assertIn(REPO_ROOT, runtime_paths["runtime_root"].parents)
+        self.assertNotIn(self.root.resolve(), runtime_paths["runtime_root"].parents)
+
+    def test_load_dependency_auto_installs_plugin_runtime_and_retries_import(self) -> None:
+        retriever_tools.set_active_workspace_root(self.root)
+        retriever_tools.pypff = retriever_tools._UNLOADED_DEPENDENCY
+        runtime_paths = retriever_tools.plugin_runtime_paths(root=self.root)
+        self.assertIsNotNone(runtime_paths)
+        dummy_module = types.SimpleNamespace(file=lambda: None)
+
+        with (
+            mock.patch.object(retriever_tools, "activate_plugin_site_packages", return_value=False) as activate_site_packages,
+            mock.patch.object(
+                retriever_tools,
+                "ensure_plugin_runtime",
+                return_value={"status": "pass", "requirements_installed": True},
+            ) as ensure_plugin_runtime,
+            mock.patch.object(
+                retriever_tools.importlib,
+                "import_module",
+                side_effect=[ImportError("missing pypff"), dummy_module],
+            ) as import_module,
+        ):
+            loaded = retriever_tools.load_dependency("pypff", allow_auto_install=True)
+
+        self.assertIs(loaded, dummy_module)
+        self.assertIs(retriever_tools.pypff, dummy_module)
+        self.assertGreaterEqual(activate_site_packages.call_count, 1)
+        ensure_plugin_runtime.assert_called_once_with(
+            runtime_paths,
+            install_requirements=True,
+            force_requirements_install=True,
+            reason="dependency:pypff",
+        )
+        self.assertEqual(import_module.call_count, 2)
 
     def test_ingest_seeds_text_revisions_and_create_run_freezes_family_snapshot(self) -> None:
         email_path = self.root / "thread.eml"
@@ -5005,7 +5068,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(doctor_result["overall"], "pass")
         self.assertEqual(doctor_result["pst_backend"]["status"], "pass")
         self.assertIn("PST backend import succeeded", doctor_result["pst_backend"]["detail"])
-        load_dependency.assert_called_once_with("pypff")
+        self.assertEqual(doctor_result["plugin_runtime"]["status"], "missing")
+        load_dependency.assert_called_once_with("pypff", allow_auto_install=False)
 
     def test_workspace_status_reports_registry_drift_without_repairing_it(self) -> None:
         retriever_tools.bootstrap(self.root)
@@ -5046,7 +5110,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(doctor_result["overall"], "pass")
         self.assertEqual(doctor_result["pst_backend"]["status"], "fail")
         self.assertIn("libpff-python", doctor_result["pst_backend"]["detail"])
-        load_dependency.assert_called_once_with("pypff")
+        self.assertEqual(doctor_result["plugin_runtime"]["status"], "missing")
+        load_dependency.assert_called_once_with("pypff", allow_auto_install=False)
 
     def test_inspect_pst_properties_surfaces_chat_scope_candidates(self) -> None:
         pst_path = self.write_fake_pst_file()

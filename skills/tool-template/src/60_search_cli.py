@@ -9809,6 +9809,7 @@ def main() -> int:
             return 0
 
         root = Path(args.workspace).expanduser().resolve()
+        set_active_workspace_root(root)
 
         if args.command == "workspace":
             if args.workspace_action == "status":

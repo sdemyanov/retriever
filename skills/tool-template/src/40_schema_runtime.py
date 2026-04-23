@@ -1481,6 +1481,168 @@ def read_runtime(path: Path) -> dict[str, object] | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_plugin_runtime_requirements_version(paths: dict[str, Path] | None) -> str | None:
+    if paths is None:
+        return None
+    marker_path = paths["requirements_marker_path"]
+    if not marker_path.exists():
+        return None
+    return normalize_whitespace(marker_path.read_text(encoding="utf-8")) or None
+
+
+def write_plugin_runtime_requirements_version(paths: dict[str, Path], version: str) -> None:
+    paths["requirements_marker_path"].write_text(f"{version}\n", encoding="utf-8")
+
+
+def activate_plugin_site_packages(paths: dict[str, Path] | None) -> bool:
+    if paths is None:
+        return False
+    site_packages_path = first_existing_plugin_runtime_site_packages(paths)
+    if site_packages_path is None:
+        return False
+    try:
+        resolved = str(site_packages_path.resolve())
+    except OSError:
+        resolved = str(site_packages_path)
+    if resolved in ACTIVATED_PLUGIN_SITE_PACKAGES or resolved in sys.path:
+        ACTIVATED_PLUGIN_SITE_PACKAGES.add(resolved)
+        return True
+    site.addsitedir(resolved)
+    ACTIVATED_PLUGIN_SITE_PACKAGES.add(resolved)
+    return True
+
+
+def describe_plugin_runtime(paths: dict[str, Path] | None) -> dict[str, object]:
+    if paths is None:
+        return {
+            "status": "unavailable",
+            "detail": "Shared plugin runtime path could not be determined from the current plugin installation.",
+            "mode": "shared",
+            "plugin_root": None,
+            "runtime_root": None,
+            "venv_present": False,
+            "python_executable": None,
+            "site_packages_path": None,
+            "requirements_version": None,
+        }
+    venv_dir_present = paths["venv_dir"].exists()
+    python_present = paths["venv_python_path"].exists()
+    site_packages_path = first_existing_plugin_runtime_site_packages(paths)
+    installed_requirements_version = read_plugin_runtime_requirements_version(paths)
+    if python_present and installed_requirements_version == REQUIREMENTS_VERSION:
+        status = "pass"
+        detail = "Shared plugin runtime and pinned requirements are ready."
+    elif python_present:
+        status = "partial"
+        detail = "Shared plugin runtime exists, but the pinned requirements are not fully installed yet."
+    elif venv_dir_present:
+        status = "partial"
+        detail = "Shared plugin runtime directory exists, but the Python executable is missing."
+    else:
+        status = "missing"
+        detail = "Shared plugin runtime has not been initialized yet."
+    return {
+        "status": status,
+        "detail": detail,
+        "mode": "shared",
+        "plugin_root": str(paths["plugin_root"]),
+        "runtime_root": str(paths["runtime_root"]),
+        "venv_present": venv_dir_present,
+        "python_executable": str(paths["venv_python_path"]) if python_present else None,
+        "site_packages_path": str(site_packages_path) if site_packages_path is not None else None,
+        "requirements_version": installed_requirements_version,
+    }
+
+
+def ensure_plugin_runtime_layout(paths: dict[str, Path]) -> None:
+    paths["runtime_root"].mkdir(parents=True, exist_ok=True)
+    paths["locks_dir"].mkdir(parents=True, exist_ok=True)
+
+
+def ensure_plugin_venv(paths: dict[str, Path]) -> dict[str, object]:
+    ensure_plugin_runtime_layout(paths)
+    venv_dir = paths["venv_dir"]
+    created = not paths["venv_python_path"].exists()
+    if created:
+        builder = venv.EnvBuilder(with_pip=True)
+        builder.create(venv_dir)
+    if not paths["venv_python_path"].exists():
+        raise RetrieverError(
+            f"Plugin runtime initialization did not create a Python executable at {paths['venv_python_path']}"
+        )
+    return {
+        "created": created,
+        "python_executable": str(paths["venv_python_path"]),
+    }
+
+
+def install_plugin_runtime_requirements(
+    paths: dict[str, Path],
+    requirements: list[str] | tuple[str, ...],
+    *,
+    reason: str,
+) -> dict[str, object]:
+    python_path = paths["venv_python_path"]
+    if not python_path.exists():
+        raise RetrieverError(f"Plugin runtime Python not found at {python_path}")
+    command = [
+        str(python_path),
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        *list(requirements),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode != 0:
+        detail = normalize_whitespace(completed.stderr or completed.stdout) or f"pip exited with status {completed.returncode}"
+        raise RetrieverError(f"Plugin runtime install failed for {reason}: {detail}")
+    write_plugin_runtime_requirements_version(paths, REQUIREMENTS_VERSION)
+    return {
+        "installed": True,
+        "reason": reason,
+        "command": command,
+        "requirements_version": REQUIREMENTS_VERSION,
+    }
+
+
+def ensure_plugin_runtime(
+    paths: dict[str, Path] | None,
+    *,
+    install_requirements: bool,
+    force_requirements_install: bool = False,
+    reason: str,
+) -> dict[str, object]:
+    if paths is None:
+        raise RetrieverError("Could not determine the shared plugin runtime location for this Retriever installation.")
+    ensure_plugin_runtime_layout(paths)
+    lock_handle = acquire_plugin_runtime_install_lock(paths)
+    try:
+        venv_result = ensure_plugin_venv(paths)
+        activate_plugin_site_packages(paths)
+        installed_requirements_version = read_plugin_runtime_requirements_version(paths)
+        requirements_installed = False
+        if install_requirements and (
+            force_requirements_install
+            or installed_requirements_version != REQUIREMENTS_VERSION
+        ):
+            install_plugin_runtime_requirements(paths, PINNED_RUNTIME_REQUIREMENTS, reason=reason)
+            installed_requirements_version = REQUIREMENTS_VERSION
+            requirements_installed = True
+            activate_plugin_site_packages(paths)
+        runtime_status = describe_plugin_runtime(paths)
+        return {
+            "status": runtime_status["status"],
+            "detail": runtime_status["detail"],
+            "venv_created": bool(venv_result["created"]),
+            "requirements_installed": requirements_installed,
+            "requirements_version": installed_requirements_version,
+            "python_executable": runtime_status["python_executable"],
+        }
+    finally:
+        release_plugin_runtime_install_lock(lock_handle)
+
+
 def read_workspace_meta(connection: sqlite3.Connection) -> dict[str, object] | None:
     if not table_exists(connection, "workspace_meta"):
         return None
@@ -1500,6 +1662,7 @@ def read_workspace_meta(connection: sqlite3.Connection) -> dict[str, object] | N
 
 def write_runtime(paths: dict[str, Path], tool_sha256: str | None) -> dict[str, object]:
     now = utc_now()
+    plugin_runtime_paths_for_workspace = plugin_runtime_paths(root=paths["root"])
     runtime = {
         "tool_version": TOOL_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -1509,6 +1672,7 @@ def write_runtime(paths: dict[str, Path], tool_sha256: str | None) -> dict[str, 
         "python_version": platform.python_version(),
         "generated_at": now,
         "last_verified_at": now,
+        "plugin_runtime": describe_plugin_runtime(plugin_runtime_paths_for_workspace),
     }
     paths["runtime_path"].write_text(json.dumps(runtime, indent=2, sort_keys=True), encoding="utf-8")
     return runtime
@@ -1595,15 +1759,24 @@ def determine_workspace_state(paths: dict[str, Path]) -> str:
 
 
 def workspace_status(root: Path, quick: bool) -> dict[str, object]:
+    set_active_workspace_root(root)
     paths = workspace_paths(root)
+    runtime_paths = plugin_runtime_paths(root=root)
+    plugin_runtime = describe_plugin_runtime(runtime_paths)
     fts5 = probe_fts5()
-    pip_ok, pip_version = run_command([sys.executable, "-m", "pip", "--version"])
+    pip_python = (
+        runtime_paths["venv_python_path"]
+        if runtime_paths is not None and runtime_paths["venv_python_path"].exists()
+        else Path(sys.executable)
+    )
+    pip_ok, pip_version = run_command([str(pip_python), "-m", "pip", "--version"])
     pst_backend = dependency_status(
         "pypff",
         package_name="libpff-python",
         import_name="pypff",
         detail_label="PST backend",
         probe_if_unloaded=True,
+        allow_auto_install=False,
     )
     runtime = read_runtime(paths["runtime_path"])
     canonical_tool_path = locate_canonical_plugin_tool_or_self()
@@ -1678,6 +1851,7 @@ def workspace_status(root: Path, quick: bool) -> dict[str, object]:
         "pst_backend": pst_backend,
         "processing_providers": processing_providers,
         "platform": detect_platform(),
+        "plugin_runtime": plugin_runtime,
         "workspace": {
             "root": str(root.resolve()),
             "state": workspace_state,
@@ -1715,15 +1889,24 @@ def workspace_status(root: Path, quick: bool) -> dict[str, object]:
 
 
 def doctor(root: Path, quick: bool) -> dict[str, object]:
+    set_active_workspace_root(root)
     paths = workspace_paths(root)
+    runtime_paths = plugin_runtime_paths(root=root)
+    plugin_runtime = describe_plugin_runtime(runtime_paths)
     fts5 = probe_fts5()
-    pip_ok, pip_version = run_command([sys.executable, "-m", "pip", "--version"])
+    pip_python = (
+        runtime_paths["venv_python_path"]
+        if runtime_paths is not None and runtime_paths["venv_python_path"].exists()
+        else Path(sys.executable)
+    )
+    pip_ok, pip_version = run_command([str(pip_python), "-m", "pip", "--version"])
     pst_backend = dependency_status(
         "pypff",
         package_name="libpff-python",
         import_name="pypff",
         detail_label="PST backend",
         probe_if_unloaded=True,
+        allow_auto_install=False,
     )
     runtime = read_runtime(paths["runtime_path"])
     canonical_tool_path = locate_canonical_plugin_tool_or_self()
@@ -1771,6 +1954,7 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
         "pst_backend": pst_backend,
         "processing_providers": processing_providers,
         "platform": detect_platform(),
+        "plugin_runtime": plugin_runtime,
         "workspace": {
             "root": str(root.resolve()),
             "state": workspace_state,
@@ -1804,6 +1988,7 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
 
 
 def bootstrap(root: Path) -> dict[str, object]:
+    set_active_workspace_root(root)
     paths = workspace_paths(root)
     ensure_layout(paths)
     canonical_tool_path = locate_canonical_plugin_tool_or_self()
@@ -2003,7 +2188,9 @@ def maybe_upgrade_workspace_tool(root: Path) -> dict[str, object] | None:
 
 
 def init_workspace(root: Path, quick: bool = False) -> dict[str, object]:
+    set_active_workspace_root(root)
     paths = workspace_paths(root)
+    runtime_paths = plugin_runtime_paths(root=root)
     tool_update: dict[str, object] | None = None
     canonical_path = locate_canonical_plugin_tool_or_self()
 
@@ -2020,6 +2207,12 @@ def init_workspace(root: Path, quick: bool = False) -> dict[str, object]:
             if maybe_update is not None:
                 tool_update = maybe_update
 
+    runtime_init = ensure_plugin_runtime(
+        runtime_paths,
+        install_requirements=True,
+        force_requirements_install=False,
+        reason="init",
+    )
     initialization_payload = bootstrap(root)
     result: dict[str, object] = {
         "action": "init",
@@ -2030,6 +2223,8 @@ def init_workspace(root: Path, quick: bool = False) -> dict[str, object]:
     }
     if tool_update is not None:
         result["tool_update"] = tool_update
+    if payload_has_meaningful_value(runtime_init):
+        result["runtime_init"] = runtime_init
     return result
 
 

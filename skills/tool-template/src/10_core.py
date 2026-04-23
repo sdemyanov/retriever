@@ -740,6 +740,129 @@ def ensure_layout(paths: dict[str, Path]) -> None:
         paths[key].mkdir(parents=True, exist_ok=True)
 
 
+def set_active_workspace_root(root: Path | None) -> None:
+    global ACTIVE_WORKSPACE_ROOT
+    if root is None:
+        ACTIVE_WORKSPACE_ROOT = None
+        return
+    ACTIVE_WORKSPACE_ROOT = Path(root).expanduser().resolve()
+
+
+def active_workspace_paths() -> dict[str, Path] | None:
+    if ACTIVE_WORKSPACE_ROOT is None:
+        return None
+    return workspace_paths(ACTIVE_WORKSPACE_ROOT)
+
+
+def _venv_python_rel_path() -> Path:
+    return Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
+
+
+def _canonical_plugin_root_from_tool_path(path: Path) -> Path | None:
+    if (
+        path.is_file()
+        and path.parent.name == "tool-template"
+        and path.parent.parent.name == "skills"
+    ):
+        return path.parent.parent.parent
+    return None
+
+
+def resolve_plugin_root(root: Path | None = None, *, current_file: str | None = None) -> Path | None:
+    env_root = normalize_whitespace(os.environ.get("RETRIEVER_PLUGIN_ROOT") or "")
+    if env_root:
+        try:
+            return Path(env_root).expanduser().resolve()
+        except OSError:
+            return Path(env_root).expanduser()
+
+    env_tool = normalize_whitespace(os.environ.get("RETRIEVER_CANONICAL_TOOL_PATH") or "")
+    if env_tool:
+        try:
+            candidate_root = _canonical_plugin_root_from_tool_path(Path(env_tool).expanduser().resolve())
+            if candidate_root is not None:
+                return candidate_root
+        except OSError:
+            pass
+
+    canonical_tool = locate_canonical_plugin_tool(current_file=current_file)
+    if canonical_tool is not None:
+        candidate_root = _canonical_plugin_root_from_tool_path(canonical_tool)
+        if candidate_root is not None:
+            return candidate_root
+
+    candidate_file = current_file or __file__
+    if candidate_file:
+        try:
+            current_path = Path(candidate_file).resolve()
+        except OSError:
+            current_path = None
+        if current_path is not None:
+            candidate_root = _canonical_plugin_root_from_tool_path(current_path)
+            if candidate_root is not None:
+                return candidate_root
+
+    if root is not None:
+        try:
+            runtime = read_runtime(workspace_paths(Path(root).expanduser().resolve())["runtime_path"])
+        except Exception:
+            runtime = None
+        if isinstance(runtime, dict):
+            runtime_payload = runtime.get("plugin_runtime")
+            if isinstance(runtime_payload, dict):
+                plugin_root_value = normalize_whitespace(str(runtime_payload.get("plugin_root") or ""))
+                if plugin_root_value:
+                    try:
+                        return Path(plugin_root_value).expanduser().resolve()
+                    except OSError:
+                        return Path(plugin_root_value).expanduser()
+    return None
+
+
+def plugin_runtime_environment_key() -> str:
+    system = re.sub(r"[^a-z0-9]+", "-", platform.system().lower()).strip("-") or "unknown-system"
+    machine = re.sub(r"[^a-z0-9]+", "-", platform.machine().lower()).strip("-") or "unknown-machine"
+    return f"{system}-{machine}-py{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def plugin_runtime_paths(root: Path | None = None, *, current_file: str | None = None) -> dict[str, Path] | None:
+    plugin_root = resolve_plugin_root(root, current_file=current_file)
+    if plugin_root is None:
+        return None
+    runtime_root = plugin_root / ".retriever-plugin-runtime" / plugin_runtime_environment_key()
+    locks_dir = runtime_root / "locks"
+    venv_dir = runtime_root / "venv"
+    return {
+        "plugin_root": plugin_root,
+        "runtime_root": runtime_root,
+        "locks_dir": locks_dir,
+        "venv_dir": venv_dir,
+        "venv_python_path": venv_dir / _venv_python_rel_path(),
+        "requirements_marker_path": runtime_root / ".requirements-version",
+        "install_lock_path": locks_dir / "runtime-install.lock",
+    }
+
+
+def plugin_runtime_site_packages_candidates(paths: dict[str, Path]) -> list[Path]:
+    if os.name == "nt":
+        return [paths["venv_dir"] / "Lib" / "site-packages"]
+    lib_dir = paths["venv_dir"] / "lib"
+    default_path = lib_dir / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    candidates = [default_path]
+    if lib_dir.exists():
+        for candidate in sorted(lib_dir.glob("python*/site-packages")):
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def first_existing_plugin_runtime_site_packages(paths: dict[str, Path]) -> Path | None:
+    for candidate in plugin_runtime_site_packages_candidates(paths):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def remove_directory_tree(path: Path) -> bool:
     try:
         if not path.exists():
@@ -815,6 +938,34 @@ def acquire_workspace_ingest_lock(paths: dict[str, Path]):
 
 
 def release_workspace_ingest_lock(handle) -> None:
+    try:
+        release_os_file_lock(handle)
+    finally:
+        handle.close()
+
+
+def acquire_plugin_runtime_install_lock(paths: dict[str, Path]):
+    paths["locks_dir"].mkdir(parents=True, exist_ok=True)
+    lock_path = paths["install_lock_path"]
+    handle = lock_path.open("a+b")
+    try:
+        acquire_os_file_lock(handle)
+    except RetrieverError:
+        handle.close()
+        raise
+    except OSError as exc:
+        handle.close()
+        if exc.errno in {errno.EACCES, errno.EAGAIN} or isinstance(exc, PermissionError):
+            raise RetrieverError(
+                "Another shared plugin runtime install is already running. Wait for it to finish and retry."
+            ) from exc
+        raise RetrieverError(
+            f"Unable to acquire plugin runtime install lock at {lock_path}: {type(exc).__name__}: {exc}"
+        ) from exc
+    return handle
+
+
+def release_plugin_runtime_install_lock(handle) -> None:
     try:
         release_os_file_lock(handle)
     finally:
@@ -4667,19 +4818,42 @@ LAZY_DEPENDENCY_IMPORT_TARGETS = {
 }
 
 
-def load_dependency(dependency_name: str) -> object | None:
+def import_dependency_target(module_name: str, attribute_name: str | None) -> object:
+    imported = importlib.import_module(module_name)
+    return imported if attribute_name is None else getattr(imported, attribute_name)
+
+
+def load_dependency(dependency_name: str, *, allow_auto_install: bool = True) -> object | None:
     current = globals().get(dependency_name, _UNLOADED_DEPENDENCY)
-    if current is not _UNLOADED_DEPENDENCY:
-        return None if current is None else current
+    if current is not _UNLOADED_DEPENDENCY and current is not None:
+        return current
     import_target = LAZY_DEPENDENCY_IMPORT_TARGETS.get(dependency_name)
     if import_target is None:
         raise RetrieverError(f"Unknown dependency loader: {dependency_name}")
     module_name, attribute_name = import_target
     try:
-        imported = importlib.import_module(module_name)
-        value = imported if attribute_name is None else getattr(imported, attribute_name)
+        value = import_dependency_target(module_name, attribute_name)
     except Exception:
         value = None
+    runtime_paths = plugin_runtime_paths(root=ACTIVE_WORKSPACE_ROOT)
+    if value is None and runtime_paths is not None:
+        try:
+            if activate_plugin_site_packages(runtime_paths):
+                value = import_dependency_target(module_name, attribute_name)
+        except Exception:
+            value = None
+    if value is None and allow_auto_install and runtime_paths is not None:
+        try:
+            ensure_plugin_runtime(
+                runtime_paths,
+                install_requirements=True,
+                force_requirements_install=True,
+                reason=f"dependency:{dependency_name}",
+            )
+            activate_plugin_site_packages(runtime_paths)
+            value = import_dependency_target(module_name, attribute_name)
+        except Exception:
+            value = None
     globals()[dependency_name] = value
     return value
 
@@ -4691,10 +4865,11 @@ def dependency_status(
     import_name: str | None = None,
     detail_label: str | None = None,
     probe_if_unloaded: bool = False,
+    allow_auto_install: bool = False,
 ) -> dict[str, str]:
     current = globals().get(dependency_name, _UNLOADED_DEPENDENCY)
     if current is _UNLOADED_DEPENDENCY and probe_if_unloaded:
-        current = load_dependency(dependency_name)
+        current = load_dependency(dependency_name, allow_auto_install=allow_auto_install)
     detail_name = detail_label or import_name or dependency_name
     import_label = import_name or dependency_name
     if current is _UNLOADED_DEPENDENCY:
@@ -4712,7 +4887,7 @@ def dependency_status(
 
 def dependency_guard(module: object | str | None, package_name: str, file_type: str) -> object:
     if isinstance(module, str):
-        module = load_dependency(module)
+        module = load_dependency(module, allow_auto_install=True)
     if module is None:
         raise RetrieverError(
             f"Missing dependency for .{file_type} parsing: install {package_name} before ingesting this file type."
