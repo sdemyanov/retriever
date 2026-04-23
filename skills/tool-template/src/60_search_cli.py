@@ -4950,6 +4950,97 @@ def summarize_scope_inline(scope: dict[str, object]) -> str:
     return "; ".join(parts) if parts else "(none)"
 
 
+def format_dataset_size_summary(item: dict[str, object]) -> str:
+    size_bytes = item.get("size_bytes")
+    if size_bytes is None:
+        return "—"
+    try:
+        size_value = int(size_bytes)
+    except (TypeError, ValueError):
+        return "—"
+
+    unit_index = 0
+    display_value = float(size_value)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    while display_value >= 1024.0 and unit_index < len(units) - 1:
+        display_value /= 1024.0
+        unit_index += 1
+    if unit_index == 0:
+        size_text = f"{int(display_value)} {units[unit_index]}"
+    else:
+        precision = 1 if display_value < 10 else 0
+        size_text = f"{display_value:.{precision}f}".rstrip("0").rstrip(".") + f" {units[unit_index]}"
+
+    document_count = int(item.get("document_count") or 0)
+    sized_document_count = int(item.get("sized_document_count") or 0)
+    if document_count > 0 and 0 < sized_document_count < document_count:
+        return f"{size_text} ({sized_document_count}/{document_count} sized)"
+    return size_text
+
+
+def format_dataset_custodian_summary(item: dict[str, object]) -> str:
+    raw_values = item.get("custodians")
+    if not isinstance(raw_values, list):
+        return "—"
+    values = [
+        normalize_inline_whitespace(str(value or ""))
+        for value in raw_values
+        if normalize_inline_whitespace(str(value or ""))
+    ]
+    if not values:
+        return "—"
+    if len(values) <= 2:
+        return ", ".join(values)
+    return ", ".join(values[:2]) + f" +{len(values) - 2}"
+
+
+def format_dataset_type_summary(item: dict[str, object]) -> str:
+    raw_values = item.get("content_types")
+    if not isinstance(raw_values, list) or not raw_values:
+        return "—"
+    parts: list[str] = []
+    for entry in raw_values[:3]:
+        if not isinstance(entry, dict):
+            continue
+        name = normalize_inline_whitespace(str(entry.get("name") or ""))
+        if not name:
+            continue
+        count = int(entry.get("count") or 0)
+        parts.append(f"{name} ({count})" if count > 0 else name)
+    extra_count = len(raw_values) - len(parts)
+    if extra_count > 0:
+        parts.append(f"+{extra_count}")
+    return ", ".join(parts) if parts else "—"
+
+
+def format_dataset_date_endpoint(value: object) -> str | None:
+    normalized = normalize_datetime(value)
+    if normalized is None:
+        return None
+    return normalized[:10]
+
+
+def format_dataset_time_range_summary(item: dict[str, object]) -> str:
+    start_value = format_dataset_date_endpoint(item.get("time_range_start"))
+    end_value = format_dataset_date_endpoint(item.get("time_range_end"))
+    if start_value is None and end_value is None:
+        return "—"
+    if start_value is None:
+        start_value = end_value
+    if end_value is None:
+        end_value = start_value
+    if start_value == end_value:
+        return start_value or "—"
+    return f"{start_value} to {end_value}"
+
+
+def escape_markdown_table_cell(value: object) -> str:
+    text = normalize_inline_whitespace(str(value or ""))
+    if not text:
+        return "—"
+    return text.replace("\\", "\\\\").replace("|", "\\|")
+
+
 def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) -> str | None:
     command_name, normalized_tail = parse_slash_command_text(raw_command)
     browse_mode = normalize_browse_mode(payload.get("browse_mode"))
@@ -5068,18 +5159,32 @@ def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) 
             datasets = payload.get("datasets")
             if not isinstance(datasets, list) or not datasets:
                 return "Datasets: (none)"
-            lines = ["Datasets:"]
+            lines = [
+                "Datasets:",
+                "",
+                "| Dataset | Docs | Size | Custodians | Types | Time Range |",
+                "| --- | ---: | --- | --- | --- | --- |",
+            ]
             for item in datasets:
                 if not isinstance(item, dict):
                     continue
                 dataset_name = normalize_inline_whitespace(str(item.get("dataset_name") or ""))
                 if not dataset_name:
                     continue
-                document_count = int(item.get("document_count") or 0)
-                manual_count = int(item.get("manual_document_count") or 0)
-                source_count = int(item.get("source_document_count") or 0)
+                document_count = str(int(item.get("document_count") or 0))
                 lines.append(
-                    f"- {dataset_name}: {document_count} docs (manual {manual_count}, source {source_count})"
+                    "| "
+                    + " | ".join(
+                        [
+                            escape_markdown_table_cell(dataset_name),
+                            escape_markdown_table_cell(document_count),
+                            escape_markdown_table_cell(format_dataset_size_summary(item)),
+                            escape_markdown_table_cell(format_dataset_custodian_summary(item)),
+                            escape_markdown_table_cell(format_dataset_type_summary(item)),
+                            escape_markdown_table_cell(format_dataset_time_range_summary(item)),
+                        ]
+                    )
+                    + " |"
                 )
             return "\n".join(lines)
         return None

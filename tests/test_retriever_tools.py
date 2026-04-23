@@ -7409,10 +7409,32 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(row["id"]),
         )
         self.assertEqual(add_exit, 0)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                """
+                UPDATE document_occurrences
+                SET file_size = ?, custodian = ?, extracted_doc_authored_at = ?, extracted_doc_modified_at = ?, extracted_content_type = ?
+                WHERE document_id = ?
+                """,
+                (
+                    12,
+                    "mailbox@example.com",
+                    "2024-01-02T10:00:00Z",
+                    "2024-01-03T11:00:00Z",
+                    "E-Doc",
+                    row["id"],
+                ),
+            )
+            retriever_tools.refresh_document_from_occurrences(connection, row["id"])
+            connection.commit()
+        finally:
+            connection.close()
 
         self.assertEqual(self.run_cli("slash", str(self.root), "/search", "alpha")[0], 0)
         self.assertEqual(self.run_cli("slash", str(self.root), "/dataset", "Review Set")[0], 0)
         self.assertEqual(self.run_cli("slash", str(self.root), "/scope", "save", "review")[0], 0)
+        list_exit, list_payload, _, _ = self.run_cli("list-datasets", str(self.root))
 
         search_show_exit, search_show_stdout, search_show_stderr = self.run_cli_raw("slash", str(self.root), "/search")
         scope_show_exit, scope_show_stdout, scope_show_stderr = self.run_cli_raw("slash", str(self.root), "/scope")
@@ -7439,11 +7461,28 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(dataset_show_stderr, "")
         self.assertEqual(dataset_show_stdout, "Dataset: Review Set")
 
+        self.assertEqual(list_exit, 0)
+        self.assertIsNotNone(list_payload)
+        review_dataset = next(item for item in list_payload["datasets"] if item["dataset_name"] == "Review Set")
+        self.assertEqual(review_dataset["size_bytes"], 12)
+        self.assertEqual(review_dataset["sized_document_count"], 1)
+        self.assertEqual(review_dataset["custodians"], ["mailbox@example.com"])
+        self.assertEqual(review_dataset["content_types"], [{"name": "E-Doc", "count": 1}])
+        self.assertEqual(review_dataset["time_range_start"], "2024-01-02T10:00:00Z")
+        self.assertEqual(review_dataset["time_range_end"], "2024-01-03T11:00:00Z")
+
         self.assertEqual(dataset_list_exit, 0)
         self.assertEqual(dataset_list_stderr, "")
         self.assertIn("Datasets:", dataset_list_stdout)
-        self.assertIn("Review Set: 1 docs (manual 1, source 0)", dataset_list_stdout)
-        self.assertIn(f"{self.root.name}:", dataset_list_stdout)
+        self.assertIn("| Dataset | Docs | Size | Custodians | Types | Time Range |", dataset_list_stdout)
+        self.assertIn(
+            "| Review Set | 1 | 12 B | mailbox@example.com | E-Doc (1) | 2024-01-02 to 2024-01-03 |",
+            dataset_list_stdout,
+        )
+        self.assertIn(
+            f"| {self.root.name} | 1 | 12 B | mailbox@example.com | E-Doc (1) | 2024-01-02 to 2024-01-03 |",
+            dataset_list_stdout,
+        )
 
     def test_slash_list_commands_auto_upgrade_clean_but_stale_workspace_tool(self) -> None:
         retriever_tools.bootstrap(self.root)
