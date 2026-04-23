@@ -9683,22 +9683,13 @@ def _auto_upgrade_and_maybe_reexec(root: Path, command: str) -> None:
     if not tool_path:
         return
     tool_path_obj = Path(str(tool_path))
-    try:
-        running = Path(__file__).resolve()
-    except OSError:
-        running = None
-    try:
-        upgraded = tool_path_obj.resolve()
-    except OSError:
-        upgraded = tool_path_obj
-    if running is not None and upgraded == running:
-        # We are already executing from the upgraded file (unusual, but
-        # possible). Nothing to re-exec.
-        return
 
     env = os.environ.copy()
     env["RETRIEVER_AUTO_UPGRADE_REEXEC"] = "1"
     try:
+        # Re-exec even when the upgraded tool path matches ``__file__``.
+        # The file was replaced in place, but the current interpreter image
+        # is still executing the old code until a new process starts.
         os.execve(sys.executable, [sys.executable, str(tool_path_obj), *sys.argv[1:]], env)
     except OSError as exc:
         print(
