@@ -3,7 +3,7 @@ name: dataset
 description: >
   This skill should be used when the user types "/dataset", "/dataset list",
   "/dataset production", "/dataset production, priority", "/dataset clear",
-  or "/dataset rename <old-name> <new-name>". It exposes Retriever's visible
+  or "/dataset rename old-name new-name". It exposes Retriever's visible
   slash-command surface for dataset scoping, discovery, and renaming.
 metadata:
   version: "0.17.3"
@@ -13,7 +13,7 @@ metadata:
 
 # Retriever /dataset
 
-Use this skill for `/dataset`, `/dataset list`, `/dataset <name>`, `/dataset <name>, <name>`, `/dataset clear`, and `/dataset rename <old-name> <new-name>`.
+Use this skill for `/dataset`, `/dataset list`, `/dataset NAME`, `/dataset NAME, NAME`, `/dataset clear`, and `/dataset rename OLD NEW`.
 
 ## Read-only fast path
 
@@ -29,7 +29,7 @@ For the exact read-only forms `/dataset` and `/dataset list`:
 
 ## Other forms
 
-For `/dataset <name>`, comma-separated dataset selection, `/dataset clear`, and `/dataset rename <old-name> <new-name>`:
+For `/dataset NAME`, comma-separated dataset selection, `/dataset clear`, and `/dataset rename OLD NEW`:
 
 1. Read [../search/SKILL.md](../search/SKILL.md).
 2. Preserve comma-separated dataset selectors exactly as written; quote names with spaces when needed.

@@ -6,8 +6,8 @@ description: >
   threads, messages, files, or attachments from the Retriever collection —
   including narrowing by keyword, phrase, sender, recipient, date, content
   type, dataset, Bates range, or any other field — or when the user types
-  "/search", "/search <query>", "/search clear", "/search --within <term>",
-  or "/search --fts <token>". It runs Retriever's search and slash browse
+  "/search", "/search query", "/search clear", "/search --within term",
+  or "/search --fts token". It runs Retriever's search and slash browse
   commands with structured filters and returns the standard rendered table
   output.
 metadata:
@@ -64,11 +64,11 @@ For exact slash forms that begin with `/search`:
 
 ## Execution rules
 
-- Prefer SQL-like `--filter "<expression>"` filters over tuple-style field/operator/value fragments.
+- Prefer SQL-like `--filter "EXPR"` filters over tuple-style field/operator/value fragments.
 - The filter grammar targets Retriever's logical document fields, including schema-defined virtual fields such as `production_name`, `is_attachment`, and `has_attachments`.
 - Use the canonical stateless `search` CLI flags: `--filter`, `--sort`, `--order`, `--page`, `--per-page`, `--columns`, and `--mode`.
 - For requests like "show 10 ...", map the requested count to `--page 1 --per-page 10`; do not invent `--limit`.
-- For sorted browse requests, use `--sort <field>` and `--order asc|desc`; do not invent `--sort-by` or `--sort-order`.
+- For sorted browse requests, use `--sort FIELD` and `--order asc|desc`; do not invent `--sort-by` or `--sort-order`.
 - Use canonical built-in field names such as `date_created`, not ad hoc variants like `created_date`.
 - Validate field names against built-in document columns, registered custom fields, and supported virtual filter fields.
 - Use browse mode when the user is mostly filtering, and keyword search when they provide terms.
