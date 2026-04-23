@@ -55,10 +55,10 @@ ping_skill_path.write_text(ping_text, encoding="utf-8")' \
 
 python3 skills/tool-template/bundle_retriever_tools.py
 
-python3 skills/routing/generate_reference.py
+python3 generate_routing_reference.py
 
 # Diagnostic: allow excluding specific skills from the archive via env var,
-# e.g. RETRIEVER_EXCLUDE_SKILLS=routing,foo
+# e.g. RETRIEVER_EXCLUDE_SKILLS=foo,bar
 
 
 TOOL_PATH="skills/tool-template/retriever_tools.py"

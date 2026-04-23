@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Regenerate the Tier 2 slash list and Tier 3 subcommand list inside
-`skills/routing/SKILL.md` so the routing ladder never goes stale.
+`CLAUDE.md` so the routing ladder never goes stale.
 
 Tier 2 (slash commands) is extracted from the tool-template source by scanning
 for every literal `command_name == "..."` occurrence inside the slash
@@ -27,10 +27,10 @@ import re
 import subprocess
 import sys
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+REPO_ROOT = pathlib.Path(__file__).resolve().parent
 SLASH_SOURCE = REPO_ROOT / "skills" / "tool-template" / "src" / "60_search_cli.py"
 TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "retriever_tools.py"
-SKILL_PATH = REPO_ROOT / "skills" / "routing" / "SKILL.md"
+CLAUDE_PATH = REPO_ROOT / "CLAUDE.md"
 
 # ---------------------------------------------------------------------------
 # Tier 2 — slash commands. No grouping.
@@ -413,7 +413,7 @@ def splice(source: str, marker_begin: str, marker_end: str, body: str) -> str:
         count=1,
     )
     if count != 1:
-        raise SystemExit(f"Could not find markers {marker_begin} / {marker_end} in {SKILL_PATH}")
+        raise SystemExit(f"Could not find markers {marker_begin} / {marker_end} in {CLAUDE_PATH}")
     return replacement
 
 
@@ -436,26 +436,26 @@ def main() -> None:
         raise SystemExit(f"Missing slash source: {SLASH_SOURCE}")
     if not TOOL_PATH.exists():
         raise SystemExit(f"Missing bundled tool: {TOOL_PATH} (run bundle_retriever_tools.py first)")
-    if not SKILL_PATH.exists():
-        raise SystemExit(f"Missing routing skill: {SKILL_PATH}")
+    if not CLAUDE_PATH.exists():
+        raise SystemExit(f"Missing CLAUDE.md: {CLAUDE_PATH}")
 
     slash_names = extract_slash_commands()
     subcommand_names = extract_subcommands()
 
-    skill_text = SKILL_PATH.read_text(encoding="utf-8")
-    skill_text = splice(
-        skill_text,
+    claude_text = CLAUDE_PATH.read_text(encoding="utf-8")
+    claude_text = splice(
+        claude_text,
         "<!-- BEGIN: slash-commands -->",
         "<!-- END: slash-commands -->",
         render_slash_section(slash_names),
     )
-    skill_text = splice(
-        skill_text,
+    claude_text = splice(
+        claude_text,
         "<!-- BEGIN: tool-subcommands -->",
         "<!-- END: tool-subcommands -->",
         render_subcommand_section(subcommand_names),
     )
-    SKILL_PATH.write_text(skill_text, encoding="utf-8")
+    CLAUDE_PATH.write_text(claude_text, encoding="utf-8")
 
     todos = _collect_todos(slash_names, "slash") + _collect_todos(subcommand_names, "subcommand")
     print(
@@ -463,7 +463,7 @@ def main() -> None:
         f"{len(subcommand_names)} subcommands"
     )
     if todos:
-        print("TODOs flagged in SKILL.md:")
+        print("TODOs flagged in CLAUDE.md:")
         for t in todos:
             print(f"  - {t}")
 
