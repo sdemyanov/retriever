@@ -5562,9 +5562,11 @@ def image_path_data_url(path: Path) -> str | None:
         if pil_image_module is None:
             return None
         with pil_image_module.open(path) as image:
-            converted = image.convert("RGB")
             buffer = io.BytesIO()
-            converted.save(buffer, format="PNG")
+            try:
+                image.save(buffer, format="PNG", optimize=True)
+            except (OSError, ValueError):
+                image.convert("RGB").save(buffer, format="PNG", optimize=True)
         return f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode('ascii')}"
     if mime_type is None or not mime_type.startswith("image/"):
         return None
