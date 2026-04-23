@@ -2,7 +2,7 @@
 name: workspace
 description: >
   Use this skill when initializing, checking, or upgrading a Retriever workspace.
-  It defines the .retriever directory layout, bootstrap flow, upgrade safety rules,
+  It defines the .retriever directory layout, initialization flow, upgrade safety rules,
   the pinned dependency contract for the current runtime, and the current non-resumable MVP runtime scope.
 metadata:
   version: "0.9.4"
@@ -12,7 +12,7 @@ metadata:
 
 # Retriever Workspace
 
-Use this skill for any task that needs to bootstrap or maintain a workspace-local Retriever installation.
+Use this skill for any task that needs to initialize or maintain a workspace-local Retriever installation.
 
 ## Load order
 
@@ -28,20 +28,20 @@ Use this skill for any task that needs to bootstrap or maintain a workspace-loca
 - Database paths stored in SQLite must be relative, never absolute.
 - Never silently overwrite a modified `.retriever/bin/retriever_tools.py`.
 - The tool's own dispatcher auto-upgrades clean-but-stale copies and blocks user-modified copies before running any non-exempt command; see [workspace.md](workspace.md) for the full auto-upgrade contract.
-- Before force-replacing a modified tool via `upgrade-workspace --force`, it is backed up under `.retriever/bin/backups/` with a `.user-modified` suffix.
+- Before force-replacing a modified tool via `workspace update --force`, it is backed up under `.retriever/bin/backups/` with a `.user-modified` suffix.
 - Treat `runtime.json` as the local state record for the installed tool, schema version, and checksum.
 - Treat canonical template checksum drift as an upgrade signal even if the plugin version string is unchanged.
 - On reinstall, the next non-exempt command will auto-upgrade the workspace tool; there is no separate reindex step needed purely because the canonical template changed.
-- If environment checks fail, stop and report the issue clearly instead of partially bootstrapping.
+- If environment checks fail, stop and report the issue clearly instead of partially initializing the workspace.
 
 ## Current outcome
 
 With the current Phase 2 tool surface, Claude should be able to:
 
-- verify the runtime with `doctor`
+- verify the runtime with `workspace status`
 - create the `.retriever/` directory structure
 - materialize the pinned `retriever_tools.py` template
-- initialize schema v9
+- initialize schema v9 with `workspace init`
 - write a stable `runtime.json`
 - ingest supported documents into `.retriever/retriever.db`
 - report PST backend readiness separately while keeping ordinary non-PST commands free of eager parser loading

@@ -36,10 +36,10 @@ Use this skill when the user says things like:
 ## Execution rules
 
 - Confirm or infer the workspace root.
-- Run `doctor --quick` if runtime state is unclear.
+- Run `workspace status --quick` if runtime state is unclear.
 - Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, and user-modified tool protection without changing the intended `ingest` vs. `ingest-production` command.
 - For `.pst` sources, use regular `ingest`, not `ingest-production`.
-- If `doctor` reports `pst_backend.status == fail`, explain that PST ingest needs the required `libpff-python` / `pypff` backend installed.
+- If `workspace status` reports `pst_backend.status == fail`, explain that PST ingest needs the required `libpff-python` / `pypff` backend installed.
 - If the user target is a processed production root, or the user explicitly asks for production ingest, run `ingest-production` instead of plain `ingest`.
 - Keep `ingest-production` as the precise entrypoint for targeted reruns, scripts, or one-off production-only ingest.
 - Treat `DAT` + companion `TEXT/`, `IMAGES/`, and optional `NATIVES/` folders as a production signature, not as loose files.

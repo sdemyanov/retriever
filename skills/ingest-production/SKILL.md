@@ -29,7 +29,7 @@ Use this skill when the user says things like:
 ## Execution rules
 
 - Confirm or infer both the workspace root and the candidate production root.
-- Run `doctor --quick` if runtime state is unclear.
+- Run `workspace status --quick` if runtime state is unclear.
 - Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, and user-modified tool protection without changing the intended `ingest-production` command.
 - Validate that the target looks like a supported processed production root, not just a loose folder of files.
 - Run `ingest-production` against the production root, not plain `ingest`.

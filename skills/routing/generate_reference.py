@@ -99,9 +99,7 @@ SLASH_USE_WHEN: dict[str, str] = {
 
 SUBCOMMAND_BLURBS: dict[str, str] = {
     # Workspace & maintenance
-    "doctor": "check runtime and workspace readiness",
-    "bootstrap": "create workspace layout and schema",
-    "upgrade-workspace": "upgrade the workspace schema",
+    "workspace": "initialize, inspect, or update workspace installation and schema",
     "schema-version": "report the current schema/tool version",
     # Datasets
     "list-datasets": "list datasets in the workspace",
@@ -174,9 +172,7 @@ SUBCOMMAND_BLURBS: dict[str, str] = {
 
 SUBCOMMAND_USE_WHEN: dict[str, str] = {
     # Workspace & maintenance
-    "doctor": "you need to diagnose runtime, workspace readiness, or install integrity",
-    "bootstrap": "you need to initialize a fresh workspace",
-    "upgrade-workspace": "the schema version is behind the bundled tool",
+    "workspace": "you need to initialize a fresh workspace, diagnose runtime or install integrity, or refresh the workspace tool",
     "schema-version": "you need the current schema/tool version string",
     # Datasets
     "list-datasets": "you need the current dataset list with document counts (programmatic form; prefer `retriever:dataset` / `/dataset list` for user-facing intent)",
@@ -248,9 +244,7 @@ SUBCOMMAND_USE_WHEN: dict[str, str] = {
 }
 
 SUBCOMMAND_GROUPS: dict[str, str] = {
-    "doctor": "Workspace & maintenance",
-    "bootstrap": "Workspace & maintenance",
-    "upgrade-workspace": "Workspace & maintenance",
+    "workspace": "Workspace & maintenance",
     "schema-version": "Workspace & maintenance",
     "list-datasets": "Datasets",
     "create-dataset": "Datasets",

@@ -114,12 +114,12 @@ When you want to be precise, you use slash commands. `/search`, `/filter`, `/sor
 
 Results render inline as a table. Each row's title is a link that opens the document in the preview panel alongside the conversation, so you can skim a hit, confirm it, and move to the next one without leaving the workflow. Native files preview natively where possible; Retriever generates HTML or CSV previews for types that need them.
 
-Skills are the other half of the form factor. A skill is a prewritten recipe Claude can follow for a specific Retriever operation — `ingest`, `doctor`, `search`, `bates`, `filter`, `scope`, `page`, `page-size`, `columns`, `sort`, `field`, `fill`, `ingest-production`, `pst`, `run-job`, and others.
+Skills are the other half of the form factor. A skill is a prewritten recipe Claude can follow for a specific Retriever operation — `workspace`, `ingest`, `search`, `bates`, `filter`, `scope`, `page`, `page-size`, `columns`, `sort`, `field`, `fill`, `ingest-production`, `pst`, `run-job`, and others.
 
 The division of labor is worth understanding:
 
 - **Slash commands are deterministic.** `/search contract`, `/bates ABC000412`, `/filter content_type = 'Email'`, `/columns set title, control_number` — these run without any reasoning. You type them, they execute. Use them when you already know exactly what you want.
-- **Natural-language requests still require reasoning.** Phrases like "run retriever doctor," "ingest this production," "add a field called issue_tag," or "jump to Bates ABC000412" go through Claude's interpretation — figuring out which operation you mean, which arguments to supply, whether to use `ingest` or `ingest-production`, what type the new field should be.
+- **Natural-language requests still require reasoning.** Phrases like "run retriever workspace status," "ingest this production," "add a field called issue_tag," or "jump to Bates ABC000412" go through Claude's interpretation — figuring out which operation you mean, which arguments to supply, whether to use `ingest` or `ingest-production`, what type the new field should be.
 - **Skills anchor that reasoning.** Once Claude identifies that a request matches a skill, the skill itself spells out how to execute — which CLI command, which arguments, what the output should look like, how to handle edge cases. That's what makes the reasoned path predictable rather than improvised.
 
 The net effect: you get the flexibility of plain English and the reliability of a prewritten recipe. If you want to skip the reasoning step entirely, use the slash commands directly.
@@ -160,10 +160,10 @@ Retriever installs as a Claude Cowork plugin.
 6. Check the runtime before your first real ingest:
 
    ```text
-   /retriever:doctor
+   /retriever:workspace status
    ```
 
-   `doctor` confirms Python and SQLite are available, FTS5 is supported, and the environment is ready for ingest, PST handling, and the rest of the pipeline.
+   `workspace status` confirms Python and SQLite are available, FTS5 is supported, and the environment is ready for ingest, PST handling, and the rest of the pipeline.
 
 ### Local load for development or evaluation
 
@@ -193,7 +193,7 @@ If you want to test the full install path end to end from a local copy:
    ```
 
 4. Restart Claude.
-5. Run `/retriever:ping` to confirm, then `/retriever:doctor` to check the runtime.
+5. Run `/retriever:ping` to confirm, then `/retriever:workspace status` to check the runtime.
 
 For the full set of install scenarios and validation steps, see [`SMOKE_TEST.md`](./SMOKE_TEST.md).
 
@@ -201,7 +201,7 @@ For the full set of install scenarios and validation steps, see [`SMOKE_TEST.md`
 
 If you are trying Retriever for the first time, this is a sensible path:
 
-1. Point Retriever at the folder and ask it to check the runtime (`retriever doctor`).
+1. Point Retriever at the folder and ask Retriever to initialize it (`retriever workspace init`) or inspect it (`retriever workspace status`).
 2. Ask it to index the workspace.
 3. Run your first keyword: `/search <term>`.
 4. Narrow it down: `/filter content_type = 'Email'`.
@@ -386,26 +386,26 @@ claude --plugin-dir /path/to/retriever-plugin
 
 Once loaded:
 
-- Use natural-language requests such as "index this workspace" or "run retriever doctor" for setup, ingest, exports, and job operations.
+- Use natural-language requests such as "index this workspace" or "run retriever workspace status" for setup, ingest, exports, and job operations.
 - Use Retriever's persistent slash commands for day-to-day browsing and narrowing once a workspace is active.
 
 ## Typical workflows
 
-### 1. Bootstrap and index a workspace
+### 1. Initialize and index a workspace
 
 Use this when you are starting with a new folder of files.
 
 In conversation:
 
-- Ask Retriever to check the runtime.
-- Ask it to bootstrap the workspace if needed.
+- Ask Retriever to run `workspace status`.
+- Ask it to run `workspace init`.
 - Ask it to ingest the folder, usually recursively.
 
 Direct CLI equivalents:
 
 ```bash
-python3 .retriever/bin/retriever_tools.py doctor .
-python3 .retriever/bin/retriever_tools.py bootstrap .
+python3 .retriever/bin/retriever_tools.py workspace status .
+python3 .retriever/bin/retriever_tools.py workspace init .
 python3 .retriever/bin/retriever_tools.py ingest . --recursive
 ```
 
@@ -818,10 +818,11 @@ Examples:
 ### Health and setup
 
 ```bash
-python3 .retriever/bin/retriever_tools.py doctor .
-python3 .retriever/bin/retriever_tools.py doctor . --quick
-python3 .retriever/bin/retriever_tools.py bootstrap .
-python3 .retriever/bin/retriever_tools.py schema-version .
+python3 .retriever/bin/retriever_tools.py workspace status .
+python3 .retriever/bin/retriever_tools.py workspace status . --quick
+python3 .retriever/bin/retriever_tools.py workspace init .
+python3 .retriever/bin/retriever_tools.py workspace update . --force
+python3 .retriever/bin/retriever_tools.py schema-version
 ```
 
 ### Search and retrieval
@@ -856,7 +857,7 @@ python3 .retriever/bin/retriever_tools.py clear-conversation-assignment . --doc-
 
 - Retriever is workspace-local. Changing workspaces means changing the database, browse state, datasets, and saved scopes you are working against.
 - Re-ingest updates changed files in place, preserves stable document identity where possible, and marks missing items instead of silently forgetting them.
-- PST support depends on the required `pypff` backend being available. `doctor` probes PST backend status separately, and missing PST support no longer blocks ordinary non-PST workflows.
+- PST support depends on the required `pypff` backend being available. `workspace status` probes PST backend status separately, and missing PST support no longer blocks ordinary non-PST workflows.
 - Production ingest is not the same as loose-file ingest. Use `ingest-production` when you want to target a production root explicitly.
 - Manual field edits are protected from later automated overwrite.
 - Results stay grounded in the active scope. If something looks missing, check `/scope`, `/dataset`, `/from-run`, `/sort`, and `/page-size` before assuming the underlying data is gone.

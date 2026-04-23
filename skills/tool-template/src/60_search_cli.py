@@ -8969,12 +8969,50 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retriever workspace tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    doctor_parser = subparsers.add_parser("doctor", help="Check runtime and workspace readiness")
-    doctor_parser.add_argument("workspace", help="Workspace root path")
-    doctor_parser.add_argument("--quick", action="store_true", help="Return the compact runtime payload")
+    workspace_parser = subparsers.add_parser(
+        "workspace",
+        help="Initialize, inspect, or update workspace installation and schema",
+    )
+    workspace_subparsers = workspace_parser.add_subparsers(dest="workspace_action", required=True)
 
-    bootstrap_parser = subparsers.add_parser("bootstrap", help="Create workspace layout and schema")
-    bootstrap_parser.add_argument("workspace", help="Workspace root path")
+    workspace_init_parser = workspace_subparsers.add_parser(
+        "init",
+        help="Materialize the workspace tool and initialize or repair schema state",
+    )
+    workspace_init_parser.add_argument("workspace", help="Workspace root path")
+    workspace_init_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Return the compact status report after initialization",
+    )
+
+    workspace_status_parser = workspace_subparsers.add_parser(
+        "status",
+        help="Check runtime and workspace readiness without auto-upgrading the tool",
+    )
+    workspace_status_parser.add_argument("workspace", help="Workspace root path")
+    workspace_status_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Return the compact runtime payload",
+    )
+
+    workspace_update_parser = workspace_subparsers.add_parser(
+        "update",
+        help="Replace the workspace's retriever_tools.py with the canonical plugin copy",
+    )
+    workspace_update_parser.add_argument("workspace", help="Workspace root path")
+    workspace_update_parser.add_argument(
+        "--from",
+        dest="canonical_source",
+        default=None,
+        help="Path to the canonical retriever_tools.py (defaults to auto-discovery)",
+    )
+    workspace_update_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the workspace tool even when it differs from runtime.json",
+    )
 
     ingest_parser = subparsers.add_parser("ingest", help="Index documents in the workspace")
     ingest_parser.add_argument("workspace", help="Workspace root path")
@@ -9635,23 +9673,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("schema-version", help="Print the schema version")
 
-    upgrade_workspace_parser = subparsers.add_parser(
-        "upgrade-workspace",
-        help="Replace the workspace's retriever_tools.py with the canonical plugin copy",
-    )
-    upgrade_workspace_parser.add_argument("workspace", help="Workspace root path")
-    upgrade_workspace_parser.add_argument(
-        "--from",
-        dest="canonical_source",
-        default=None,
-        help="Path to the canonical retriever_tools.py (defaults to auto-discovery)",
-    )
-    upgrade_workspace_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite the workspace tool even when it differs from runtime.json",
-    )
-
     return parser
 
 
@@ -9712,57 +9733,41 @@ def main() -> int:
 
         root = Path(args.workspace).expanduser().resolve()
 
-        if args.command == "upgrade-workspace":
-            canonical_source = getattr(args, "canonical_source", None)
-            if canonical_source:
-                canonical_path = Path(canonical_source).expanduser().resolve()
-                if not canonical_path.is_file():
-                    raise RetrieverError(
-                        f"Canonical tool not found at --from path: {canonical_path}"
-                    )
-            else:
-                located = locate_canonical_plugin_tool()
-                if located is None:
-                    # Fallback: the user invoked the canonical plugin tool
-                    # directly (e.g. `python3 skills/tool-template/retriever_tools.py
-                    # upgrade-workspace ...`). In that case __file__ *is* the
-                    # canonical copy; ``locate_canonical_plugin_tool`` skips
-                    # it to avoid self-upgrade loops, but here we want to
-                    # honor it.
-                    try:
-                        self_path = Path(__file__).resolve()
-                    except OSError:
-                        self_path = None
-                    if (
-                        self_path is not None
-                        and self_path.is_file()
-                        and self_path.parent.name == "tool-template"
-                        and self_path.parent.parent.name == "skills"
-                    ):
-                        located = self_path
-                if located is None:
+        if args.command == "workspace":
+            if args.workspace_action == "status":
+                status_payload = workspace_status(root, bool(getattr(args, "quick", False)))
+                return emit_cli_payload("workspace", {"action": "status", **status_payload})
+
+            if args.workspace_action == "init":
+                return emit_cli_payload(
+                    "workspace",
+                    init_workspace(root, quick=bool(getattr(args, "quick", False))),
+                )
+
+            if args.workspace_action == "update":
+                canonical_source = getattr(args, "canonical_source", None)
+                if canonical_source:
+                    canonical_path = Path(canonical_source).expanduser().resolve()
+                    if not canonical_path.is_file():
+                        raise RetrieverError(
+                            f"Canonical tool not found at --from path: {canonical_path}"
+                        )
+                else:
+                    canonical_path = locate_canonical_plugin_tool_or_self()
+                if canonical_path is None:
                     raise RetrieverError(
                         "Could not auto-discover the canonical retriever_tools.py. "
                         "Pass --from <path> or set RETRIEVER_CANONICAL_TOOL_PATH."
                     )
-                canonical_path = located
-            return emit_cli_payload(
-                "upgrade-workspace",
-                upgrade_workspace_tool(
+                update_payload = upgrade_workspace_tool(
                     root,
                     canonical_path,
                     force=bool(getattr(args, "force", False)),
                     reason="manual",
-                ),
-            )
+                )
+                return emit_cli_payload("workspace", {"action": "update", **update_payload})
 
         _auto_upgrade_and_maybe_reexec(root, args.command)
-
-        if args.command == "doctor":
-            return emit_cli_payload("doctor", doctor(root, args.quick))
-
-        if args.command == "bootstrap":
-            return emit_cli_payload("bootstrap", bootstrap(root))
 
         if args.command == "ingest":
             return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types))
