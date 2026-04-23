@@ -5106,12 +5106,18 @@ def ingest_container_source(
     source_scan_hash = normalize_whitespace(str(source_scan_hash_override or "")) or sha256_text(
         f"{scan_hash_salt}:{sha256_file(path) or ''}"
     )
+    transaction_was_open = connection.in_transaction
     dataset_id, dataset_source_id = ensure_source_backed_dataset(
         connection,
         source_kind=source_kind,
         source_locator=source_rel_path,
         dataset_name=dataset_name,
     )
+    if not transaction_was_open and connection.in_transaction:
+        # Source-backed dataset repair may create or reattach dataset metadata
+        # for legacy workspaces. Flush that implicit transaction before the
+        # per-source BEGIN blocks below.
+        connection.commit()
     existing_source = get_container_source_row(connection, source_kind, source_rel_path)
     file_size = file_size_bytes(path)
     file_mtime = file_mtime_timestamp(path)
@@ -5647,12 +5653,17 @@ def ingest_gmail_export_root(
         }
 
     primary_source_rel_path = relative_document_path(root, all_mbox_paths[0])
+    transaction_was_open = connection.in_transaction
     dataset_id, dataset_source_id = ensure_source_backed_dataset(
         connection,
         source_kind=MBOX_SOURCE_KIND,
         source_locator=primary_source_rel_path,
         dataset_name=mbox_dataset_name(primary_source_rel_path),
     )
+    if not transaction_was_open and connection.in_transaction:
+        # Gmail exports can repair legacy dataset-source rows before any of the
+        # explicit per-source BEGIN blocks run.
+        connection.commit()
     email_metadata_by_message_id = {
         str(key): dict(value)
         for key, value in dict(descriptor.get("email_metadata_by_message_id") or {}).items()

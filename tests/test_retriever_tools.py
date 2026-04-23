@@ -10827,6 +10827,84 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         browse_results = retriever_tools.search(self.root, "", None, None, None, 1, 20)
         self.assertEqual(browse_results["total_hits"], 1)
 
+    def test_unchanged_pst_source_recreates_missing_dataset_source_without_nested_transaction(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-msg-001",
+                subject="PST Parent",
+                body_text="Parent message body",
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["new"], 1)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                """
+                DELETE FROM dataset_sources
+                WHERE source_kind = ? AND source_locator = ?
+                """,
+                (retriever_tools.PST_SOURCE_KIND, "mailbox.pst"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with mock.patch.object(
+            retriever_tools,
+            "iter_pst_messages",
+            side_effect=AssertionError("PST iterator should not run on unchanged source"),
+        ):
+            second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["skipped"], 1)
+        self.assertEqual(second_ingest["pst_sources_skipped"], 1)
+        self.assertEqual(second_ingest["failed"], 0)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            dataset_source_row = connection.execute(
+                """
+                SELECT id, dataset_id
+                FROM dataset_sources
+                WHERE source_kind = ? AND source_locator = ?
+                """,
+                (retriever_tools.PST_SOURCE_KIND, "mailbox.pst"),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(dataset_source_row)
+
+    def test_ingest_rolls_back_failed_pst_source_and_continues(self) -> None:
+        self.write_fake_pst_file()
+        (self.root / "note.txt").write_text("plain text body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+
+        def broken_ingest_pst_source(connection: sqlite3.Connection, *args, **kwargs):
+            connection.execute(
+                """
+                UPDATE workspace_meta
+                SET updated_at = updated_at
+                WHERE id = 1
+                """
+            )
+            raise sqlite3.OperationalError("synthetic nested transaction trigger")
+
+        with mock.patch.object(retriever_tools, "ingest_pst_source", side_effect=broken_ingest_pst_source):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 1)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(len(ingest_result["failures"]), 1)
+        self.assertEqual(ingest_result["failures"][0]["rel_path"], "mailbox.pst")
+        note_row = self.fetch_document_row("note.txt")
+        self.assertIsNotNone(note_row)
+
     def test_unchanged_pst_chat_source_reparses_when_chat_threading_rows_are_missing(self) -> None:
         self.write_fake_pst_file()
         messages = [
