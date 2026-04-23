@@ -69,6 +69,16 @@ A reinstall with a changed canonical template is still an upgrade, even if the p
 
 The workspace tool enforces these rules itself on every non-exempt command. The runner is still free to call `upgrade-workspace` explicitly; the auto-upgrade path just removes the need to remember to do it.
 
+### Ingest command preflight
+
+Use this as the shared preflight contract for runners that are about to call `ingest` or `ingest-production`.
+
+- Confirm or infer the workspace root first, and run `doctor --quick` if runtime state is unclear.
+- If `.retriever/bin/retriever_tools.py` or `.retriever/runtime.json` is missing, materialize the canonical workspace tool and run `bootstrap` before continuing.
+- Otherwise, run the intended workspace-local command through the existing workspace tool and rely on the dispatcher's auto-upgrade path for clean-but-stale copies.
+- If the dispatcher reports `retriever-auto-upgrade: {"status": "blocked", ...}` because the workspace tool is user-modified, stop and ask before `upgrade-workspace --force`.
+- After bootstrap or an explicit forced upgrade, resume the original intended command. Do not swap `ingest` for `ingest-production`, or vice versa, just because the workspace tool was refreshed.
+
 ### Auto-upgrade dispatch hook
 
 Before executing any command other than `schema-version`, `bootstrap`, `doctor`, `upgrade-workspace`, or `slash`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper.

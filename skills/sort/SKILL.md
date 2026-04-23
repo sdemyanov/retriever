@@ -9,6 +9,8 @@ metadata:
   version: "0.17.3"
 ---
 
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+
 # Retriever /sort
 
 Use this skill for `/sort`, `/sort list`, `/sort <field> <asc|desc>`, `/sort <field> <asc|desc>, <field> <asc|desc>`, and `/sort default`.

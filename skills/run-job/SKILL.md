@@ -2,11 +2,16 @@
 name: run-job
 description: >
   Use this skill when the user wants to execute a planned Retriever processing run
-  inline or in the background. It decides between inline execution and spawning a
-  subagent, and drives the claim / complete / heartbeat loop against the processing DB.
+  inline or in the background — including natural-language phrasings like "run OCR",
+  "start the image-description job", "kick off the OCR worker", "process the queue",
+  "execute run 42", "resume the stalled run", or "finish processing". It decides
+  between inline execution and spawning a subagent, and drives the
+  claim / complete / heartbeat loop against the processing DB.
 metadata:
   version: "0.9.5"
 ---
+
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
 
 # Run Job
 

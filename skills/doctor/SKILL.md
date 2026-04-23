@@ -10,6 +10,8 @@ metadata:
   version: "0.9.4"
 ---
 
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
+
 # Retriever Doctor
 
 Inspect Retriever's actual workspace/runtime state, not just the ambient VM.

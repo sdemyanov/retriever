@@ -1,13 +1,20 @@
 ---
 name: search
 description: >
-  Use this skill when the user wants to find documents or conversations,
-  filter the collection, or browse linked search results. It runs Retriever's
-  search and slash browse commands with structured filters and returns the
-  standard rendered table output.
+  Use this skill whenever the user wants to show, list, view, display, browse,
+  find, search, or otherwise retrieve documents, conversations, emails, chats,
+  threads, messages, files, or attachments from the Retriever collection —
+  including narrowing by keyword, phrase, sender, recipient, date, content
+  type, dataset, Bates range, or any other field — or when the user types
+  "/search", "/search <query>", "/search clear", "/search --within <term>",
+  or "/search --fts <token>". It runs Retriever's search and slash browse
+  commands with structured filters and returns the standard rendered table
+  output.
 metadata:
   version: "0.9.8"
 ---
+
+> Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `retriever_tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
 
 # Retriever Search
 
@@ -44,7 +51,7 @@ For exact slash forms that begin with `/search`:
 
 ## View vs compose
 
-- Use `--mode view` whenever the user primarily wants to see a document listing, not just when they literally say "table". Treat verbs like "show", "show me", "list", "display", "browse", "which documents", "what files", "show 10", and "show only" as view requests unless the user explicitly asks for a summary, explanation, or a different layout.
+- Use `--mode view` whenever the user primarily wants to see a document listing, not just when they literally say "table". Treat verbs like "show", "show me", "list", "display", "view", "browse", "find", "which documents", "what files", "show 10", and "show only" as view requests unless the user explicitly asks for a summary, explanation, or a different layout.
 - Use `--mode view` for the slash browse surface (`/search`, `/bates`, `/filter`, `/dataset`, `/from-run`, `/scope`, `/sort`, `/page`, `/next`, `/previous`, `/page-size`, `/columns`, and the internal browse-mode toggles `/documents` and `/conversations`, plus read-only `list` forms such as `/scope list`, `/dataset list`, `/sort list`, and `/columns list`).
 - For document-listing requests inside an active investigation, prefer the slash/session browse surface over a fresh stateless search so the current `/page-size`, `/columns`, `/sort`, and related browse state apply automatically.
 - If the user asks to show, list, browse, or display **conversations**, **threads**, **email threads**, **chat threads**, **channels**, **DMs**, or similar grouped discussion units, treat that as a conversation-browse request and switch the slash/session browse surface to `/conversations` before rendering results. If the user instead asks for individual documents, emails, messages, files, attachments, or per-item details, switch or stay in `/documents` mode before rendering results.
@@ -71,7 +78,6 @@ For exact slash forms that begin with `/search`:
 - Bare slash commands are read-only state inspection when supported: `/scope` shows the active scope, `/dataset` the active dataset selector, `/sort` the active sort, `/page` the current page state, `/page-size` the active page size, and `/columns` the active display columns.
 - Use `list` subcommands for discoverability: `/scope list` lists saved scopes, `/dataset list` lists available datasets, `/sort list` lists sortable fields, and `/columns list` lists displayable fields.
 - Start with Retriever's default compact output; add `--verbose` only when you need attachment rows, alternate preview targets, or extended metadata not present in compact mode.
-- If the user asked to show/list/display/browse documents, or asked to see a table, use the slash/session browse surface when practical, otherwise call search with `--mode view`, and reply with only `rendered_markdown` unless the user explicitly asks for a different layout or a non-standard summary. Never append an interpretive summary in the same turn.
 - For ordinary browse/list/show requests, do not inspect SQLite tables or write ad hoc SQL if Retriever already has a browse/search command for the task. Raw database inspection is for debugging schema/data issues, not for user-facing result rendering.
 - For conversation-listing requests, prefer this sequence when practical: apply dataset/scope/filter commands first, then run `/conversations`, and return the rendered conversation table exactly as produced.
 - For document- or message-listing requests that arrive while conversation mode is active, switch back to `/documents` before rendering so the result shape, columns, and title links match the user's request.
