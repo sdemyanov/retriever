@@ -4,8 +4,8 @@
 
 Tier 2 (slash commands) is extracted from the tool-template source by scanning
 for every literal `command_name == "..."` occurrence inside the slash
-dispatcher. Tier 3 (named subcommands of `retriever_tools.py`) is extracted
-by shelling out to `--help` on the freshly bundled tool.
+dispatcher. Tier 3 (named subcommands of `tools.py`) is extracted by shelling
+out to `--help` on the freshly bundled tool.
 
 For each command we keep three hand-authored pieces of metadata:
 
@@ -29,7 +29,7 @@ import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent
 SLASH_SOURCE = REPO_ROOT / "skills" / "tool-template" / "src" / "60_search_cli.py"
-TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "retriever_tools.py"
+TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "tools.py"
 CLAUDE_PATH = REPO_ROOT / "CLAUDE.md"
 
 # ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ SLASH_USE_WHEN: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Tier 3 — retriever_tools.py subcommands, grouped by topic.
+# Tier 3 — tools.py subcommands, grouped by topic.
 # ---------------------------------------------------------------------------
 
 SUBCOMMAND_BLURBS: dict[str, str] = {
@@ -346,7 +346,7 @@ def extract_subcommands() -> list[str]:
     )
     match = re.search(r"\{([^}]+)\}", result.stdout)
     if not match:
-        raise SystemExit("Could not parse subcommand list from retriever_tools.py --help")
+        raise SystemExit("Could not parse subcommand list from tools.py --help")
     raw = match.group(1)
     return sorted(
         command_name
