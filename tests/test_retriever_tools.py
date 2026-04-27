@@ -6618,6 +6618,103 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(updated_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
         self.assertIsNone(updated_row["participants"])
 
+    def test_reingest_refreshes_unchanged_file_when_current_extract_differs_from_stored_metadata(self) -> None:
+        memo_path = self.root / "ip-audit.txt"
+        memo_path.write_text(
+            "\n".join(
+                [
+                    "INTELLECTUAL PROPERTY AUDIT REPORT",
+                    "TO:",
+                    "Amanda Foster, General Counsel",
+                    "FROM:",
+                    "Dr. Helen Chang, Director of Intellectual Property",
+                    "DATE:",
+                    "March 15, 2023",
+                    "RE:",
+                    "Critical Patent Encumbrance Issues",
+                    "January 15, 2023: Routine patent maintenance review identified discrepancies.",
+                    "MIT Licensing Obligations: Three patents involving manufacturing processes.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_ingest["failed"], 0)
+
+        row = self.fetch_document_row("ip-audit.txt")
+        self.assertEqual(row["content_type"], "E-Doc")
+        self.assertIsNone(row["conversation_id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            conversation_id = retriever_tools.upsert_conversation_row(
+                connection,
+                source_kind=retriever_tools.EMAIL_CONVERSATION_SOURCE_KIND,
+                source_locator=retriever_tools.filesystem_dataset_locator(),
+                conversation_key="stale-ip-audit-thread",
+                conversation_type="email",
+                display_name="INTELLECTUAL PROPERTY AUDIT REPORT",
+            )
+            connection.execute(
+                """
+                UPDATE documents
+                SET content_type = 'Email',
+                    canonical_kind = 'email',
+                    conversation_id = ?,
+                    conversation_assignment_mode = ?,
+                    participants = 'January 15, 2023, MIT Licensing Obligations'
+                WHERE id = ?
+                """,
+                (
+                    conversation_id,
+                    retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO,
+                    int(row["id"]),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE document_occurrences
+                SET extracted_content_type = 'Email',
+                    extracted_participants = 'January 15, 2023, MIT Licensing Obligations'
+                WHERE document_id = ?
+                """,
+                (int(row["id"]),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(second_ingest["failed"], 0)
+        self.assertEqual(second_ingest["updated"], 1)
+        self.assertEqual(second_ingest["skipped"], 0)
+
+        updated_row = self.fetch_document_row("ip-audit.txt")
+        self.assertEqual(updated_row["content_type"], "E-Doc")
+        self.assertEqual(updated_row["canonical_kind"], "document")
+        self.assertIsNone(updated_row["conversation_id"])
+        self.assertIsNone(updated_row["participants"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            occurrence_row = connection.execute(
+                """
+                SELECT extracted_content_type, extracted_participants
+                FROM document_occurrences
+                WHERE document_id = ?
+                """,
+                (int(row["id"]),),
+            ).fetchone()
+            self.assertIsNotNone(occurrence_row)
+            assert occurrence_row is not None
+            self.assertEqual(occurrence_row["extracted_content_type"], "E-Doc")
+            self.assertIsNone(occurrence_row["extracted_participants"])
+        finally:
+            connection.close()
+
     def test_scoped_ingest_only_marks_missing_documents_inside_scope(self) -> None:
         raw_dir = self.root / "raw"
         other_dir = self.root / "other"

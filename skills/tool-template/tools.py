@@ -25114,6 +25114,46 @@ def document_row_has_seeded_text_revisions(document_row: sqlite3.Row | None) -> 
     )
 
 
+DOCUMENT_EXTRACTED_METADATA_FIELDS = (
+    "page_count",
+    "author",
+    "content_type",
+    "date_created",
+    "date_modified",
+    "participants",
+    "title",
+    "subject",
+    "recipients",
+    "text_status",
+)
+
+
+def comparable_document_metadata_value(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    normalized = normalize_whitespace(str(value))
+    return normalized or None
+
+
+def extracted_payload_matches_document_row(document_row: sqlite3.Row | None, extracted: object) -> bool:
+    if document_row is None or not isinstance(extracted, dict):
+        return True
+    keys = set(document_row.keys())
+    if "content_hash" in keys:
+        extracted_content_hash = sha256_text(str(extracted.get("text_content") or ""))
+        if comparable_document_metadata_value(document_row["content_hash"]) != extracted_content_hash:
+            return False
+    for field_name in DOCUMENT_EXTRACTED_METADATA_FIELDS:
+        if field_name not in keys:
+            continue
+        extracted_value = extracted.get("text_status", "ok") if field_name == "text_status" else extracted.get(field_name)
+        if comparable_document_metadata_value(document_row[field_name]) != comparable_document_metadata_value(extracted_value):
+            return False
+    return True
+
+
 def container_documents_missing_text_revisions(
     connection: sqlite3.Connection,
     *,
@@ -32784,10 +32824,14 @@ def commit_prepared_loose_file(
         ).fetchone()
         if existing_row is None:
             raise RetrieverError(f"Occurrence {existing_occurrence_row['id']} points at a missing document.")
+        extracted_for_skip_check = prepared_item.get("extracted_payload")
+        if isinstance(extracted_for_skip_check, dict):
+            extracted_for_skip_check = apply_manual_locks(existing_row, dict(extracted_for_skip_check))
         if (
             existing_occurrence_row["file_hash"] == file_hash
             and existing_occurrence_row["lifecycle_status"] == ACTIVE_OCCURRENCE_STATUS
             and document_row_has_seeded_text_revisions(existing_row)
+            and extracted_payload_matches_document_row(existing_row, extracted_for_skip_check)
             and document_row_has_email_threading(connection, existing_row)
         ):
             filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()

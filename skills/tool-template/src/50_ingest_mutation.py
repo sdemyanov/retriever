@@ -3263,10 +3263,14 @@ def commit_prepared_loose_file(
         ).fetchone()
         if existing_row is None:
             raise RetrieverError(f"Occurrence {existing_occurrence_row['id']} points at a missing document.")
+        extracted_for_skip_check = prepared_item.get("extracted_payload")
+        if isinstance(extracted_for_skip_check, dict):
+            extracted_for_skip_check = apply_manual_locks(existing_row, dict(extracted_for_skip_check))
         if (
             existing_occurrence_row["file_hash"] == file_hash
             and existing_occurrence_row["lifecycle_status"] == ACTIVE_OCCURRENCE_STATUS
             and document_row_has_seeded_text_revisions(existing_row)
+            and extracted_payload_matches_document_row(existing_row, extracted_for_skip_check)
             and document_row_has_email_threading(connection, existing_row)
         ):
             filesystem_dataset_id, filesystem_dataset_source_id = ensure_filesystem_dataset()
