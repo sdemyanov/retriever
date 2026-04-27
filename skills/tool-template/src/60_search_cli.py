@@ -10718,7 +10718,13 @@ def main() -> int:
                 ingest_v2_prepare_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
             )
 
-        if args.command in {"ingest-commit-step", "ingest-finalize-step"}:
+        if args.command == "ingest-commit-step":
+            return emit_cli_payload(
+                "ingest-commit-step",
+                ingest_v2_commit_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
+        if args.command == "ingest-finalize-step":
             return emit_cli_payload(
                 args.command,
                 ingest_v2_step_not_implemented(

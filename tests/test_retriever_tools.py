@@ -6891,6 +6891,96 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             hashlib.sha256(alpha_text.encode("utf-8")).hexdigest(),
         )
 
+    def test_ingest_v2_commit_step_commits_prepared_loose_files(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (raw_dir / "beta.md").write_text("# beta\n\nbody\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+        prepare_exit, prepare_payload, _, _ = self.run_cli("ingest-prepare-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["run"]["phase"], "committing")
+
+        commit_exit, commit_payload, _, _ = self.run_cli(
+            "ingest-commit-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(commit_exit, 0)
+        self.assertIsNotNone(commit_payload)
+        self.assertTrue(commit_payload["implemented"])
+        self.assertEqual(commit_payload["committed"], 2)
+        self.assertEqual(commit_payload["failed"], 0)
+        self.assertEqual(commit_payload["actions"], {"new": 2})
+        self.assertFalse(commit_payload["more_commit_remaining"])
+        self.assertTrue(commit_payload["advanced_to_finalize"])
+        run_payload = commit_payload["run"]
+        self.assertEqual(run_payload["phase"], "finalizing")
+        self.assertEqual(run_payload["status"], "finalizing")
+        self.assertEqual(run_payload["counts"]["work_items"]["committed"], 2)
+        self.assertIn("ingest-finalize-step", " ".join(run_payload["next_recommended_commands"]))
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            documents = connection.execute(
+                """
+                SELECT rel_path, control_number
+                FROM documents
+                ORDER BY rel_path ASC
+                """
+            ).fetchall()
+            work_items = connection.execute(
+                """
+                SELECT status, affected_document_ids_json, artifact_manifest_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                ORDER BY commit_order ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            chunk_count = int(connection.execute("SELECT COUNT(*) FROM document_chunks").fetchone()[0] or 0)
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json, status
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'committing'
+                  AND cursor_key = 'loose_file_commit'
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual([row["rel_path"] for row in documents], ["raw/alpha.txt", "raw/beta.md"])
+        self.assertEqual([row["control_number"] for row in documents], ["DOC001.00000001", "DOC001.00000002"])
+        self.assertTrue(all(row["status"] == "committed" for row in work_items))
+        self.assertTrue(all(json.loads(row["affected_document_ids_json"]) for row in work_items))
+        self.assertTrue(all(json.loads(row["artifact_manifest_json"])["commit_action"] == "new" for row in work_items))
+        self.assertGreaterEqual(chunk_count, 2)
+        self.assertIsNotNone(cursor_row)
+        self.assertEqual(cursor_row["status"], "complete")
+        cursor_payload = json.loads(cursor_row["cursor_json"])
+        self.assertEqual(cursor_payload["actions"], {"new": 2})
+
     def test_ingest_v2_rejects_budget_above_hard_cap(self) -> None:
         exit_code, payload, _, stderr = self.run_cli(
             "ingest-start",

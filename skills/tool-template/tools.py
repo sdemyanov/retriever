@@ -29288,6 +29288,7 @@ INGEST_V2_WORK_ITEM_STATUSES = (
 INGEST_V2_WORK_ITEM_LEASE_SECONDS = 180
 INGEST_V2_PREPARE_BATCH_SIZE = DEFAULT_WORKER_BATCH_SIZE
 INGEST_V2_PREPARE_MIN_START_SECONDS = 1.0
+INGEST_V2_COMMIT_MIN_START_SECONDS = 1.0
 INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES = 2 * 1024 * 1024 * 1024
 INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
 
@@ -30037,6 +30038,469 @@ def ingest_v2_maybe_advance_after_prepare(connection: sqlite3.Connection, *, run
             (next_phase, next_phase, now, run_id),
         )
         advanced = int(cursor.rowcount or 0) > 0
+        connection.commit()
+        return advanced
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_acquire_writer_lease(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    writer_id: str,
+) -> bool:
+    now_dt = datetime.now(timezone.utc)
+    now = format_utc_timestamp(now_dt)
+    lease_expires_at = lease_expiration_after(INGEST_V2_WORK_ITEM_LEASE_SECONDS, now=now_dt)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE ingest_runs
+            SET committer_lease_owner = ?,
+                committer_lease_expires_at = ?,
+                committer_heartbeat_at = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND phase = 'committing'
+              AND status = 'committing'
+              AND cancel_requested_at IS NULL
+              AND (
+                committer_lease_owner IS NULL
+                OR committer_lease_expires_at IS NULL
+                OR committer_lease_expires_at <= ?
+                OR committer_lease_owner = ?
+              )
+            """,
+            (writer_id, lease_expires_at, now, now, run_id, now, writer_id),
+        )
+        acquired = int(cursor.rowcount or 0) > 0
+        connection.commit()
+        return acquired
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_release_writer_lease(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    writer_id: str,
+) -> None:
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        connection.execute(
+            """
+            UPDATE ingest_runs
+            SET committer_lease_owner = NULL,
+                committer_lease_expires_at = NULL,
+                committer_heartbeat_at = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND committer_lease_owner = ?
+            """,
+            (now, now, run_id, writer_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_reclaim_stale_commit_items(connection: sqlite3.Connection, *, run_id: str) -> int:
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE ingest_work_items
+            SET status = 'prepared',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?
+            WHERE run_id = ?
+              AND status = 'committing'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            """,
+            (now, run_id, now),
+        )
+        reclaimed = int(cursor.rowcount or 0)
+        if reclaimed:
+            connection.execute(
+                """
+                INSERT INTO ingest_worker_events (
+                  run_id, worker_id, event_type, phase, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    None,
+                    "reclaim_stale_commit_items",
+                    "commit",
+                    compact_json_text({"reclaimed": reclaimed}),
+                    now,
+                ),
+            )
+        connection.commit()
+        return reclaimed
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_load_commit_cursor(connection: sqlite3.Connection, *, run_id: str) -> dict[str, object]:
+    cursor_row = connection.execute(
+        """
+        SELECT cursor_json
+        FROM ingest_phase_cursors
+        WHERE run_id = ?
+          AND phase = 'committing'
+          AND cursor_key = 'loose_file_commit'
+        """,
+        (run_id,),
+    ).fetchone()
+    if cursor_row is not None:
+        cursor = decode_json_text(cursor_row["cursor_json"], default={}) or {}
+        if isinstance(cursor, dict):
+            cursor.setdefault("schema_version", 1)
+            cursor.setdefault("current_ingestion_batch", None)
+            cursor.setdefault("actions", {})
+            cursor.setdefault("freshness_fallbacks", 0)
+            return cursor
+    return {
+        "schema_version": 1,
+        "current_ingestion_batch": None,
+        "actions": {},
+        "freshness_fallbacks": 0,
+    }
+
+
+def ingest_v2_run_loose_rel_paths(connection: sqlite3.Connection, *, run_id: str) -> set[str]:
+    rows = connection.execute(
+        """
+        SELECT rel_path
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND unit_type = 'loose_file'
+          AND rel_path IS NOT NULL
+        """,
+        (run_id,),
+    ).fetchall()
+    return {str(row["rel_path"]) for row in rows}
+
+
+def ingest_v2_load_loose_file_commit_state(
+    connection: sqlite3.Connection,
+    *,
+    root: Path,
+    run_row: sqlite3.Row,
+) -> tuple[dict[str, sqlite3.Row], dict[str, list[sqlite3.Row]]]:
+    run_id = str(run_row["run_id"])
+    scanned_rel_paths = ingest_v2_run_loose_rel_paths(connection, run_id=run_id)
+    scan_scope = ingest_v2_scan_scope_from_run(root, run_row)
+    existing_by_rel, unseen_existing_by_hash = load_loose_file_commit_state(
+        connection,
+        scanned_rel_paths,
+        set(),
+        set(),
+        scan_scope=scan_scope,
+    )
+    consumed_rows = connection.execute(
+        """
+        SELECT source_occurrence_id
+        FROM ingest_rename_consumptions
+        WHERE run_id = ?
+          AND source_occurrence_id IS NOT NULL
+        """,
+        (run_id,),
+    ).fetchall()
+    consumed_occurrence_ids = {int(row["source_occurrence_id"]) for row in consumed_rows}
+    if consumed_occurrence_ids:
+        for file_hash, rows in list(unseen_existing_by_hash.items()):
+            filtered_rows = [row for row in rows if int(row["id"]) not in consumed_occurrence_ids]
+            if filtered_rows:
+                unseen_existing_by_hash[file_hash] = filtered_rows
+            else:
+                unseen_existing_by_hash.pop(file_hash, None)
+    return existing_by_rel, unseen_existing_by_hash
+
+
+def ingest_v2_claim_next_commit_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    writer_id: str,
+) -> sqlite3.Row | None:
+    now_dt = datetime.now(timezone.utc)
+    now = format_utc_timestamp(now_dt)
+    lease_expires_at = lease_expiration_after(INGEST_V2_WORK_ITEM_LEASE_SECONDS, now=now_dt)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        run_row = require_ingest_v2_run_row(connection, run_id)
+        if (
+            str(run_row["phase"]) != "committing"
+            or str(run_row["status"]) != "committing"
+            or run_row["cancel_requested_at"] is not None
+            or run_row["committer_lease_owner"] != writer_id
+            or not lease_is_active(run_row["committer_lease_expires_at"], now=now_dt)
+        ):
+            connection.rollback()
+            return None
+        item_row = connection.execute(
+            """
+            SELECT id
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND status = 'prepared'
+            ORDER BY commit_order ASC, id ASC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if item_row is None:
+            connection.commit()
+            return None
+        work_item_id = int(item_row["id"])
+        connection.execute(
+            """
+            UPDATE ingest_work_items
+            SET status = 'committing',
+                lease_owner = ?,
+                lease_expires_at = ?,
+                updated_at = ?
+            WHERE run_id = ?
+              AND id = ?
+              AND status = 'prepared'
+            """,
+            (writer_id, lease_expires_at, now, run_id, work_item_id),
+        )
+        connection.execute(
+            """
+            UPDATE ingest_runs
+            SET committer_heartbeat_at = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND committer_lease_owner = ?
+            """,
+            (now, now, run_id, writer_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return connection.execute(
+        """
+        SELECT wi.*, pi.payload_kind, pi.payload_json AS prepared_payload_json,
+               pi.source_fingerprint_json, pi.error_json
+        FROM ingest_work_items wi
+        JOIN ingest_prepared_items pi ON pi.work_item_id = wi.id
+        WHERE wi.run_id = ?
+          AND wi.id = ?
+          AND wi.status = 'committing'
+          AND wi.lease_owner = ?
+        """,
+        (run_id, work_item_id, writer_id),
+    ).fetchone()
+
+
+def ingest_v2_prepared_item_from_row(row: sqlite3.Row) -> dict[str, object]:
+    payload = decode_json_text(row["prepared_payload_json"], default={}) or {}
+    restored_payload = ingest_v2_json_restore_value(payload)
+    if isinstance(restored_payload, dict) and isinstance(restored_payload.get("prepared_item"), dict):
+        return dict(restored_payload["prepared_item"])
+    raise RetrieverError(f"Prepared payload for work item {row['id']} is malformed.")
+
+
+def ingest_v2_mark_commit_failed(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    message: str,
+) -> bool:
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE ingest_work_items
+            SET status = 'failed',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?,
+                last_error = ?
+            WHERE run_id = ?
+              AND id = ?
+              AND status = 'committing'
+              AND lease_owner = ?
+            """,
+            (now, message, run_id, work_item_id, writer_id),
+        )
+        marked = int(cursor.rowcount or 0) > 0
+        if marked:
+            connection.execute(
+                """
+                INSERT INTO ingest_worker_events (
+                  run_id, worker_id, event_type, work_item_id, phase, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    writer_id,
+                    "commit_failed",
+                    work_item_id,
+                    "commit",
+                    compact_json_text({"error": message}),
+                    now,
+                ),
+            )
+        connection.commit()
+        return marked
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_commit_work_item_hook(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    result: dict[str, object],
+) -> None:
+    now = utc_now()
+    action = str(result.get("action") or "")
+    affected_document_ids = [
+        int(result["document_id"])
+    ] if result.get("document_id") is not None else []
+    if action == "renamed" and result.get("source_occurrence_id") is not None:
+        connection.execute(
+            """
+            INSERT INTO ingest_rename_consumptions (
+              run_id, target_work_item_id, source_document_id, source_occurrence_id, file_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                work_item_id,
+                result.get("source_document_id"),
+                result.get("source_occurrence_id"),
+                str(result.get("file_hash") or ""),
+                now,
+            ),
+        )
+    cursor["current_ingestion_batch"] = result.get("current_ingestion_batch")
+    actions = cursor.setdefault("actions", {})
+    if isinstance(actions, dict):
+        actions[action] = int(actions.get(action) or 0) + 1
+    if bool(result.get("freshness_fallback")):
+        cursor["freshness_fallbacks"] = int(cursor.get("freshness_fallbacks") or 0) + 1
+    ingest_v2_save_phase_cursor(
+        connection,
+        run_id=run_id,
+        phase="committing",
+        cursor_key="loose_file_commit",
+        cursor=cursor,
+        status="pending",
+    )
+    update_cursor = connection.execute(
+        """
+        UPDATE ingest_work_items
+        SET status = 'committed',
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            affected_document_ids_json = ?,
+            artifact_manifest_json = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE run_id = ?
+          AND id = ?
+          AND status = 'committing'
+          AND lease_owner = ?
+        """,
+        (
+            compact_json_text(affected_document_ids),
+            compact_json_text(
+                {
+                    "commit_action": action,
+                    "freshness_fallback": bool(result.get("freshness_fallback")),
+                    "document_id": result.get("document_id"),
+                }
+            ),
+            now,
+            run_id,
+            work_item_id,
+            writer_id,
+        ),
+    )
+    if int(update_cursor.rowcount or 0) != 1:
+        raise RetrieverError(f"Could not mark V2 ingest work item {work_item_id} committed.")
+    connection.execute(
+        """
+        UPDATE ingest_runs
+        SET committer_heartbeat_at = ?,
+            last_heartbeat_at = ?
+        WHERE run_id = ?
+          AND committer_lease_owner = ?
+        """,
+        (now, now, run_id, writer_id),
+    )
+
+
+def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_id: str) -> bool:
+    row = require_ingest_v2_run_row(connection, run_id)
+    if str(row["phase"]) != "committing" or row["cancel_requested_at"] is not None:
+        return False
+    remaining_commit_items = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND status IN ('prepared', 'committing')
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        or 0
+    )
+    if remaining_commit_items:
+        return False
+    cursor = ingest_v2_load_commit_cursor(connection, run_id=run_id)
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        ingest_v2_save_phase_cursor(
+            connection,
+            run_id=run_id,
+            phase="committing",
+            cursor_key="loose_file_commit",
+            cursor=cursor,
+            status="complete",
+        )
+        update_cursor = connection.execute(
+            """
+            UPDATE ingest_runs
+            SET phase = 'finalizing',
+                status = 'finalizing',
+                committer_lease_owner = NULL,
+                committer_lease_expires_at = NULL,
+                committer_heartbeat_at = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND phase = 'committing'
+              AND cancel_requested_at IS NULL
+            """,
+            (now, now, run_id),
+        )
+        advanced = int(update_cursor.rowcount or 0) > 0
         connection.commit()
         return advanced
     except Exception:
@@ -30823,6 +31287,208 @@ def ingest_v2_prepare_step(
         connection.close()
 
 
+def ingest_v2_commit_step(
+    root: Path,
+    *,
+    run_id: str,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    writer_id = ingest_v2_worker_id("commit")
+    committed = 0
+    failed = 0
+    stale_reclaimed = 0
+    actions: dict[str, int] = {}
+    freshness_fallbacks = 0
+    writer_busy = False
+    connection = connect_db(paths["db_path"])
+    lease_acquired = False
+    try:
+        apply_schema(connection, root)
+        row = require_ingest_v2_run_row(connection, run_id)
+        if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "commit",
+                "writer_id": writer_id,
+                "writer_busy": False,
+                "committed": 0,
+                "failed": 0,
+                "stale_reclaimed": 0,
+                "actions": {},
+                "freshness_fallbacks": 0,
+                "advanced_to_finalize": False,
+                "more_commit_remaining": False,
+                "more_work_remaining": False,
+                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+            }
+        if str(row["phase"]) != "committing":
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "commit",
+                "writer_id": writer_id,
+                "writer_busy": False,
+                "committed": 0,
+                "failed": 0,
+                "stale_reclaimed": 0,
+                "actions": {},
+                "freshness_fallbacks": 0,
+                "advanced_to_finalize": False,
+                "more_commit_remaining": str(row["phase"]) in {"planning", "preparing"},
+                "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+            }
+
+        lease_acquired = ingest_v2_acquire_writer_lease(connection, run_id=run_id, writer_id=writer_id)
+        if not lease_acquired:
+            writer_busy = True
+            updated_row = require_ingest_v2_run_row(connection, run_id)
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "commit",
+                "writer_id": writer_id,
+                "writer_busy": True,
+                "committed": 0,
+                "failed": 0,
+                "stale_reclaimed": 0,
+                "actions": {},
+                "freshness_fallbacks": 0,
+                "advanced_to_finalize": False,
+                "more_commit_remaining": True,
+                "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+                "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+            }
+
+        stale_reclaimed = ingest_v2_reclaim_stale_commit_items(connection, run_id=run_id)
+        run_row = require_ingest_v2_run_row(connection, run_id)
+        existing_by_rel, unseen_existing_by_hash = ingest_v2_load_loose_file_commit_state(
+            connection,
+            root=root,
+            run_row=run_row,
+        )
+        cursor = ingest_v2_load_commit_cursor(connection, run_id=run_id)
+        filesystem_dataset_id: int | None = None
+        filesystem_dataset_source_id: int | None = None
+
+        def ensure_filesystem_dataset() -> tuple[int, int]:
+            nonlocal filesystem_dataset_id, filesystem_dataset_source_id
+            if filesystem_dataset_id is None or filesystem_dataset_source_id is None:
+                filesystem_dataset_id, filesystem_dataset_source_id = ensure_source_backed_dataset(
+                    connection,
+                    source_kind=FILESYSTEM_SOURCE_KIND,
+                    source_locator=filesystem_dataset_locator(),
+                    dataset_name=filesystem_dataset_name(root),
+                )
+                connection.commit()
+            return filesystem_dataset_id, filesystem_dataset_source_id
+
+        while ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS:
+            claimed_row = ingest_v2_claim_next_commit_item(
+                connection,
+                run_id=run_id,
+                writer_id=writer_id,
+            )
+            if claimed_row is None:
+                break
+            work_item_id = int(claimed_row["id"])
+            try:
+                prepared_item = ingest_v2_prepared_item_from_row(claimed_row)
+                commit_result = commit_prepared_loose_file(
+                    connection,
+                    paths,
+                    prepared_item,
+                    existing_by_rel,
+                    unseen_existing_by_hash,
+                    ensure_filesystem_dataset,
+                    (
+                        int(cursor["current_ingestion_batch"])
+                        if cursor.get("current_ingestion_batch") is not None
+                        else None
+                    ),
+                    before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_work_item_hook(
+                        commit_connection,
+                        run_id=run_id,
+                        work_item_id=work_item_id,
+                        writer_id=writer_id,
+                        cursor=cursor,
+                        result=result,
+                    ),
+                )
+                action = str(commit_result.get("action") or "")
+                if action == "failed":
+                    failed += 1
+                    ingest_v2_mark_commit_failed(
+                        connection,
+                        run_id=run_id,
+                        work_item_id=work_item_id,
+                        writer_id=writer_id,
+                        message=str(commit_result.get("error") or "Commit failed."),
+                    )
+                else:
+                    committed += 1
+                    actions[action] = int(actions.get(action) or 0) + 1
+                    if bool(commit_result.get("freshness_fallback")):
+                        freshness_fallbacks += 1
+            except Exception as exc:
+                rollback_open_transaction(connection)
+                failed += 1
+                ingest_v2_mark_commit_failed(
+                    connection,
+                    run_id=run_id,
+                    work_item_id=work_item_id,
+                    writer_id=writer_id,
+                    message=f"{type(exc).__name__}: {exc}",
+                )
+
+        advanced_to_finalize = ingest_v2_maybe_advance_after_commit(connection, run_id=run_id)
+        if lease_acquired:
+            ingest_v2_release_writer_lease(connection, run_id=run_id, writer_id=writer_id)
+            lease_acquired = False
+        updated_row = require_ingest_v2_run_row(connection, run_id)
+        remaining_commit_items = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND status IN ('prepared', 'committing')
+                """,
+                (run_id,),
+            ).fetchone()[0]
+            or 0
+        )
+        return {
+            "ok": True,
+            "implemented": True,
+            "step": "commit",
+            "writer_id": writer_id,
+            "writer_busy": writer_busy,
+            "committed": committed,
+            "failed": failed,
+            "stale_reclaimed": stale_reclaimed,
+            "actions": actions,
+            "freshness_fallbacks": freshness_fallbacks,
+            "advanced_to_finalize": advanced_to_finalize,
+            "more_commit_remaining": remaining_commit_items > 0,
+            "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+            "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+        }
+    finally:
+        if lease_acquired:
+            try:
+                ingest_v2_release_writer_lease(connection, run_id=run_id, writer_id=writer_id)
+            except Exception:
+                pass
+        connection.close()
+
+
 def ingest_v2_step_not_implemented(
     root: Path,
     *,
@@ -31466,6 +32132,7 @@ def commit_prepared_loose_file(
     unseen_existing_by_hash: dict[str, list[sqlite3.Row]],
     ensure_filesystem_dataset,
     current_ingestion_batch: int | None,
+    before_transaction_commit=None,
 ) -> dict[str, object]:
     prepared_item, freshness_fallback = refresh_prepared_loose_file_item_if_stale(prepared_item)
     rel_path = str(prepared_item["rel_path"])
@@ -31496,12 +32163,17 @@ def commit_prepared_loose_file(
                     dataset_id=filesystem_dataset_id,
                     dataset_source_id=filesystem_dataset_source_id,
                 )
-                connection.commit()
-                return {
+                result = {
                     "action": "skipped",
                     "current_ingestion_batch": current_ingestion_batch,
                     "freshness_fallback": freshness_fallback,
+                    "document_id": int(existing_occurrence_row["document_id"]),
+                    "file_hash": file_hash,
                 }
+                if before_transaction_commit is not None:
+                    before_transaction_commit(connection, result)
+                connection.commit()
+                return result
             except Exception:
                 connection.rollback()
                 raise
@@ -31575,11 +32247,17 @@ def commit_prepared_loose_file(
                     document_id=int(exact_duplicate_document["id"]),
                     dataset_source_id=filesystem_dataset_source_id,
                 )
-                connection.commit()
-                return {
+                result = {
                     "action": "new",
                     "current_ingestion_batch": current_ingestion_batch,
+                    "freshness_fallback": freshness_fallback,
+                    "document_id": int(exact_duplicate_document["id"]),
+                    "file_hash": file_hash,
                 }
+                if before_transaction_commit is not None:
+                    before_transaction_commit(connection, result)
+                connection.commit()
+                return result
             except Exception:
                 connection.rollback()
                 raise
@@ -31685,12 +32363,20 @@ def commit_prepared_loose_file(
         if superseded_document_id is not None and superseded_document_id != document_id:
             refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
             refresh_document_from_occurrences(connection, superseded_document_id)
-        connection.commit()
-        return {
+        result = {
             "action": action,
             "current_ingestion_batch": current_ingestion_batch,
             "freshness_fallback": freshness_fallback,
+            "document_id": document_id,
+            "file_hash": file_hash,
         }
+        if action == "renamed" and existing_occurrence_row is not None:
+            result["source_occurrence_id"] = int(existing_occurrence_row["id"])
+            result["source_document_id"] = int(existing_occurrence_row["document_id"])
+        if before_transaction_commit is not None:
+            before_transaction_commit(connection, result)
+        connection.commit()
+        return result
     except Exception as exc:
         connection.rollback()
         return {
@@ -48975,7 +49661,13 @@ def main() -> int:
                 ingest_v2_prepare_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
             )
 
-        if args.command in {"ingest-commit-step", "ingest-finalize-step"}:
+        if args.command == "ingest-commit-step":
+            return emit_cli_payload(
+                "ingest-commit-step",
+                ingest_v2_commit_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
+        if args.command == "ingest-finalize-step":
             return emit_cli_payload(
                 args.command,
                 ingest_v2_step_not_implemented(
