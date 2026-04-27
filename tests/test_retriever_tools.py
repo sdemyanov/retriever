@@ -4958,6 +4958,136 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             retriever_tools.search(self.root, "", None, "is_attachment", None, 1, 20)
         self.assertIn("virtual filter field", str(context.exception))
 
+    def test_email_preview_styles_attachment_section_heading(self) -> None:
+        preview_html = retriever_tools.build_email_thread_preview_html(
+            thread_title="Energy Balance Revenue Summary",
+            page_title="Energy Balance Revenue Summary",
+            documents=[
+                {
+                    "id": 1,
+                    "author": "Alice Example <alice@example.com>",
+                    "recipients": "Bob Example <bob@example.com>",
+                    "date_created": "2026-04-15T09:00:00Z",
+                    "content_type": "Email",
+                    "text_content": "Hello team.",
+                }
+            ],
+            attachment_links_by_document_id={
+                1: [
+                    {
+                        "href": "attachments/notes.txt",
+                        "label": "notes.txt",
+                        "detail": "text/plain",
+                    }
+                ]
+            },
+        )
+
+        self.assertIn('<section class="retriever-attachments"><h2>Attachments</h2><ul>', preview_html)
+        self.assertIn(".retriever-attachments h2", preview_html)
+        self.assertNotIn(".retriever-attachments h3", preview_html)
+
+    def test_report_style_colon_sections_are_not_extracted_as_participants(self) -> None:
+        report_text = "\n".join(
+            [
+                "INTELLECTUAL PROPERTY AUDIT REPORT",
+                "",
+                "TO:",
+                "",
+                "Amanda Foster, General Counsel",
+                "",
+                "Dr. Patricia Liu, Chief Regulatory Officer",
+                "",
+                "FROM:",
+                "",
+                "Dr. Helen Chang, Director of Intellectual Property",
+                "",
+                "DATE:",
+                "",
+                "March 15, 2023",
+                "",
+                "January 15, 2023: Routine patent maintenance review identified discrepancies.",
+                "February 3, 2023: Stanford University Technology Licensing Office inquiry.",
+                "MIT Licensing Obligations: Three patents involving manufacturing processes.",
+                "Due Diligence Exposure: Potential acquirers will demand full disclosure.",
+            ]
+        )
+
+        email_headers = retriever_tools.extract_email_like_headers(report_text)
+
+        self.assertEqual(email_headers, {})
+        self.assertIsNone(retriever_tools.extract_chat_transcript_metadata(report_text))
+        self.assertIsNone(retriever_tools.extract_chat_participants(report_text))
+        self.assertEqual(
+            retriever_tools.determine_content_type(
+                Path("audit.docx"),
+                report_text,
+                email_headers=email_headers,
+                chat_metadata=None,
+                explicit_content_type="E-Doc",
+            ),
+            "E-Doc",
+        )
+        self.assertEqual(
+            retriever_tools.extract_chat_participants(
+                "Alice Example: Hi Bob.\nBob Example: Hi Alice.\nAlice Example: Thanks."
+            ),
+            "Alice Example, Bob Example",
+        )
+
+    def test_reingest_clears_stale_conversation_when_document_becomes_e_doc(self) -> None:
+        memo_path = self.root / "audit.txt"
+        memo_path.write_text("Plain audit report.\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_ingest["failed"], 0)
+
+        row = self.fetch_document_row("audit.txt")
+        self.assertEqual(row["content_type"], "E-Doc")
+        self.assertIsNone(row["conversation_id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            conversation_id = retriever_tools.upsert_conversation_row(
+                connection,
+                source_kind=retriever_tools.EMAIL_CONVERSATION_SOURCE_KIND,
+                source_locator=retriever_tools.filesystem_dataset_locator(),
+                conversation_key="stale-audit-thread",
+                conversation_type="email",
+                display_name="Plain audit report",
+            )
+            connection.execute(
+                """
+                UPDATE documents
+                SET content_type = 'Email',
+                    canonical_kind = 'email',
+                    conversation_id = ?,
+                    conversation_assignment_mode = ?,
+                    participants = 'January 15, 2023'
+                WHERE id = ?
+                """,
+                (
+                    conversation_id,
+                    retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO,
+                    int(row["id"]),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        memo_path.write_text("Plain audit report, revised.\n", encoding="utf-8")
+        second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(second_ingest["failed"], 0)
+
+        updated_row = self.fetch_document_row("audit.txt")
+        self.assertEqual(updated_row["content_type"], "E-Doc")
+        self.assertEqual(updated_row["canonical_kind"], "document")
+        self.assertIsNone(updated_row["conversation_id"])
+        self.assertEqual(updated_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
+        self.assertIsNone(updated_row["participants"])
+
     def test_non_attachment_child_documents_are_not_treated_as_attachments(self) -> None:
         parent_path = self.root / "parent.txt"
         parent_path.write_text("parent body\n", encoding="utf-8")

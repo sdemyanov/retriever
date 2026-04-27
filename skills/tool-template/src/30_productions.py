@@ -1045,8 +1045,19 @@ def upsert_document_row(
     effective_dataset_id = dataset_id
     if effective_dataset_id is None and existing_row is not None and existing_row["dataset_id"] is not None:
         effective_dataset_id = int(existing_row["dataset_id"])
+    normalized_extracted_content_type = normalize_whitespace(str(extracted.get("content_type") or "")).lower()
+    should_preserve_existing_conversation = (
+        effective_child_kind is not None
+        or normalized_extracted_content_type in {"email", "chat"}
+        or conversation_id is not None
+    )
     effective_conversation_id = conversation_id
-    if effective_conversation_id is None and existing_row is not None and "conversation_id" in existing_row.keys():
+    if (
+        effective_conversation_id is None
+        and should_preserve_existing_conversation
+        and existing_row is not None
+        and "conversation_id" in existing_row.keys()
+    ):
         if existing_row["conversation_id"] is not None:
             effective_conversation_id = int(existing_row["conversation_id"])
     effective_conversation_assignment = effective_conversation_assignment_mode(
@@ -1056,6 +1067,8 @@ def upsert_document_row(
         if existing_row is not None and "conversation_assignment_mode" in existing_row.keys()
         else None
     )
+    if not should_preserve_existing_conversation:
+        effective_conversation_assignment = CONVERSATION_ASSIGNMENT_MODE_AUTO
     effective_root_message_key = root_message_key
     if effective_root_message_key is None and existing_row is not None and "root_message_key" in existing_row.keys():
         effective_root_message_key = existing_row["root_message_key"]
@@ -2494,7 +2507,25 @@ def assign_pst_chat_conversations(connection: sqlite3.Connection) -> dict[str, i
     }
 
 
+def clear_unsupported_conversation_assignments(connection: sqlite3.Connection) -> int:
+    cursor = connection.execute(
+        """
+        UPDATE documents
+        SET conversation_id = NULL,
+            conversation_assignment_mode = ?,
+            updated_at = ?
+        WHERE parent_document_id IS NULL
+          AND conversation_id IS NOT NULL
+          AND lifecycle_status NOT IN ('missing', 'deleted')
+          AND LOWER(TRIM(COALESCE(content_type, ''))) NOT IN ('email', 'chat')
+        """,
+        (CONVERSATION_ASSIGNMENT_MODE_AUTO, utc_now()),
+    )
+    return int(cursor.rowcount or 0)
+
+
 def assign_supported_conversations(connection: sqlite3.Connection) -> dict[str, int]:
+    clear_unsupported_conversation_assignments(connection)
     email_assignment = assign_email_conversations(connection)
     pst_chat_assignment = assign_pst_chat_conversations(connection)
     return {
@@ -2811,7 +2842,7 @@ def build_email_preview_head_html() -> str:
         ".retriever-calendar-invite-meta a { color: #174ea6; text-decoration: none; word-break: break-all; }"
         ".retriever-calendar-invite-meta a:hover { text-decoration: underline; }"
         ".retriever-attachments { margin-top: 1rem; padding-top: 0.8rem; border-top: 1px solid #eceff3; }"
-        ".retriever-attachments h3 { margin: 0 0 0.5rem; font-size: 0.86rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #5f6368; }"
+        ".retriever-attachments h2 { margin: 0 0 0.5rem; font-size: 0.86rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #5f6368; }"
         ".retriever-attachments ul { margin: 0; padding-left: 1.1rem; }"
         ".retriever-attachments li { margin: 0.26rem 0; }"
         ".chat-avatar-svg { width: 3rem; height: 3rem; flex: 0 0 auto; display: block; }"
