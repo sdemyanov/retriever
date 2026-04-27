@@ -1284,6 +1284,62 @@ def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_
         raise
 
 
+def ingest_v2_load_finalize_cursor(connection: sqlite3.Connection, *, run_id: str) -> dict[str, object]:
+    cursor_row = connection.execute(
+        """
+        SELECT cursor_json
+        FROM ingest_phase_cursors
+        WHERE run_id = ?
+          AND phase = 'finalizing'
+          AND cursor_key = 'loose_file_finalize'
+        """,
+        (run_id,),
+    ).fetchone()
+    if cursor_row is not None:
+        cursor = decode_json_text(cursor_row["cursor_json"], default={}) or {}
+        if isinstance(cursor, dict):
+            cursor.setdefault("schema_version", 1)
+            cursor.setdefault("stage", "missing")
+            cursor.setdefault("filesystem_missing", 0)
+            cursor.setdefault("conversation_assignment", {})
+            cursor.setdefault("conversation_previews_refreshed", 0)
+            cursor.setdefault("pruned_unused_filesystem_dataset", False)
+            return cursor
+    return {
+        "schema_version": 1,
+        "stage": "missing",
+        "filesystem_missing": 0,
+        "conversation_assignment": {},
+        "conversation_previews_refreshed": 0,
+        "pruned_unused_filesystem_dataset": False,
+    }
+
+
+def ingest_v2_save_finalize_cursor(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    cursor: dict[str, object],
+    status: str,
+) -> None:
+    ingest_v2_save_phase_cursor(
+        connection,
+        run_id=run_id,
+        phase="finalizing",
+        cursor_key="loose_file_finalize",
+        cursor=cursor,
+        status=status,
+    )
+    connection.execute(
+        """
+        UPDATE ingest_runs
+        SET last_heartbeat_at = ?
+        WHERE run_id = ?
+        """,
+        (utc_now(), run_id),
+    )
+
+
 def active_ingest_v2_run_row(connection: sqlite3.Connection) -> sqlite3.Row | None:
     return connection.execute(
         """
@@ -2262,6 +2318,150 @@ def ingest_v2_commit_step(
                 ingest_v2_release_writer_lease(connection, run_id=run_id, writer_id=writer_id)
             except Exception:
                 pass
+        connection.close()
+
+
+def ingest_v2_finalize_step(
+    root: Path,
+    *,
+    run_id: str,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    stages_completed: list[str] = []
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = require_ingest_v2_run_row(connection, run_id)
+        if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "finalize",
+                "stages_completed": [],
+                "finalization_complete": str(row["status"]) == "completed",
+                "more_finalize_remaining": False,
+                "more_work_remaining": False,
+                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+            }
+        if str(row["phase"]) != "finalizing":
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "finalize",
+                "stages_completed": [],
+                "finalization_complete": False,
+                "more_finalize_remaining": str(row["phase"]) in {"planning", "preparing", "committing"},
+                "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+            }
+
+        cursor = ingest_v2_load_finalize_cursor(connection, run_id=run_id)
+        stage = str(cursor.get("stage") or "missing")
+        if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_COMMIT_MIN_START_SECONDS:
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "finalize",
+                "stages_completed": [],
+                "finalization_complete": False,
+                "more_finalize_remaining": True,
+                "more_work_remaining": True,
+                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+            }
+
+        if stage == "missing":
+            scanned_rel_paths = ingest_v2_run_loose_rel_paths(connection, run_id=run_id)
+            scan_scope = ingest_v2_scan_scope_from_run(root, row)
+            filesystem_missing = mark_missing_documents(connection, scanned_rel_paths, scan_scope=scan_scope)
+            cursor["filesystem_missing"] = int(filesystem_missing)
+            cursor["stage"] = "conversations"
+            connection.execute("BEGIN")
+            try:
+                ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="pending")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            stages_completed.append("missing")
+            stage = "conversations"
+
+        if stage == "conversations" and ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS:
+            connection.execute("BEGIN")
+            try:
+                conversation_assignment = assign_supported_conversations(connection)
+                previews_refreshed = refresh_conversation_previews(connection, paths)
+                cursor["conversation_assignment"] = {
+                    key: int(value)
+                    for key, value in dict(conversation_assignment).items()
+                }
+                cursor["conversation_previews_refreshed"] = int(previews_refreshed)
+                cursor["stage"] = "prune"
+                ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="pending")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            stages_completed.append("conversations")
+            stage = "prune"
+
+        if stage == "prune" and ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS:
+            connection.execute("BEGIN")
+            try:
+                pruned = prune_unused_filesystem_dataset(connection)
+                cursor["pruned_unused_filesystem_dataset"] = bool(pruned)
+                cursor["stage"] = "complete"
+                ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="pending")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            stages_completed.append("prune")
+            stage = "complete"
+
+        finalization_complete = stage == "complete"
+        if finalization_complete:
+            now = utc_now()
+            connection.execute("BEGIN")
+            try:
+                ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="complete")
+                connection.execute(
+                    """
+                    UPDATE ingest_runs
+                    SET phase = 'completed',
+                        status = 'completed',
+                        completed_at = COALESCE(completed_at, ?),
+                        last_heartbeat_at = ?,
+                        error = NULL
+                    WHERE run_id = ?
+                      AND phase = 'finalizing'
+                      AND cancel_requested_at IS NULL
+                    """,
+                    (now, now, run_id),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            stages_completed.append("complete")
+
+        updated_row = require_ingest_v2_run_row(connection, run_id)
+        return {
+            "ok": True,
+            "implemented": True,
+            "step": "finalize",
+            "stages_completed": stages_completed,
+            "cursor": cursor,
+            "finalization_complete": str(updated_row["status"]) == "completed",
+            "more_finalize_remaining": str(updated_row["phase"]) == "finalizing",
+            "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+            "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+        }
+    finally:
         connection.close()
 
 

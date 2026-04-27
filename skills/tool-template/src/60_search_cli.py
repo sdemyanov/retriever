@@ -10726,13 +10726,8 @@ def main() -> int:
 
         if args.command == "ingest-finalize-step":
             return emit_cli_payload(
-                args.command,
-                ingest_v2_step_not_implemented(
-                    root,
-                    run_id=args.run_id,
-                    phase=args.command.removeprefix("ingest-").removesuffix("-step"),
-                    budget_seconds=args.budget_seconds,
-                ),
+                "ingest-finalize-step",
+                ingest_v2_finalize_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
             )
 
         if args.command == "ingest-production":
