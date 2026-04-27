@@ -1532,16 +1532,20 @@ def ingest_v2_next_commands(
     run_id_arg = shlex.quote(str(row["run_id"]))
     root_arg = shlex.quote(str(root))
     budget_arg = str(int(budget_seconds))
-    commands: list[str] = []
+    runnable_commands: list[str] = []
     phase = str(row["phase"] or "")
     if phase == "planning":
-        commands.append(f"ingest-plan-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+        runnable_commands.append(f"ingest-plan-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
     if counts.get("pending", 0) > 0 and int(leases.get("active_prepare_workers") or 0) < int(leases.get("prepare_worker_soft_limit") or 0):
-        commands.append(f"ingest-prepare-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+        runnable_commands.append(f"ingest-prepare-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
     if counts.get("prepared", 0) > 0 and not bool(leases.get("writer_busy")):
-        commands.append(f"ingest-commit-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+        runnable_commands.append(f"ingest-commit-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
     if phase == "finalizing" or int(artifacts.get("orphan_pending_sweep") or 0) > 0:
-        commands.append(f"ingest-finalize-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+        runnable_commands.append(f"ingest-finalize-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+    commands: list[str] = []
+    if runnable_commands:
+        commands.append(f"ingest-run-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+        commands.extend(runnable_commands)
     if leases.get("oldest_stale_lease_age_seconds") is not None:
         commands.append(f"ingest-status {root_arg} --run-id {run_id_arg}")
     return commands
@@ -2124,9 +2128,11 @@ def ingest_v2_commit_step(
     *,
     run_id: str,
     budget_seconds: int | None = None,
+    max_items: int | None = None,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
+    item_limit = None if max_items is None else max(1, int(max_items))
     deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -2221,7 +2227,10 @@ def ingest_v2_commit_step(
                 connection.commit()
             return filesystem_dataset_id, filesystem_dataset_source_id
 
-        while ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS:
+        while (
+            ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS
+            and (item_limit is None or committed + failed < item_limit)
+        ):
             claimed_row = ingest_v2_claim_next_commit_item(
                 connection,
                 run_id=run_id,
@@ -2463,6 +2472,100 @@ def ingest_v2_finalize_step(
         }
     finally:
         connection.close()
+
+
+def ingest_v2_run_step(
+    root: Path,
+    *,
+    run_id: str | None = None,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = require_ingest_v2_run_row(connection, run_id) if run_id else latest_ingest_v2_run_row(connection)
+        if row is None:
+            status_payload = ingest_v2_status(root, run_id=None, budget_seconds=budget)
+            run_payload = dict(status_payload)
+            run_payload.pop("ok", None)
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "run",
+                "executed": False,
+                "selected_step": None,
+                "reason": "no_ingest_run",
+                "step_result": None,
+                "more_work_remaining": False,
+                "run": run_payload,
+            }
+        resolved_run_id = str(row["run_id"])
+        status_payload = ingest_v2_status_payload(connection, root, row, budget_seconds=budget)
+        selected_step: str | None = None
+        for command in list(status_payload.get("next_recommended_commands") or []):
+            try:
+                command_name = shlex.split(str(command))[0]
+            except (IndexError, ValueError):
+                continue
+            if command_name == "ingest-run-step":
+                continue
+            if command_name == "ingest-plan-step":
+                selected_step = "plan"
+                break
+            if command_name == "ingest-prepare-step":
+                selected_step = "prepare"
+                break
+            if command_name == "ingest-commit-step":
+                selected_step = "commit"
+                break
+            if command_name == "ingest-finalize-step":
+                selected_step = "finalize"
+                break
+        if selected_step is None:
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "run",
+                "executed": False,
+                "selected_step": None,
+                "reason": (
+                    "run_terminal"
+                    if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None
+                    else "no_runnable_step"
+                ),
+                "step_result": None,
+                "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+                "run": status_payload,
+            }
+    finally:
+        connection.close()
+
+    if selected_step == "plan":
+        step_result = ingest_v2_plan_step(root, run_id=resolved_run_id, budget_seconds=budget)
+    elif selected_step == "prepare":
+        step_result = ingest_v2_prepare_step(root, run_id=resolved_run_id, budget_seconds=budget)
+    elif selected_step == "commit":
+        step_result = ingest_v2_commit_step(root, run_id=resolved_run_id, budget_seconds=budget)
+    elif selected_step == "finalize":
+        step_result = ingest_v2_finalize_step(root, run_id=resolved_run_id, budget_seconds=budget)
+    else:
+        raise RetrieverError(f"Unsupported resumable ingest step selection: {selected_step}")
+
+    return {
+        "ok": True,
+        "implemented": True,
+        "step": "run",
+        "executed": True,
+        "selected_step": selected_step,
+        "reason": None,
+        "step_result": step_result,
+        "more_work_remaining": bool(step_result.get("more_work_remaining")),
+        "run": step_result.get("run"),
+    }
 
 
 def ingest_v2_step_not_implemented(

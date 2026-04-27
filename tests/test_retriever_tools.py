@@ -198,6 +198,30 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             exit_code = retriever_tools.main()
         return exit_code, stdout.getvalue().strip(), stderr.getvalue().strip()
 
+    def run_v2_loose_ingest(self, *scan_paths: str) -> dict[str, object]:
+        start_args = ["ingest-start", str(self.root), "--recursive"]
+        for scan_path in scan_paths:
+            start_args.extend(["--path", scan_path])
+        start_exit, start_payload, _, _ = self.run_cli(*start_args)
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        assert start_payload is not None
+        run_id = str(start_payload["run_id"])
+
+        payloads: dict[str, object] = {"run_id": run_id, "start": start_payload}
+        for command, payload_key in (
+            ("ingest-plan-step", "plan"),
+            ("ingest-prepare-step", "prepare"),
+            ("ingest-commit-step", "commit"),
+            ("ingest-finalize-step", "finalize"),
+        ):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            payloads[payload_key] = payload
+        return payloads
+
     def preview_target_file_path(self, target: dict[str, object]) -> Path:
         file_abs_path = str(target.get("file_abs_path") or target.get("abs_path") or "")
         return Path(file_abs_path.split("#", 1)[0])
@@ -6731,6 +6755,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(cancel_payload["status"], "canceled")
         self.assertEqual(cancel_payload["phase"], "canceled")
 
+    def test_ingest_v2_run_step_reports_no_run(self) -> None:
+        exit_code, payload, _, _ = self.run_cli("ingest-run-step", str(self.root))
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertTrue(payload["implemented"])
+        self.assertFalse(payload["executed"])
+        self.assertEqual(payload["reason"], "no_ingest_run")
+        self.assertEqual(payload["run"]["status"], "none")
+
     def test_ingest_v2_plan_step_creates_loose_file_work_items(self) -> None:
         raw_dir = self.root / "raw"
         nested_dir = raw_dir / "nested"
@@ -6809,6 +6843,46 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(second_plan_payload["processed_paths"], 0)
         self.assertEqual(second_plan_payload["planned_loose_files"], 0)
         self.assertEqual(second_plan_payload["run"]["counts"]["work_items"]["pending"], 2)
+
+    def test_ingest_v2_run_step_advances_one_recommended_step_at_a_time(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha runner body\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertIn("ingest-run-step", start_payload["next_recommended_commands"][0])
+        run_id = str(start_payload["run_id"])
+
+        selected_steps: list[str] = []
+        for expected_step in ("plan", "prepare", "commit", "finalize"):
+            args = ["ingest-run-step", str(self.root), "--budget-seconds", "35"]
+            if expected_step != "plan":
+                args.extend(["--run-id", run_id])
+            exit_code, payload, _, _ = self.run_cli(*args)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+            self.assertTrue(payload["executed"])
+            self.assertEqual(payload["selected_step"], expected_step)
+            selected_steps.append(str(payload["selected_step"]))
+
+        self.assertEqual(selected_steps, ["plan", "prepare", "commit", "finalize"])
+        completed_row = self.fetch_document_row("raw/alpha.txt")
+        self.assertEqual(completed_row["control_number"], "DOC001.00000001")
+
+        final_exit, final_payload, _, _ = self.run_cli("ingest-run-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(final_exit, 0)
+        self.assertIsNotNone(final_payload)
+        self.assertFalse(final_payload["executed"])
+        self.assertEqual(final_payload["reason"], "run_terminal")
+        self.assertEqual(final_payload["run"]["status"], "completed")
 
     def test_ingest_v2_prepare_step_prepares_loose_files_without_document_writes(self) -> None:
         raw_dir = self.root / "raw"
@@ -7066,6 +7140,217 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(cursor_row)
         self.assertEqual(cursor_row["status"], "complete")
         self.assertEqual(json.loads(cursor_row["cursor_json"])["stage"], "complete")
+
+    def test_ingest_v2_reingest_skips_unchanged_loose_file(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        alpha_path = raw_dir / "alpha.txt"
+        alpha_path.write_text("alpha body\n", encoding="utf-8")
+
+        first_payloads = self.run_v2_loose_ingest("raw")
+        self.assertEqual(first_payloads["commit"]["actions"], {"new": 1})
+        original_row = self.fetch_document_row("raw/alpha.txt")
+
+        second_payloads = self.run_v2_loose_ingest("raw")
+        self.assertEqual(second_payloads["commit"]["actions"], {"skipped": 1})
+        self.assertEqual(second_payloads["commit"]["committed"], 1)
+        self.assertTrue(second_payloads["finalize"]["finalization_complete"])
+
+        skipped_row = self.fetch_document_row("raw/alpha.txt")
+        self.assertEqual(skipped_row["id"], original_row["id"])
+        self.assertEqual(skipped_row["control_number"], original_row["control_number"])
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_count = int(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] or 0)
+            artifact_row = connection.execute(
+                """
+                SELECT artifact_manifest_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                """,
+                (second_payloads["run_id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(document_count, 1)
+        self.assertIsNotNone(artifact_row)
+        self.assertEqual(json.loads(artifact_row["artifact_manifest_json"])["commit_action"], "skipped")
+
+    def test_ingest_v2_reingest_updates_modified_loose_file(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        alpha_path = raw_dir / "alpha.txt"
+        alpha_path.write_text("original v2 body\n", encoding="utf-8")
+
+        first_payloads = self.run_v2_loose_ingest("raw")
+        self.assertEqual(first_payloads["commit"]["actions"], {"new": 1})
+        original_row = self.fetch_document_row("raw/alpha.txt")
+
+        alpha_path.write_text("updated v2 body with searchable marker\n", encoding="utf-8")
+        second_payloads = self.run_v2_loose_ingest("raw")
+        self.assertEqual(second_payloads["commit"]["actions"], {"updated": 1})
+        self.assertTrue(second_payloads["finalize"]["finalization_complete"])
+
+        updated_row = self.fetch_document_row("raw/alpha.txt")
+        self.assertEqual(updated_row["id"], original_row["id"])
+        self.assertEqual(updated_row["control_number"], original_row["control_number"])
+        search_payload = retriever_tools.search(self.root, "searchable marker", None, None, None, 1, 20)
+        self.assertEqual(search_payload["total_hits"], 1)
+        self.assertEqual(search_payload["results"][0]["id"], updated_row["id"])
+
+    def test_ingest_v2_rename_consumption_is_durable_across_commit_steps(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        original_path = raw_dir / "original.txt"
+        body = "same durable rename body\n"
+        original_path.write_text(body, encoding="utf-8")
+
+        first_payloads = self.run_v2_loose_ingest("raw")
+        self.assertEqual(first_payloads["commit"]["actions"], {"new": 1})
+        original_row = self.fetch_document_row("raw/original.txt")
+
+        original_path.unlink()
+        (raw_dir / "renamed-a.txt").write_text(body, encoding="utf-8")
+        (raw_dir / "renamed-b.txt").write_text(body, encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+        for command in ("ingest-plan-step", "ingest-prepare-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        first_commit_exit, first_commit_payload, _, _ = self.run_cli(
+            "ingest-commit-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--max-items",
+            "1",
+        )
+        self.assertEqual(first_commit_exit, 0)
+        self.assertIsNotNone(first_commit_payload)
+        self.assertEqual(first_commit_payload["actions"], {"renamed": 1})
+        self.assertTrue(first_commit_payload["more_commit_remaining"])
+
+        second_commit_exit, second_commit_payload, _, _ = self.run_cli(
+            "ingest-commit-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--max-items",
+            "1",
+        )
+        self.assertEqual(second_commit_exit, 0)
+        self.assertIsNotNone(second_commit_payload)
+        self.assertEqual(second_commit_payload["actions"], {"new": 1})
+        self.assertTrue(second_commit_payload["advanced_to_finalize"])
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli("ingest-finalize-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertTrue(finalize_payload["finalization_complete"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            rename_rows = connection.execute(
+                """
+                SELECT source_document_id, source_occurrence_id
+                FROM ingest_rename_consumptions
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchall()
+            occurrence_rows = connection.execute(
+                """
+                SELECT rel_path, lifecycle_status
+                FROM document_occurrences
+                WHERE document_id = ?
+                ORDER BY rel_path ASC
+                """,
+                (original_row["id"],),
+            ).fetchall()
+            work_item_actions = [
+                json.loads(row["artifact_manifest_json"])["commit_action"]
+                for row in connection.execute(
+                    """
+                    SELECT artifact_manifest_json
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                    ORDER BY commit_order ASC
+                    """,
+                    (run_id,),
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+        self.assertEqual(len(rename_rows), 1)
+        self.assertEqual(int(rename_rows[0]["source_document_id"]), original_row["id"])
+        self.assertEqual(work_item_actions, ["renamed", "new"])
+        self.assertEqual(
+            [(row["rel_path"], row["lifecycle_status"]) for row in occurrence_rows],
+            [("raw/renamed-a.txt", "active"), ("raw/renamed-b.txt", "active")],
+        )
+
+    def test_ingest_v2_commit_reprepares_when_source_changes_after_prepare(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        alpha_path = raw_dir / "alpha.txt"
+        alpha_path.write_text("old prepared body\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+        for command in ("ingest-plan-step", "ingest-prepare-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        alpha_path.write_text("new prepared body with fallback marker\n", encoding="utf-8")
+        commit_exit, commit_payload, _, _ = self.run_cli("ingest-commit-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(commit_exit, 0)
+        self.assertIsNotNone(commit_payload)
+        self.assertEqual(commit_payload["actions"], {"new": 1})
+        self.assertEqual(commit_payload["freshness_fallbacks"], 1)
+        finalize_exit, finalize_payload, _, _ = self.run_cli("ingest-finalize-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertTrue(finalize_payload["finalization_complete"])
+
+        row = self.fetch_document_row("raw/alpha.txt")
+        search_payload = retriever_tools.search(self.root, "fallback marker", None, None, None, 1, 20)
+        self.assertEqual(search_payload["total_hits"], 1)
+        self.assertEqual(search_payload["results"][0]["id"], row["id"])
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            artifact_row = connection.execute(
+                """
+                SELECT artifact_manifest_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(artifact_row)
+        self.assertTrue(json.loads(artifact_row["artifact_manifest_json"])["freshness_fallback"])
 
     def test_ingest_v2_rejects_budget_above_hard_cap(self) -> None:
         exit_code, payload, _, stderr = self.run_cli(
