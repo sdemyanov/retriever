@@ -1869,15 +1869,23 @@ def container_email_documents_missing_threading(
     source_kind: str,
     source_rel_path: str,
 ) -> bool:
+    root_document_ids = sorted(
+        container_root_document_ids_for_source(
+            connection,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+        )
+    )
+    if not root_document_ids:
+        return False
+    placeholders = ", ".join("?" for _ in root_document_ids)
     row = connection.execute(
-        """
+        f"""
         SELECT 1
         FROM documents d
         LEFT JOIN document_email_threading det ON det.document_id = d.id
         LEFT JOIN document_chat_threading dct ON dct.document_id = d.id
-        WHERE d.source_kind = ?
-          AND d.source_rel_path = ?
-          AND d.parent_document_id IS NULL
+        WHERE d.id IN ({placeholders})
           AND d.lifecycle_status != 'deleted'
           AND (
             (d.content_type = 'Email' AND det.document_id IS NULL)
@@ -1885,7 +1893,7 @@ def container_email_documents_missing_threading(
           )
         LIMIT 1
         """,
-        (source_kind, source_rel_path),
+        root_document_ids,
     ).fetchone()
     return row is not None
 
@@ -2498,7 +2506,7 @@ def pst_chat_cluster_scope_key(document: dict[str, object]) -> tuple[str, str]:
     source_rel_path = normalize_whitespace(str(document.get("source_rel_path") or ""))
     thread_id = normalize_pst_chat_thread_id(document.get("thread_id"))
     if thread_id:
-        return (source_rel_path, f"thread:{thread_id.lower()}")
+        return (filesystem_dataset_locator(), f"thread:{thread_id.lower()}")
     source_folder_path = normalize_whitespace(str(document.get("source_folder_path") or ""))
     if source_folder_path:
         return (source_rel_path, f"folder:{source_folder_path.lower()}")
@@ -2531,6 +2539,19 @@ def derive_pst_chat_conversation_key(cluster: dict[str, object]) -> str:
     if source_item_ids:
         return f"item:{source_item_ids[0]}"
     return f"doc:{int(cluster['documents'][0]['id'])}"
+
+
+def pst_chat_conversation_source_locator(cluster: dict[str, object]) -> str:
+    if any(normalize_pst_chat_thread_id(value) for value in cluster["thread_ids"]):
+        return filesystem_dataset_locator()
+    return next(
+        (
+            str(value)
+            for value in sorted(cluster["source_rel_paths"])
+            if normalize_whitespace(str(value))
+        ),
+        None,
+    ) or filesystem_dataset_locator()
 
 
 def derive_pst_chat_conversation_display_name(cluster: dict[str, object]) -> str:
@@ -2606,18 +2627,10 @@ def assign_pst_chat_conversations(connection: sqlite3.Connection) -> dict[str, i
         if manual_conversation_id is not None:
             conversation_id = int(manual_conversation_id)
         else:
-            source_locator = next(
-                (
-                    str(value)
-                    for value in sorted(cluster["source_rel_paths"])
-                    if normalize_whitespace(str(value))
-                ),
-                None,
-            ) or filesystem_dataset_locator()
             conversation_id = upsert_conversation_row(
                 connection,
                 source_kind=PST_SOURCE_KIND,
-                source_locator=source_locator,
+                source_locator=pst_chat_conversation_source_locator(cluster),
                 conversation_key=derive_pst_chat_conversation_key(cluster),
                 conversation_type="chat",
                 display_name=derive_pst_chat_conversation_display_name(cluster),
@@ -4885,30 +4898,30 @@ def mark_container_source_documents_active(
     source_rel_path: str,
     seen_at: str,
 ) -> int:
-    parent_rows = connection.execute(
-        """
-        SELECT id
-        FROM documents
-        WHERE parent_document_id IS NULL
-          AND source_kind = ?
-          AND source_rel_path = ?
-          AND lifecycle_status != 'deleted'
-        """,
-        (source_kind, source_rel_path),
-    ).fetchall()
-    parent_ids = [int(row["id"]) for row in parent_rows]
-    if not parent_ids:
+    root_occurrence_ids = [
+        int(row["id"])
+        for row in container_root_occurrence_rows_for_source(
+            connection,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+        )
+    ]
+    if not root_occurrence_ids:
         return 0
-    placeholders = ", ".join("?" for _ in parent_ids)
+    placeholders = ", ".join("?" for _ in root_occurrence_ids)
     cursor = connection.execute(
         f"""
-        UPDATE documents
+        UPDATE document_occurrences
         SET lifecycle_status = 'active', last_seen_at = ?, updated_at = ?
         WHERE lifecycle_status != 'deleted'
-          AND (id IN ({placeholders}) OR parent_document_id IN ({placeholders}))
+          AND (id IN ({placeholders}) OR parent_occurrence_id IN ({placeholders}))
         """,
-        [seen_at, seen_at, *parent_ids, *parent_ids],
+        [seen_at, seen_at, *root_occurrence_ids, *root_occurrence_ids],
     )
+    affected_document_ids = container_document_ids_for_root_occurrence_ids(connection, root_occurrence_ids)
+    for document_id in sorted(affected_document_ids):
+        refresh_source_backed_dataset_memberships_for_document(connection, document_id)
+        refresh_document_from_occurrences(connection, document_id)
     return int(cursor.rowcount or 0)
 
 
@@ -4920,74 +4933,106 @@ def assign_dataset_to_container_documents(
     dataset_id: int,
     dataset_source_id: int | None = None,
 ) -> None:
-    connection.execute(
-        """
-        UPDATE documents
-        SET dataset_id = ?
-        WHERE (source_kind = ? AND source_rel_path = ?)
-           OR parent_document_id IN (
-                SELECT id
-                FROM documents
-                WHERE source_kind = ? AND source_rel_path = ?
-           )
-        """,
-        (dataset_id, source_kind, source_rel_path, source_kind, source_rel_path),
-    )
-    parent_rows = connection.execute(
-        """
-        SELECT id
-        FROM documents
-        WHERE parent_document_id IS NULL
-          AND source_kind = ?
-          AND source_rel_path = ?
-        ORDER BY id ASC
-        """,
-        (source_kind, source_rel_path),
-    ).fetchall()
-    for parent_row in parent_rows:
-        ensure_dataset_document_membership(
+    _ = (dataset_id, dataset_source_id)
+    for document_id in sorted(
+        container_document_ids_for_source(
             connection,
-            dataset_id=dataset_id,
-            document_id=int(parent_row["id"]),
-            dataset_source_id=dataset_source_id,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
         )
-        child_rows = connection.execute(
-            """
-            SELECT id
-            FROM documents
-            WHERE parent_document_id = ?
-            ORDER BY id ASC
-            """,
-            (parent_row["id"],),
-        ).fetchall()
-        for child_row in child_rows:
-            ensure_dataset_document_membership(
-                connection,
-                dataset_id=dataset_id,
-                document_id=int(child_row["id"]),
-                dataset_source_id=dataset_source_id,
-            )
+    ):
+        refresh_source_backed_dataset_memberships_for_document(connection, document_id)
 
 
-def existing_container_rows_by_source_item(
+def existing_container_entries_by_source_item(
     connection: sqlite3.Connection,
     *,
     source_kind: str,
     source_rel_path: str,
-) -> dict[str, sqlite3.Row]:
-    rows = connection.execute(
+) -> dict[str, dict[str, sqlite3.Row]]:
+    occurrence_rows = connection.execute(
         """
         SELECT *
-        FROM documents
-        WHERE parent_document_id IS NULL
+        FROM document_occurrences
+        WHERE parent_occurrence_id IS NULL
           AND source_kind = ?
           AND source_rel_path = ?
           AND source_item_id IS NOT NULL
+          AND lifecycle_status != 'deleted'
         ORDER BY id ASC
         """,
         (source_kind, source_rel_path),
     ).fetchall()
-    return {str(row["source_item_id"]): row for row in rows}
+    if not occurrence_rows:
+        return {}
+    document_ids = sorted({int(row["document_id"]) for row in occurrence_rows})
+    placeholders = ", ".join("?" for _ in document_ids)
+    document_rows = connection.execute(
+        f"""
+        SELECT *
+        FROM documents
+        WHERE id IN ({placeholders})
+          AND parent_document_id IS NULL
+        ORDER BY id ASC
+        """,
+        document_ids,
+    ).fetchall()
+    documents_by_id = {int(row["id"]): row for row in document_rows}
+    rows_by_source_item: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for occurrence_row in occurrence_rows:
+        document_id = int(occurrence_row["document_id"])
+        if document_id not in documents_by_id:
+            continue
+        rows_by_source_item[str(occurrence_row["source_item_id"])].append(occurrence_row)
+    entries: dict[str, dict[str, sqlite3.Row]] = {}
+    for source_item_id, source_rows in rows_by_source_item.items():
+        preferred_row = select_preferred_occurrence(source_rows) or source_rows[0]
+        entries[source_item_id] = {
+            "document_row": documents_by_id[int(preferred_row["document_id"])],
+            "occurrence_row": preferred_row,
+        }
+    return entries
+
+
+def delete_documents_with_only_deleted_occurrences(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_ids: set[int],
+    *,
+    deleted_at: str,
+) -> int:
+    deleted = 0
+    for document_id in sorted(int(value) for value in document_ids):
+        remaining_row = connection.execute(
+            """
+            SELECT 1
+            FROM document_occurrences
+            WHERE document_id = ?
+              AND lifecycle_status != 'deleted'
+            LIMIT 1
+            """,
+            (document_id,),
+        ).fetchone()
+        if remaining_row is not None:
+            continue
+        document_row = connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+        if document_row is None or document_row["lifecycle_status"] == "deleted":
+            continue
+        cleanup_document_artifacts(paths, connection, document_row)
+        delete_document_related_rows(connection, document_id)
+        connection.execute(
+            """
+            UPDATE documents
+            SET lifecycle_status = 'deleted', updated_at = ?
+            WHERE id = ?
+            """,
+            (deleted_at, document_id),
+        )
+        deleted += 1
+    return deleted
 
 
 def retire_unseen_container_messages(
@@ -4998,11 +5043,11 @@ def retire_unseen_container_messages(
     source_rel_path: str,
     scan_started_at: str,
 ) -> int:
-    parent_rows = connection.execute(
+    root_occurrence_rows = connection.execute(
         """
         SELECT *
-        FROM documents
-        WHERE parent_document_id IS NULL
+        FROM document_occurrences
+        WHERE parent_occurrence_id IS NULL
           AND source_kind = ?
           AND source_rel_path = ?
           AND lifecycle_status != 'deleted'
@@ -5011,37 +5056,32 @@ def retire_unseen_container_messages(
         """,
         (source_kind, source_rel_path, scan_started_at),
     ).fetchall()
-    if not parent_rows:
+    if not root_occurrence_rows:
         return 0
 
     now = utc_now()
-    for parent_row in parent_rows:
-        child_rows = connection.execute(
-            """
-            SELECT *
-            FROM documents
-            WHERE parent_document_id = ?
-            ORDER BY id ASC
-            """,
-            (parent_row["id"],),
-        ).fetchall()
-        for child_row in child_rows:
-            cleanup_document_artifacts(paths, connection, child_row)
-            delete_document_related_rows(connection, int(child_row["id"]))
-        cleanup_document_artifacts(paths, connection, parent_row)
-        delete_document_related_rows(connection, int(parent_row["id"]))
-        child_ids = [int(child_row["id"]) for child_row in child_rows]
-        related_ids = [int(parent_row["id"]), *child_ids]
-        placeholders = ", ".join("?" for _ in related_ids)
-        connection.execute(
-            f"""
-            UPDATE documents
-            SET lifecycle_status = 'deleted', updated_at = ?
-            WHERE id IN ({placeholders})
-            """,
-            [now, *related_ids],
-        )
-    return len(parent_rows)
+    root_occurrence_ids = [int(row["id"]) for row in root_occurrence_rows]
+    placeholders = ", ".join("?" for _ in root_occurrence_ids)
+    connection.execute(
+        f"""
+        UPDATE document_occurrences
+        SET lifecycle_status = 'deleted', updated_at = ?
+        WHERE lifecycle_status != 'deleted'
+          AND (id IN ({placeholders}) OR parent_occurrence_id IN ({placeholders}))
+        """,
+        [now, *root_occurrence_ids, *root_occurrence_ids],
+    )
+    affected_document_ids = container_document_ids_for_root_occurrence_ids(connection, root_occurrence_ids)
+    for document_id in sorted(affected_document_ids):
+        refresh_source_backed_dataset_memberships_for_document(connection, document_id)
+        refresh_document_from_occurrences(connection, document_id)
+    delete_documents_with_only_deleted_occurrences(
+        connection,
+        paths,
+        affected_document_ids,
+        deleted_at=now,
+    )
+    return len(root_occurrence_rows)
 
 
 def mark_missing_container_documents(
@@ -5069,11 +5109,11 @@ def mark_missing_container_documents(
             continue
         if source_rel_path in scanned_source_rel_paths:
             continue
-        parent_rows = connection.execute(
+        root_occurrence_rows = connection.execute(
             """
             SELECT *
-            FROM documents
-            WHERE parent_document_id IS NULL
+            FROM document_occurrences
+            WHERE parent_occurrence_id IS NULL
               AND source_kind = ?
               AND source_rel_path = ?
               AND lifecycle_status NOT IN ('missing', 'deleted')
@@ -5081,36 +5121,32 @@ def mark_missing_container_documents(
             """,
             (source_kind, source_rel_path),
         ).fetchall()
-        if not parent_rows:
+        if not root_occurrence_rows:
             continue
-        parent_ids = [int(row["id"]) for row in parent_rows]
-        child_rows: list[sqlite3.Row] = []
-        if parent_ids:
-            placeholders = ", ".join("?" for _ in parent_ids)
-            child_rows = connection.execute(
-                f"""
-                SELECT *
-                FROM documents
-                WHERE parent_document_id IN ({placeholders})
-                  AND lifecycle_status NOT IN ('missing', 'deleted')
-                ORDER BY id ASC
-                """,
-                parent_ids,
-            ).fetchall()
-        related_ids = [*parent_ids, *[int(row["id"]) for row in child_rows]]
-        if not related_ids:
-            continue
-        placeholders = ", ".join("?" for _ in related_ids)
+        root_occurrence_ids = [int(row["id"]) for row in root_occurrence_rows]
+        placeholders = ", ".join("?" for _ in root_occurrence_ids)
         connection.execute(
             f"""
-            UPDATE documents
+            UPDATE document_occurrences
             SET lifecycle_status = 'missing', updated_at = ?
-            WHERE id IN ({placeholders})
+            WHERE lifecycle_status NOT IN ('missing', 'deleted')
+              AND (id IN ({placeholders}) OR parent_occurrence_id IN ({placeholders}))
             """,
-            [now, *related_ids],
+            [now, *root_occurrence_ids, *root_occurrence_ids],
         )
+        affected_document_ids = container_document_ids_for_root_occurrence_ids(connection, root_occurrence_ids)
+        for document_id in sorted(affected_document_ids):
+            refresh_source_backed_dataset_memberships_for_document(connection, document_id)
+            refresh_document_from_occurrences(connection, document_id)
         sources_missing += 1
-        documents_missing += len(related_ids)
+        documents_missing += sum(
+            1
+            for document_id in affected_document_ids
+            if connection.execute(
+                "SELECT lifecycle_status FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()["lifecycle_status"] == "missing"
+        )
     if sources_missing or documents_missing:
         connection.commit()
     return sources_missing, documents_missing
@@ -5190,6 +5226,7 @@ def commit_prepared_container_message(
     paths: dict[str, Path],
     prepared_item: dict[str, object],
     existing_row: sqlite3.Row | None,
+    existing_occurrence_row: sqlite3.Row | None,
     *,
     current_ingestion_batch: int | None,
     dataset_id: int,
@@ -5199,11 +5236,167 @@ def commit_prepared_container_message(
     file_type_override: str,
     scan_started_at: str,
 ) -> dict[str, object]:
+    file_hash = (
+        str(prepared_item["file_hash"])
+        if prepared_item.get("file_hash") is not None
+        else None
+    )
+    source_folder_path = prepared_item.get("source_folder_path")
+    extracted_payload = dict(prepared_item["extracted_payload"] or {})
+    resolved_custodian = normalize_whitespace(str(extracted_payload.get("custodian") or "")) or None
+    if resolved_custodian is None:
+        resolved_custodian = infer_source_custodian(
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+        )
+    if existing_occurrence_row is None and file_hash:
+        exact_duplicate_document = get_document_by_dedupe_key(
+            connection,
+            basis="file_hash",
+            key_value=file_hash,
+        )
+        if exact_duplicate_document is not None:
+            connection.execute("BEGIN")
+            try:
+                duplicate_occurrence_id = attach_occurrence_to_existing_document(
+                    connection,
+                    exact_duplicate_document,
+                    existing_occurrence_row=find_active_occurrence_by_source_identity(
+                        connection,
+                        source_kind=source_kind,
+                        custodian=resolved_custodian,
+                        source_rel_path=source_rel_path,
+                        source_item_id=str(prepared_item["source_item_id"]),
+                    ),
+                    rel_path=str(prepared_item["rel_path"]),
+                    file_name=str(prepared_item["file_name"]),
+                    file_type=file_type_override,
+                    file_size=None,
+                    file_hash=file_hash,
+                    source_kind=source_kind,
+                    source_rel_path=source_rel_path,
+                    source_item_id=str(prepared_item["source_item_id"]),
+                    source_folder_path=source_folder_path,
+                    custodian=resolved_custodian,
+                    occurrence_control_number=str(exact_duplicate_document["control_number"] or ""),
+                    ingested_at=scan_started_at,
+                    last_seen_at=scan_started_at,
+                    updated_at=scan_started_at,
+                )
+                replace_document_email_threading_row(
+                    connection,
+                    document_id=int(exact_duplicate_document["id"]),
+                    email_threading=extracted_payload.get("email_threading"),
+                )
+                replace_document_chat_threading_row(
+                    connection,
+                    document_id=int(exact_duplicate_document["id"]),
+                    chat_threading=extracted_payload.get("chat_threading"),
+                )
+                clone_duplicate_family_child_occurrences(
+                    connection,
+                    paths,
+                    parent_document_id=int(exact_duplicate_document["id"]),
+                    parent_occurrence_id=duplicate_occurrence_id,
+                    parent_rel_path=str(prepared_item["rel_path"]),
+                    custodian=resolved_custodian,
+                    ingested_at=scan_started_at,
+                    last_seen_at=scan_started_at,
+                    updated_at=scan_started_at,
+                )
+                ensure_dataset_document_membership(
+                    connection,
+                    dataset_id=dataset_id,
+                    document_id=int(exact_duplicate_document["id"]),
+                    dataset_source_id=dataset_source_id,
+                )
+                connection.commit()
+                return {
+                    "action": "new",
+                    "current_ingestion_batch": current_ingestion_batch,
+                }
+            except Exception:
+                connection.rollback()
+                raise
+
     connection.execute("BEGIN")
     try:
-        extracted = apply_manual_locks(existing_row, dict(prepared_item["extracted_payload"] or {}))
+        existing_document_row = existing_row
+        reused_existing_occurrence_row = existing_occurrence_row
+        superseded_document_id: int | None = None
+        if existing_document_row is not None and file_hash:
+            exact_duplicate_document = get_document_by_dedupe_key(
+                connection,
+                basis="file_hash",
+                key_value=file_hash,
+            )
+            if (
+                exact_duplicate_document is not None
+                and int(exact_duplicate_document["id"]) != int(existing_document_row["id"])
+                and existing_document_row["parent_document_id"] is None
+                and exact_duplicate_document["parent_document_id"] is None
+            ):
+                merge_candidate = evaluate_reconcile_candidate_group(
+                    connection,
+                    [existing_document_row, exact_duplicate_document],
+                )
+                if merge_candidate["status"] == "ready":
+                    merge_result = apply_evaluated_document_merge_group(
+                        connection,
+                        paths=paths,
+                        merge_basis="ingest:file_hash",
+                        merge_group=merge_candidate,
+                    )
+                    existing_document_row = connection.execute(
+                        "SELECT * FROM documents WHERE id = ?",
+                        (int(merge_result["survivor_document_id"]),),
+                    ).fetchone()
+                    if existing_document_row is None:
+                        raise RetrieverError(
+                            f"Missing survivor document after exact-duplicate merge: "
+                            f"{merge_result['survivor_document_id']}"
+                        )
+                    if reused_existing_occurrence_row is not None:
+                        reused_existing_occurrence_row = connection.execute(
+                            "SELECT * FROM document_occurrences WHERE id = ?",
+                            (int(reused_existing_occurrence_row["id"]),),
+                        ).fetchone()
+                        if reused_existing_occurrence_row is None:
+                            raise RetrieverError(
+                                "Missing source occurrence after exact-duplicate merge during container ingest."
+                            )
+        if reused_existing_occurrence_row is not None:
+            if existing_document_row is None:
+                existing_document_row = connection.execute(
+                    "SELECT * FROM documents WHERE id = ?",
+                    (reused_existing_occurrence_row["document_id"],),
+                ).fetchone()
+            if existing_document_row is None:
+                raise RetrieverError(
+                    f"Occurrence {reused_existing_occurrence_row['id']} points at a missing document."
+                )
+            active_occurrence_rows = active_occurrence_rows_for_document(connection, int(existing_document_row["id"]))
+            if (
+                len(active_occurrence_rows) > 1
+                and reused_existing_occurrence_row["file_hash"] != file_hash
+            ):
+                connection.execute(
+                    """
+                    UPDATE document_occurrences
+                    SET lifecycle_status = 'superseded', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (scan_started_at, reused_existing_occurrence_row["id"]),
+                )
+                superseded_document_id = int(existing_document_row["id"])
+                refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
+                refresh_document_from_occurrences(connection, superseded_document_id)
+                existing_document_row = None
+                reused_existing_occurrence_row = None
+
+        extracted = apply_manual_locks(existing_document_row, extracted_payload)
         attachments = list(prepared_item.get("attachments") or [])
-        if existing_row is None:
+        if existing_document_row is None:
             if current_ingestion_batch is None:
                 current_ingestion_batch = allocate_ingestion_batch_number(connection)
             control_number_batch = current_ingestion_batch
@@ -5211,18 +5404,19 @@ def commit_prepared_container_message(
             control_number = format_control_number(control_number_batch, control_number_family_sequence)
             control_number_attachment_sequence = None
         else:
-            control_number_batch = int(existing_row["control_number_batch"])
-            control_number_family_sequence = int(existing_row["control_number_family_sequence"])
-            control_number = str(existing_row["control_number"])
-            control_number_attachment_sequence = existing_row["control_number_attachment_sequence"]
-            cleanup_document_artifacts(paths, connection, existing_row)
+            control_number_batch = int(existing_document_row["control_number_batch"])
+            control_number_family_sequence = int(existing_document_row["control_number_family_sequence"])
+            control_number = str(existing_document_row["control_number"])
+            control_number_attachment_sequence = existing_document_row["control_number_attachment_sequence"]
+            cleanup_document_artifacts(paths, connection, existing_document_row)
 
         document_id = upsert_document_row(
             connection,
             str(prepared_item["rel_path"]),
             None,
-            existing_row,
+            existing_document_row,
             extracted,
+            existing_occurrence_row=reused_existing_occurrence_row,
             file_name=str(prepared_item["file_name"]),
             parent_document_id=None,
             control_number=control_number,
@@ -5233,14 +5427,10 @@ def commit_prepared_container_message(
             source_kind=source_kind,
             source_rel_path=source_rel_path,
             source_item_id=str(prepared_item["source_item_id"]),
-            source_folder_path=prepared_item.get("source_folder_path"),
+            source_folder_path=source_folder_path,
             file_type_override=file_type_override,
             file_size_override=None,
-            file_hash_override=(
-                str(prepared_item["file_hash"])
-                if prepared_item.get("file_hash") is not None
-                else None
-            ),
+            file_hash_override=file_hash,
             ingested_at_override=scan_started_at,
             last_seen_at_override=scan_started_at,
             updated_at_override=scan_started_at,
@@ -5260,7 +5450,7 @@ def commit_prepared_container_message(
             paths,
             document_id=document_id,
             extracted=extracted,
-            existing_row=existing_row,
+            existing_row=existing_document_row,
             created_at=scan_started_at,
         )
         preview_rows = write_preview_artifacts(
@@ -5291,13 +5481,16 @@ def commit_prepared_container_message(
             attachments,
             [(dataset_id, dataset_source_id)],
         )
+        if superseded_document_id is not None and superseded_document_id != document_id:
+            refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
+            refresh_document_from_occurrences(connection, superseded_document_id)
         connection.commit()
     except Exception:
         connection.rollback()
         raise
 
     return {
-        "action": "new" if existing_row is None else "updated",
+        "action": "new" if existing_document_row is None else "updated",
         "current_ingestion_batch": current_ingestion_batch,
     }
 
@@ -5366,18 +5559,13 @@ def ingest_container_source(
         ):
             message_count = int(existing_source["message_count"] or 0)
             if message_count == 0:
-                row = connection.execute(
-                    """
-                    SELECT COUNT(*) AS count
-                    FROM documents
-                    WHERE parent_document_id IS NULL
-                      AND source_kind = ?
-                      AND source_rel_path = ?
-                      AND lifecycle_status != 'deleted'
-                    """,
-                    (source_kind, source_rel_path),
-                ).fetchone()
-                message_count = int(row["count"] or 0)
+                message_count = len(
+                    container_root_occurrence_rows_for_source(
+                        connection,
+                        source_kind=source_kind,
+                        source_rel_path=source_rel_path,
+                    )
+                )
             connection.execute("BEGIN")
             try:
                 mark_container_source_documents_active(
@@ -5431,6 +5619,14 @@ def ingest_container_source(
             )
         ):
             message_count = int(existing_source["message_count"] or 0)
+            if message_count == 0:
+                message_count = len(
+                    container_root_occurrence_rows_for_source(
+                        connection,
+                        source_kind=source_kind,
+                        source_rel_path=source_rel_path,
+                    )
+                )
             connection.execute("BEGIN")
             try:
                 mark_container_source_documents_active(
@@ -5488,7 +5684,7 @@ def ingest_container_source(
     )
     connection.commit()
 
-    existing_rows_by_source_item = existing_container_rows_by_source_item(
+    existing_entries_by_source_item = existing_container_entries_by_source_item(
         connection,
         source_kind=source_kind,
         source_rel_path=source_rel_path,
@@ -5515,13 +5711,24 @@ def ingest_container_source(
         if prepared_item.get("skip"):
             continue
         message_count += 1
-        existing_row = existing_rows_by_source_item.get(str(prepared_item["source_item_id"]))
+        existing_entry = existing_entries_by_source_item.get(str(prepared_item["source_item_id"]))
+        existing_row = (
+            existing_entry["document_row"]
+            if isinstance(existing_entry, dict)
+            else None
+        )
+        existing_occurrence_row = (
+            existing_entry["occurrence_row"]
+            if isinstance(existing_entry, dict)
+            else None
+        )
         commit_started = time.perf_counter()
         commit_result = commit_prepared_container_message(
             connection,
             paths,
             prepared_item,
             existing_row,
+            existing_occurrence_row,
             current_ingestion_batch=current_ingestion_batch,
             dataset_id=dataset_id,
             dataset_source_id=dataset_source_id,
@@ -5671,7 +5878,7 @@ def ingest_pst_source(
         path,
         source_rel_path,
         source_kind=PST_SOURCE_KIND,
-        scan_hash_salt="pst-ingest-v4",
+        scan_hash_salt="pst-ingest-v5",
         dataset_name=pst_dataset_name(source_rel_path),
         iter_messages=iter_pst_messages,
         normalize_message=normalize_enriched_pst_message,

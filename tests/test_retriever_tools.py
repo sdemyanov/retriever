@@ -13750,6 +13750,213 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Kickoff thread for launch planning.", preview_html)
         self.assertIn("Follow-up from the same Teams space.", preview_html)
 
+    def test_ingest_deduplicates_exact_pst_chat_messages_across_custodians(self) -> None:
+        self.write_fake_pst_file(name="max.pst", content=b"pst-max-v1")
+        self.write_fake_pst_file(name="sergey.pst", content=b"pst-sergey-v1")
+        thread_id = "19:launch-thread@unq.gbl.spaces"
+        shared_body = "Kickoff thread for launch planning."
+        messages_by_name = {
+            "max.pst": [
+                self.build_fake_pst_message(
+                    source_item_id="pst-chat-max-001",
+                    subject=None,
+                    body_text=shared_body,
+                    folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                    author="max",
+                    recipients=None,
+                    date_created="2026-04-15T09:00:00Z",
+                    chat_threading={
+                        "thread_id": thread_id,
+                        "message_id": "1713882000000",
+                        "thread_type": "chat",
+                        "participants": ["max", "sergey"],
+                    },
+                )
+            ],
+            "sergey.pst": [
+                self.build_fake_pst_message(
+                    source_item_id="pst-chat-sergey-001",
+                    subject=None,
+                    body_text=shared_body,
+                    folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                    author="max",
+                    recipients=None,
+                    date_created="2026-04-15T09:00:00Z",
+                    chat_threading={
+                        "thread_id": thread_id,
+                        "message_id": "1713882000000",
+                        "thread_type": "chat",
+                        "participants": ["max", "sergey"],
+                    },
+                )
+            ],
+        }
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(
+            retriever_tools,
+            "iter_pst_messages",
+            side_effect=lambda path: iter(messages_by_name[path.name]),
+        ):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        search_result = retriever_tools.search(self.root, shared_body, None, None, None, 1, 20)
+        self.assertEqual(search_result["total_hits"], 1)
+        root_row = self.fetch_document_by_id(int(search_result["results"][0]["id"]))
+        self.assertEqual(root_row["content_type"], "Chat")
+        self.assertEqual(root_row["title"], "max / sergey")
+        self.assertEqual(set(root_row["custodians"]), {"max", "sergey"})
+        self.assertIsNotNone(root_row["conversation_id"])
+
+        occurrence_rows = self.fetch_occurrence_rows(int(root_row["id"]))
+        active_root_occurrence_rows = [
+            row
+            for row in occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+            and row["parent_occurrence_id"] is None
+        ]
+        self.assertEqual(
+            sorted((str(row["source_rel_path"]), str(row["source_item_id"])) for row in active_root_occurrence_rows),
+            [("max.pst", "pst-chat-max-001"), ("sergey.pst", "pst-chat-sergey-001")],
+        )
+        self.assertEqual(self.count_rows("documents"), 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            conversation_rows = connection.execute(
+                """
+                SELECT source_locator, conversation_key
+                FROM conversations
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(len(conversation_rows), 1)
+        self.assertEqual(conversation_rows[0]["source_locator"], retriever_tools.filesystem_dataset_locator())
+        self.assertEqual(conversation_rows[0]["conversation_key"], f"thread:{thread_id}")
+
+    def test_reingest_splits_deduplicated_pst_chat_when_one_source_copy_changes(self) -> None:
+        self.write_fake_pst_file(name="max.pst", content=b"pst-max-v1")
+        sergey_path = self.write_fake_pst_file(name="sergey.pst", content=b"pst-sergey-v1")
+        thread_id = "19:launch-thread@unq.gbl.spaces"
+        shared_body = "Kickoff thread for launch planning."
+        diverged_body = "Diverged copy from Sergey's PST."
+        messages_by_name = {
+            "max.pst": [
+                self.build_fake_pst_message(
+                    source_item_id="pst-chat-max-001",
+                    subject=None,
+                    body_text=shared_body,
+                    folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                    author="max",
+                    recipients=None,
+                    date_created="2026-04-15T09:00:00Z",
+                    chat_threading={
+                        "thread_id": thread_id,
+                        "message_id": "1713882000000",
+                        "thread_type": "chat",
+                        "participants": ["max", "sergey"],
+                    },
+                )
+            ],
+            "sergey.pst": [
+                self.build_fake_pst_message(
+                    source_item_id="pst-chat-sergey-001",
+                    subject=None,
+                    body_text=shared_body,
+                    folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                    author="max",
+                    recipients=None,
+                    date_created="2026-04-15T09:00:00Z",
+                    chat_threading={
+                        "thread_id": thread_id,
+                        "message_id": "1713882000000",
+                        "thread_type": "chat",
+                        "participants": ["max", "sergey"],
+                    },
+                )
+            ],
+        }
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(
+            retriever_tools,
+            "iter_pst_messages",
+            side_effect=lambda path: iter(messages_by_name[path.name]),
+        ):
+            first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(first_ingest["failed"], 0)
+        self.assertEqual(
+            retriever_tools.search(self.root, shared_body, None, None, None, 1, 20)["total_hits"],
+            1,
+        )
+
+        sergey_path.write_bytes(b"pst-sergey-v2")
+        messages_by_name["sergey.pst"] = [
+            self.build_fake_pst_message(
+                source_item_id="pst-chat-sergey-001",
+                subject=None,
+                body_text=diverged_body,
+                folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                author="max",
+                recipients=None,
+                date_created="2026-04-15T09:00:00Z",
+                chat_threading={
+                    "thread_id": thread_id,
+                    "message_id": "1713882000000",
+                    "thread_type": "chat",
+                    "participants": ["max", "sergey"],
+                },
+            )
+        ]
+        with mock.patch.object(
+            retriever_tools,
+            "iter_pst_messages",
+            side_effect=lambda path: iter(messages_by_name[path.name]),
+        ):
+            second_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(second_ingest["failed"], 0)
+        self.assertEqual(self.count_rows("documents"), 2)
+
+        shared_search = retriever_tools.search(self.root, shared_body, None, None, None, 1, 20)
+        diverged_search = retriever_tools.search(self.root, diverged_body, None, None, None, 1, 20)
+        self.assertEqual(shared_search["total_hits"], 1)
+        self.assertEqual(diverged_search["total_hits"], 1)
+
+        shared_row = self.fetch_document_by_id(int(shared_search["results"][0]["id"]))
+        diverged_row = self.fetch_document_by_id(int(diverged_search["results"][0]["id"]))
+        self.assertNotEqual(shared_row["id"], diverged_row["id"])
+        self.assertEqual(set(shared_row["custodians"]), {"max"})
+        self.assertEqual(set(diverged_row["custodians"]), {"sergey"})
+        self.assertEqual(shared_row["conversation_id"], diverged_row["conversation_id"])
+
+        shared_occurrence_rows = self.fetch_occurrence_rows(int(shared_row["id"]))
+        diverged_occurrence_rows = self.fetch_occurrence_rows(int(diverged_row["id"]))
+        active_shared_occurrence_rows = [
+            row
+            for row in shared_occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+            and row["parent_occurrence_id"] is None
+        ]
+        active_diverged_occurrence_rows = [
+            row
+            for row in diverged_occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+            and row["parent_occurrence_id"] is None
+        ]
+        self.assertEqual(
+            [(str(row["source_rel_path"]), str(row["source_item_id"])) for row in active_shared_occurrence_rows],
+            [("max.pst", "pst-chat-max-001")],
+        )
+        self.assertEqual(
+            [(str(row["source_rel_path"]), str(row["source_item_id"])) for row in active_diverged_occurrence_rows],
+            [("sergey.pst", "pst-chat-sergey-001")],
+        )
+
     def test_ingest_pst_routes_teams_messages_to_chat_and_skips_system_folders(self) -> None:
         self.write_fake_pst_file()
         messages = [

@@ -493,18 +493,21 @@ def container_documents_missing_text_revisions(
     source_kind: str,
     source_rel_path: str,
 ) -> bool:
+    document_ids = sorted(
+        container_document_ids_for_source(
+            connection,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+        )
+    )
+    if not document_ids:
+        return False
+    placeholders = ", ".join("?" for _ in document_ids)
     row = connection.execute(
-        """
+        f"""
         SELECT 1
         FROM documents
-        WHERE (
-            (source_kind = ? AND source_rel_path = ?)
-            OR parent_document_id IN (
-                SELECT id
-                FROM documents
-                WHERE source_kind = ? AND source_rel_path = ?
-            )
-        )
+        WHERE id IN ({placeholders})
           AND lifecycle_status != 'deleted'
           AND (
             source_text_revision_id IS NULL
@@ -512,7 +515,7 @@ def container_documents_missing_text_revisions(
           )
         LIMIT 1
         """,
-        (source_kind, source_rel_path, source_kind, source_rel_path),
+        document_ids,
     ).fetchone()
     return row is not None
 

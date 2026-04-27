@@ -5135,6 +5135,93 @@ def find_active_occurrence_by_source_identity(
     ).fetchone()
 
 
+def container_root_occurrence_rows_for_source(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_rel_path: str,
+    include_deleted: bool = False,
+) -> list[sqlite3.Row]:
+    normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
+    normalized_source_rel_path = normalize_whitespace(str(source_rel_path or ""))
+    if not normalized_source_kind or not normalized_source_rel_path:
+        return []
+    clauses = [
+        "parent_occurrence_id IS NULL",
+        "source_kind = ?",
+        "source_rel_path = ?",
+    ]
+    parameters: list[object] = [normalized_source_kind, normalized_source_rel_path]
+    if not include_deleted:
+        clauses.append("lifecycle_status != 'deleted'")
+    return connection.execute(
+        f"""
+        SELECT *
+        FROM document_occurrences
+        WHERE {' AND '.join(clauses)}
+        ORDER BY id ASC
+        """,
+        parameters,
+    ).fetchall()
+
+
+def container_document_ids_for_root_occurrence_ids(
+    connection: sqlite3.Connection,
+    root_occurrence_ids: list[int],
+) -> set[int]:
+    normalized_ids = sorted({int(occurrence_id) for occurrence_id in root_occurrence_ids})
+    if not normalized_ids:
+        return set()
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    rows = connection.execute(
+        f"""
+        SELECT DISTINCT document_id
+        FROM document_occurrences
+        WHERE id IN ({placeholders}) OR parent_occurrence_id IN ({placeholders})
+        ORDER BY document_id ASC
+        """,
+        [*normalized_ids, *normalized_ids],
+    ).fetchall()
+    return {int(row["document_id"]) for row in rows}
+
+
+def container_root_document_ids_for_source(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_rel_path: str,
+    include_deleted: bool = False,
+) -> set[int]:
+    return {
+        int(row["document_id"])
+        for row in container_root_occurrence_rows_for_source(
+            connection,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+            include_deleted=include_deleted,
+        )
+    }
+
+
+def container_document_ids_for_source(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_rel_path: str,
+    include_deleted: bool = False,
+) -> set[int]:
+    root_occurrence_ids = [
+        int(row["id"])
+        for row in container_root_occurrence_rows_for_source(
+            connection,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+            include_deleted=include_deleted,
+        )
+    ]
+    return container_document_ids_for_root_occurrence_ids(connection, root_occurrence_ids)
+
+
 def upsert_document_occurrence(
     connection: sqlite3.Connection,
     *,
