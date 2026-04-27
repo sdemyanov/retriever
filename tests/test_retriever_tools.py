@@ -6981,6 +6981,92 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         cursor_payload = json.loads(cursor_row["cursor_json"])
         self.assertEqual(cursor_payload["actions"], {"new": 2})
 
+    def test_ingest_v2_finalize_step_completes_and_marks_missing_loose_files(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        stale_path = raw_dir / "stale.txt"
+        stale_path.write_text("stale body\n", encoding="utf-8")
+
+        legacy_exit, legacy_payload, _, _ = self.run_cli(
+            "ingest",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(legacy_exit, 0)
+        self.assertIsNotNone(legacy_payload)
+        self.assertEqual(legacy_payload["new"], 1)
+
+        stale_path.unlink()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        for command in ("ingest-plan-step", "ingest-prepare-step", "ingest-commit-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "ingest-finalize-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertTrue(finalize_payload["implemented"])
+        self.assertTrue(finalize_payload["finalization_complete"])
+        self.assertEqual(finalize_payload["stages_completed"], ["missing", "conversations", "prune", "complete"])
+        self.assertEqual(finalize_payload["cursor"]["filesystem_missing"], 1)
+        run_payload = finalize_payload["run"]
+        self.assertEqual(run_payload["phase"], "completed")
+        self.assertEqual(run_payload["status"], "completed")
+        self.assertFalse(finalize_payload["more_work_remaining"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            occurrence_rows = connection.execute(
+                """
+                SELECT rel_path, lifecycle_status
+                FROM document_occurrences
+                WHERE rel_path IN ('raw/alpha.txt', 'raw/stale.txt')
+                ORDER BY rel_path ASC
+                """
+            ).fetchall()
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json, status
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'finalizing'
+                  AND cursor_key = 'loose_file_finalize'
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            [(row["rel_path"], row["lifecycle_status"]) for row in occurrence_rows],
+            [("raw/alpha.txt", "active"), ("raw/stale.txt", "missing")],
+        )
+        self.assertIsNotNone(cursor_row)
+        self.assertEqual(cursor_row["status"], "complete")
+        self.assertEqual(json.loads(cursor_row["cursor_json"])["stage"], "complete")
+
     def test_ingest_v2_rejects_budget_above_hard_cap(self) -> None:
         exit_code, payload, _, stderr = self.run_cli(
             "ingest-start",
