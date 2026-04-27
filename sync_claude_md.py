@@ -107,6 +107,7 @@ SUBCOMMAND_BLURBS: dict[str, str] = {
     "add-to-dataset": "add documents to a dataset",
     "remove-from-dataset": "remove documents from a dataset",
     "delete-dataset": "delete a dataset",
+    "delete-docs": "delete selected documents or matching occurrences",
     # Ingestion
     "ingest": "index documents in the workspace",
     "ingest-production": "ingest a processed production volume",
@@ -180,6 +181,7 @@ SUBCOMMAND_USE_WHEN: dict[str, str] = {
     "add-to-dataset": "the user asks to add, put, tag, include, or assign documents into an existing dataset — phrasings like \"put these in X\", \"tag these into priority\", \"add these docs to the responsive set\", or \"include these in Y\"",
     "remove-from-dataset": "the user asks to remove, drop, take out, or exclude documents from an existing dataset — phrasings like \"remove these from X\", \"drop these out of priority\", \"pull these from the responsive set\", or \"unassign from Y\"",
     "delete-dataset": "the user asks to delete, trash, remove, or get rid of an entire dataset — phrasings like \"delete the X dataset\", \"trash the old collection\", \"get rid of the priority group\", or \"remove dataset Y entirely\"",
+    "delete-docs": "the user asks to delete, trash, remove, or purge specific documents or documents matching a filter/path/scope — phrasings like \"delete these docs\", \"remove everything under raw/\", \"purge docs matching this filter\", or \"drop the selected documents from the index\"",
     # Ingestion
     "ingest": "you need to index or refresh a folder",
     "ingest-production": "you need to ingest a processed production (DAT/OPT/TEXT/IMAGES)",
@@ -251,6 +253,7 @@ SUBCOMMAND_GROUPS: dict[str, str] = {
     "add-to-dataset": "Datasets",
     "remove-from-dataset": "Datasets",
     "delete-dataset": "Datasets",
+    "delete-docs": "Documents & text",
     "ingest": "Ingestion",
     "ingest-production": "Ingestion",
     "inspect-pst-properties": "Ingestion",

@@ -11465,6 +11465,185 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(result["abs_path"], str(self.root / "custodian-b" / "dup-copy.txt"))
         self.assertEqual(result["source_rel_path"], "custodian-b/dup-copy.txt")
 
+    def test_delete_docs_requires_confirm_and_deletes_document_family(self) -> None:
+        self.write_email_message(
+            self.root / "thread.eml",
+            subject="Delete family thread",
+            body_text="family delete body\n",
+            attachment_name="notes.txt",
+            attachment_text="attached note\n",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        root_row = self.fetch_document_row("thread.eml")
+        child_rows = self.fetch_child_rows(int(root_row["id"]))
+        self.assertEqual(len(child_rows), 1)
+
+        preview_exit, preview_payload, _, _ = self.run_cli(
+            "delete-docs",
+            str(self.root),
+            "--doc-id",
+            str(root_row["id"]),
+        )
+        self.assertEqual(preview_exit, 0)
+        self.assertIsNotNone(preview_payload)
+        self.assertEqual(preview_payload["status"], "confirm_required")
+        self.assertEqual(preview_payload["matched_document_count"], 1)
+        self.assertEqual(preview_payload["would_delete_occurrences"], 2)
+        self.assertEqual(preview_payload["would_touch_documents"], 2)
+
+        apply_exit, apply_payload, _, _ = self.run_cli(
+            "delete-docs",
+            str(self.root),
+            "--doc-id",
+            str(root_row["id"]),
+            "--confirm",
+        )
+        self.assertEqual(apply_exit, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["status"], "ok")
+        self.assertEqual(apply_payload["deleted_occurrences"], 2)
+        self.assertEqual(apply_payload["deleted_documents"], 2)
+
+        deleted_root_row = self.fetch_document_by_id(int(root_row["id"]))
+        self.assertEqual(deleted_root_row["lifecycle_status"], "deleted")
+        deleted_child_row = self.fetch_document_by_id(int(child_rows[0]["id"]))
+        self.assertEqual(deleted_child_row["lifecycle_status"], "deleted")
+
+        root_search = retriever_tools.search(self.root, "family delete body", None, None, None, 1, 20)
+        self.assertEqual(root_search["total_hits"], 0)
+        attachment_search = retriever_tools.search(self.root, "attached note", None, None, None, 1, 20)
+        self.assertEqual(attachment_search["total_hits"], 0)
+
+    def test_delete_docs_filter_deletes_only_matching_duplicate_occurrence(self) -> None:
+        left_dir = self.root / "custodian-a"
+        right_dir = self.root / "custodian-b"
+        left_dir.mkdir()
+        right_dir.mkdir()
+        duplicate_text = "same logical document body\n"
+        (left_dir / "dup.txt").write_text(duplicate_text, encoding="utf-8")
+        (right_dir / "dup-copy.txt").write_text(duplicate_text, encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        search_result = retriever_tools.search(self.root, "same logical document body", None, None, None, 1, 20)
+        self.assertEqual(search_result["total_hits"], 1)
+        document_id = int(search_result["results"][0]["id"])
+
+        preview_exit, preview_payload, _, _ = self.run_cli(
+            "delete-docs",
+            str(self.root),
+            "--filter",
+            "rel_path = 'custodian-b/dup-copy.txt'",
+        )
+        self.assertEqual(preview_exit, 0)
+        self.assertIsNotNone(preview_payload)
+        self.assertEqual(preview_payload["status"], "confirm_required")
+        self.assertTrue(preview_payload["occurrence_scoped"])
+        self.assertEqual(preview_payload["matched_document_count"], 1)
+        self.assertEqual(preview_payload["would_delete_occurrences"], 1)
+        self.assertEqual(preview_payload["would_touch_documents"], 1)
+
+        apply_exit, apply_payload, _, _ = self.run_cli(
+            "delete-docs",
+            str(self.root),
+            "--filter",
+            "rel_path = 'custodian-b/dup-copy.txt'",
+            "--confirm",
+        )
+        self.assertEqual(apply_exit, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["status"], "ok")
+        self.assertEqual(apply_payload["deleted_occurrences"], 1)
+        self.assertEqual(apply_payload["deleted_documents"], 0)
+        self.assertEqual(apply_payload["retained_documents"], 1)
+
+        occurrence_rows = self.fetch_occurrence_rows(document_id)
+        active_rel_paths = sorted(
+            str(row["rel_path"])
+            for row in occurrence_rows
+            if row["lifecycle_status"] == retriever_tools.ACTIVE_OCCURRENCE_STATUS
+        )
+        self.assertEqual(active_rel_paths, ["custodian-a/dup.txt"])
+
+        deleted_filter_result = retriever_tools.search(
+            self.root,
+            "",
+            [["rel_path", "eq", "custodian-b/dup-copy.txt"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(deleted_filter_result["total_hits"], 0)
+        surviving_filter_result = retriever_tools.search(
+            self.root,
+            "",
+            [["rel_path", "eq", "custodian-a/dup.txt"]],
+            None,
+            None,
+            1,
+            20,
+        )
+        self.assertEqual(surviving_filter_result["total_hits"], 1)
+
+    def test_delete_docs_path_prefix_shortcut_removes_matching_rows_and_dataset_membership(self) -> None:
+        raw_dir = self.root / "raw"
+        keep_dir = self.root / "keep"
+        raw_dir.mkdir()
+        keep_dir.mkdir()
+        (raw_dir / "a.txt").write_text("raw body\n", encoding="utf-8")
+        (keep_dir / "b.txt").write_text("keep body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        preview_exit, preview_payload, _, _ = self.run_cli(
+            "delete-docs",
+            str(self.root),
+            "--path",
+            "raw",
+        )
+        self.assertEqual(preview_exit, 0)
+        self.assertIsNotNone(preview_payload)
+        self.assertEqual(preview_payload["status"], "confirm_required")
+        self.assertTrue(preview_payload["occurrence_scoped"])
+        self.assertEqual(preview_payload["matched_document_count"], 1)
+
+        apply_exit, apply_payload, _, _ = self.run_cli(
+            "delete-docs",
+            str(self.root),
+            "--path",
+            "raw",
+            "--confirm",
+        )
+        self.assertEqual(apply_exit, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["status"], "ok")
+        self.assertEqual(apply_payload["deleted_documents"], 1)
+
+        deleted_row = self.fetch_document_row("raw/a.txt")
+        self.assertEqual(deleted_row["lifecycle_status"], "deleted")
+        kept_row = self.fetch_document_row("keep/b.txt")
+        self.assertEqual(kept_row["lifecycle_status"], "active")
+
+        deleted_search = retriever_tools.search(self.root, "", [["rel_path", "eq", "raw/a.txt"]], None, None, 1, 20)
+        self.assertEqual(deleted_search["total_hits"], 0)
+        kept_search = retriever_tools.search(self.root, "", [["rel_path", "eq", "keep/b.txt"]], None, None, 1, 20)
+        self.assertEqual(kept_search["total_hits"], 1)
+
+        list_exit, list_payload, _, _ = self.run_cli("list-datasets", str(self.root))
+        self.assertEqual(list_exit, 0)
+        self.assertIsNotNone(list_payload)
+        dataset_entry = {item["dataset_name"]: item for item in list_payload["datasets"]}[self.root.name]
+        self.assertEqual(dataset_entry["document_count"], 1)
+
     def test_sql_like_custodian_filter_picks_matching_occurrence_for_duplicate_links(self) -> None:
         left_dir = self.root / "custodian-a"
         right_dir = self.root / "custodian-b"

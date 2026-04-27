@@ -9014,6 +9014,319 @@ def sample_documents_for_fill(
     return sample_rows
 
 
+def normalize_delete_path_prefixes(raw_path_prefixes: list[str] | None) -> list[str]:
+    normalized_prefixes: list[str] = []
+    for raw_path_prefix in raw_path_prefixes or []:
+        candidate = str(raw_path_prefix or "").strip()
+        if candidate.startswith("./"):
+            candidate = candidate[2:]
+        candidate = candidate.rstrip("/")
+        if candidate:
+            normalized_prefixes.append(candidate)
+    return list(dict.fromkeys(normalized_prefixes))
+
+
+def sql_text_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def path_prefix_scope_expression(path_prefixes: list[str]) -> str | None:
+    clauses: list[str] = []
+    for path_prefix in normalize_delete_path_prefixes(path_prefixes):
+        clauses.append(
+            f"(rel_path = {sql_text_literal(path_prefix)} OR rel_path LIKE {sql_text_literal(path_prefix + '/%')})"
+        )
+    if not clauses:
+        return None
+    return " OR ".join(clauses)
+
+
+def raw_filters_include_occurrence_scope(
+    connection: sqlite3.Connection,
+    raw_filters: list[list[str]] | None,
+) -> bool:
+    if not raw_filters:
+        return False
+    if uses_legacy_tuple_filters(raw_filters):
+        for raw_filter in parse_filter_args(raw_filters):
+            field_def = resolve_field_definition(connection, str(raw_filter["field_name"]))
+            if str(field_def["field_name"]) in OCCURRENCE_FILTER_FIELDS:
+                return True
+        return False
+
+    pattern = re.compile(
+        r"\b(?:"
+        + "|".join(re.escape(field_name) for field_name in sorted(OCCURRENCE_FILTER_FIELDS, key=len, reverse=True))
+        + r")\b",
+        re.IGNORECASE,
+    )
+    return any(
+        pattern.search(expression) is not None
+        for expression in normalize_sql_filter_expressions(raw_filters)
+    )
+
+
+def raw_filter_item_includes_occurrence_scope(
+    connection: sqlite3.Connection,
+    raw_filter_item: object,
+) -> bool:
+    if not isinstance(raw_filter_item, (list, tuple)):
+        return False
+    if len(raw_filter_item) >= 2:
+        operator = normalize_inline_whitespace(str(raw_filter_item[1] or "")).lower()
+        if operator in {"eq", "neq", "gt", "gte", "lt", "lte", "contains", "is-null", "not-null"}:
+            field_def = resolve_field_definition(connection, str(raw_filter_item[0]))
+            return str(field_def["field_name"]) in OCCURRENCE_FILTER_FIELDS
+    expression = " ".join(str(part) for part in raw_filter_item if normalize_inline_whitespace(str(part or "")))
+    if not expression:
+        return False
+    pattern = re.compile(
+        r"\b(?:"
+        + "|".join(re.escape(field_name) for field_name in sorted(OCCURRENCE_FILTER_FIELDS, key=len, reverse=True))
+        + r")\b",
+        re.IGNORECASE,
+    )
+    return pattern.search(expression) is not None
+
+
+def document_only_raw_filters(
+    connection: sqlite3.Connection,
+    raw_filters: list[list[str]] | None,
+) -> list[list[str]]:
+    document_filters: list[list[str]] = []
+    for raw_filter_item in raw_filters or []:
+        if raw_filter_item_includes_occurrence_scope(connection, raw_filter_item):
+            continue
+        document_filters.append(list(raw_filter_item))
+    return document_filters
+
+
+def document_ids_matching_occurrence_filters(
+    connection: sqlite3.Connection,
+    raw_filters: list[list[str]],
+) -> list[int]:
+    occurrence_scope_clauses, occurrence_scope_params = build_occurrence_scope_filters(connection, raw_filters)
+    rows = connection.execute(
+        f"""
+        SELECT DISTINCT d.id
+        FROM document_occurrences o
+        JOIN documents d ON d.id = o.document_id
+        WHERE d.lifecycle_status NOT IN ('missing', 'deleted')
+          AND {' AND '.join(occurrence_scope_clauses)}
+        ORDER BY d.id ASC
+        """,
+        occurrence_scope_params,
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def fetch_deletable_document_rows_by_ids(
+    connection: sqlite3.Connection,
+    document_ids: list[int],
+) -> list[sqlite3.Row]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in document_ids))
+    if not normalized_document_ids:
+        return []
+    placeholders = ", ".join("?" for _ in normalized_document_ids)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM documents
+        WHERE id IN ({placeholders})
+        """,
+        normalized_document_ids,
+    ).fetchall()
+    rows_by_id = {int(row["id"]): row for row in rows}
+    missing_ids: list[int] = []
+    lifecycle_hidden: list[str] = []
+    visible_rows_by_id: dict[int, sqlite3.Row] = {}
+    for document_id in normalized_document_ids:
+        row = rows_by_id.get(document_id)
+        if row is None:
+            missing_ids.append(document_id)
+            continue
+        if row["lifecycle_status"] in {"missing", "deleted"}:
+            lifecycle_hidden.append(f"{document_id} ({row['lifecycle_status']})")
+            continue
+        visible_rows_by_id[document_id] = row
+
+    errors: list[str] = []
+    if missing_ids:
+        errors.append(
+            "Unknown document id" + ("" if len(missing_ids) == 1 else "s") + f": {', '.join(str(document_id) for document_id in missing_ids)}"
+        )
+    if lifecycle_hidden:
+        errors.append(
+            "Document id"
+            + ("" if len(lifecycle_hidden) == 1 else "s")
+            + " not deletable due to lifecycle_status: "
+            + ", ".join(lifecycle_hidden)
+        )
+    if errors:
+        raise RetrieverError(" ".join(errors))
+    return [visible_rows_by_id[document_id] for document_id in normalized_document_ids]
+
+
+def sample_documents_for_delete(
+    connection: sqlite3.Connection,
+    document_ids: list[int],
+    *,
+    limit: int = 5,
+) -> list[dict[str, object]]:
+    normalized_ids = list(dict.fromkeys(int(document_id) for document_id in document_ids))[:limit]
+    if not normalized_ids:
+        return []
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    rows = connection.execute(
+        f"""
+        SELECT
+          id,
+          control_number,
+          rel_path,
+          file_name,
+          title
+        FROM documents
+        WHERE id IN ({placeholders})
+        """,
+        tuple(normalized_ids),
+    ).fetchall()
+    rows_by_id = {int(row["id"]): row for row in rows}
+    sample_rows: list[dict[str, object]] = []
+    for document_id in normalized_ids:
+        row = rows_by_id.get(document_id)
+        if row is None:
+            continue
+        sample_rows.append(
+            {
+                "document_id": int(row["id"]),
+                "control_number": row["control_number"],
+                "rel_path": row["rel_path"],
+                "file_name": row["file_name"],
+                "title": row["title"],
+            }
+        )
+    return sample_rows
+
+
+def scoped_active_occurrence_rows_for_document(
+    connection: sqlite3.Connection,
+    document_id: int,
+    occurrence_scope_clauses: list[str],
+    occurrence_scope_params: list[object],
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        f"""
+        SELECT o.*
+        FROM document_occurrences o
+        JOIN documents d ON d.id = o.document_id
+        WHERE o.document_id = ?
+          AND {' AND '.join(occurrence_scope_clauses)}
+        ORDER BY o.id ASC
+        """,
+        [document_id, *occurrence_scope_params],
+    ).fetchall()
+
+
+def collect_occurrence_rows_for_delete_plan(
+    connection: sqlite3.Connection,
+    *,
+    root_occurrence_ids: set[int],
+    direct_occurrence_ids: set[int],
+) -> list[sqlite3.Row]:
+    rows_by_id: dict[int, sqlite3.Row] = {}
+
+    normalized_root_ids = sorted(int(occurrence_id) for occurrence_id in root_occurrence_ids)
+    if normalized_root_ids:
+        placeholders = ", ".join("?" for _ in normalized_root_ids)
+        root_rows = connection.execute(
+            f"""
+            SELECT *
+            FROM document_occurrences
+            WHERE id IN ({placeholders}) OR parent_occurrence_id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            [*normalized_root_ids, *normalized_root_ids],
+        ).fetchall()
+        for row in root_rows:
+            rows_by_id[int(row["id"])] = row
+
+    normalized_direct_ids = sorted(int(occurrence_id) for occurrence_id in direct_occurrence_ids)
+    if normalized_direct_ids:
+        placeholders = ", ".join("?" for _ in normalized_direct_ids)
+        direct_rows = connection.execute(
+            f"""
+            SELECT *
+            FROM document_occurrences
+            WHERE id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            normalized_direct_ids,
+        ).fetchall()
+        for row in direct_rows:
+            rows_by_id[int(row["id"])] = row
+
+    return [rows_by_id[occurrence_id] for occurrence_id in sorted(rows_by_id)]
+
+
+def delete_documents_with_no_active_occurrences(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_ids: list[int] | set[int],
+    *,
+    deleted_at: str,
+) -> list[int]:
+    deleted_document_ids: list[int] = []
+    for document_id in sorted({int(value) for value in document_ids}):
+        remaining_row = connection.execute(
+            """
+            SELECT 1
+            FROM document_occurrences
+            WHERE document_id = ?
+              AND lifecycle_status = 'active'
+            LIMIT 1
+            """,
+            (document_id,),
+        ).fetchone()
+        if remaining_row is not None:
+            continue
+        document_row = connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+        if document_row is None or document_row["lifecycle_status"] == "deleted":
+            continue
+        cleanup_document_artifacts(paths, connection, document_row)
+        delete_document_related_rows(connection, document_id)
+        connection.execute(
+            """
+            UPDATE documents
+            SET dataset_id = NULL, lifecycle_status = 'deleted', updated_at = ?
+            WHERE id = ?
+            """,
+            (deleted_at, document_id),
+        )
+        deleted_document_ids.append(document_id)
+    return deleted_document_ids
+
+
+def delete_dataset_memberships_for_documents(
+    connection: sqlite3.Connection,
+    document_ids: list[int] | set[int],
+) -> int:
+    normalized_document_ids = sorted({int(document_id) for document_id in document_ids})
+    if not normalized_document_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in normalized_document_ids)
+    cursor = connection.execute(
+        f"""
+        DELETE FROM dataset_documents
+        WHERE document_id IN ({placeholders})
+        """,
+        normalized_document_ids,
+    )
+    return int(cursor.rowcount or 0)
+
+
 def round_half_away_from_zero(raw_value: float) -> int:
     if raw_value >= 0:
         return int(raw_value + 0.5)
@@ -9856,6 +10169,247 @@ def clear_conversation_assignment(root: Path, document_id: int) -> dict[str, obj
                 updated_row["conversation_assignment_mode"]
             ),
             "assignment_summary": assignment,
+        }
+    finally:
+        connection.close()
+
+
+def delete_docs(
+    root: Path,
+    *,
+    document_ids: list[int] | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    dataset_names: list[str] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
+    path_prefixes: list[str] | None = None,
+    dry_run: bool = False,
+    confirm: bool = False,
+) -> dict[str, object]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+    normalized_path_prefixes = normalize_delete_path_prefixes(path_prefixes)
+    selector_inputs_present = bool(
+        query.strip()
+        or raw_bates
+        or raw_filters
+        or dataset_names
+        or from_run_id is not None
+        or normalized_path_prefixes
+    )
+    if normalized_document_ids and (selector_inputs_present or select_from_scope):
+        raise RetrieverError("delete-docs accepts either --doc-id selectors or query/filter/scope selectors, not both.")
+    if dry_run and confirm:
+        raise RetrieverError("Choose either --dry-run or --confirm, not both.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+
+        effective_raw_filters = list(raw_filters or [])
+        path_expression = path_prefix_scope_expression(normalized_path_prefixes)
+        if path_expression:
+            effective_raw_filters.append([path_expression])
+        occurrence_scoped = bool(normalized_path_prefixes) or raw_filters_include_occurrence_scope(
+            connection,
+            effective_raw_filters,
+        )
+
+        if normalized_document_ids:
+            target_rows = fetch_deletable_document_rows_by_ids(connection, normalized_document_ids)
+            target_document_ids = [int(row["id"]) for row in target_rows]
+            selector_payload: dict[str, object] = {
+                "mode": "document_ids",
+                "document_ids": target_document_ids,
+            }
+            selected_from_scope = False
+        else:
+            selector = build_effective_scope_selector(
+                connection,
+                paths,
+                query=query,
+                raw_bates=raw_bates,
+                raw_filters=effective_raw_filters,
+                dataset_names=dataset_names,
+                from_run_id=from_run_id,
+                select_from_scope=select_from_scope,
+            )
+            if not scope_run_selector_has_inputs(selector):
+                raise RetrieverError(
+                    "No document selection active. Provide --doc-id, --path, or at least one of --keyword, --filter, --bates, --dataset, --from-run-id, or --select-from-scope."
+                )
+            if occurrence_scoped:
+                occurrence_document_ids = document_ids_matching_occurrence_filters(connection, effective_raw_filters)
+                base_selector = build_effective_scope_selector(
+                    connection,
+                    paths,
+                    query=query,
+                    raw_bates=raw_bates,
+                    raw_filters=document_only_raw_filters(connection, effective_raw_filters),
+                    dataset_names=dataset_names,
+                    from_run_id=from_run_id,
+                    select_from_scope=select_from_scope,
+                )
+                if scope_run_selector_has_inputs(base_selector):
+                    base_document_ids, _, _ = resolve_seed_documents_for_scope_selector(connection, base_selector)
+                    allowed_document_ids = {int(document_id) for document_id in base_document_ids}
+                    scope_document_ids = [
+                        document_id
+                        for document_id in occurrence_document_ids
+                        if document_id in allowed_document_ids
+                    ]
+                else:
+                    scope_document_ids = occurrence_document_ids
+            else:
+                scope_document_ids, _, _ = resolve_seed_documents_for_scope_selector(connection, selector)
+            target_rows = fetch_deletable_document_rows_by_ids(connection, scope_document_ids)
+            target_document_ids = [int(row["id"]) for row in target_rows]
+            selector_payload = {
+                "mode": "scope_search",
+                "scope": selector,
+            }
+            selected_from_scope = bool(select_from_scope)
+
+        occurrence_scope_clauses: list[str] = []
+        occurrence_scope_params: list[object] = []
+        if occurrence_scoped:
+            occurrence_scope_clauses, occurrence_scope_params = build_occurrence_scope_filters(
+                connection,
+                effective_raw_filters,
+            )
+
+        root_occurrence_ids: set[int] = set()
+        direct_occurrence_ids: set[int] = set()
+        preview_refresh_document_ids: set[int] = set()
+
+        for row in target_rows:
+            document_id = int(row["id"])
+            if occurrence_scoped:
+                occurrence_rows = scoped_active_occurrence_rows_for_document(
+                    connection,
+                    document_id,
+                    occurrence_scope_clauses,
+                    occurrence_scope_params,
+                )
+            else:
+                occurrence_rows = active_occurrence_rows_for_document(connection, document_id)
+            if not occurrence_rows:
+                continue
+
+            if row["parent_document_id"] is None:
+                root_occurrence_ids.update(int(occurrence_row["id"]) for occurrence_row in occurrence_rows)
+                preview_refresh_document_ids.add(document_id)
+            else:
+                direct_occurrence_ids.update(int(occurrence_row["id"]) for occurrence_row in occurrence_rows)
+                preview_refresh_document_ids.add(int(row["parent_document_id"]))
+
+        targeted_occurrence_rows = collect_occurrence_rows_for_delete_plan(
+            connection,
+            root_occurrence_ids=root_occurrence_ids,
+            direct_occurrence_ids=direct_occurrence_ids,
+        )
+        targeted_occurrence_ids = [int(row["id"]) for row in targeted_occurrence_rows]
+        affected_document_ids = sorted({int(row["document_id"]) for row in targeted_occurrence_rows})
+
+        preview_payload = {
+            "selector": selector_payload,
+            "selected_from_scope": selected_from_scope,
+            "occurrence_scoped": occurrence_scoped,
+            "path_prefixes": normalized_path_prefixes,
+            "matched_document_count": len(target_document_ids),
+            "document_ids": target_document_ids,
+            "affected_document_ids": affected_document_ids,
+            "would_delete_occurrences": len(targeted_occurrence_ids),
+            "would_touch_documents": len(affected_document_ids),
+            "sample": sample_documents_for_delete(connection, target_document_ids),
+        }
+        if not targeted_occurrence_ids:
+            return {
+                "status": "ok",
+                **preview_payload,
+                "deleted_occurrences": 0,
+                "deleted_document_ids": [],
+                "deleted_documents": 0,
+                "retained_document_ids": [],
+                "retained_documents": 0,
+                "dataset_memberships_removed": 0,
+                "attachment_preview_updates": 0,
+                "assignment_summary": {"documents_assigned": 0, "conversations_created": 0},
+            }
+
+        if dry_run:
+            return {"status": "ok", "dry_run": True, **preview_payload}
+        if not confirm:
+            return {"status": "confirm_required", **preview_payload}
+
+        connection.execute("BEGIN")
+        try:
+            deleted_at = utc_now()
+            placeholders = ", ".join("?" for _ in targeted_occurrence_ids)
+            deleted_occurrence_cursor = connection.execute(
+                f"""
+                UPDATE document_occurrences
+                SET lifecycle_status = 'deleted', updated_at = ?
+                WHERE lifecycle_status != 'deleted'
+                  AND id IN ({placeholders})
+                """,
+                [deleted_at, *targeted_occurrence_ids],
+            )
+
+            for document_id in affected_document_ids:
+                refresh_source_backed_dataset_memberships_for_document(connection, document_id)
+                refresh_document_from_occurrences(connection, document_id)
+
+            deleted_document_ids = delete_documents_with_no_active_occurrences(
+                connection,
+                paths,
+                affected_document_ids,
+                deleted_at=deleted_at,
+            )
+            dataset_memberships_removed = delete_dataset_memberships_for_documents(connection, deleted_document_ids)
+            assignment_summary = reassign_conversations_and_refresh_previews(connection, paths)
+
+            attachment_preview_updates = 0
+            for preview_document_id in sorted(preview_refresh_document_ids):
+                preview_document_row = connection.execute(
+                    """
+                    SELECT lifecycle_status
+                    FROM documents
+                    WHERE id = ?
+                    """,
+                    (preview_document_id,),
+                ).fetchone()
+                if preview_document_row is None or preview_document_row["lifecycle_status"] in {"missing", "deleted"}:
+                    continue
+                attachment_preview_updates += sync_document_attachment_preview_links(
+                    connection,
+                    paths,
+                    preview_document_id,
+                )
+
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        deleted_document_id_set = {int(document_id) for document_id in deleted_document_ids}
+        retained_document_ids = [
+            document_id for document_id in affected_document_ids if document_id not in deleted_document_id_set
+        ]
+        return {
+            "status": "ok",
+            **preview_payload,
+            "deleted_occurrences": int(deleted_occurrence_cursor.rowcount or 0),
+            "deleted_document_ids": deleted_document_ids,
+            "deleted_documents": len(deleted_document_ids),
+            "retained_document_ids": retained_document_ids,
+            "retained_documents": len(retained_document_ids),
+            "dataset_memberships_removed": dataset_memberships_removed,
+            "attachment_preview_updates": attachment_preview_updates,
+            "assignment_summary": assignment_summary,
         }
     finally:
         connection.close()

@@ -10231,6 +10231,19 @@ def build_parser() -> argparse.ArgumentParser:
     delete_dataset_parser.add_argument("workspace", help="Workspace root path")
     add_dataset_selector_arguments(delete_dataset_parser)
 
+    delete_docs_parser = subparsers.add_parser("delete-docs", help="Delete selected documents or matching occurrences")
+    delete_docs_parser.add_argument("workspace", help="Workspace root path")
+    delete_docs_parser.add_argument("--doc-id", dest="document_ids", action="append", type=int, help="Document id to delete (repeatable)")
+    delete_docs_parser.add_argument(
+        "--path",
+        dest="path_prefixes",
+        action="append",
+        help="Delete documents whose rel_path matches this exact path or prefix (repeatable)",
+    )
+    add_scope_run_selector_arguments(delete_docs_parser)
+    delete_docs_parser.add_argument("--dry-run", action="store_true", help="Preview matches without deleting them")
+    delete_docs_parser.add_argument("--confirm", action="store_true", help="Confirm the delete")
+
     list_runs_parser = subparsers.add_parser("list-runs", help="List planned processing runs")
     list_runs_parser.add_argument("workspace", help="Workspace root path")
 
@@ -11151,6 +11164,24 @@ def main() -> int:
                     root,
                     dataset_id=args.dataset_id,
                     dataset_name=args.dataset_name,
+                ),
+            )
+
+        if args.command == "delete-docs":
+            return emit_cli_payload(
+                "delete-docs",
+                delete_docs(
+                    root,
+                    document_ids=args.document_ids,
+                    query=args.query,
+                    raw_bates=args.bates,
+                    raw_filters=args.filters,
+                    dataset_names=args.dataset_names,
+                    from_run_id=args.from_run_id,
+                    select_from_scope=args.select_from_scope,
+                    path_prefixes=args.path_prefixes,
+                    dry_run=args.dry_run,
+                    confirm=args.confirm,
                 ),
             )
 
