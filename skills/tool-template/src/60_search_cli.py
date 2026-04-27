@@ -9085,6 +9085,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_parser.add_argument("workspace", help="Workspace root path")
     ingest_parser.add_argument("--recursive", action="store_true", help="Scan directories recursively")
     ingest_parser.add_argument(
+        "--path",
+        dest="paths",
+        action="append",
+        help="Limit ingest to a file or directory inside the workspace; repeat to scan multiple paths",
+    )
+    ingest_parser.add_argument(
         "--file-types",
         help="Comma-separated file types to include, e.g. pdf,docx,eml",
     )
@@ -9810,7 +9816,7 @@ def main() -> int:
         _auto_upgrade_and_maybe_reexec(root, args.command)
 
         if args.command == "ingest":
-            return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types))
+            return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types, raw_paths=args.paths))
 
         if args.command == "ingest-production":
             return emit_cli_payload("ingest-production", ingest_production(root, args.production_root))
