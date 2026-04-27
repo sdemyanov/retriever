@@ -74,7 +74,7 @@ except Exception:  # pragma: no cover - platform-specific locking
 
 
 TOOL_VERSION = "1.0.3"
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/tools.py"
@@ -575,6 +575,20 @@ VIRTUAL_FILTER_FIELD_TYPES = {
     "dataset_name": "text",
     "is_attachment": "boolean",
     "has_attachments": "boolean",
+    "participant": "text",
+    "recipient": "text",
+    "raw_author": "text",
+    "raw_custodian": "text",
+    "raw_participant": "text",
+    "raw_participants": "text",
+    "raw_recipient": "text",
+    "raw_recipients": "text",
+    "author_entity_id": "integer",
+    "custodian_entity_id": "integer",
+    "participant_entity_id": "integer",
+    "participants_entity_id": "integer",
+    "recipient_entity_id": "integer",
+    "recipients_entity_id": "integer",
     "production_name": "text",
 }
 DISPLAYABLE_VIRTUAL_FIELDS = {

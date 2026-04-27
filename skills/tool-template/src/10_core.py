@@ -168,6 +168,7 @@ SCHEMA_STATEMENTS = [
       extracted_doc_modified_at TEXT,
       extracted_content_type TEXT,
       extracted_kind TEXT,
+      entity_hints_json TEXT NOT NULL DEFAULT '{}',
       text_status TEXT NOT NULL DEFAULT 'ok',
       lifecycle_status TEXT NOT NULL DEFAULT 'active',
       has_preview INTEGER NOT NULL DEFAULT 0,
@@ -1984,7 +1985,17 @@ def infer_source_custodian(
     normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
     normalized_source_rel_path = normalize_whitespace(str(source_rel_path or ""))
     if normalized_source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and normalized_source_rel_path:
-        return normalize_whitespace(Path(normalized_source_rel_path).stem)
+        basename = normalize_whitespace(Path(normalized_source_rel_path).stem)
+        if not basename:
+            return None
+        basename_email = normalize_entity_email(basename)
+        if basename_email:
+            entity_type = entity_type_from_candidate_parts(name_value=None, email_value=basename_email)
+            if entity_type in {ENTITY_TYPE_SHARED_MAILBOX, ENTITY_TYPE_SYSTEM_MAILBOX}:
+                return None
+            return basename_email
+        stripped = normalize_whitespace(strip_entity_container_words(basename))
+        return stripped or None
     return None
 
 
@@ -2664,6 +2675,7 @@ def list_dataset_summaries(connection: sqlite3.Connection, root: Path | None = N
                 "time_range_end": time_range_end,
                 "source_binding_count": len(source_bindings),
                 "source_bindings": source_bindings,
+                "merge_policy": dataset_merge_policy_payload_from_row(row),
             }
         )
     return summaries
@@ -3461,10 +3473,15 @@ def split_entity_like_values(raw_value: object, *, prefer_single_comma_name: boo
     return [text]
 
 
+ENTITY_LABELED_EXTERNAL_ID_PATTERN = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9 _/-]{1,40})\s*[:=#]\s*([A-Za-z0-9][A-Za-z0-9_.:/-]{2,80})"
+)
+
+
 def parse_labeled_external_ids(value: object) -> list[dict[str, object]]:
     text = normalize_entity_text(value)
     identifiers: list[dict[str, object]] = []
-    for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9 _/-]{1,40})\s*[:=#]\s*([A-Za-z0-9][A-Za-z0-9_.:/-]{2,80})", text):
+    for match in ENTITY_LABELED_EXTERNAL_ID_PATTERN.finditer(text):
         identifier_name = normalize_entity_identifier_name(match.group(1))
         normalized_value = normalize_entity_lookup_text(match.group(2))
         if not identifier_name or not normalized_value:
@@ -3478,6 +3495,15 @@ def parse_labeled_external_ids(value: object) -> list[dict[str, object]]:
             }
         )
     return identifiers
+
+
+def strip_labeled_external_ids(value: object) -> str:
+    text = normalize_entity_text(value)
+    if not text:
+        return ""
+    stripped = ENTITY_LABELED_EXTERNAL_ID_PATTERN.sub(" ", text)
+    stripped = re.sub(r"\s*[\[\](){}]\s*", " ", stripped)
+    return normalize_entity_text(stripped)
 
 
 def parse_entity_candidate_text(
@@ -3519,6 +3545,7 @@ def parse_entity_candidate_text(
     phone = normalize_entity_phone(text)
     if phone:
         name_source = normalize_whitespace(str(name_source).replace(str(phone["display_value"]), " "))
+    name_source = strip_labeled_external_ids(name_source)
     identifiers: list[dict[str, object]] = []
     for email in emails:
         identifiers.append(
@@ -3590,6 +3617,178 @@ def parse_entity_candidate_text(
     }
 
 
+def normalize_entity_hint_identifier(
+    raw_identifier: object,
+    *,
+    default_source_kind: object = None,
+) -> dict[str, object] | None:
+    if not isinstance(raw_identifier, dict):
+        return None
+    identifier_type = normalize_entity_identifier_name(
+        raw_identifier.get("identifier_type") or raw_identifier.get("type") or ""
+    )
+    if identifier_type != "external_id":
+        return None
+    identifier_name = normalize_entity_identifier_name(
+        raw_identifier.get("identifier_name") or raw_identifier.get("name") or ""
+    )
+    display_value = normalize_entity_text(
+        raw_identifier.get("display_value")
+        or raw_identifier.get("value")
+        or raw_identifier.get("normalized_value")
+        or ""
+    )
+    normalized_value = normalize_entity_lookup_text(raw_identifier.get("normalized_value") or display_value)
+    if not identifier_name or not normalized_value:
+        return None
+    identifier: dict[str, object] = {
+        "identifier_type": "external_id",
+        "display_value": display_value or normalized_value,
+        "normalized_value": normalized_value,
+        "identifier_name": identifier_name,
+        "is_verified": 1 if int(raw_identifier.get("is_verified") or 0) else 0,
+    }
+    identifier_scope = normalize_entity_lookup_text(
+        raw_identifier.get("identifier_scope") or raw_identifier.get("scope") or ""
+    )
+    if identifier_scope:
+        identifier["identifier_scope"] = identifier_scope
+    source_kind = normalize_entity_identifier_name(raw_identifier.get("source_kind") or default_source_kind or "")
+    if source_kind:
+        identifier["source_kind"] = source_kind
+    return identifier
+
+
+def parse_entity_hint_candidates(
+    raw_hints: object,
+    *,
+    role: str,
+) -> list[dict[str, object]]:
+    if not isinstance(raw_hints, list):
+        return []
+    candidates: list[dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for raw_hint in raw_hints:
+        if not isinstance(raw_hint, dict):
+            continue
+        display_value = normalize_entity_text(
+            raw_hint.get("display_value")
+            or raw_hint.get("name")
+            or raw_hint.get("value")
+            or ""
+        )
+        if not display_value:
+            continue
+        base_candidate = parse_entity_candidate_text(display_value, role=role)
+        identifiers = list(base_candidate.get("identifiers") or []) if base_candidate is not None else []
+        seen_identifier_keys = {
+            entity_candidate_identifier_key(identifier)
+            for identifier in identifiers
+        }
+        for raw_identifier in list(raw_hint.get("identifiers") or []):
+            identifier = normalize_entity_hint_identifier(
+                raw_identifier,
+                default_source_kind=raw_hint.get("source_kind"),
+            )
+            if identifier is None:
+                continue
+            identifier_key = entity_candidate_identifier_key(identifier)
+            if identifier_key in seen_identifier_keys:
+                continue
+            seen_identifier_keys.add(identifier_key)
+            identifiers.append(identifier)
+        if not identifiers:
+            continue
+        parsed_name_identifiers = [identifier for identifier in identifiers if identifier.get("identifier_type") == "name"]
+        email_identifiers = [identifier for identifier in identifiers if identifier.get("identifier_type") == "email"]
+        entity_type = (
+            str(base_candidate.get("entity_type"))
+            if base_candidate is not None
+            else entity_type_from_candidate_parts(
+                name_value=str(parsed_name_identifiers[0]["display_value"]) if parsed_name_identifiers else display_value,
+                email_value=str(email_identifiers[0]["normalized_value"]) if email_identifiers else None,
+                name_is_full=bool(parsed_name_identifiers and parsed_name_identifiers[0].get("normalized_full_name")),
+            )
+        )
+        display_basis = str(base_candidate.get("display_value")) if base_candidate is not None else display_value
+        candidate = {
+            "role": role,
+            "raw_value": display_value,
+            "display_value": display_basis,
+            "entity_type": entity_type,
+            "identifiers": identifiers,
+            "normalized_candidate_key": entity_candidate_key(role, identifiers, display_value),
+        }
+        key = str(candidate["normalized_candidate_key"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        candidates.append(candidate)
+    return candidates
+
+
+def entity_candidate_match_keys(candidate: dict[str, object]) -> set[str]:
+    keys = {
+        normalize_entity_lookup_text(candidate.get("display_value") or ""),
+        normalize_entity_lookup_text(candidate.get("raw_value") or ""),
+    }
+    for identifier in list(candidate.get("identifiers") or []):
+        if not isinstance(identifier, dict):
+            continue
+        if identifier.get("identifier_type") != "name":
+            continue
+        for field_name in ("display_value", "normalized_value", "normalized_full_name", "normalized_sort_name"):
+            key = normalize_entity_lookup_text(identifier.get(field_name) or "")
+            if key:
+                keys.add(key)
+    return {key for key in keys if key}
+
+
+def entity_hints_for_role(raw_hints: object, role: str) -> list[dict[str, object]]:
+    if isinstance(raw_hints, str):
+        try:
+            raw_hints = json.loads(raw_hints)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    if not isinstance(raw_hints, dict):
+        return []
+    role_keys = [role]
+    if role == "participant":
+        role_keys.append("participants")
+    elif role == "recipient":
+        role_keys.append("recipients")
+    elif role == "custodian":
+        role_keys.append("custodians")
+    for role_key in role_keys:
+        value = raw_hints.get(role_key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def parse_entity_candidates_with_hints(
+    raw_value: object,
+    *,
+    role: str,
+    raw_hints: object = None,
+) -> list[dict[str, object]]:
+    hint_candidates = parse_entity_hint_candidates(entity_hints_for_role(raw_hints, role), role=role)
+    covered_keys: set[str] = set()
+    for candidate in hint_candidates:
+        covered_keys.update(entity_candidate_match_keys(candidate))
+    candidates = list(hint_candidates)
+    seen_keys = {str(candidate["normalized_candidate_key"]) for candidate in candidates}
+    for candidate in parse_entity_candidates(raw_value, role=role):
+        if entity_candidate_match_keys(candidate) & covered_keys:
+            continue
+        key = str(candidate["normalized_candidate_key"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        candidates.append(candidate)
+    return candidates
+
+
 def parse_entity_candidates(
     raw_value: object,
     *,
@@ -3636,6 +3835,28 @@ def source_backed_dataset_policy_from_row(row: sqlite3.Row | None) -> dict[str, 
             for name in [normalize_entity_identifier_name(raw_name)]
             if name
         },
+    }
+
+
+def dataset_merge_policy_payload_from_row(row: sqlite3.Row) -> dict[str, object]:
+    source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
+    names = sorted(
+        {
+            name
+            for raw_name in normalize_string_list(row["external_id_auto_merge_names_json"])
+            for name in [normalize_entity_identifier_name(raw_name)]
+            if name
+        }
+    )
+    return {
+        "dataset_id": int(row["id"]),
+        "source_backed": source_kind != MANUAL_DATASET_SOURCE_KIND,
+        "allow_auto_merge": bool(int(row["allow_auto_merge"] or 0)),
+        "email_auto_merge": bool(int(row["email_auto_merge"] or 0)),
+        "handle_auto_merge": bool(int(row["handle_auto_merge"] or 0)),
+        "phone_auto_merge": bool(int(row["phone_auto_merge"] or 0)),
+        "name_auto_merge": bool(int(row["name_auto_merge"] or 0)),
+        "external_id_auto_merge_names": names,
     }
 
 
@@ -4121,6 +4342,43 @@ def entity_candidate_is_globally_ignored(connection: sqlite3.Connection, candida
     return row is not None
 
 
+def document_entity_override_for_candidate(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    role: str,
+    source_entity_id: int,
+    candidate: dict[str, object],
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM entity_overrides
+        WHERE scope_type = 'document'
+          AND scope_id = ?
+          AND (role IS NULL OR role = ?)
+          AND (
+            source_entity_id = ?
+            OR normalized_candidate_key = ?
+            OR (
+              source_entity_id IS NULL
+              AND normalized_candidate_key IS NULL
+              AND source_hint = ?
+            )
+          )
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            int(document_id),
+            role,
+            int(source_entity_id),
+            candidate.get("normalized_candidate_key"),
+            candidate.get("raw_value"),
+        ),
+    ).fetchone()
+
+
 def sync_document_entities(
     connection: sqlite3.Connection,
     document_id: int,
@@ -4138,6 +4396,10 @@ def sync_document_entities(
     ordinals_by_role: dict[str, int] = defaultdict(int)
     for occurrence_row in occurrence_rows_in_preferred_order(active_rows):
         dataset_source_row = dataset_source_row_for_occurrence(connection, occurrence_row)
+        if dataset_source_row is None:
+            dataset_source_row = dataset_source_row_for_document_membership(connection, document_id)
+        if dataset_source_row is None:
+            continue
         policy = source_backed_dataset_policy_for_source(connection, dataset_source_row)
         role_values = (
             ("author", occurrence_row["extracted_author"]),
@@ -4145,11 +4407,40 @@ def sync_document_entities(
             ("recipient", occurrence_row["extracted_recipients"]),
             ("custodian", occurrence_row["custodian"]),
         )
+        raw_entity_hints = occurrence_row["entity_hints_json"] if "entity_hints_json" in occurrence_row.keys() else None
         for role, raw_value in role_values:
-            for candidate in parse_entity_candidates(raw_value, role=role):
+            for candidate in parse_entity_candidates_with_hints(raw_value, role=role, raw_hints=raw_entity_hints):
                 if entity_candidate_is_globally_ignored(connection, candidate):
                     continue
                 entity_id = resolve_entity_candidate(connection, candidate, policy=policy)
+                override_row = document_entity_override_for_candidate(
+                    connection,
+                    document_id=document_id,
+                    role=role,
+                    source_entity_id=entity_id,
+                    candidate=candidate,
+                )
+                if override_row is not None:
+                    if override_row["override_effect"] == "remove":
+                        continue
+                    if override_row["override_effect"] == "replace":
+                        replacement_entity_id = override_row["replacement_entity_id"]
+                        if replacement_entity_id is None:
+                            continue
+                        canonical_replacement_id = canonicalize_entity_id(connection, int(replacement_entity_id))
+                        if canonical_replacement_id is None:
+                            continue
+                        replacement_row = connection.execute(
+                            """
+                            SELECT canonical_status
+                            FROM entities
+                            WHERE id = ?
+                            """,
+                            (canonical_replacement_id,),
+                        ).fetchone()
+                        if replacement_row is None or replacement_row["canonical_status"] != ENTITY_STATUS_ACTIVE:
+                            continue
+                        entity_id = canonical_replacement_id
                 role_entity_key = (role, entity_id)
                 if role_entity_key in seen_role_entities:
                     continue
@@ -4384,6 +4675,24 @@ def dataset_source_row_for_occurrence(
         source_rel_path=occurrence_row["source_rel_path"],
         production_id=occurrence_row["production_id"],
     )
+
+
+def dataset_source_row_for_document_membership(
+    connection: sqlite3.Connection,
+    document_id: int,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT ds.*
+        FROM dataset_documents dd
+        JOIN dataset_sources ds ON ds.id = dd.dataset_source_id
+        WHERE dd.document_id = ?
+          AND dd.dataset_source_id IS NOT NULL
+        ORDER BY dd.dataset_id ASC, dd.dataset_source_id ASC
+        LIMIT 1
+        """,
+        (int(document_id),),
+    ).fetchone()
 
 
 def refresh_source_backed_dataset_memberships_for_document(connection: sqlite3.Connection, document_id: int) -> None:
@@ -4731,6 +5040,12 @@ def upsert_document_occurrence(
         production_id=production_id,
     )
     dataset_source_id = int(dataset_source_row["id"]) if dataset_source_row is not None else None
+    raw_entity_hints = extracted.get("entity_hints")
+    entity_hints_json = json.dumps(
+        raw_entity_hints if isinstance(raw_entity_hints, dict) else {},
+        ensure_ascii=True,
+        sort_keys=True,
+    )
     occurrence_values = (
         document_id,
         dataset_source_id,
@@ -4767,6 +5082,7 @@ def upsert_document_occurrence(
             file_type=file_type,
             source_kind=source_kind,
         ),
+        entity_hints_json,
         text_status,
         ACTIVE_OCCURRENCE_STATUS,
         1 if has_preview else 0,
@@ -4782,9 +5098,9 @@ def upsert_document_occurrence(
               source_folder_path, production_id, begin_bates, end_bates, begin_attachment, end_attachment,
               rel_path, file_name, file_type, mime_type, file_size, file_hash, custodian, fs_created_at, fs_modified_at,
               extracted_author, extracted_title, extracted_subject, extracted_participants, extracted_recipients,
-              extracted_doc_authored_at, extracted_doc_modified_at, extracted_content_type, extracted_kind, text_status,
+              extracted_doc_authored_at, extracted_doc_modified_at, extracted_content_type, extracted_kind, entity_hints_json, text_status,
               lifecycle_status, has_preview, ingested_at, last_seen_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             occurrence_values,
         )
@@ -4799,7 +5115,7 @@ def upsert_document_occurrence(
             file_size = ?, file_hash = ?, custodian = ?, fs_created_at = ?, fs_modified_at = ?, extracted_author = ?,
             extracted_title = ?, extracted_subject = ?, extracted_participants = ?, extracted_recipients = ?,
             extracted_doc_authored_at = ?, extracted_doc_modified_at = ?, extracted_content_type = ?, extracted_kind = ?,
-            text_status = ?, lifecycle_status = ?, has_preview = ?, ingested_at = ?, last_seen_at = ?, updated_at = ?
+            entity_hints_json = ?, text_status = ?, lifecycle_status = ?, has_preview = ?, ingested_at = ?, last_seen_at = ?, updated_at = ?
         WHERE id = ?
         """,
         (*occurrence_values, existing_occurrence_id),

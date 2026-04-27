@@ -1248,6 +1248,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
             self.assertIn("dataset_source_id", retriever_tools.table_columns(connection, "document_occurrences"))
+            self.assertIn("entity_hints_json", retriever_tools.table_columns(connection, "document_occurrences"))
             dataset_columns = retriever_tools.table_columns(connection, "datasets")
             for column_name in (
                 "allow_auto_merge",
@@ -1282,6 +1283,48 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(jane_identifiers["name"]["normalized_full_name"], "jane doe")
         self.assertEqual(jane_identifiers["name"]["normalized_sort_name"], "doe jane")
         self.assertEqual(candidates[1]["entity_type"], retriever_tools.ENTITY_TYPE_SHARED_MAILBOX)
+
+    def test_source_custodian_inference_handles_archive_basename_clues(self) -> None:
+        self.assertEqual(
+            retriever_tools.infer_source_custodian(
+                source_kind=retriever_tools.PST_SOURCE_KIND,
+                source_rel_path="Sergey@Example.COM.pst",
+            ),
+            "sergey@example.com",
+        )
+        self.assertEqual(
+            retriever_tools.infer_source_custodian(
+                source_kind=retriever_tools.MBOX_SOURCE_KIND,
+                source_rel_path="exports/Jane Doe Mailbox.mbox",
+            ),
+            "Jane Doe",
+        )
+        self.assertEqual(
+            retriever_tools.infer_source_custodian(
+                source_kind=retriever_tools.PST_SOURCE_KIND,
+                source_rel_path="Legal/Acme Corp Archive.pst",
+            ),
+            "Acme Corp",
+        )
+        self.assertIsNone(
+            retriever_tools.infer_source_custodian(
+                source_kind=retriever_tools.PST_SOURCE_KIND,
+                source_rel_path="noreply@example.com.pst",
+            )
+        )
+        self.assertIsNone(
+            retriever_tools.infer_source_custodian(
+                source_kind=retriever_tools.MBOX_SOURCE_KIND,
+                source_rel_path="support@example.com.mbox",
+            )
+        )
+        self.assertEqual(
+            retriever_tools.infer_source_custodian(
+                source_kind=retriever_tools.MBOX_SOURCE_KIND,
+                source_rel_path="mailbox.mbox",
+            ),
+            "mailbox",
+        )
 
     def test_ingest_syncs_author_entities_by_email_resolution_key(self) -> None:
         self.write_email_message(
@@ -1426,6 +1469,1263 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         author_links = [item for item in show_payload["documents"] if item["role"] == "author"]
         self.assertEqual(len(author_links), 2)
+
+        exit_code, entity_filter_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "author = 'alice@example.com'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(entity_filter_payload)
+        assert entity_filter_payload is not None
+        self.assertEqual(entity_filter_payload["total_hits"], 2)
+
+        exit_code, entity_id_filter_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            f"author_entity_id = {alice_entity['id']}",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(entity_id_filter_payload)
+        assert entity_id_filter_payload is not None
+        self.assertEqual(entity_id_filter_payload["total_hits"], 2)
+
+        exit_code, raw_author_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "raw_author LIKE '%Alice A%'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(raw_author_payload)
+        assert raw_author_payload is not None
+        self.assertEqual(raw_author_payload["total_hits"], 1)
+        self.assertEqual(raw_author_payload["results"][0]["file_name"], "second.eml")
+
+        exit_code, inventory_payload, _, _ = self.run_cli(
+            "list-entity-role-inventory",
+            str(self.root),
+            "--role",
+            "author",
+            "--filter",
+            "author = 'alice@example.com'",
+            "--examples",
+            "1",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(inventory_payload)
+        assert inventory_payload is not None
+        author_inventory_rows = [
+            row
+            for row in inventory_payload["rows"]
+            if row["entity_id"] == alice_entity["id"] and row["role"] == "author"
+        ]
+        self.assertEqual(len(author_inventory_rows), 1)
+        self.assertEqual(author_inventory_rows[0]["document_count"], 2)
+        self.assertEqual(len(author_inventory_rows[0]["examples"]), 1)
+
+    def test_entity_similar_block_and_merge_commands(self) -> None:
+        self.write_email_message(
+            self.root / "old.eml",
+            subject="Old Jane",
+            body_text="Old Jane body",
+            author="Jane Doe <jane.old@example.com>",
+            recipients="Reviewer <reviewer@example.com>",
+            cc=None,
+            message_id="<old-jane@example.com>",
+        )
+        self.write_email_message(
+            self.root / "new.eml",
+            subject="New Jane",
+            body_text="New Jane body",
+            author="Jane Doe <jane.new@example.org>",
+            recipients="Reviewer <reviewer@example.com>",
+            cc=None,
+            message_id="<new-jane@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        exit_code, list_payload, _, _ = self.run_cli("list-entities", str(self.root), "--query", "Jane Doe")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        jane_entities = {
+            entity["primary_email"]: entity
+            for entity in list_payload["entities"]
+            if entity["primary_email"] in {"jane.old@example.com", "jane.new@example.org"}
+        }
+        self.assertEqual(set(jane_entities), {"jane.old@example.com", "jane.new@example.org"})
+        source_id = int(jane_entities["jane.old@example.com"]["id"])
+        target_id = int(jane_entities["jane.new@example.org"]["id"])
+
+        exit_code, similar_payload, _, _ = self.run_cli("similar-entities", str(self.root), str(source_id))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(similar_payload)
+        assert similar_payload is not None
+        similar_ids = [int(item["entity"]["id"]) for item in similar_payload["suggestions"]]
+        self.assertIn(target_id, similar_ids)
+        target_suggestion = next(item for item in similar_payload["suggestions"] if int(item["entity"]["id"]) == target_id)
+        self.assertIn("exact_full_name", {reason["kind"] for reason in target_suggestion["reasons"]})
+
+        exit_code, block_payload, _, _ = self.run_cli(
+            "block-entity-merge",
+            str(self.root),
+            str(source_id),
+            str(target_id),
+            "--reason",
+            "different Jane records",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(block_payload)
+        self.assertTrue(block_payload["created"])
+
+        exit_code, similar_payload, _, _ = self.run_cli("similar-entities", str(self.root), str(source_id))
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn(target_id, [int(item["entity"]["id"]) for item in similar_payload["suggestions"]])
+
+        blocked_exit, blocked_payload, _, _ = self.run_cli(
+            "merge-entities",
+            str(self.root),
+            str(source_id),
+            str(target_id),
+        )
+        self.assertEqual(blocked_exit, 2)
+        self.assertIsNotNone(blocked_payload)
+        self.assertIn("merge block", blocked_payload["error"])
+
+        exit_code, merge_payload, _, _ = self.run_cli(
+            "merge-entities",
+            str(self.root),
+            str(source_id),
+            str(target_id),
+            "--force",
+            "--reason",
+            "manual cleanup",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(merge_payload)
+        self.assertEqual(merge_payload["source_entity_id"], source_id)
+        self.assertEqual(merge_payload["target_entity_id"], target_id)
+        self.assertEqual(sorted(merge_payload["affected_document_ids"]), sorted([self.fetch_document_row("old.eml")["id"], self.fetch_document_row("new.eml")["id"]]))
+
+        exit_code, show_payload, _, _ = self.run_cli("show-entity", str(self.root), str(target_id))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(show_payload)
+        merged_identifiers = {
+            (identifier["identifier_type"], identifier["normalized_value"])
+            for identifier in show_payload["identifiers"]
+        }
+        self.assertIn(("email", "jane.old@example.com"), merged_identifiers)
+        self.assertIn(("email", "jane.new@example.org"), merged_identifiers)
+
+        exit_code, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            f"author_entity_id = {target_id}",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(search_payload)
+        self.assertEqual(search_payload["total_hits"], 2)
+
+        exit_code, source_search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            f"author_entity_id = {source_id}",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(source_search_payload)
+        self.assertEqual(source_search_payload["total_hits"], 0)
+
+    def test_ignore_entity_hides_links_but_preserves_raw_metadata_after_rebuild(self) -> None:
+        self.write_email_message(
+            self.root / "artifact.eml",
+            subject="Artifact",
+            body_text="Artifact body",
+            author="Alice Example <alice@example.com>",
+            recipients="Parser Artifact <artifact@example.com>",
+            cc=None,
+            message_id="<artifact@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        exit_code, list_payload, _, _ = self.run_cli("list-entities", str(self.root), "--query", "artifact@example.com")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        artifact_entities = [
+            entity
+            for entity in list_payload["entities"]
+            if entity["primary_email"] == "artifact@example.com"
+        ]
+        self.assertEqual(len(artifact_entities), 1)
+        artifact_id = int(artifact_entities[0]["id"])
+
+        exit_code, ignore_payload, _, _ = self.run_cli(
+            "ignore-entity",
+            str(self.root),
+            str(artifact_id),
+            "--reason",
+            "parser artifact",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(ignore_payload)
+        self.assertGreaterEqual(ignore_payload["document_links_deleted"], 1)
+        self.assertGreaterEqual(ignore_payload["override_count"], 1)
+
+        exit_code, hidden_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "recipient = 'artifact@example.com'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(hidden_payload)
+        self.assertEqual(hidden_payload["total_hits"], 0)
+
+        exit_code, raw_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "raw_recipient LIKE '%artifact@example.com%'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(raw_payload)
+        self.assertEqual(raw_payload["total_hits"], 1)
+
+        exit_code, rebuild_payload, _, _ = self.run_cli("rebuild-entities", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(rebuild_payload)
+
+        exit_code, hidden_after_rebuild_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "recipient = 'artifact@example.com'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(hidden_after_rebuild_payload)
+        self.assertEqual(hidden_after_rebuild_payload["total_hits"], 0)
+
+        exit_code, active_list_payload, _, _ = self.run_cli("list-entities", str(self.root), "--query", "artifact@example.com")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(active_list_payload)
+        self.assertEqual(active_list_payload["entities"], [])
+
+        exit_code, ignored_list_payload, _, _ = self.run_cli(
+            "list-entities",
+            str(self.root),
+            "--query",
+            "artifact@example.com",
+            "--include-ignored",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(ignored_list_payload)
+        self.assertEqual(ignored_list_payload["entities"][0]["canonical_status"], retriever_tools.ENTITY_STATUS_IGNORED)
+
+    def test_split_entity_moves_document_link_and_survives_rebuild(self) -> None:
+        self.write_email_message(
+            self.root / "one.eml",
+            subject="Shared one",
+            body_text="Shared one body",
+            author="Shared Identity <shared@example.com>",
+            recipients="Reviewer <reviewer@example.com>",
+            cc=None,
+            message_id="<shared-one@example.com>",
+        )
+        self.write_email_message(
+            self.root / "two.eml",
+            subject="Shared two",
+            body_text="Shared two body",
+            author="Shared Identity <shared@example.com>",
+            recipients="Reviewer <reviewer@example.com>",
+            cc=None,
+            message_id="<shared-two@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        one_row = self.fetch_document_row("one.eml")
+        two_row = self.fetch_document_row("two.eml")
+
+        exit_code, list_payload, _, _ = self.run_cli("list-entities", str(self.root), "--query", "shared@example.com")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        shared_entities = [
+            entity
+            for entity in list_payload["entities"]
+            if entity["primary_email"] == "shared@example.com"
+        ]
+        self.assertEqual(len(shared_entities), 1)
+        source_id = int(shared_entities[0]["id"])
+        self.assertEqual(shared_entities[0]["document_count"], 2)
+
+        exit_code, split_payload, _, _ = self.run_cli(
+            "split-entity",
+            str(self.root),
+            str(source_id),
+            "--doc-id",
+            str(two_row["id"]),
+            "--role",
+            "author",
+            "--display-name",
+            "Split Identity",
+            "--reason",
+            "separate person",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(split_payload)
+        target_id = int(split_payload["target_entity_id"])
+        self.assertTrue(split_payload["created_target"])
+        self.assertEqual(split_payload["moved_document_links"], 1)
+        self.assertGreaterEqual(split_payload["overrides_created"], 1)
+
+        exit_code, source_search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            f"author_entity_id = {source_id}",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(source_search_payload)
+        self.assertEqual(source_search_payload["total_hits"], 1)
+        self.assertEqual(source_search_payload["results"][0]["id"], one_row["id"])
+
+        exit_code, target_search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            f"author_entity_id = {target_id}",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(target_search_payload)
+        self.assertEqual(target_search_payload["total_hits"], 1)
+        self.assertEqual(target_search_payload["results"][0]["id"], two_row["id"])
+        self.assertEqual(self.fetch_document_row("two.eml")["author"], "Split Identity")
+
+        blocked_exit, blocked_payload, _, _ = self.run_cli(
+            "merge-entities",
+            str(self.root),
+            str(target_id),
+            str(source_id),
+        )
+        self.assertEqual(blocked_exit, 2)
+        self.assertIsNotNone(blocked_payload)
+        self.assertIn("merge block", blocked_payload["error"])
+
+        rebuild_exit, rebuild_payload, _, _ = self.run_cli(
+            "rebuild-entities",
+            str(self.root),
+            "--doc-id",
+            str(two_row["id"]),
+        )
+        self.assertEqual(rebuild_exit, 0)
+        self.assertIsNotNone(rebuild_payload)
+
+        exit_code, target_after_rebuild_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            f"author_entity_id = {target_id}",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(target_after_rebuild_payload)
+        self.assertEqual(target_after_rebuild_payload["total_hits"], 1)
+        self.assertEqual(target_after_rebuild_payload["results"][0]["id"], two_row["id"])
+        self.assertEqual(self.fetch_document_row("two.eml")["author"], "Split Identity")
+
+    def test_assign_and_unassign_entity_update_caches_and_survive_rebuild(self) -> None:
+        self.write_email_message(
+            self.root / "assign.eml",
+            subject="Assign",
+            body_text="Assign body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            cc=None,
+            message_id="<assign@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        document_row = self.fetch_document_row("assign.eml")
+
+        exit_code, list_payload, _, _ = self.run_cli("list-entities", str(self.root), "--query", "alice@example.com")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        alice_id = next(
+            int(entity["id"])
+            for entity in list_payload["entities"]
+            if entity["primary_email"] == "alice@example.com"
+        )
+
+        exit_code, assign_payload, _, _ = self.run_cli(
+            "assign-entity",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+            "--role",
+            "custodian",
+            "--entity-id",
+            str(alice_id),
+            "--reason",
+            "manual custodian",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(assign_payload)
+        self.assertTrue(assign_payload["created"])
+        self.assertEqual(self.fetch_document_row("assign.eml")["custodians"], ["Alice Example <alice@example.com>"])
+
+        exit_code, custodian_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "custodian = 'alice@example.com'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(custodian_payload)
+        self.assertEqual(custodian_payload["total_hits"], 1)
+
+        exit_code, unassign_payload, _, _ = self.run_cli(
+            "unassign-entity",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+            "--role",
+            "author",
+            "--entity-id",
+            str(alice_id),
+            "--reason",
+            "not the author",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(unassign_payload)
+        self.assertEqual(unassign_payload["auto_links_removed"], 1)
+        self.assertGreaterEqual(unassign_payload["overrides_created"], 1)
+        self.assertIsNone(self.fetch_document_row("assign.eml")["author"])
+
+        exit_code, author_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "author = 'alice@example.com'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(author_payload)
+        self.assertEqual(author_payload["total_hits"], 0)
+
+        exit_code, raw_author_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "raw_author LIKE '%alice@example.com%'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(raw_author_payload)
+        self.assertEqual(raw_author_payload["total_hits"], 1)
+
+        rebuild_exit, rebuild_payload, _, _ = self.run_cli(
+            "rebuild-entities",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(rebuild_exit, 0)
+        self.assertIsNotNone(rebuild_payload)
+
+        exit_code, author_after_rebuild_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "author = 'alice@example.com'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(author_after_rebuild_payload)
+        self.assertEqual(author_after_rebuild_payload["total_hits"], 0)
+        self.assertEqual(self.fetch_document_row("assign.eml")["custodians"], ["Alice Example <alice@example.com>"])
+
+    def test_create_and_edit_entity_commands_update_manual_links(self) -> None:
+        self.write_email_message(
+            self.root / "manual-person.eml",
+            subject="Manual person",
+            body_text="Manual person body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            cc=None,
+            message_id="<manual-person@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        document_row = self.fetch_document_row("manual-person.eml")
+
+        exit_code, create_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--entity-type",
+            "person",
+            "--display-name",
+            "Manual Person",
+            "--email",
+            "manual@example.com",
+            "--name",
+            "Manual Person",
+            "--notes",
+            "seed profile",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(create_payload)
+        assert create_payload is not None
+        entity_id = int(create_payload["entity_id"])
+        self.assertEqual(create_payload["entity"]["label"], "Manual Person <manual@example.com>")
+        self.assertEqual(create_payload["created_identifier_count"], 2)
+        self.assertEqual(create_payload["created_resolution_keys"], 1)
+
+        exit_code, assign_payload, _, _ = self.run_cli(
+            "assign-entity",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+            "--role",
+            "custodian",
+            "--entity-id",
+            str(entity_id),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(assign_payload)
+        self.assertEqual(self.fetch_document_row("manual-person.eml")["custodians"], ["Manual Person <manual@example.com>"])
+
+        exit_code, edit_payload, _, _ = self.run_cli(
+            "edit-entity",
+            str(self.root),
+            str(entity_id),
+            "--display-name",
+            "Manual Renamed",
+            "--add-email",
+            "renamed@example.com",
+            "--add-phone",
+            "+1 (212) 555-0100",
+            "--notes",
+            "updated profile",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(edit_payload)
+        assert edit_payload is not None
+        self.assertEqual(edit_payload["entity"]["label"], "Manual Renamed <manual@example.com>")
+        self.assertEqual(edit_payload["created_identifier_count"], 2)
+        self.assertEqual(edit_payload["created_resolution_keys"], 1)
+        self.assertEqual(edit_payload["affected_document_ids"], [document_row["id"]])
+        self.assertEqual(self.fetch_document_row("manual-person.eml")["custodians"], ["Manual Renamed <manual@example.com>"])
+
+        exit_code, custodian_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "custodian = 'renamed@example.com'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(custodian_payload)
+        self.assertEqual(custodian_payload["total_hits"], 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            entity_row = connection.execute("SELECT notes, display_name_source FROM entities WHERE id = ?", (entity_id,)).fetchone()
+            self.assertIsNotNone(entity_row)
+            assert entity_row is not None
+            self.assertEqual(entity_row["notes"], "updated profile")
+            self.assertEqual(entity_row["display_name_source"], retriever_tools.ENTITY_DISPLAY_SOURCE_MANUAL)
+        finally:
+            connection.close()
+
+    def test_dataset_policy_commands_update_source_backed_policy(self) -> None:
+        (self.root / "policy.txt").write_text("Dataset policy source document", encoding="utf-8")
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        exit_code, list_payload, _, _ = self.run_cli("list-datasets", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        assert list_payload is not None
+        dataset = next(item for item in list_payload["datasets"] if item["source_kind"] == retriever_tools.FILESYSTEM_SOURCE_KIND)
+        dataset_id = int(dataset["id"])
+        self.assertTrue(dataset["merge_policy"]["source_backed"])
+        self.assertTrue(dataset["merge_policy"]["email_auto_merge"])
+        self.assertFalse(dataset["merge_policy"]["name_auto_merge"])
+
+        exit_code, show_payload, _, _ = self.run_cli(
+            "show-dataset-policy",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(show_payload)
+        assert show_payload is not None
+        self.assertEqual(show_payload["merge_policy"]["dataset_id"], dataset_id)
+        self.assertTrue(show_payload["merge_policy"]["allow_auto_merge"])
+
+        exit_code, set_payload, _, _ = self.run_cli(
+            "set-dataset-policy",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+            "--email-auto-merge",
+            "false",
+            "--phone-auto-merge",
+            "true",
+            "--name-auto-merge",
+            "true",
+            "--external-id-auto-merge-name",
+            "Employee ID",
+            "--external-id-auto-merge-name",
+            "HR-ID",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(set_payload)
+        assert set_payload is not None
+        self.assertTrue(set_payload["changed"])
+        self.assertTrue(set_payload["rebuild_recommended"])
+        self.assertIn("rebuild-entities", set_payload["rebuild_command"])
+        self.assertTrue(set_payload["before_merge_policy"]["email_auto_merge"])
+        self.assertFalse(set_payload["merge_policy"]["email_auto_merge"])
+        self.assertTrue(set_payload["merge_policy"]["phone_auto_merge"])
+        self.assertTrue(set_payload["merge_policy"]["name_auto_merge"])
+        self.assertEqual(set_payload["merge_policy"]["external_id_auto_merge_names"], ["employee_id", "hr_id"])
+
+        exit_code, show_after_payload, _, _ = self.run_cli(
+            "show-dataset-policy",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(show_after_payload)
+        self.assertEqual(show_after_payload["merge_policy"], set_payload["merge_policy"])
+
+        exit_code, create_dataset_payload, _, _ = self.run_cli("create-dataset", str(self.root), "Review Set")
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(create_dataset_payload)
+        rejected_exit, rejected_payload, _, _ = self.run_cli(
+            "set-dataset-policy",
+            str(self.root),
+            "--dataset-name",
+            "Review Set",
+            "--email-auto-merge",
+            "false",
+        )
+        self.assertEqual(rejected_exit, 2)
+        self.assertIsNotNone(rejected_payload)
+        self.assertIn("source-backed", rejected_payload["error"])
+
+    def test_rebuild_after_email_policy_demotion_preserves_manual_state(self) -> None:
+        self.write_email_message(
+            self.root / "policy-one.eml",
+            subject="Policy one",
+            body_text="Policy one body",
+            author="Policy Person <policy@example.com>",
+            recipients="Shared Recipient <recipient@example.com>",
+            cc=None,
+            message_id="<policy-one@example.com>",
+        )
+        self.write_email_message(
+            self.root / "policy-two.eml",
+            subject="Policy two",
+            body_text="Policy two body",
+            author="Policy Alias <policy@example.com>",
+            recipients="Shared Recipient <recipient@example.com>",
+            cc=None,
+            message_id="<policy-two@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        one_row = self.fetch_document_row("policy-one.eml")
+        two_row = self.fetch_document_row("policy-two.eml")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            dataset_row = connection.execute(
+                """
+                SELECT id
+                FROM datasets
+                WHERE source_kind = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (retriever_tools.FILESYSTEM_SOURCE_KIND,),
+            ).fetchone()
+            self.assertIsNotNone(dataset_row)
+            assert dataset_row is not None
+            dataset_id = int(dataset_row["id"])
+            author_entity_rows = connection.execute(
+                """
+                SELECT DISTINCT de.entity_id
+                FROM document_entities de
+                JOIN entity_identifiers ei ON ei.entity_id = de.entity_id
+                WHERE de.role = 'author'
+                  AND ei.identifier_type = 'email'
+                  AND ei.normalized_value = 'policy@example.com'
+                ORDER BY de.entity_id ASC
+                """
+            ).fetchall()
+            key_row = connection.execute(
+                """
+                SELECT *
+                FROM entity_resolution_keys
+                WHERE key_type = 'email'
+                  AND normalized_value = 'policy@example.com'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(len(author_entity_rows), 1)
+        original_author_entity_id = int(author_entity_rows[0]["entity_id"])
+        self.assertIsNotNone(key_row)
+
+        exit_code, manual_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--display-name",
+            "Manual Keeper",
+            "--email",
+            "keeper@example.com",
+            "--name",
+            "Manual Keeper",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(manual_payload)
+        assert manual_payload is not None
+        manual_entity_id = int(manual_payload["entity_id"])
+
+        exit_code, assign_payload, _, _ = self.run_cli(
+            "assign-entity",
+            str(self.root),
+            "--doc-id",
+            str(one_row["id"]),
+            "--role",
+            "custodian",
+            "--entity-id",
+            str(manual_entity_id),
+            "--reason",
+            "manual keeper",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(assign_payload)
+
+        exit_code, recipient_list_payload, _, _ = self.run_cli(
+            "list-entities",
+            str(self.root),
+            "--query",
+            "recipient@example.com",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(recipient_list_payload)
+        assert recipient_list_payload is not None
+        recipient_entity_id = next(
+            int(entity["id"])
+            for entity in recipient_list_payload["entities"]
+            if entity["primary_email"] == "recipient@example.com"
+        )
+        exit_code, unassign_payload, _, _ = self.run_cli(
+            "unassign-entity",
+            str(self.root),
+            "--doc-id",
+            str(one_row["id"]),
+            "--role",
+            "recipient",
+            "--entity-id",
+            str(recipient_entity_id),
+            "--reason",
+            "doc one should not show recipient",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(unassign_payload)
+        self.assertGreaterEqual(unassign_payload["overrides_created"], 1)
+
+        exit_code, block_a_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--display-name",
+            "Blocked A",
+            "--email",
+            "blocked.a@example.com",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(block_a_payload)
+        exit_code, block_b_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--display-name",
+            "Blocked B",
+            "--email",
+            "blocked.b@example.com",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(block_b_payload)
+        block_a_id = int(block_a_payload["entity_id"])
+        block_b_id = int(block_b_payload["entity_id"])
+        exit_code, block_payload, _, _ = self.run_cli(
+            "block-entity-merge",
+            str(self.root),
+            str(block_a_id),
+            str(block_b_id),
+            "--reason",
+            "dogfood block",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(block_payload)
+        self.assertTrue(block_payload["created"])
+
+        exit_code, policy_payload, _, _ = self.run_cli(
+            "set-dataset-policy",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+            "--email-auto-merge",
+            "false",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(policy_payload)
+        self.assertTrue(policy_payload["rebuild_recommended"])
+
+        exit_code, rebuild_payload, _, _ = self.run_cli("rebuild-entities", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(rebuild_payload)
+        assert rebuild_payload is not None
+        self.assertGreaterEqual(rebuild_payload["auto_resolution_keys_deleted"], 1)
+        self.assertGreaterEqual(rebuild_payload["auto_identifiers_deleted"], 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            demoted_key_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entity_resolution_keys
+                    WHERE key_type = 'email'
+                      AND normalized_value = 'policy@example.com'
+                    """
+                ).fetchone()[0]
+                or 0
+            )
+            author_entity_rows_after = connection.execute(
+                """
+                SELECT de.document_id, de.entity_id
+                FROM document_entities de
+                JOIN entity_identifiers ei ON ei.entity_id = de.entity_id
+                WHERE de.role = 'author'
+                  AND ei.identifier_type = 'email'
+                  AND ei.normalized_value = 'policy@example.com'
+                ORDER BY de.document_id ASC, de.entity_id ASC
+                """
+            ).fetchall()
+            manual_identifier_row = connection.execute(
+                """
+                SELECT *
+                FROM entity_identifiers
+                WHERE entity_id = ?
+                  AND identifier_type = 'email'
+                  AND normalized_value = 'keeper@example.com'
+                  AND source_kind = 'manual'
+                """,
+                (manual_entity_id,),
+            ).fetchone()
+            manual_resolution_key_row = connection.execute(
+                """
+                SELECT *
+                FROM entity_resolution_keys
+                WHERE entity_id = ?
+                  AND key_type = 'email'
+                  AND normalized_value = 'keeper@example.com'
+                """,
+                (manual_entity_id,),
+            ).fetchone()
+            manual_assignment_row = connection.execute(
+                """
+                SELECT *
+                FROM document_entities
+                WHERE document_id = ?
+                  AND entity_id = ?
+                  AND role = 'custodian'
+                  AND assignment_mode = 'manual'
+                """,
+                (one_row["id"], manual_entity_id),
+            ).fetchone()
+            override_row = connection.execute(
+                """
+                SELECT *
+                FROM entity_overrides
+                WHERE scope_type = 'document'
+                  AND scope_id = ?
+                  AND role = 'recipient'
+                  AND override_effect = 'remove'
+                """,
+                (one_row["id"],),
+            ).fetchone()
+            merge_block_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entity_merge_blocks
+                    WHERE left_entity_id = MIN(?, ?)
+                      AND right_entity_id = MAX(?, ?)
+                    """,
+                    (block_a_id, block_b_id, block_a_id, block_b_id),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(demoted_key_count, 0)
+        self.assertEqual(len(author_entity_rows_after), 2)
+        self.assertEqual(
+            {int(row["document_id"]) for row in author_entity_rows_after},
+            {one_row["id"], two_row["id"]},
+        )
+        self.assertNotEqual(
+            int(author_entity_rows_after[0]["entity_id"]),
+            int(author_entity_rows_after[1]["entity_id"]),
+        )
+        self.assertNotIn(
+            original_author_entity_id,
+            {int(row["entity_id"]) for row in author_entity_rows_after},
+        )
+        self.assertIsNotNone(manual_identifier_row)
+        self.assertIsNotNone(manual_resolution_key_row)
+        self.assertIsNotNone(manual_assignment_row)
+        self.assertIsNotNone(override_row)
+        self.assertEqual(merge_block_count, 1)
+        self.assertEqual(self.fetch_document_row("policy-one.eml")["custodians"], ["Manual Keeper <keeper@example.com>"])
+
+        exit_code, recipient_search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "",
+            "--filter",
+            "recipient = 'recipient@example.com'",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(recipient_search_payload)
+        self.assertEqual(recipient_search_payload["total_hits"], 1)
+        self.assertEqual(recipient_search_payload["results"][0]["id"], two_row["id"])
+
+    def test_rebuild_after_source_backed_dataset_delete_preserves_manual_state(self) -> None:
+        self.write_email_message(
+            self.root / "delete-one.eml",
+            subject="Delete one",
+            body_text="Delete one body",
+            author="Delete Person <delete.person@example.com>",
+            recipients="Delete Recipient <delete.recipient@example.com>",
+            cc=None,
+            message_id="<delete-one@example.com>",
+        )
+        self.write_email_message(
+            self.root / "delete-two.eml",
+            subject="Delete two",
+            body_text="Delete two body",
+            author="Delete Alias <delete.person@example.com>",
+            recipients="Delete Recipient <delete.recipient@example.com>",
+            cc=None,
+            message_id="<delete-two@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        one_row = self.fetch_document_row("delete-one.eml")
+        two_row = self.fetch_document_row("delete-two.eml")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            dataset_row = connection.execute(
+                """
+                SELECT id
+                FROM datasets
+                WHERE source_kind = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (retriever_tools.FILESYSTEM_SOURCE_KIND,),
+            ).fetchone()
+            self.assertIsNotNone(dataset_row)
+            assert dataset_row is not None
+            dataset_id = int(dataset_row["id"])
+            source_resolution_key_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entity_resolution_keys
+                    WHERE key_type = 'email'
+                      AND normalized_value IN ('delete.person@example.com', 'delete.recipient@example.com')
+                    """
+                ).fetchone()[0]
+                or 0
+            )
+            source_auto_link_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM document_entities
+                    WHERE assignment_mode = 'auto'
+                      AND document_id IN (?, ?)
+                    """,
+                    (one_row["id"], two_row["id"]),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+        self.assertGreaterEqual(source_resolution_key_count, 2)
+        self.assertGreaterEqual(source_auto_link_count, 4)
+
+        exit_code, manual_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--display-name",
+            "Deleted Source Keeper",
+            "--email",
+            "deleted.keeper@example.com",
+            "--name",
+            "Deleted Source Keeper",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(manual_payload)
+        assert manual_payload is not None
+        manual_entity_id = int(manual_payload["entity_id"])
+
+        exit_code, assign_payload, _, _ = self.run_cli(
+            "assign-entity",
+            str(self.root),
+            "--doc-id",
+            str(one_row["id"]),
+            "--role",
+            "custodian",
+            "--entity-id",
+            str(manual_entity_id),
+            "--reason",
+            "manual keeper",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(assign_payload)
+
+        exit_code, recipient_list_payload, _, _ = self.run_cli(
+            "list-entities",
+            str(self.root),
+            "--query",
+            "delete.recipient@example.com",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(recipient_list_payload)
+        assert recipient_list_payload is not None
+        recipient_entity_id = next(
+            int(entity["id"])
+            for entity in recipient_list_payload["entities"]
+            if entity["primary_email"] == "delete.recipient@example.com"
+        )
+        exit_code, unassign_payload, _, _ = self.run_cli(
+            "unassign-entity",
+            str(self.root),
+            "--doc-id",
+            str(one_row["id"]),
+            "--role",
+            "recipient",
+            "--entity-id",
+            str(recipient_entity_id),
+            "--reason",
+            "preserve override while deleting source",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(unassign_payload)
+        self.assertGreaterEqual(unassign_payload["overrides_created"], 1)
+
+        exit_code, block_a_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--display-name",
+            "Delete Block A",
+            "--email",
+            "delete.block.a@example.com",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(block_a_payload)
+        exit_code, block_b_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--display-name",
+            "Delete Block B",
+            "--email",
+            "delete.block.b@example.com",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(block_b_payload)
+        block_a_id = int(block_a_payload["entity_id"])
+        block_b_id = int(block_b_payload["entity_id"])
+        exit_code, block_payload, _, _ = self.run_cli(
+            "block-entity-merge",
+            str(self.root),
+            str(block_a_id),
+            str(block_b_id),
+            "--reason",
+            "preserve block while deleting source",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(block_payload)
+        self.assertTrue(block_payload["created"])
+
+        exit_code, delete_payload, _, _ = self.run_cli(
+            "delete-dataset",
+            str(self.root),
+            "--dataset-id",
+            str(dataset_id),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(delete_payload)
+        assert delete_payload is not None
+        self.assertEqual(
+            sorted(delete_payload["documents_without_dataset_memberships"]),
+            sorted([one_row["id"], two_row["id"]]),
+        )
+        self.assertEqual(retriever_tools.search(self.root, "", None, None, None, 1, 20)["total_hits"], 0)
+
+        exit_code, rebuild_payload, _, _ = self.run_cli("rebuild-entities", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(rebuild_payload)
+        assert rebuild_payload is not None
+        self.assertEqual(rebuild_payload["status"], "ok")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            remaining_source_auto_links = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM document_entities
+                    WHERE assignment_mode = 'auto'
+                      AND document_id IN (?, ?)
+                    """,
+                    (one_row["id"], two_row["id"]),
+                ).fetchone()[0]
+                or 0
+            )
+            remaining_source_resolution_keys = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entity_resolution_keys
+                    WHERE key_type = 'email'
+                      AND normalized_value IN ('delete.person@example.com', 'delete.recipient@example.com')
+                    """
+                ).fetchone()[0]
+                or 0
+            )
+            remaining_source_auto_identifiers = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entity_identifiers
+                    WHERE source_kind = 'auto'
+                      AND identifier_type = 'email'
+                      AND normalized_value IN ('delete.person@example.com', 'delete.recipient@example.com')
+                    """
+                ).fetchone()[0]
+                or 0
+            )
+            manual_identifier_row = connection.execute(
+                """
+                SELECT *
+                FROM entity_identifiers
+                WHERE entity_id = ?
+                  AND identifier_type = 'email'
+                  AND normalized_value = 'deleted.keeper@example.com'
+                  AND source_kind = 'manual'
+                """,
+                (manual_entity_id,),
+            ).fetchone()
+            manual_assignment_row = connection.execute(
+                """
+                SELECT *
+                FROM document_entities
+                WHERE document_id = ?
+                  AND entity_id = ?
+                  AND role = 'custodian'
+                  AND assignment_mode = 'manual'
+                """,
+                (one_row["id"], manual_entity_id),
+            ).fetchone()
+            override_row = connection.execute(
+                """
+                SELECT *
+                FROM entity_overrides
+                WHERE scope_type = 'document'
+                  AND scope_id = ?
+                  AND role = 'recipient'
+                  AND override_effect = 'remove'
+                """,
+                (one_row["id"],),
+            ).fetchone()
+            merge_block_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entity_merge_blocks
+                    WHERE left_entity_id = MIN(?, ?)
+                      AND right_entity_id = MAX(?, ?)
+                    """,
+                    (block_a_id, block_b_id, block_a_id, block_b_id),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(remaining_source_auto_links, 0)
+        self.assertEqual(remaining_source_resolution_keys, 0)
+        self.assertEqual(remaining_source_auto_identifiers, 0)
+        self.assertIsNotNone(manual_identifier_row)
+        self.assertIsNotNone(manual_assignment_row)
+        self.assertIsNotNone(override_row)
+        self.assertEqual(merge_block_count, 1)
+        self.assertIsNone(self.fetch_document_row("delete-one.eml")["author"])
+        self.assertIsNone(self.fetch_document_row("delete-two.eml")["author"])
+        self.assertEqual(self.fetch_document_row("delete-one.eml")["custodians"], ["Deleted Source Keeper <deleted.keeper@example.com>"])
+
+        exit_code, source_entity_payload, _, _ = self.run_cli(
+            "list-entities",
+            str(self.root),
+            "--query",
+            "delete.person@example.com",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(source_entity_payload)
+        self.assertEqual(source_entity_payload["entities"], [])
 
     def test_bootstrap_initializes_processing_schema_and_job_crud(self) -> None:
         result = retriever_tools.bootstrap(self.root)
@@ -6147,6 +7447,217 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         search_result = retriever_tools.search(self.root, "sync", None, None, None, 1, 20)
         self.assertEqual(search_result["results"][0]["id"], day_row["id"])
 
+    def test_slack_user_external_id_hints_follow_dataset_policy_on_rebuild(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "First Slack identity clue",
+                        "user": "U04SERGEY1",
+                        "user_profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                        "ts": "1671235434.237949",
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (channel_dir / "2022-12-17.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Second Slack identity clue",
+                        "user": "U04SERGEY1",
+                        "user_profile": {
+                            "real_name": "Sergey D.",
+                            "display_name": "SD",
+                        },
+                        "ts": "1671321834.237949",
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["slack_documents_created"], 2)
+
+        day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        self.assertEqual(day_one_row["participants"], "Sergey Demyanov")
+        self.assertEqual(day_two_row["participants"], "Sergey D")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            participant_rows = connection.execute(
+                """
+                SELECT d.rel_path, de.entity_id, e.display_name, e.entity_origin
+                FROM document_entities de
+                JOIN documents d ON d.id = de.document_id
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.role = 'participant'
+                  AND d.id IN (?, ?)
+                ORDER BY d.rel_path ASC
+                """,
+                (day_one_row["id"], day_two_row["id"]),
+            ).fetchall()
+            hint_row = connection.execute(
+                """
+                SELECT entity_hints_json
+                FROM document_occurrences
+                WHERE document_id = ?
+                """,
+                (day_one_row["id"],),
+            ).fetchone()
+            external_identifier_rows = connection.execute(
+                """
+                SELECT entity_id, identifier_name, identifier_scope, normalized_value
+                FROM entity_identifiers
+                WHERE identifier_type = 'external_id'
+                  AND identifier_name = 'slack_user_id'
+                  AND identifier_scope = 'data/slack'
+                  AND normalized_value = 'u04sergey1'
+                ORDER BY entity_id ASC
+                """
+            ).fetchall()
+            external_key_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM entity_resolution_keys
+                WHERE key_type = 'external_id'
+                  AND identifier_name = 'slack_user_id'
+                  AND identifier_scope = 'data/slack'
+                  AND normalized_value = 'u04sergey1'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(participant_rows), 2)
+        self.assertNotEqual(participant_rows[0]["entity_id"], participant_rows[1]["entity_id"])
+        self.assertEqual({row["entity_origin"] for row in participant_rows}, {retriever_tools.ENTITY_ORIGIN_OBSERVED})
+        self.assertIsNotNone(hint_row)
+        hint_payload = json.loads(hint_row["entity_hints_json"])
+        self.assertEqual(
+            hint_payload["participants"][0]["identifiers"][0]["identifier_name"],
+            "slack_user_id",
+        )
+        self.assertEqual(
+            hint_payload["participants"][0]["identifiers"][0]["identifier_scope"],
+            "data/slack",
+        )
+        self.assertEqual(len(external_identifier_rows), 2)
+        self.assertEqual(int(external_key_count["row_count"] or 0), 0)
+
+        exit_code, set_payload, _, _ = self.run_cli(
+            "set-dataset-policy",
+            str(self.root),
+            "--dataset-id",
+            str(day_one_row["dataset_id"]),
+            "--external-id-auto-merge-name",
+            "slack_user_id",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(set_payload)
+        self.assertEqual(set_payload["merge_policy"]["external_id_auto_merge_names"], ["slack_user_id"])
+
+        exit_code, rebuild_payload, _, _ = self.run_cli("rebuild-entities", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(rebuild_payload)
+        self.assertEqual(rebuild_payload["documents_synced"], 2)
+
+        rebuilt_day_one = self.fetch_document_by_id(day_one_row["id"])
+        rebuilt_day_two = self.fetch_document_by_id(day_two_row["id"])
+        self.assertEqual(rebuilt_day_one["participants"], "Sergey Demyanov")
+        self.assertEqual(rebuilt_day_two["participants"], "Sergey Demyanov")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            rebuilt_participant_rows = connection.execute(
+                """
+                SELECT d.rel_path, de.entity_id, e.display_name, e.entity_origin
+                FROM document_entities de
+                JOIN documents d ON d.id = de.document_id
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.role = 'participant'
+                  AND d.id IN (?, ?)
+                ORDER BY d.rel_path ASC
+                """,
+                (day_one_row["id"], day_two_row["id"]),
+            ).fetchall()
+            rebuilt_external_key_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM entity_resolution_keys
+                WHERE key_type = 'external_id'
+                  AND identifier_name = 'slack_user_id'
+                  AND identifier_scope = 'data/slack'
+                  AND normalized_value = 'u04sergey1'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(rebuilt_participant_rows), 2)
+        self.assertEqual(
+            {row["entity_id"] for row in rebuilt_participant_rows},
+            {rebuilt_participant_rows[0]["entity_id"]},
+        )
+        self.assertEqual(
+            {row["entity_origin"] for row in rebuilt_participant_rows},
+            {retriever_tools.ENTITY_ORIGIN_IDENTIFIED},
+        )
+        self.assertEqual(int(rebuilt_external_key_count["row_count"] or 0), 1)
+
     def test_ingest_creates_slack_reply_thread_child_documents(self) -> None:
         export_root = self.root / "data" / "slack"
         export_root.mkdir(parents=True)
@@ -9943,6 +11454,106 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachment_result = next(item for item in attachment_search["results"] if item["id"] == child_row["id"])
         self.assertEqual(attachment_result["parent"]["control_number"], parent_row["control_number"])
 
+    def test_ingest_mbox_applies_archive_basename_custodian_rules(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Email basename custodian",
+                    body_text="Email basename custodian body",
+                    message_id="<mbox-custodian-email@example.com>",
+                )
+            ],
+            name="jane@example.com.mbox",
+        )
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Generic basename custodian",
+                    body_text="Generic basename custodian body",
+                    message_id="<mbox-custodian-generic@example.com>",
+                )
+            ],
+            name="noreply@example.com.mbox",
+        )
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Name basename custodian",
+                    body_text="Name basename custodian body",
+                    message_id="<mbox-custodian-name@example.com>",
+                )
+            ],
+            name="Jane Doe Mailbox.mbox",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["mbox_messages_created"], 3)
+
+        email_rel_path = retriever_tools.mbox_message_rel_path(
+            "jane@example.com.mbox",
+            "<mbox-custodian-email@example.com>",
+        )
+        generic_rel_path = retriever_tools.mbox_message_rel_path(
+            "noreply@example.com.mbox",
+            "<mbox-custodian-generic@example.com>",
+        )
+        name_rel_path = retriever_tools.mbox_message_rel_path(
+            "Jane Doe Mailbox.mbox",
+            "<mbox-custodian-name@example.com>",
+        )
+        email_row = self.fetch_document_row(email_rel_path)
+        generic_row = self.fetch_document_row(generic_rel_path)
+        name_row = self.fetch_document_row(name_rel_path)
+
+        self.assertEqual(email_row["custodian"], "jane@example.com")
+        self.assertIsNone(generic_row["custodian"])
+        self.assertEqual(name_row["custodian"], "Jane Doe")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            custodian_rows = connection.execute(
+                """
+                SELECT d.rel_path, e.entity_type, e.primary_email, e.display_name, e.entity_origin
+                FROM document_entities de
+                JOIN documents d ON d.id = de.document_id
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.role = 'custodian'
+                  AND d.id IN (?, ?, ?)
+                ORDER BY d.rel_path ASC
+                """,
+                (email_row["id"], generic_row["id"], name_row["id"]),
+            ).fetchall()
+            name_resolution_key_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM entity_resolution_keys
+                WHERE key_type = 'name' AND normalized_value = 'jane doe'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        custodian_entities_by_path = {row["rel_path"]: row for row in custodian_rows}
+        self.assertEqual(set(custodian_entities_by_path), {email_rel_path, name_rel_path})
+        self.assertEqual(
+            custodian_entities_by_path[email_rel_path]["entity_type"],
+            retriever_tools.ENTITY_TYPE_PERSON,
+        )
+        self.assertEqual(custodian_entities_by_path[email_rel_path]["primary_email"], "jane@example.com")
+        self.assertEqual(
+            custodian_entities_by_path[name_rel_path]["entity_type"],
+            retriever_tools.ENTITY_TYPE_PERSON,
+        )
+        self.assertEqual(custodian_entities_by_path[name_rel_path]["display_name"], "Jane Doe")
+        self.assertEqual(
+            custodian_entities_by_path[name_rel_path]["entity_origin"],
+            retriever_tools.ENTITY_ORIGIN_OBSERVED,
+        )
+        self.assertEqual(int(name_resolution_key_count["row_count"] or 0), 0)
+
     def test_ingest_mbox_fixture_file_is_searchable(self) -> None:
         fixture_source = REGRESSION_CORPUS_ROOT / "sample_utf8.mbox"
         fixture_target = self.root / fixture_source.name
@@ -10719,6 +12330,77 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachment_result = next(item for item in attachment_search["results"] if item["id"] == child_row["id"])
         self.assertEqual(attachment_result["parent"]["control_number"], parent_row["control_number"])
 
+    def test_ingest_pst_classifies_archive_basename_custodians_without_generic_mailbox_assignment(self) -> None:
+        self.write_fake_pst_file(name="Acme Corp.pst")
+        self.write_fake_pst_file(name="support@example.com.pst")
+        messages_by_name = {
+            "Acme Corp.pst": [
+                self.build_fake_pst_message(
+                    source_item_id="pst-org-custodian-001",
+                    subject="Organization custodian",
+                    body_text="Organization custodian body",
+                )
+            ],
+            "support@example.com.pst": [
+                self.build_fake_pst_message(
+                    source_item_id="pst-shared-custodian-001",
+                    subject="Shared mailbox basename",
+                    body_text="Shared mailbox basename body",
+                )
+            ],
+        }
+
+        def fake_iter_pst_messages(path: Path):
+            return iter(messages_by_name[path.name])
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", side_effect=fake_iter_pst_messages):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 2)
+
+        organization_rel_path = retriever_tools.pst_message_rel_path("Acme Corp.pst", "pst-org-custodian-001")
+        shared_rel_path = retriever_tools.pst_message_rel_path(
+            "support@example.com.pst",
+            "pst-shared-custodian-001",
+        )
+        organization_row = self.fetch_document_row(organization_rel_path)
+        shared_row = self.fetch_document_row(shared_rel_path)
+
+        self.assertEqual(organization_row["custodian"], "Acme Corp")
+        self.assertIsNone(shared_row["custodian"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            organization_entity_row = connection.execute(
+                """
+                SELECT e.entity_type, e.display_name, e.primary_email, e.entity_origin
+                FROM document_entities de
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.document_id = ? AND de.role = 'custodian'
+                """,
+                (organization_row["id"],),
+            ).fetchone()
+            shared_custodian_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM document_entities
+                WHERE document_id = ? AND role = 'custodian'
+                """,
+                (shared_row["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(organization_entity_row)
+        assert organization_entity_row is not None
+        self.assertEqual(organization_entity_row["entity_type"], retriever_tools.ENTITY_TYPE_ORGANIZATION)
+        self.assertEqual(organization_entity_row["display_name"], "Acme Corp")
+        self.assertIsNone(organization_entity_row["primary_email"])
+        self.assertEqual(organization_entity_row["entity_origin"], retriever_tools.ENTITY_ORIGIN_OBSERVED)
+        self.assertEqual(int(shared_custodian_count["row_count"] or 0), 0)
+
     def test_ingest_pst_export_sidecars_augment_messages_and_stay_out_of_filesystem_docs(self) -> None:
         (self.root / "Exchange").mkdir(parents=True, exist_ok=True)
         self.write_fake_pst_file(name="Exchange/mailbox.pst")
@@ -10836,6 +12518,204 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertEqual(sidecar_count, 0)
         self.assertGreaterEqual(chunk_count, 1)
+
+    def test_pst_export_location_external_id_hints_follow_dataset_policy_on_rebuild(self) -> None:
+        (self.root / "Exchange").mkdir(parents=True, exist_ok=True)
+        self.write_fake_pst_file(name="Exchange/mailbox.pst")
+        shared_location = "PST Location, Primary, location-guid-123"
+        self.write_csv_rows(
+            self.root / "Results.csv",
+            fieldnames=[
+                "Item Identity",
+                "Document ID",
+                "Target Path",
+                "Location",
+                "Location Name",
+                "Subject or Title",
+            ],
+            rows=[
+                {
+                    "Item Identity": "pst-location-001",
+                    "Document ID": "101",
+                    "Target Path": r"Exchange\mailbox.pst\Top of Information Store\Inbox\Location One",
+                    "Location": shared_location,
+                    "Location Name": "Alpha Owner One",
+                    "Subject or Title": "Location One",
+                },
+                {
+                    "Item Identity": "pst-location-002",
+                    "Document ID": "102",
+                    "Target Path": r"Exchange\mailbox.pst\Top of Information Store\Inbox\Location Two",
+                    "Location": shared_location,
+                    "Location Name": "Alpha Owner Alias",
+                    "Subject or Title": "Location Two",
+                },
+            ],
+        )
+        self.write_csv_rows(
+            self.root / "Export Summary 05.24.2024-1357PM.csv",
+            fieldnames=["Export Name", "Value"],
+            rows=[{"Export Name": "Example Export", "Value": "done"}],
+        )
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-location-001",
+                subject="Location One",
+                body_text="First location body",
+                folder_path="Top of Information Store/Inbox",
+                author=None,
+                recipients=None,
+            ),
+            self.build_fake_pst_message(
+                source_item_id="pst-location-002",
+                subject="Location Two",
+                body_text="Second location body",
+                folder_path="Top of Information Store/Inbox",
+                author=None,
+                recipients=None,
+            ),
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 2)
+
+        first_row = self.fetch_document_row(
+            retriever_tools.pst_message_rel_path("Exchange/mailbox.pst", "pst-location-001")
+        )
+        second_row = self.fetch_document_row(
+            retriever_tools.pst_message_rel_path("Exchange/mailbox.pst", "pst-location-002")
+        )
+        self.assertEqual(first_row["custodian"], "Alpha Owner One")
+        self.assertEqual(second_row["custodian"], "Alpha Owner Alias")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            custodian_rows = connection.execute(
+                """
+                SELECT d.rel_path, de.entity_id, e.display_name, e.entity_origin
+                FROM document_entities de
+                JOIN documents d ON d.id = de.document_id
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.role = 'custodian'
+                  AND d.id IN (?, ?)
+                ORDER BY d.rel_path ASC
+                """,
+                (first_row["id"], second_row["id"]),
+            ).fetchall()
+            hint_row = connection.execute(
+                """
+                SELECT entity_hints_json
+                FROM document_occurrences
+                WHERE document_id = ?
+                """,
+                (first_row["id"],),
+            ).fetchone()
+            location_identifier_rows = connection.execute(
+                """
+                SELECT entity_id, identifier_name, identifier_scope, normalized_value
+                FROM entity_identifiers
+                WHERE identifier_type = 'external_id'
+                  AND identifier_name = 'pst_location'
+                  AND identifier_scope = 'exchange/mailbox.pst'
+                  AND normalized_value = 'pst location primary location-guid-123'
+                ORDER BY entity_id ASC
+                """
+            ).fetchall()
+            location_key_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM entity_resolution_keys
+                WHERE key_type = 'external_id'
+                  AND identifier_name = 'pst_location'
+                  AND identifier_scope = 'exchange/mailbox.pst'
+                  AND normalized_value = 'pst location primary location-guid-123'
+                """
+            ).fetchone()
+            document_id_identifier_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM entity_identifiers
+                WHERE identifier_type = 'external_id'
+                  AND identifier_name IN ('document_id', 'item_identity', 'export_item_id')
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(custodian_rows), 2)
+        self.assertNotEqual(custodian_rows[0]["entity_id"], custodian_rows[1]["entity_id"])
+        self.assertEqual({row["entity_origin"] for row in custodian_rows}, {retriever_tools.ENTITY_ORIGIN_OBSERVED})
+        self.assertIsNotNone(hint_row)
+        hint_payload = json.loads(hint_row["entity_hints_json"])
+        self.assertEqual(hint_payload["custodian"][0]["identifiers"][0]["identifier_name"], "pst_location")
+        self.assertEqual(hint_payload["custodian"][0]["identifiers"][0]["identifier_scope"], "exchange/mailbox.pst")
+        self.assertEqual(len(location_identifier_rows), 2)
+        self.assertEqual(int(location_key_count["row_count"] or 0), 0)
+        self.assertEqual(int(document_id_identifier_count["row_count"] or 0), 0)
+
+        exit_code, set_payload, _, _ = self.run_cli(
+            "set-dataset-policy",
+            str(self.root),
+            "--dataset-id",
+            str(first_row["dataset_id"]),
+            "--external-id-auto-merge-name",
+            "pst_location",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(set_payload)
+        self.assertEqual(set_payload["merge_policy"]["external_id_auto_merge_names"], ["pst_location"])
+
+        exit_code, rebuild_payload, _, _ = self.run_cli("rebuild-entities", str(self.root))
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(rebuild_payload)
+        self.assertEqual(rebuild_payload["documents_synced"], 2)
+
+        rebuilt_first = self.fetch_document_by_id(first_row["id"])
+        rebuilt_second = self.fetch_document_by_id(second_row["id"])
+        self.assertEqual(rebuilt_first["custodian"], "Alpha Owner One")
+        self.assertEqual(rebuilt_second["custodian"], "Alpha Owner One")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            rebuilt_custodian_rows = connection.execute(
+                """
+                SELECT d.rel_path, de.entity_id, e.display_name, e.entity_origin
+                FROM document_entities de
+                JOIN documents d ON d.id = de.document_id
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.role = 'custodian'
+                  AND d.id IN (?, ?)
+                ORDER BY d.rel_path ASC
+                """,
+                (first_row["id"], second_row["id"]),
+            ).fetchall()
+            rebuilt_location_key_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM entity_resolution_keys
+                WHERE key_type = 'external_id'
+                  AND identifier_name = 'pst_location'
+                  AND identifier_scope = 'exchange/mailbox.pst'
+                  AND normalized_value = 'pst location primary location-guid-123'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(rebuilt_custodian_rows), 2)
+        self.assertEqual(
+            {row["entity_id"] for row in rebuilt_custodian_rows},
+            {rebuilt_custodian_rows[0]["entity_id"]},
+        )
+        self.assertEqual(
+            {row["entity_origin"] for row in rebuilt_custodian_rows},
+            {retriever_tools.ENTITY_ORIGIN_IDENTIFIED},
+        )
+        self.assertEqual(int(rebuilt_location_key_count["row_count"] or 0), 1)
 
     def test_changed_pst_export_results_sidecar_reingests_unchanged_pst_source(self) -> None:
         (self.root / "Exchange").mkdir(parents=True, exist_ok=True)

@@ -74,7 +74,7 @@ except Exception:  # pragma: no cover - platform-specific locking
 
 
 TOOL_VERSION = "1.0.3"
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/tools.py"
@@ -575,6 +575,20 @@ VIRTUAL_FILTER_FIELD_TYPES = {
     "dataset_name": "text",
     "is_attachment": "boolean",
     "has_attachments": "boolean",
+    "participant": "text",
+    "recipient": "text",
+    "raw_author": "text",
+    "raw_custodian": "text",
+    "raw_participant": "text",
+    "raw_participants": "text",
+    "raw_recipient": "text",
+    "raw_recipients": "text",
+    "author_entity_id": "integer",
+    "custodian_entity_id": "integer",
+    "participant_entity_id": "integer",
+    "participants_entity_id": "integer",
+    "recipient_entity_id": "integer",
+    "recipients_entity_id": "integer",
     "production_name": "text",
 }
 DISPLAYABLE_VIRTUAL_FIELDS = {
@@ -960,6 +974,7 @@ SCHEMA_STATEMENTS = [
       extracted_doc_modified_at TEXT,
       extracted_content_type TEXT,
       extracted_kind TEXT,
+      entity_hints_json TEXT NOT NULL DEFAULT '{}',
       text_status TEXT NOT NULL DEFAULT 'ok',
       lifecycle_status TEXT NOT NULL DEFAULT 'active',
       has_preview INTEGER NOT NULL DEFAULT 0,
@@ -2776,7 +2791,17 @@ def infer_source_custodian(
     normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
     normalized_source_rel_path = normalize_whitespace(str(source_rel_path or ""))
     if normalized_source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and normalized_source_rel_path:
-        return normalize_whitespace(Path(normalized_source_rel_path).stem)
+        basename = normalize_whitespace(Path(normalized_source_rel_path).stem)
+        if not basename:
+            return None
+        basename_email = normalize_entity_email(basename)
+        if basename_email:
+            entity_type = entity_type_from_candidate_parts(name_value=None, email_value=basename_email)
+            if entity_type in {ENTITY_TYPE_SHARED_MAILBOX, ENTITY_TYPE_SYSTEM_MAILBOX}:
+                return None
+            return basename_email
+        stripped = normalize_whitespace(strip_entity_container_words(basename))
+        return stripped or None
     return None
 
 
@@ -3456,6 +3481,7 @@ def list_dataset_summaries(connection: sqlite3.Connection, root: Path | None = N
                 "time_range_end": time_range_end,
                 "source_binding_count": len(source_bindings),
                 "source_bindings": source_bindings,
+                "merge_policy": dataset_merge_policy_payload_from_row(row),
             }
         )
     return summaries
@@ -4253,10 +4279,15 @@ def split_entity_like_values(raw_value: object, *, prefer_single_comma_name: boo
     return [text]
 
 
+ENTITY_LABELED_EXTERNAL_ID_PATTERN = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9 _/-]{1,40})\s*[:=#]\s*([A-Za-z0-9][A-Za-z0-9_.:/-]{2,80})"
+)
+
+
 def parse_labeled_external_ids(value: object) -> list[dict[str, object]]:
     text = normalize_entity_text(value)
     identifiers: list[dict[str, object]] = []
-    for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9 _/-]{1,40})\s*[:=#]\s*([A-Za-z0-9][A-Za-z0-9_.:/-]{2,80})", text):
+    for match in ENTITY_LABELED_EXTERNAL_ID_PATTERN.finditer(text):
         identifier_name = normalize_entity_identifier_name(match.group(1))
         normalized_value = normalize_entity_lookup_text(match.group(2))
         if not identifier_name or not normalized_value:
@@ -4270,6 +4301,15 @@ def parse_labeled_external_ids(value: object) -> list[dict[str, object]]:
             }
         )
     return identifiers
+
+
+def strip_labeled_external_ids(value: object) -> str:
+    text = normalize_entity_text(value)
+    if not text:
+        return ""
+    stripped = ENTITY_LABELED_EXTERNAL_ID_PATTERN.sub(" ", text)
+    stripped = re.sub(r"\s*[\[\](){}]\s*", " ", stripped)
+    return normalize_entity_text(stripped)
 
 
 def parse_entity_candidate_text(
@@ -4311,6 +4351,7 @@ def parse_entity_candidate_text(
     phone = normalize_entity_phone(text)
     if phone:
         name_source = normalize_whitespace(str(name_source).replace(str(phone["display_value"]), " "))
+    name_source = strip_labeled_external_ids(name_source)
     identifiers: list[dict[str, object]] = []
     for email in emails:
         identifiers.append(
@@ -4382,6 +4423,178 @@ def parse_entity_candidate_text(
     }
 
 
+def normalize_entity_hint_identifier(
+    raw_identifier: object,
+    *,
+    default_source_kind: object = None,
+) -> dict[str, object] | None:
+    if not isinstance(raw_identifier, dict):
+        return None
+    identifier_type = normalize_entity_identifier_name(
+        raw_identifier.get("identifier_type") or raw_identifier.get("type") or ""
+    )
+    if identifier_type != "external_id":
+        return None
+    identifier_name = normalize_entity_identifier_name(
+        raw_identifier.get("identifier_name") or raw_identifier.get("name") or ""
+    )
+    display_value = normalize_entity_text(
+        raw_identifier.get("display_value")
+        or raw_identifier.get("value")
+        or raw_identifier.get("normalized_value")
+        or ""
+    )
+    normalized_value = normalize_entity_lookup_text(raw_identifier.get("normalized_value") or display_value)
+    if not identifier_name or not normalized_value:
+        return None
+    identifier: dict[str, object] = {
+        "identifier_type": "external_id",
+        "display_value": display_value or normalized_value,
+        "normalized_value": normalized_value,
+        "identifier_name": identifier_name,
+        "is_verified": 1 if int(raw_identifier.get("is_verified") or 0) else 0,
+    }
+    identifier_scope = normalize_entity_lookup_text(
+        raw_identifier.get("identifier_scope") or raw_identifier.get("scope") or ""
+    )
+    if identifier_scope:
+        identifier["identifier_scope"] = identifier_scope
+    source_kind = normalize_entity_identifier_name(raw_identifier.get("source_kind") or default_source_kind or "")
+    if source_kind:
+        identifier["source_kind"] = source_kind
+    return identifier
+
+
+def parse_entity_hint_candidates(
+    raw_hints: object,
+    *,
+    role: str,
+) -> list[dict[str, object]]:
+    if not isinstance(raw_hints, list):
+        return []
+    candidates: list[dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for raw_hint in raw_hints:
+        if not isinstance(raw_hint, dict):
+            continue
+        display_value = normalize_entity_text(
+            raw_hint.get("display_value")
+            or raw_hint.get("name")
+            or raw_hint.get("value")
+            or ""
+        )
+        if not display_value:
+            continue
+        base_candidate = parse_entity_candidate_text(display_value, role=role)
+        identifiers = list(base_candidate.get("identifiers") or []) if base_candidate is not None else []
+        seen_identifier_keys = {
+            entity_candidate_identifier_key(identifier)
+            for identifier in identifiers
+        }
+        for raw_identifier in list(raw_hint.get("identifiers") or []):
+            identifier = normalize_entity_hint_identifier(
+                raw_identifier,
+                default_source_kind=raw_hint.get("source_kind"),
+            )
+            if identifier is None:
+                continue
+            identifier_key = entity_candidate_identifier_key(identifier)
+            if identifier_key in seen_identifier_keys:
+                continue
+            seen_identifier_keys.add(identifier_key)
+            identifiers.append(identifier)
+        if not identifiers:
+            continue
+        parsed_name_identifiers = [identifier for identifier in identifiers if identifier.get("identifier_type") == "name"]
+        email_identifiers = [identifier for identifier in identifiers if identifier.get("identifier_type") == "email"]
+        entity_type = (
+            str(base_candidate.get("entity_type"))
+            if base_candidate is not None
+            else entity_type_from_candidate_parts(
+                name_value=str(parsed_name_identifiers[0]["display_value"]) if parsed_name_identifiers else display_value,
+                email_value=str(email_identifiers[0]["normalized_value"]) if email_identifiers else None,
+                name_is_full=bool(parsed_name_identifiers and parsed_name_identifiers[0].get("normalized_full_name")),
+            )
+        )
+        display_basis = str(base_candidate.get("display_value")) if base_candidate is not None else display_value
+        candidate = {
+            "role": role,
+            "raw_value": display_value,
+            "display_value": display_basis,
+            "entity_type": entity_type,
+            "identifiers": identifiers,
+            "normalized_candidate_key": entity_candidate_key(role, identifiers, display_value),
+        }
+        key = str(candidate["normalized_candidate_key"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        candidates.append(candidate)
+    return candidates
+
+
+def entity_candidate_match_keys(candidate: dict[str, object]) -> set[str]:
+    keys = {
+        normalize_entity_lookup_text(candidate.get("display_value") or ""),
+        normalize_entity_lookup_text(candidate.get("raw_value") or ""),
+    }
+    for identifier in list(candidate.get("identifiers") or []):
+        if not isinstance(identifier, dict):
+            continue
+        if identifier.get("identifier_type") != "name":
+            continue
+        for field_name in ("display_value", "normalized_value", "normalized_full_name", "normalized_sort_name"):
+            key = normalize_entity_lookup_text(identifier.get(field_name) or "")
+            if key:
+                keys.add(key)
+    return {key for key in keys if key}
+
+
+def entity_hints_for_role(raw_hints: object, role: str) -> list[dict[str, object]]:
+    if isinstance(raw_hints, str):
+        try:
+            raw_hints = json.loads(raw_hints)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    if not isinstance(raw_hints, dict):
+        return []
+    role_keys = [role]
+    if role == "participant":
+        role_keys.append("participants")
+    elif role == "recipient":
+        role_keys.append("recipients")
+    elif role == "custodian":
+        role_keys.append("custodians")
+    for role_key in role_keys:
+        value = raw_hints.get(role_key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def parse_entity_candidates_with_hints(
+    raw_value: object,
+    *,
+    role: str,
+    raw_hints: object = None,
+) -> list[dict[str, object]]:
+    hint_candidates = parse_entity_hint_candidates(entity_hints_for_role(raw_hints, role), role=role)
+    covered_keys: set[str] = set()
+    for candidate in hint_candidates:
+        covered_keys.update(entity_candidate_match_keys(candidate))
+    candidates = list(hint_candidates)
+    seen_keys = {str(candidate["normalized_candidate_key"]) for candidate in candidates}
+    for candidate in parse_entity_candidates(raw_value, role=role):
+        if entity_candidate_match_keys(candidate) & covered_keys:
+            continue
+        key = str(candidate["normalized_candidate_key"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        candidates.append(candidate)
+    return candidates
+
+
 def parse_entity_candidates(
     raw_value: object,
     *,
@@ -4428,6 +4641,28 @@ def source_backed_dataset_policy_from_row(row: sqlite3.Row | None) -> dict[str, 
             for name in [normalize_entity_identifier_name(raw_name)]
             if name
         },
+    }
+
+
+def dataset_merge_policy_payload_from_row(row: sqlite3.Row) -> dict[str, object]:
+    source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
+    names = sorted(
+        {
+            name
+            for raw_name in normalize_string_list(row["external_id_auto_merge_names_json"])
+            for name in [normalize_entity_identifier_name(raw_name)]
+            if name
+        }
+    )
+    return {
+        "dataset_id": int(row["id"]),
+        "source_backed": source_kind != MANUAL_DATASET_SOURCE_KIND,
+        "allow_auto_merge": bool(int(row["allow_auto_merge"] or 0)),
+        "email_auto_merge": bool(int(row["email_auto_merge"] or 0)),
+        "handle_auto_merge": bool(int(row["handle_auto_merge"] or 0)),
+        "phone_auto_merge": bool(int(row["phone_auto_merge"] or 0)),
+        "name_auto_merge": bool(int(row["name_auto_merge"] or 0)),
+        "external_id_auto_merge_names": names,
     }
 
 
@@ -4913,6 +5148,43 @@ def entity_candidate_is_globally_ignored(connection: sqlite3.Connection, candida
     return row is not None
 
 
+def document_entity_override_for_candidate(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    role: str,
+    source_entity_id: int,
+    candidate: dict[str, object],
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM entity_overrides
+        WHERE scope_type = 'document'
+          AND scope_id = ?
+          AND (role IS NULL OR role = ?)
+          AND (
+            source_entity_id = ?
+            OR normalized_candidate_key = ?
+            OR (
+              source_entity_id IS NULL
+              AND normalized_candidate_key IS NULL
+              AND source_hint = ?
+            )
+          )
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            int(document_id),
+            role,
+            int(source_entity_id),
+            candidate.get("normalized_candidate_key"),
+            candidate.get("raw_value"),
+        ),
+    ).fetchone()
+
+
 def sync_document_entities(
     connection: sqlite3.Connection,
     document_id: int,
@@ -4930,6 +5202,10 @@ def sync_document_entities(
     ordinals_by_role: dict[str, int] = defaultdict(int)
     for occurrence_row in occurrence_rows_in_preferred_order(active_rows):
         dataset_source_row = dataset_source_row_for_occurrence(connection, occurrence_row)
+        if dataset_source_row is None:
+            dataset_source_row = dataset_source_row_for_document_membership(connection, document_id)
+        if dataset_source_row is None:
+            continue
         policy = source_backed_dataset_policy_for_source(connection, dataset_source_row)
         role_values = (
             ("author", occurrence_row["extracted_author"]),
@@ -4937,11 +5213,40 @@ def sync_document_entities(
             ("recipient", occurrence_row["extracted_recipients"]),
             ("custodian", occurrence_row["custodian"]),
         )
+        raw_entity_hints = occurrence_row["entity_hints_json"] if "entity_hints_json" in occurrence_row.keys() else None
         for role, raw_value in role_values:
-            for candidate in parse_entity_candidates(raw_value, role=role):
+            for candidate in parse_entity_candidates_with_hints(raw_value, role=role, raw_hints=raw_entity_hints):
                 if entity_candidate_is_globally_ignored(connection, candidate):
                     continue
                 entity_id = resolve_entity_candidate(connection, candidate, policy=policy)
+                override_row = document_entity_override_for_candidate(
+                    connection,
+                    document_id=document_id,
+                    role=role,
+                    source_entity_id=entity_id,
+                    candidate=candidate,
+                )
+                if override_row is not None:
+                    if override_row["override_effect"] == "remove":
+                        continue
+                    if override_row["override_effect"] == "replace":
+                        replacement_entity_id = override_row["replacement_entity_id"]
+                        if replacement_entity_id is None:
+                            continue
+                        canonical_replacement_id = canonicalize_entity_id(connection, int(replacement_entity_id))
+                        if canonical_replacement_id is None:
+                            continue
+                        replacement_row = connection.execute(
+                            """
+                            SELECT canonical_status
+                            FROM entities
+                            WHERE id = ?
+                            """,
+                            (canonical_replacement_id,),
+                        ).fetchone()
+                        if replacement_row is None or replacement_row["canonical_status"] != ENTITY_STATUS_ACTIVE:
+                            continue
+                        entity_id = canonical_replacement_id
                 role_entity_key = (role, entity_id)
                 if role_entity_key in seen_role_entities:
                     continue
@@ -5176,6 +5481,24 @@ def dataset_source_row_for_occurrence(
         source_rel_path=occurrence_row["source_rel_path"],
         production_id=occurrence_row["production_id"],
     )
+
+
+def dataset_source_row_for_document_membership(
+    connection: sqlite3.Connection,
+    document_id: int,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT ds.*
+        FROM dataset_documents dd
+        JOIN dataset_sources ds ON ds.id = dd.dataset_source_id
+        WHERE dd.document_id = ?
+          AND dd.dataset_source_id IS NOT NULL
+        ORDER BY dd.dataset_id ASC, dd.dataset_source_id ASC
+        LIMIT 1
+        """,
+        (int(document_id),),
+    ).fetchone()
 
 
 def refresh_source_backed_dataset_memberships_for_document(connection: sqlite3.Connection, document_id: int) -> None:
@@ -5523,6 +5846,12 @@ def upsert_document_occurrence(
         production_id=production_id,
     )
     dataset_source_id = int(dataset_source_row["id"]) if dataset_source_row is not None else None
+    raw_entity_hints = extracted.get("entity_hints")
+    entity_hints_json = json.dumps(
+        raw_entity_hints if isinstance(raw_entity_hints, dict) else {},
+        ensure_ascii=True,
+        sort_keys=True,
+    )
     occurrence_values = (
         document_id,
         dataset_source_id,
@@ -5559,6 +5888,7 @@ def upsert_document_occurrence(
             file_type=file_type,
             source_kind=source_kind,
         ),
+        entity_hints_json,
         text_status,
         ACTIVE_OCCURRENCE_STATUS,
         1 if has_preview else 0,
@@ -5574,9 +5904,9 @@ def upsert_document_occurrence(
               source_folder_path, production_id, begin_bates, end_bates, begin_attachment, end_attachment,
               rel_path, file_name, file_type, mime_type, file_size, file_hash, custodian, fs_created_at, fs_modified_at,
               extracted_author, extracted_title, extracted_subject, extracted_participants, extracted_recipients,
-              extracted_doc_authored_at, extracted_doc_modified_at, extracted_content_type, extracted_kind, text_status,
+              extracted_doc_authored_at, extracted_doc_modified_at, extracted_content_type, extracted_kind, entity_hints_json, text_status,
               lifecycle_status, has_preview, ingested_at, last_seen_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             occurrence_values,
         )
@@ -5591,7 +5921,7 @@ def upsert_document_occurrence(
             file_size = ?, file_hash = ?, custodian = ?, fs_created_at = ?, fs_modified_at = ?, extracted_author = ?,
             extracted_title = ?, extracted_subject = ?, extracted_participants = ?, extracted_recipients = ?,
             extracted_doc_authored_at = ?, extracted_doc_modified_at = ?, extracted_content_type = ?, extracted_kind = ?,
-            text_status = ?, lifecycle_status = ?, has_preview = ?, ingested_at = ?, last_seen_at = ?, updated_at = ?
+            entity_hints_json = ?, text_status = ?, lifecycle_status = ?, has_preview = ?, ingested_at = ?, last_seen_at = ?, updated_at = ?
         WHERE id = ?
         """,
         (*occurrence_values, existing_occurrence_id),
@@ -8427,6 +8757,8 @@ def resolve_slack_user_info(
         resolved["speaker_name"] = user_id
     if user_id and not resolved.get("mention_name"):
         resolved["mention_name"] = user_id
+    if user_id:
+        resolved["slack_user_id"] = user_id
     return resolved
 
 
@@ -11871,11 +12203,37 @@ def parse_slack_int(value: object) -> int:
         return 0
 
 
+def slack_actor_entity_hint(
+    actor_info: dict[str, str | None],
+    *,
+    identifier_scope: str | None,
+) -> dict[str, object] | None:
+    slack_user_id = normalize_whitespace(str(actor_info.get("slack_user_id") or ""))
+    speaker_name = normalize_entity_text(actor_info.get("speaker_name") or "")
+    if not slack_user_id or not speaker_name:
+        return None
+    identifier: dict[str, object] = {
+        "identifier_type": "external_id",
+        "identifier_name": "slack_user_id",
+        "display_value": slack_user_id,
+        "normalized_value": normalize_entity_lookup_text(slack_user_id),
+        "is_verified": 1,
+    }
+    normalized_scope = normalize_entity_lookup_text(identifier_scope or "")
+    if normalized_scope:
+        identifier["identifier_scope"] = normalized_scope
+    return {
+        "display_value": speaker_name,
+        "identifiers": [identifier],
+    }
+
+
 def load_slack_day_messages(
     day_file: Path,
     *,
     rel_path: str,
     user_directory: dict[str, dict[str, str | None]],
+    entity_identifier_scope: str | None = None,
 ) -> list[dict[str, object]]:
     try:
         raw_value = json.loads(day_file.read_text(encoding="utf-8"))
@@ -11899,6 +12257,10 @@ def load_slack_day_messages(
             continue
         actor_info = slack_message_actor_info(item, user_directory)
         speaker = actor_info.get("speaker_name") or "Slack message"
+        entity_hint = slack_actor_entity_hint(
+            actor_info,
+            identifier_scope=entity_identifier_scope,
+        )
         timestamp = normalize_slack_timestamp(ts_raw)
         thread_ts_raw = choose_slack_text(item.get("thread_ts"))
         is_reply = bool(thread_ts_raw and thread_ts_raw != ts_raw)
@@ -11918,6 +12280,7 @@ def load_slack_day_messages(
                 "day_rel_path": rel_path,
                 "day_file_name": day_file.name,
                 "ordinal": ordinal,
+                "entity_hint": entity_hint,
             }
         )
     return sorted(
@@ -11932,6 +12295,8 @@ def load_slack_day_messages(
 def build_slack_transcript_components(messages: list[dict[str, object]]) -> dict[str, object]:
     participants: list[str] = []
     seen_participants: set[str] = set()
+    participant_entity_hints: list[dict[str, object]] = []
+    seen_participant_hint_keys: set[str] = set()
     transcript_lines: list[str] = []
     chat_entries: list[dict[str, object]] = []
     first_timestamp: str | None = None
@@ -11944,6 +12309,23 @@ def build_slack_transcript_components(messages: list[dict[str, object]]) -> dict
         if normalized_speaker not in seen_participants:
             seen_participants.add(normalized_speaker)
             participants.append(speaker)
+        entity_hint = message.get("entity_hint")
+        if isinstance(entity_hint, dict):
+            hint_key = normalize_entity_lookup_text(entity_hint.get("display_value") or "")
+            for identifier in list(entity_hint.get("identifiers") or []):
+                if isinstance(identifier, dict) and identifier.get("identifier_type") == "external_id":
+                    hint_key = "|".join(
+                        [
+                            "external_id",
+                            normalize_entity_lookup_text(identifier.get("identifier_name") or ""),
+                            normalize_entity_lookup_text(identifier.get("identifier_scope") or ""),
+                            normalize_entity_lookup_text(identifier.get("normalized_value") or identifier.get("display_value") or ""),
+                        ]
+                    )
+                    break
+            if hint_key and hint_key not in seen_participant_hint_keys:
+                seen_participant_hint_keys.add(hint_key)
+                participant_entity_hints.append(entity_hint)
         body = normalize_whitespace(str(message.get("body") or ""))
         timestamp = normalize_whitespace(str(message.get("timestamp") or "")) or None
         if timestamp:
@@ -11973,6 +12355,7 @@ def build_slack_transcript_components(messages: list[dict[str, object]]) -> dict
         "date_modified": last_timestamp if last_timestamp and last_timestamp != first_timestamp else None,
         "message_count": len(chat_entries),
         "timestamped_message_count": timestamped_message_count,
+        "entity_hints": {"participants": participant_entity_hints} if participant_entity_hints else {},
     }
 
 
@@ -12004,7 +12387,7 @@ def build_slack_chat_payload(
         "message_count": components["message_count"],
         "timestamped_message_count": components["timestamped_message_count"],
     }
-    return build_chat_extracted_payload(
+    payload = build_chat_extracted_payload(
         title=title,
         author=None,
         date_created=components["date_created"],
@@ -12015,6 +12398,9 @@ def build_slack_chat_payload(
         chat_metadata=chat_metadata,
         chat_entries=list(components["chat_entries"]),
     )
+    if components.get("entity_hints"):
+        payload["entity_hints"] = components["entity_hints"]
+    return payload
 
 
 def build_slack_day_record(
@@ -12023,6 +12409,7 @@ def build_slack_day_record(
     rel_path: str,
     conversation_meta: dict[str, str],
     user_directory: dict[str, dict[str, str | None]],
+    entity_identifier_scope: str | None = None,
 ) -> dict[str, object]:
     return {
         "day_file": day_file,
@@ -12036,6 +12423,7 @@ def build_slack_day_record(
             day_file,
             rel_path=rel_path,
             user_directory=user_directory,
+            entity_identifier_scope=entity_identifier_scope,
         ),
     }
 
@@ -12190,6 +12578,7 @@ def plan_slack_export_conversations(
                 rel_path=rel_path,
                 conversation_meta=conversation_meta,
                 user_directory=user_directory,
+                entity_identifier_scope=rel_root,
             )
         )
 
@@ -13627,6 +14016,66 @@ def pst_export_sidecar_custodian_candidate(message_metadata: dict[str, object] |
     return None
 
 
+def pst_export_custodian_entity_hint(
+    message_metadata: dict[str, object] | None,
+    *,
+    identifier_scope: str | None = None,
+) -> dict[str, object] | None:
+    custodian = pst_export_sidecar_custodian_candidate(message_metadata)
+    location = pst_export_normalized_text(dict(message_metadata or {}).get("location"))
+    if not custodian or not location:
+        return None
+    if normalize_entity_lookup_text(custodian) == normalize_entity_lookup_text(location):
+        return None
+    identifier: dict[str, object] = {
+        "identifier_type": "external_id",
+        "identifier_name": "pst_location",
+        "display_value": location,
+        "normalized_value": normalize_entity_lookup_text(location),
+        "is_verified": 1,
+    }
+    normalized_scope = normalize_entity_lookup_text(identifier_scope or "")
+    if normalized_scope:
+        identifier["identifier_scope"] = normalized_scope
+    return {
+        "display_value": custodian,
+        "identifiers": [identifier],
+    }
+
+
+def merge_entity_hint_payload(
+    existing_hints: object,
+    *,
+    role: str,
+    hint: dict[str, object] | None,
+) -> dict[str, object]:
+    hints = dict(existing_hints) if isinstance(existing_hints, dict) else {}
+    if hint is None:
+        return hints
+    role_hints = [
+        item
+        for item in list(hints.get(role) or [])
+        if isinstance(item, dict)
+    ]
+    hint_key = normalize_entity_lookup_text(hint.get("display_value") or "")
+    for identifier in list(hint.get("identifiers") or []):
+        if isinstance(identifier, dict):
+            hint_key = entity_candidate_identifier_key(identifier)
+            break
+    if hint_key:
+        for item in role_hints:
+            item_key = normalize_entity_lookup_text(item.get("display_value") or "")
+            for identifier in list(item.get("identifiers") or []):
+                if isinstance(identifier, dict):
+                    item_key = entity_candidate_identifier_key(identifier)
+                    break
+            if item_key == hint_key:
+                return hints
+    role_hints.append(hint)
+    hints[role] = role_hints
+    return hints
+
+
 def select_pst_export_message_metadata(
     normalized_message: dict[str, object],
     *,
@@ -13719,6 +14168,7 @@ def apply_pst_export_message_metadata(
     extracted: dict[str, object],
     *,
     message_metadata: dict[str, object] | None,
+    identifier_scope: str | None = None,
 ) -> dict[str, object]:
     if not message_metadata:
         return dict(extracted)
@@ -13742,6 +14192,16 @@ def apply_pst_export_message_metadata(
     current_custodian = normalize_whitespace(str(enriched.get("custodian") or ""))
     if custodian_candidate and (not current_custodian or ("@" in custodian_candidate and "@" not in current_custodian)):
         enriched["custodian"] = custodian_candidate
+    custodian_entity_hint = pst_export_custodian_entity_hint(
+        message_metadata,
+        identifier_scope=identifier_scope,
+    )
+    if custodian_entity_hint is not None:
+        enriched["entity_hints"] = merge_entity_hint_payload(
+            enriched.get("entity_hints"),
+            role="custodian",
+            hint=custodian_entity_hint,
+        )
     if normalize_whitespace(str(enriched.get("content_type") or "")).lower() == "email":
         email_threading = dict(enriched.get("email_threading") or {})
         if not normalize_email_message_id(email_threading.get("message_id")):
@@ -19789,6 +20249,7 @@ def ingest_pst_source(
         enriched["extracted"] = apply_pst_export_message_metadata(
             dict(normalized["extracted"]),
             message_metadata=message_metadata,
+            identifier_scope=source_rel_path_for_message,
         )
         enriched["file_hash"] = pst_export_enriched_message_file_hash(
             normalized.get("file_hash"),
@@ -22214,6 +22675,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "document_occurrences", "extracted_doc_modified_at TEXT")
     ensure_column(connection, "document_occurrences", "extracted_content_type TEXT")
     ensure_column(connection, "document_occurrences", "extracted_kind TEXT")
+    ensure_column(connection, "document_occurrences", "entity_hints_json TEXT NOT NULL DEFAULT '{}'")
     ensure_column(connection, "document_email_threading", "message_id TEXT")
     ensure_column(connection, "document_email_threading", "in_reply_to TEXT")
     ensure_column(connection, "document_email_threading", "references_json TEXT NOT NULL DEFAULT '[]'")
@@ -31445,6 +31907,1718 @@ def show_entity(root: Path, entity_id: int, *, document_limit: int = 25) -> dict
         connection.close()
 
 
+def entity_payload_by_id(connection: sqlite3.Connection, entity_id: int) -> dict[str, object]:
+    row = connection.execute(
+        """
+        SELECT e.*,
+               COUNT(DISTINCT de.document_id) AS document_count,
+               GROUP_CONCAT(DISTINCT de.role) AS roles
+        FROM entities e
+        LEFT JOIN document_entities de ON de.entity_id = e.id
+        WHERE e.id = ?
+        GROUP BY e.id
+        """,
+        (int(entity_id),),
+    ).fetchone()
+    if row is None:
+        raise RetrieverError(f"Unknown entity id: {entity_id}")
+    identifiers = entity_identifiers_by_entity_id(connection, [int(entity_id)]).get(int(entity_id), [])
+    return {
+        "entity": serialize_entity_summary(row, identifiers),
+        "identifiers": identifiers,
+    }
+
+
+def active_entity_row(connection: sqlite3.Connection, entity_id: int) -> sqlite3.Row:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM entities
+        WHERE id = ?
+        """,
+        (int(entity_id),),
+    ).fetchone()
+    if row is None:
+        raise RetrieverError(f"Unknown entity id: {entity_id}")
+    if row["canonical_status"] != ENTITY_STATUS_ACTIVE:
+        raise RetrieverError(f"Entity {entity_id} is not active; status is {row['canonical_status']}.")
+    return row
+
+
+def normalize_entity_type_arg(raw_entity_type: object) -> str:
+    normalized = normalize_entity_lookup_text(raw_entity_type).replace("-", "_").replace(" ", "_")
+    aliases = {
+        "shared": ENTITY_TYPE_SHARED_MAILBOX,
+        "shared_mailbox": ENTITY_TYPE_SHARED_MAILBOX,
+        "system": ENTITY_TYPE_SYSTEM_MAILBOX,
+        "system_mailbox": ENTITY_TYPE_SYSTEM_MAILBOX,
+        "mailbox": ENTITY_TYPE_SHARED_MAILBOX,
+    }
+    entity_type = aliases.get(normalized, normalized)
+    if entity_type not in ENTITY_TYPES:
+        raise RetrieverError(
+            f"Unsupported entity type: {raw_entity_type}. Supported types: {', '.join(sorted(ENTITY_TYPES))}."
+        )
+    return entity_type
+
+
+def parse_manual_handle_identifier_arg(raw_value: object) -> dict[str, object]:
+    parts = [part.strip() for part in str(raw_value or "").split(":", 2)]
+    if len(parts) != 3:
+        raise RetrieverError("Handle identifiers must use provider:scope:handle, e.g. slack:workspace:@jane.")
+    provider = normalize_entity_identifier_name(parts[0])
+    provider_scope = normalize_entity_lookup_text(parts[1])
+    handle = normalize_entity_handle(parts[2])
+    if not provider or not provider_scope or not handle:
+        raise RetrieverError("Handle identifiers require non-empty provider, scope, and handle values.")
+    return {
+        "identifier_type": "handle",
+        "display_value": parts[2],
+        "normalized_value": handle,
+        "provider": provider,
+        "provider_scope": provider_scope,
+        "source_kind": "manual",
+    }
+
+
+def parse_manual_external_id_identifier_arg(raw_value: object) -> dict[str, object]:
+    parts = [part.strip() for part in str(raw_value or "").split(":", 2)]
+    if len(parts) == 2:
+        raw_name, raw_value_part = parts
+        raw_scope = None
+    elif len(parts) == 3:
+        raw_name, raw_scope, raw_value_part = parts
+    else:
+        raise RetrieverError("External identifiers must use name:value or name:scope:value.")
+    identifier_name = normalize_entity_identifier_name(raw_name)
+    identifier_scope = normalize_entity_lookup_text(raw_scope) if raw_scope else None
+    normalized_value = normalize_entity_lookup_text(raw_value_part)
+    if not identifier_name or not normalized_value:
+        raise RetrieverError("External identifiers require non-empty name and value fields.")
+    return {
+        "identifier_type": "external_id",
+        "display_value": raw_value_part,
+        "normalized_value": normalized_value,
+        "identifier_name": identifier_name,
+        "identifier_scope": identifier_scope,
+        "source_kind": "manual",
+    }
+
+
+def manual_entity_identifier_payloads(
+    *,
+    emails: list[str] | None = None,
+    phones: list[str] | None = None,
+    names: list[str] | None = None,
+    handles: list[str] | None = None,
+    external_ids: list[str] | None = None,
+) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for index, raw_email in enumerate(emails or []):
+        email = normalize_entity_email(raw_email)
+        if not email:
+            raise RetrieverError(f"Invalid entity email identifier: {raw_email}")
+        payloads.append(
+            {
+                "identifier_type": "email",
+                "display_value": email,
+                "normalized_value": email,
+                "is_primary": 1 if index == 0 else 0,
+                "is_verified": 1,
+                "source_kind": "manual",
+            }
+        )
+    for index, raw_phone in enumerate(phones or []):
+        phone = normalize_entity_phone(raw_phone)
+        if phone is None:
+            raise RetrieverError(f"Invalid entity phone identifier: {raw_phone}")
+        payloads.append(
+            {
+                "identifier_type": "phone",
+                "display_value": phone["display_value"],
+                "normalized_value": phone["normalized_value"],
+                "parsed_phone_json": json.dumps(phone["parsed_phone"], ensure_ascii=True, sort_keys=True),
+                "is_primary": 1 if index == 0 else 0,
+                "source_kind": "manual",
+            }
+        )
+    for index, raw_name in enumerate(names or []):
+        parsed_name = parse_entity_name(raw_name)
+        if parsed_name is None:
+            raise RetrieverError(f"Invalid entity name identifier: {raw_name}")
+        payloads.append(
+            {
+                "identifier_type": "name",
+                "display_value": parsed_name["display_value"],
+                "normalized_value": parsed_name["normalized_value"],
+                "parsed_name_json": json.dumps(parsed_name["parsed_name"], ensure_ascii=True, sort_keys=True),
+                "normalized_full_name": parsed_name["normalized_full_name"],
+                "normalized_sort_name": parsed_name["normalized_sort_name"],
+                "is_primary": 1 if index == 0 or parsed_name["is_full_name"] else 0,
+                "source_kind": "manual",
+            }
+        )
+    payloads.extend(parse_manual_handle_identifier_arg(raw_handle) for raw_handle in handles or [])
+    payloads.extend(parse_manual_external_id_identifier_arg(raw_external_id) for raw_external_id in external_ids or [])
+
+    deduped_payloads: list[dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for payload in payloads:
+        key = entity_candidate_identifier_key(payload)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped_payloads.append(payload)
+    return deduped_payloads
+
+
+def manual_identifier_error_label(identifier: dict[str, object]) -> str:
+    identifier_type = str(identifier.get("identifier_type") or "identifier")
+    display_value = str(identifier.get("display_value") or identifier.get("normalized_value") or "")
+    if identifier_type == "external_id" and identifier.get("identifier_name"):
+        return f"{identifier.get('identifier_name')}:{display_value}"
+    if identifier_type == "handle" and identifier.get("provider") and identifier.get("provider_scope"):
+        return f"{identifier.get('provider')}:{identifier.get('provider_scope')}:{display_value}"
+    return f"{identifier_type}:{display_value}"
+
+
+def assert_manual_resolution_identifiers_available(
+    connection: sqlite3.Connection,
+    identifiers: list[dict[str, object]],
+    *,
+    entity_id: int | None = None,
+) -> None:
+    for identifier in identifiers:
+        if identifier.get("identifier_type") not in {"email", "handle", "external_id"}:
+            continue
+        owner_entity_id = active_entity_id_for_resolution_key(connection, identifier)
+        if owner_entity_id is not None and (entity_id is None or owner_entity_id != int(entity_id)):
+            raise RetrieverError(
+                f"Identifier {manual_identifier_error_label(identifier)!r} already resolves to entity {owner_entity_id}."
+            )
+
+
+def ensure_manual_entity_identifiers(
+    connection: sqlite3.Connection,
+    *,
+    entity_id: int,
+    identifiers: list[dict[str, object]],
+) -> dict[str, object]:
+    identifier_ids: list[int] = []
+    created_count = 0
+    existing_count = 0
+    for identifier in identifiers:
+        before_count = int(connection.execute("SELECT COUNT(*) FROM entity_identifiers").fetchone()[0] or 0)
+        identifier_id = ensure_entity_identifier(connection, entity_id=int(entity_id), identifier=identifier)
+        after_count = int(connection.execute("SELECT COUNT(*) FROM entity_identifiers").fetchone()[0] or 0)
+        identifier_ids.append(identifier_id)
+        if after_count > before_count:
+            created_count += 1
+        else:
+            existing_count += 1
+    return {
+        "identifier_ids": identifier_ids,
+        "created_identifier_count": created_count,
+        "existing_identifier_count": existing_count,
+    }
+
+
+def create_entity(
+    root: Path,
+    *,
+    entity_type: str = ENTITY_TYPE_PERSON,
+    display_name: str | None = None,
+    notes: str | None = None,
+    emails: list[str] | None = None,
+    phones: list[str] | None = None,
+    names: list[str] | None = None,
+    handles: list[str] | None = None,
+    external_ids: list[str] | None = None,
+) -> dict[str, object]:
+    normalized_entity_type = normalize_entity_type_arg(entity_type)
+    normalized_display_name = normalize_whitespace(str(display_name or "")) or None
+    normalized_notes = normalize_whitespace(str(notes or "")) or None
+    identifiers = manual_entity_identifier_payloads(
+        emails=emails,
+        phones=phones,
+        names=names,
+        handles=handles,
+        external_ids=external_ids,
+    )
+    if normalized_display_name is None and not identifiers:
+        raise RetrieverError("create-entity requires --display-name or at least one identifier.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="create-entity"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            connection.execute("BEGIN")
+            try:
+                assert_manual_resolution_identifiers_available(connection, identifiers)
+                connection.execute(
+                    """
+                    INSERT INTO entities (
+                      entity_type, display_name, notes, display_name_source, entity_origin,
+                      canonical_status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_entity_type,
+                        normalized_display_name,
+                        normalized_notes,
+                        ENTITY_DISPLAY_SOURCE_MANUAL if normalized_display_name else ENTITY_DISPLAY_SOURCE_AUTO,
+                        ENTITY_ORIGIN_MANUAL,
+                        ENTITY_STATUS_ACTIVE,
+                        utc_now(),
+                        utc_now(),
+                    ),
+                )
+                entity_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+                identifier_counts = ensure_manual_entity_identifiers(
+                    connection,
+                    entity_id=entity_id,
+                    identifiers=identifiers,
+                )
+                created_resolution_keys = ensure_manual_email_resolution_keys(connection, entity_id)
+                recompute_entity_caches(connection, entity_id)
+                payload = entity_payload_by_id(connection, entity_id)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return {
+                "status": "ok",
+                "created": True,
+                "entity_id": entity_id,
+                "created_resolution_keys": created_resolution_keys,
+                **identifier_counts,
+                **payload,
+            }
+        finally:
+            connection.close()
+
+
+def edit_entity(
+    root: Path,
+    entity_id: int,
+    *,
+    entity_type: str | None = None,
+    display_name: str | None = None,
+    clear_display_name: bool = False,
+    notes: str | None = None,
+    clear_notes: bool = False,
+    add_emails: list[str] | None = None,
+    add_phones: list[str] | None = None,
+    add_names: list[str] | None = None,
+    add_handles: list[str] | None = None,
+    add_external_ids: list[str] | None = None,
+) -> dict[str, object]:
+    if clear_display_name and display_name is not None:
+        raise RetrieverError("Use either --display-name or --clear-display-name, not both.")
+    if clear_notes and notes is not None:
+        raise RetrieverError("Use either --notes or --clear-notes, not both.")
+    normalized_entity_type = normalize_entity_type_arg(entity_type) if entity_type is not None else None
+    normalized_display_name = normalize_whitespace(str(display_name or "")) if display_name is not None else None
+    normalized_notes = normalize_whitespace(str(notes or "")) if notes is not None else None
+    identifiers = manual_entity_identifier_payloads(
+        emails=add_emails,
+        phones=add_phones,
+        names=add_names,
+        handles=add_handles,
+        external_ids=add_external_ids,
+    )
+    has_entity_update = (
+        normalized_entity_type is not None
+        or display_name is not None
+        or clear_display_name
+        or notes is not None
+        or clear_notes
+    )
+    if not has_entity_update and not identifiers:
+        raise RetrieverError("edit-entity requires an entity field change or at least one added identifier.")
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="edit-entity"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            active_entity_row(connection, entity_id)
+            affected_document_ids = [
+                int(row["document_id"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT document_id
+                    FROM document_entities
+                    WHERE entity_id = ?
+                    ORDER BY document_id ASC
+                    """,
+                    (int(entity_id),),
+                ).fetchall()
+            ]
+            connection.execute("BEGIN")
+            try:
+                assert_manual_resolution_identifiers_available(connection, identifiers, entity_id=int(entity_id))
+                update_values: dict[str, object] = {
+                    "entity_origin": ENTITY_ORIGIN_MANUAL,
+                    "updated_at": utc_now(),
+                }
+                if normalized_entity_type is not None:
+                    update_values["entity_type"] = normalized_entity_type
+                if display_name is not None:
+                    update_values["display_name"] = normalized_display_name or None
+                    update_values["display_name_source"] = ENTITY_DISPLAY_SOURCE_MANUAL
+                elif clear_display_name:
+                    update_values["display_name"] = None
+                    update_values["display_name_source"] = ENTITY_DISPLAY_SOURCE_AUTO
+                if notes is not None:
+                    update_values["notes"] = normalized_notes or None
+                elif clear_notes:
+                    update_values["notes"] = None
+                set_clause = ", ".join(f"{quote_identifier(column)} = ?" for column in update_values)
+                connection.execute(
+                    f"""
+                    UPDATE entities
+                    SET {set_clause}
+                    WHERE id = ?
+                    """,
+                    [*update_values.values(), int(entity_id)],
+                )
+                identifier_counts = ensure_manual_entity_identifiers(
+                    connection,
+                    entity_id=int(entity_id),
+                    identifiers=identifiers,
+                )
+                created_resolution_keys = ensure_manual_email_resolution_keys(connection, int(entity_id))
+                recompute_entity_caches(connection, int(entity_id))
+                refresh_documents_after_entity_graph_change(connection, affected_document_ids)
+                payload = entity_payload_by_id(connection, int(entity_id))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return {
+                "status": "ok",
+                "entity_id": int(entity_id),
+                "created_resolution_keys": created_resolution_keys,
+                "affected_document_ids": affected_document_ids,
+                **identifier_counts,
+                **payload,
+            }
+        finally:
+            connection.close()
+
+
+def entity_pair_key(left_entity_id: int, right_entity_id: int) -> tuple[int, int]:
+    left = int(left_entity_id)
+    right = int(right_entity_id)
+    if left == right:
+        raise RetrieverError("Entity pair requires two distinct entity ids.")
+    return (left, right) if left < right else (right, left)
+
+
+def entity_merge_block_exists(connection: sqlite3.Connection, left_entity_id: int, right_entity_id: int) -> bool:
+    left, right = entity_pair_key(left_entity_id, right_entity_id)
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM entity_merge_blocks
+        WHERE left_entity_id = ?
+          AND right_entity_id = ?
+        LIMIT 1
+        """,
+        (left, right),
+    ).fetchone()
+    return row is not None
+
+
+def block_entity_merge(
+    root: Path,
+    left_entity_id: int,
+    right_entity_id: int,
+    *,
+    reason: str | None = None,
+) -> dict[str, object]:
+    left, right = entity_pair_key(left_entity_id, right_entity_id)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        active_entity_row(connection, left)
+        active_entity_row(connection, right)
+        normalized_reason = normalize_whitespace(str(reason or "")) or None
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO entity_merge_blocks (
+                  left_entity_id, right_entity_id, reason, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (left, right, normalized_reason, utc_now()),
+            )
+            inserted = connection.execute("SELECT changes()").fetchone()[0]
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {
+            "status": "ok",
+            "left_entity_id": left,
+            "right_entity_id": right,
+            "created": bool(inserted),
+            "reason": normalized_reason,
+        }
+    finally:
+        connection.close()
+
+
+def entity_profile_from_summary(entity: dict[str, object], identifiers: list[dict[str, object]]) -> dict[str, object]:
+    emails = {
+        normalize_entity_email(identifier.get("normalized_value") or identifier.get("display_value"))
+        for identifier in identifiers
+        if identifier.get("identifier_type") == "email"
+    }
+    emails = {email for email in emails if email}
+    email_locals = {email.split("@", 1)[0] for email in emails}
+    email_domains = {email.split("@", 1)[1] for email in emails}
+    full_names = {
+        normalize_entity_lookup_text(identifier.get("normalized_full_name") or identifier.get("display_value"))
+        for identifier in identifiers
+        if identifier.get("identifier_type") == "name"
+    }
+    full_names = {name for name in full_names if name and len(name.split()) >= 2}
+    sort_names = {
+        normalize_entity_lookup_text(identifier.get("normalized_sort_name"))
+        for identifier in identifiers
+        if identifier.get("identifier_type") == "name"
+    }
+    sort_names = {name for name in sort_names if name}
+    phones = {
+        normalize_entity_lookup_text(identifier.get("normalized_value") or identifier.get("display_value"))
+        for identifier in identifiers
+        if identifier.get("identifier_type") == "phone"
+    }
+    phones = {phone for phone in phones if phone}
+    handles = {
+        (
+            normalize_entity_lookup_text(identifier.get("provider")),
+            normalize_entity_lookup_text(identifier.get("provider_scope")),
+            normalize_entity_lookup_text(identifier.get("normalized_value")),
+        )
+        for identifier in identifiers
+        if identifier.get("identifier_type") == "handle"
+    }
+    handles = {handle for handle in handles if handle[2]}
+    label = normalize_entity_lookup_text(entity.get("label"))
+    display_name = normalize_entity_lookup_text(entity.get("display_name"))
+    if display_name and len(display_name.split()) >= 2:
+        full_names.add(display_name)
+    if label and len(label.split()) >= 2 and "@" not in label:
+        full_names.add(label)
+    return {
+        "emails": emails,
+        "email_locals": email_locals,
+        "email_domains": email_domains,
+        "full_names": full_names,
+        "sort_names": sort_names,
+        "phones": phones,
+        "handles": handles,
+        "label": label,
+    }
+
+
+def name_initial_family_pairs(full_names: set[str]) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for name in full_names:
+        parts = name.split()
+        if len(parts) < 2:
+            continue
+        pairs.add((parts[-1], parts[0][:1]))
+    return pairs
+
+
+def entity_similarity_reasons(left_profile: dict[str, object], right_profile: dict[str, object]) -> list[dict[str, object]]:
+    reasons: list[dict[str, object]] = []
+    left_emails = set(left_profile["emails"])  # type: ignore[arg-type]
+    right_emails = set(right_profile["emails"])  # type: ignore[arg-type]
+    if left_emails & right_emails:
+        reasons.append({"kind": "exact_email", "score": 100, "value": sorted(left_emails & right_emails)[0]})
+    left_full_names = set(left_profile["full_names"])  # type: ignore[arg-type]
+    right_full_names = set(right_profile["full_names"])  # type: ignore[arg-type]
+    if left_full_names & right_full_names:
+        reasons.append({"kind": "exact_full_name", "score": 80, "value": sorted(left_full_names & right_full_names)[0]})
+    left_sort_names = set(left_profile["sort_names"])  # type: ignore[arg-type]
+    right_sort_names = set(right_profile["sort_names"])  # type: ignore[arg-type]
+    if left_sort_names & right_sort_names:
+        reasons.append({"kind": "exact_sort_name", "score": 80, "value": sorted(left_sort_names & right_sort_names)[0]})
+    left_phones = set(left_profile["phones"])  # type: ignore[arg-type]
+    right_phones = set(right_profile["phones"])  # type: ignore[arg-type]
+    if left_phones & right_phones:
+        reasons.append({"kind": "same_phone", "score": 70, "value": sorted(left_phones & right_phones)[0]})
+    left_handles = set(left_profile["handles"])  # type: ignore[arg-type]
+    right_handles = set(right_profile["handles"])  # type: ignore[arg-type]
+    shared_handles = left_handles & right_handles
+    if shared_handles:
+        handle = sorted(shared_handles)[0]
+        reasons.append({"kind": "same_handle", "score": 65, "value": handle[2]})
+    left_initial_pairs = name_initial_family_pairs(left_full_names)
+    right_initial_pairs = name_initial_family_pairs(right_full_names)
+    if left_initial_pairs & right_initial_pairs:
+        family, initial = sorted(left_initial_pairs & right_initial_pairs)[0]
+        reasons.append({"kind": "family_name_and_initial", "score": 45, "value": f"{family}, {initial}"})
+    left_email_locals = set(left_profile["email_locals"])  # type: ignore[arg-type]
+    right_email_locals = set(right_profile["email_locals"])  # type: ignore[arg-type]
+    if left_email_locals & right_email_locals:
+        reasons.append({"kind": "same_email_local_part", "score": 40, "value": sorted(left_email_locals & right_email_locals)[0]})
+    left_email_domains = set(left_profile["email_domains"])  # type: ignore[arg-type]
+    right_email_domains = set(right_profile["email_domains"])  # type: ignore[arg-type]
+    if left_email_domains & right_email_domains and (left_full_names & right_full_names or left_initial_pairs & right_initial_pairs):
+        reasons.append({"kind": "same_email_domain", "score": 20, "value": sorted(left_email_domains & right_email_domains)[0]})
+    return reasons
+
+
+def load_active_entity_summaries(
+    connection: sqlite3.Connection,
+    *,
+    query: str | None = None,
+    limit: int = 500,
+) -> tuple[list[dict[str, object]], dict[int, list[dict[str, object]]]]:
+    normalized_limit = max(1, min(int(limit or 500), 5000))
+    normalized_query = normalize_whitespace(str(query or "")).lower()
+    where_clauses = ["e.canonical_status = ?"]
+    params: list[object] = [ENTITY_STATUS_ACTIVE]
+    if normalized_query:
+        like_query = f"%{normalized_query}%"
+        where_clauses.append(
+            """
+            (
+              LOWER(COALESCE(e.display_name, '')) LIKE ?
+              OR LOWER(COALESCE(e.primary_email, '')) LIKE ?
+              OR LOWER(COALESCE(e.primary_phone, '')) LIKE ?
+              OR EXISTS (
+                SELECT 1
+                FROM entity_identifiers ei
+                WHERE ei.entity_id = e.id
+                  AND (
+                    LOWER(COALESCE(ei.display_value, '')) LIKE ?
+                    OR LOWER(COALESCE(ei.normalized_value, '')) LIKE ?
+                  )
+              )
+            )
+            """
+        )
+        params.extend([like_query, like_query, like_query, like_query, like_query])
+    rows = connection.execute(
+        f"""
+        SELECT e.*,
+               COUNT(DISTINCT de.document_id) AS document_count,
+               GROUP_CONCAT(DISTINCT de.role) AS roles
+        FROM entities e
+        LEFT JOIN document_entities de ON de.entity_id = e.id
+        WHERE {' AND '.join(where_clauses)}
+        GROUP BY e.id
+        ORDER BY document_count DESC,
+                 COALESCE(e.sort_name, e.display_name, e.primary_email, e.primary_phone, '') ASC,
+                 e.id ASC
+        LIMIT ?
+        """,
+        (*params, normalized_limit),
+    ).fetchall()
+    entity_ids = [int(row["id"]) for row in rows]
+    identifiers_by_entity = entity_identifiers_by_entity_id(connection, entity_ids)
+    return (
+        [serialize_entity_summary(row, identifiers_by_entity.get(int(row["id"]), [])) for row in rows],
+        identifiers_by_entity,
+    )
+
+
+def similar_entities(root: Path, entity_id: int, *, limit: int = 25) -> dict[str, object]:
+    normalized_limit = max(1, min(int(limit or 25), 200))
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        active_entity_row(connection, entity_id)
+        entities, identifiers_by_entity = load_active_entity_summaries(connection, limit=5000)
+        summaries_by_id = {int(entity["id"]): entity for entity in entities}
+        target = summaries_by_id.get(int(entity_id))
+        if target is None:
+            raise RetrieverError(f"Entity {entity_id} is not active.")
+        profiles = {
+            int(entity["id"]): entity_profile_from_summary(
+                entity,
+                identifiers_by_entity.get(int(entity["id"]), []),
+            )
+            for entity in entities
+        }
+        target_profile = profiles[int(entity_id)]
+        suggestions: list[dict[str, object]] = []
+        for candidate in entities:
+            candidate_id = int(candidate["id"])
+            if candidate_id == int(entity_id):
+                continue
+            if entity_merge_block_exists(connection, int(entity_id), candidate_id):
+                continue
+            reasons = entity_similarity_reasons(target_profile, profiles[candidate_id])
+            if not reasons:
+                continue
+            score = sum(int(reason["score"]) for reason in reasons)
+            suggestions.append(
+                {
+                    "entity": candidate,
+                    "score": score,
+                    "reasons": reasons,
+                }
+            )
+        suggestions.sort(
+            key=lambda item: (
+                -int(item["score"]),
+                -int(item["entity"]["document_count"]),  # type: ignore[index]
+                str(item["entity"]["label"]),  # type: ignore[index]
+                int(item["entity"]["id"]),  # type: ignore[index]
+            )
+        )
+        return {
+            "status": "ok",
+            "entity": target,
+            "suggestions": suggestions[:normalized_limit],
+            "limit": normalized_limit,
+        }
+    finally:
+        connection.close()
+
+
+def resolution_key_matches_row(connection: sqlite3.Connection, row: sqlite3.Row, *, exclude_id: int | None = None) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM entity_resolution_keys
+        WHERE key_type = ?
+          AND COALESCE(provider, '') = COALESCE(?, '')
+          AND COALESCE(provider_scope, '') = COALESCE(?, '')
+          AND COALESCE(identifier_name, '') = COALESCE(?, '')
+          AND COALESCE(identifier_scope, '') = COALESCE(?, '')
+          AND normalized_value = ?
+          AND (? IS NULL OR id != ?)
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (
+            row["key_type"],
+            row["provider"],
+            row["provider_scope"],
+            row["identifier_name"],
+            row["identifier_scope"],
+            row["normalized_value"],
+            exclude_id,
+            exclude_id,
+        ),
+    ).fetchone()
+
+
+def matching_survivor_identifier_id(
+    connection: sqlite3.Connection,
+    *,
+    survivor_entity_id: int,
+    identifier_row: sqlite3.Row,
+) -> int | None:
+    row = connection.execute(
+        """
+        SELECT id
+        FROM entity_identifiers
+        WHERE entity_id = ?
+          AND identifier_type = ?
+          AND normalized_value = ?
+          AND COALESCE(provider, '') = COALESCE(?, '')
+          AND COALESCE(provider_scope, '') = COALESCE(?, '')
+          AND COALESCE(identifier_name, '') = COALESCE(?, '')
+          AND COALESCE(identifier_scope, '') = COALESCE(?, '')
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (
+            survivor_entity_id,
+            identifier_row["identifier_type"],
+            identifier_row["normalized_value"],
+            identifier_row["provider"],
+            identifier_row["provider_scope"],
+            identifier_row["identifier_name"],
+            identifier_row["identifier_scope"],
+        ),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
+def identifier_payload_from_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "identifier_type": row["identifier_type"],
+        "display_value": row["display_value"],
+        "normalized_value": row["normalized_value"],
+        "provider": row["provider"],
+        "provider_scope": row["provider_scope"],
+        "identifier_name": row["identifier_name"],
+        "identifier_scope": row["identifier_scope"],
+        "parsed_name_json": row["parsed_name_json"],
+        "parsed_phone_json": row["parsed_phone_json"],
+        "normalized_full_name": row["normalized_full_name"],
+        "normalized_sort_name": row["normalized_sort_name"],
+        "is_primary": row["is_primary"],
+        "is_verified": row["is_verified"],
+        "source_kind": row["source_kind"],
+    }
+
+
+def move_loser_identifiers_to_survivor(
+    connection: sqlite3.Connection,
+    *,
+    loser_entity_id: int,
+    survivor_entity_id: int,
+) -> dict[str, int]:
+    moved_identifiers = 0
+    deduped_identifiers = 0
+    moved_resolution_keys = 0
+    deleted_resolution_keys = 0
+    identifier_rows = connection.execute(
+        """
+        SELECT *
+        FROM entity_identifiers
+        WHERE entity_id = ?
+        ORDER BY id ASC
+        """,
+        (loser_entity_id,),
+    ).fetchall()
+    for identifier_row in identifier_rows:
+        loser_identifier_id = int(identifier_row["id"])
+        target_identifier_id = matching_survivor_identifier_id(
+            connection,
+            survivor_entity_id=survivor_entity_id,
+            identifier_row=identifier_row,
+        )
+        if target_identifier_id is None:
+            connection.execute(
+                """
+                UPDATE entity_identifiers
+                SET entity_id = ?, source_kind = 'manual', updated_at = ?
+                WHERE id = ?
+                """,
+                (survivor_entity_id, utc_now(), loser_identifier_id),
+            )
+            target_identifier_id = loser_identifier_id
+            moved_identifiers += 1
+        else:
+            connection.execute(
+                """
+                UPDATE entity_identifiers
+                SET source_kind = 'manual', updated_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), target_identifier_id),
+            )
+            deduped_identifiers += 1
+
+        key_rows = connection.execute(
+            """
+            SELECT *
+            FROM entity_resolution_keys
+            WHERE identifier_id = ?
+            ORDER BY id ASC
+            """,
+            (loser_identifier_id,),
+        ).fetchall()
+        for key_row in key_rows:
+            existing_key = resolution_key_matches_row(connection, key_row, exclude_id=int(key_row["id"]))
+            if existing_key is not None:
+                connection.execute("DELETE FROM entity_resolution_keys WHERE id = ?", (int(key_row["id"]),))
+                deleted_resolution_keys += 1
+            else:
+                connection.execute(
+                    """
+                    UPDATE entity_resolution_keys
+                    SET entity_id = ?, identifier_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (survivor_entity_id, target_identifier_id, utc_now(), int(key_row["id"])),
+                )
+                moved_resolution_keys += 1
+
+        if target_identifier_id != loser_identifier_id:
+            connection.execute("DELETE FROM entity_identifiers WHERE id = ?", (loser_identifier_id,))
+
+    for key_row in connection.execute(
+        """
+        SELECT *
+        FROM entity_resolution_keys
+        WHERE entity_id = ?
+        ORDER BY id ASC
+        """,
+        (loser_entity_id,),
+    ).fetchall():
+        existing_key = resolution_key_matches_row(connection, key_row, exclude_id=int(key_row["id"]))
+        if existing_key is not None:
+            connection.execute("DELETE FROM entity_resolution_keys WHERE id = ?", (int(key_row["id"]),))
+            deleted_resolution_keys += 1
+        else:
+            connection.execute(
+                """
+                UPDATE entity_resolution_keys
+                SET entity_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (survivor_entity_id, utc_now(), int(key_row["id"])),
+            )
+            moved_resolution_keys += 1
+
+    connection.execute(
+        """
+        UPDATE entity_identifiers
+        SET source_kind = 'manual', updated_at = ?
+        WHERE entity_id = ?
+        """,
+        (utc_now(), survivor_entity_id),
+    )
+    return {
+        "moved_identifiers": moved_identifiers,
+        "deduped_identifiers": deduped_identifiers,
+        "moved_resolution_keys": moved_resolution_keys,
+        "deleted_resolution_keys": deleted_resolution_keys,
+    }
+
+
+def ensure_manual_email_resolution_keys(connection: sqlite3.Connection, entity_id: int) -> int:
+    created = 0
+    for identifier_row in connection.execute(
+        """
+        SELECT *
+        FROM entity_identifiers
+        WHERE entity_id = ?
+          AND identifier_type IN ('email', 'handle', 'external_id')
+        ORDER BY id ASC
+        """,
+        (entity_id,),
+    ).fetchall():
+        before = connection.execute("SELECT COUNT(*) FROM entity_resolution_keys").fetchone()[0]
+        ensure_entity_resolution_key(
+            connection,
+            entity_id=entity_id,
+            identifier_id=int(identifier_row["id"]),
+            identifier=identifier_payload_from_row(identifier_row),
+        )
+        after = connection.execute("SELECT COUNT(*) FROM entity_resolution_keys").fetchone()[0]
+        created += max(0, int(after or 0) - int(before or 0))
+    return created
+
+
+def refresh_documents_after_entity_graph_change(connection: sqlite3.Connection, document_ids: list[int]) -> None:
+    for document_id in sorted(set(int(item) for item in document_ids)):
+        rebuild_document_entity_caches(connection, document_id)
+        refresh_documents_fts_row(connection, document_id)
+
+
+def merge_entities(
+    root: Path,
+    source_entity_id: int,
+    target_entity_id: int,
+    *,
+    force: bool = False,
+    reason: str | None = None,
+) -> dict[str, object]:
+    loser_entity_id = int(source_entity_id)
+    survivor_entity_id = int(target_entity_id)
+    if loser_entity_id == survivor_entity_id:
+        raise RetrieverError("Cannot merge an entity into itself.")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="merge-entities"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            loser_row = active_entity_row(connection, loser_entity_id)
+            survivor_row = active_entity_row(connection, survivor_entity_id)
+            if entity_merge_block_exists(connection, loser_entity_id, survivor_entity_id) and not force:
+                raise RetrieverError("These entities have a merge block. Pass --force to merge anyway.")
+            affected_document_ids = [
+                int(row["document_id"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT document_id
+                    FROM document_entities
+                    WHERE entity_id IN (?, ?)
+                    ORDER BY document_id ASC
+                    """,
+                    (loser_entity_id, survivor_entity_id),
+                ).fetchall()
+            ]
+            connection.execute("BEGIN")
+            try:
+                identifier_counts = move_loser_identifiers_to_survivor(
+                    connection,
+                    loser_entity_id=loser_entity_id,
+                    survivor_entity_id=survivor_entity_id,
+                )
+                duplicate_link_count = counted_delete(
+                    connection,
+                    count_sql="""
+                        SELECT COUNT(*)
+                        FROM document_entities
+                        WHERE entity_id = ?
+                          AND EXISTS (
+                            SELECT 1
+                            FROM document_entities survivor_link
+                            WHERE survivor_link.document_id = document_entities.document_id
+                              AND survivor_link.role = document_entities.role
+                              AND survivor_link.entity_id = ?
+                          )
+                    """,
+                    delete_sql="""
+                        DELETE FROM document_entities
+                        WHERE entity_id = ?
+                          AND EXISTS (
+                            SELECT 1
+                            FROM document_entities survivor_link
+                            WHERE survivor_link.document_id = document_entities.document_id
+                              AND survivor_link.role = document_entities.role
+                              AND survivor_link.entity_id = ?
+                          )
+                    """,
+                    params=(loser_entity_id, survivor_entity_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE document_entities
+                    SET entity_id = ?, updated_at = ?
+                    WHERE entity_id = ?
+                    """,
+                    (survivor_entity_id, utc_now(), loser_entity_id),
+                )
+                moved_link_count = int(connection.execute("SELECT changes()").fetchone()[0] or 0)
+                connection.execute(
+                    """
+                    UPDATE entity_overrides
+                    SET replacement_entity_id = ?, updated_at = ?
+                    WHERE replacement_entity_id = ?
+                    """,
+                    (survivor_entity_id, utc_now(), loser_entity_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE entity_overrides
+                    SET source_entity_id = ?, updated_at = ?
+                    WHERE source_entity_id = ?
+                    """,
+                    (survivor_entity_id, utc_now(), loser_entity_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE entities
+                    SET entity_origin = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (ENTITY_ORIGIN_MANUAL, utc_now(), survivor_entity_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE entities
+                    SET canonical_status = ?, merged_into_entity_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (ENTITY_STATUS_MERGED, survivor_entity_id, utc_now(), loser_entity_id),
+                )
+                created_resolution_keys = ensure_manual_email_resolution_keys(connection, survivor_entity_id)
+                recompute_entity_caches(connection, survivor_entity_id)
+                refresh_documents_after_entity_graph_change(connection, affected_document_ids)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return {
+                "status": "ok",
+                "source_entity_id": loser_entity_id,
+                "target_entity_id": survivor_entity_id,
+                "source_label": entity_display_label_from_row(loser_row),
+                "target_label": entity_display_label_from_row(survivor_row),
+                "force": bool(force),
+                "reason": normalize_whitespace(str(reason or "")) or None,
+                "affected_document_ids": affected_document_ids,
+                "moved_document_links": moved_link_count,
+                "deduped_document_links": duplicate_link_count,
+                "created_resolution_keys": created_resolution_keys,
+                **identifier_counts,
+            }
+        finally:
+            connection.close()
+
+
+def ignore_override_keys_for_entity(connection: sqlite3.Connection, entity_id: int) -> list[dict[str, object]]:
+    keys: dict[tuple[str | None, str | None, str | None], dict[str, object]] = {}
+    rows = connection.execute(
+        """
+        SELECT role, evidence_json
+        FROM document_entities
+        WHERE entity_id = ?
+        ORDER BY id ASC
+        """,
+        (int(entity_id),),
+    ).fetchall()
+    for row in rows:
+        try:
+            evidence = json.loads(str(row["evidence_json"] or "{}"))
+        except json.JSONDecodeError:
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        role = str(row["role"] or "")
+        raw_value = normalize_whitespace(str(evidence.get("raw_value") or ""))
+        candidate_key = normalize_whitespace(str(evidence.get("normalized_candidate_key") or ""))
+        if candidate_key:
+            keys[(role, candidate_key, raw_value or None)] = {
+                "role": role,
+                "normalized_candidate_key": candidate_key,
+                "source_hint": raw_value or None,
+            }
+        if raw_value:
+            for candidate in parse_entity_candidates(raw_value, role=role):
+                parsed_key = normalize_whitespace(str(candidate.get("normalized_candidate_key") or ""))
+                if parsed_key:
+                    keys[(role, parsed_key, raw_value)] = {
+                        "role": role,
+                        "normalized_candidate_key": parsed_key,
+                        "source_hint": raw_value,
+                    }
+    return list(keys.values())
+
+
+def ignore_entity(root: Path, entity_id: int, *, reason: str | None = None) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="ignore-entity"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            entity_row = active_entity_row(connection, entity_id)
+            affected_document_ids = [
+                int(row["document_id"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT document_id
+                    FROM document_entities
+                    WHERE entity_id = ?
+                    ORDER BY document_id ASC
+                    """,
+                    (int(entity_id),),
+                ).fetchall()
+            ]
+            override_keys = ignore_override_keys_for_entity(connection, int(entity_id))
+            normalized_reason = normalize_whitespace(str(reason or "")) or None
+            connection.execute("BEGIN")
+            try:
+                for override in override_keys:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO entity_overrides (
+                          scope_type, scope_id, role, source_entity_id,
+                          normalized_candidate_key, replacement_entity_id,
+                          override_effect, source_hint, reason, created_at, updated_at
+                        ) VALUES ('global', NULL, ?, ?, ?, NULL, 'ignore', ?, ?, ?, ?)
+                        """,
+                        (
+                            override.get("role"),
+                            int(entity_id),
+                            override.get("normalized_candidate_key"),
+                            override.get("source_hint"),
+                            normalized_reason,
+                            utc_now(),
+                            utc_now(),
+                        ),
+                    )
+                resolution_keys_deleted = counted_delete(
+                    connection,
+                    count_sql="SELECT COUNT(*) FROM entity_resolution_keys WHERE entity_id = ?",
+                    delete_sql="DELETE FROM entity_resolution_keys WHERE entity_id = ?",
+                    params=(int(entity_id),),
+                )
+                document_links_deleted = counted_delete(
+                    connection,
+                    count_sql="SELECT COUNT(*) FROM document_entities WHERE entity_id = ?",
+                    delete_sql="DELETE FROM document_entities WHERE entity_id = ?",
+                    params=(int(entity_id),),
+                )
+                connection.execute(
+                    """
+                    UPDATE entities
+                    SET canonical_status = ?, merged_into_entity_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (ENTITY_STATUS_IGNORED, utc_now(), int(entity_id)),
+                )
+                refresh_documents_after_entity_graph_change(connection, affected_document_ids)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return {
+                "status": "ok",
+                "entity_id": int(entity_id),
+                "label": entity_display_label_from_row(entity_row),
+                "reason": normalized_reason,
+                "affected_document_ids": affected_document_ids,
+                "override_count": len(override_keys),
+                "document_links_deleted": document_links_deleted,
+                "resolution_keys_deleted": resolution_keys_deleted,
+            }
+        finally:
+            connection.close()
+
+
+def normalize_document_entity_role(raw_role: object) -> str:
+    normalized = normalize_entity_lookup_text(raw_role).replace(" ", "_")
+    aliases = {
+        "participants": "participant",
+        "recipients": "recipient",
+        "authors": "author",
+        "custodians": "custodian",
+    }
+    role = aliases.get(normalized, normalized)
+    if role not in DOCUMENT_ENTITY_ROLES:
+        raise RetrieverError(f"Unsupported entity role: {raw_role}. Supported roles: {', '.join(sorted(DOCUMENT_ENTITY_ROLES))}.")
+    return role
+
+
+def ensure_document_row(connection: sqlite3.Connection, document_id: int) -> sqlite3.Row:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE id = ?
+        """,
+        (int(document_id),),
+    ).fetchone()
+    if row is None:
+        raise RetrieverError(f"Unknown document id: {document_id}")
+    return row
+
+
+def next_document_entity_ordinal(connection: sqlite3.Connection, document_id: int, role: str) -> int:
+    row = connection.execute(
+        """
+        SELECT COALESCE(MAX(ordinal), -1) + 1 AS next_ordinal
+        FROM document_entities
+        WHERE document_id = ?
+          AND role = ?
+        """,
+        (int(document_id), role),
+    ).fetchone()
+    return int(row["next_ordinal"] or 0) if row is not None else 0
+
+
+def assign_entity(
+    root: Path,
+    *,
+    document_id: int,
+    role: str,
+    entity_id: int,
+    reason: str | None = None,
+) -> dict[str, object]:
+    normalized_role = normalize_document_entity_role(role)
+    normalized_reason = normalize_whitespace(str(reason or "")) or None
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="assign-entity"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            ensure_document_row(connection, document_id)
+            entity_row = active_entity_row(connection, entity_id)
+            connection.execute("BEGIN")
+            try:
+                existing_row = connection.execute(
+                    """
+                    SELECT *
+                    FROM document_entities
+                    WHERE document_id = ?
+                      AND role = ?
+                      AND entity_id = ?
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """,
+                    (int(document_id), normalized_role, int(entity_id)),
+                ).fetchone()
+                evidence = json.dumps(
+                    {"source": "manual_assignment", "reason": normalized_reason},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+                if existing_row is not None:
+                    connection.execute(
+                        """
+                        UPDATE document_entities
+                        SET assignment_mode = 'manual', evidence_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (evidence, utc_now(), int(existing_row["id"])),
+                    )
+                    created = False
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO document_entities (
+                          document_id, entity_id, role, ordinal, assignment_mode,
+                          observed_title, evidence_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'manual', NULL, ?, ?, ?)
+                        """,
+                        (
+                            int(document_id),
+                            int(entity_id),
+                            normalized_role,
+                            next_document_entity_ordinal(connection, int(document_id), normalized_role),
+                            evidence,
+                            utc_now(),
+                            utc_now(),
+                        ),
+                    )
+                    created = True
+                refresh_documents_after_entity_graph_change(connection, [int(document_id)])
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return {
+                "status": "ok",
+                "document_id": int(document_id),
+                "role": normalized_role,
+                "entity_id": int(entity_id),
+                "label": entity_display_label_from_row(entity_row),
+                "created": created,
+                "reason": normalized_reason,
+            }
+        finally:
+            connection.close()
+
+
+def document_override_from_link(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    role: str,
+    source_entity_id: int,
+    override_effect: str,
+    replacement_entity_id: int | None = None,
+    evidence_json: object = None,
+    reason: str | None = None,
+) -> int:
+    evidence: dict[str, object] = {}
+    if isinstance(evidence_json, str):
+        try:
+            parsed = json.loads(evidence_json or "{}")
+            if isinstance(parsed, dict):
+                evidence = parsed
+        except json.JSONDecodeError:
+            evidence = {}
+    elif isinstance(evidence_json, dict):
+        evidence = evidence_json
+    normalized_candidate_key = normalize_whitespace(str(evidence.get("normalized_candidate_key") or "")) or None
+    source_hint = normalize_whitespace(str(evidence.get("raw_value") or "")) or None
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO entity_overrides (
+          scope_type, scope_id, role, source_entity_id,
+          normalized_candidate_key, replacement_entity_id,
+          override_effect, source_hint, reason, created_at, updated_at
+        ) VALUES ('document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(document_id),
+            role,
+            int(source_entity_id),
+            normalized_candidate_key,
+            replacement_entity_id,
+            override_effect,
+            source_hint,
+            reason,
+            utc_now(),
+            utc_now(),
+        ),
+    )
+    return int(connection.execute("SELECT changes()").fetchone()[0] or 0)
+
+
+def unassign_entity(
+    root: Path,
+    *,
+    document_id: int,
+    role: str,
+    entity_id: int,
+    reason: str | None = None,
+) -> dict[str, object]:
+    normalized_role = normalize_document_entity_role(role)
+    normalized_reason = normalize_whitespace(str(reason or "")) or None
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="unassign-entity"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            ensure_document_row(connection, document_id)
+            active_entity_row(connection, entity_id)
+            link_rows = connection.execute(
+                """
+                SELECT *
+                FROM document_entities
+                WHERE document_id = ?
+                  AND role = ?
+                  AND entity_id = ?
+                ORDER BY id ASC
+                """,
+                (int(document_id), normalized_role, int(entity_id)),
+            ).fetchall()
+            if not link_rows:
+                raise RetrieverError(
+                    f"Document {document_id} has no {normalized_role} link for entity {entity_id}."
+                )
+            manual_links_removed = 0
+            auto_links_removed = 0
+            overrides_created = 0
+            connection.execute("BEGIN")
+            try:
+                for link_row in link_rows:
+                    if link_row["assignment_mode"] == "manual":
+                        connection.execute("DELETE FROM document_entities WHERE id = ?", (int(link_row["id"]),))
+                        manual_links_removed += 1
+                    else:
+                        overrides_created += document_override_from_link(
+                            connection,
+                            document_id=int(document_id),
+                            role=normalized_role,
+                            source_entity_id=int(entity_id),
+                            override_effect="remove",
+                            evidence_json=link_row["evidence_json"],
+                            reason=normalized_reason,
+                        )
+                        connection.execute("DELETE FROM document_entities WHERE id = ?", (int(link_row["id"]),))
+                        auto_links_removed += 1
+                refresh_documents_after_entity_graph_change(connection, [int(document_id)])
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return {
+                "status": "ok",
+                "document_id": int(document_id),
+                "role": normalized_role,
+                "entity_id": int(entity_id),
+                "manual_links_removed": manual_links_removed,
+                "auto_links_removed": auto_links_removed,
+                "overrides_created": overrides_created,
+                "reason": normalized_reason,
+            }
+        finally:
+            connection.close()
+
+
+def create_split_target_entity(
+    connection: sqlite3.Connection,
+    *,
+    source_row: sqlite3.Row,
+    display_name: str | None,
+) -> int:
+    normalized_display_name = normalize_whitespace(str(display_name or "")) or None
+    connection.execute(
+        """
+        INSERT INTO entities (
+          entity_type, display_name, display_name_source, entity_origin,
+          canonical_status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_row["entity_type"],
+            normalized_display_name,
+            ENTITY_DISPLAY_SOURCE_MANUAL if normalized_display_name else ENTITY_DISPLAY_SOURCE_AUTO,
+            ENTITY_ORIGIN_MANUAL,
+            ENTITY_STATUS_ACTIVE,
+            utc_now(),
+            utc_now(),
+        ),
+    )
+    return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def selected_identifier_rows_for_split(
+    connection: sqlite3.Connection,
+    *,
+    source_entity_id: int,
+    identifier_ids: list[int] | None,
+) -> list[sqlite3.Row]:
+    normalized_ids = list(dict.fromkeys(int(identifier_id) for identifier_id in identifier_ids or []))
+    if not normalized_ids:
+        return []
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM entity_identifiers
+        WHERE id IN ({placeholders})
+          AND entity_id = ?
+        ORDER BY id ASC
+        """,
+        [*normalized_ids, int(source_entity_id)],
+    ).fetchall()
+    found_ids = {int(row["id"]) for row in rows}
+    missing_ids = [identifier_id for identifier_id in normalized_ids if identifier_id not in found_ids]
+    if missing_ids:
+        raise RetrieverError(
+            f"Identifier id(s) do not belong to entity {source_entity_id}: {', '.join(str(item) for item in missing_ids)}"
+        )
+    return rows
+
+
+def move_selected_identifiers_to_target(
+    connection: sqlite3.Connection,
+    *,
+    source_entity_id: int,
+    target_entity_id: int,
+    identifier_rows: list[sqlite3.Row],
+) -> dict[str, int]:
+    moved_identifiers = 0
+    deduped_identifiers = 0
+    moved_resolution_keys = 0
+    deleted_resolution_keys = 0
+    for identifier_row in identifier_rows:
+        source_identifier_id = int(identifier_row["id"])
+        target_identifier_id = matching_survivor_identifier_id(
+            connection,
+            survivor_entity_id=int(target_entity_id),
+            identifier_row=identifier_row,
+        )
+        if target_identifier_id is None:
+            connection.execute(
+                """
+                UPDATE entity_identifiers
+                SET entity_id = ?, source_kind = 'manual', updated_at = ?
+                WHERE id = ?
+                """,
+                (int(target_entity_id), utc_now(), source_identifier_id),
+            )
+            target_identifier_id = source_identifier_id
+            moved_identifiers += 1
+        else:
+            deduped_identifiers += 1
+        for key_row in connection.execute(
+            """
+            SELECT *
+            FROM entity_resolution_keys
+            WHERE identifier_id = ?
+               OR entity_id = ?
+                  AND key_type = ?
+                  AND normalized_value = ?
+                  AND COALESCE(provider, '') = COALESCE(?, '')
+                  AND COALESCE(provider_scope, '') = COALESCE(?, '')
+                  AND COALESCE(identifier_name, '') = COALESCE(?, '')
+                  AND COALESCE(identifier_scope, '') = COALESCE(?, '')
+            ORDER BY id ASC
+            """,
+            (
+                source_identifier_id,
+                int(source_entity_id),
+                identifier_row["identifier_type"],
+                identifier_row["normalized_value"],
+                identifier_row["provider"],
+                identifier_row["provider_scope"],
+                identifier_row["identifier_name"],
+                identifier_row["identifier_scope"],
+            ),
+        ).fetchall():
+            existing_key = resolution_key_matches_row(connection, key_row, exclude_id=int(key_row["id"]))
+            if existing_key is not None:
+                connection.execute("DELETE FROM entity_resolution_keys WHERE id = ?", (int(key_row["id"]),))
+                deleted_resolution_keys += 1
+            else:
+                connection.execute(
+                    """
+                    UPDATE entity_resolution_keys
+                    SET entity_id = ?, identifier_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (int(target_entity_id), target_identifier_id, utc_now(), int(key_row["id"])),
+                )
+                moved_resolution_keys += 1
+        if target_identifier_id != source_identifier_id:
+            connection.execute("DELETE FROM entity_identifiers WHERE id = ?", (source_identifier_id,))
+    return {
+        "moved_identifiers": moved_identifiers,
+        "deduped_identifiers": deduped_identifiers,
+        "moved_resolution_keys": moved_resolution_keys,
+        "deleted_resolution_keys": deleted_resolution_keys,
+    }
+
+
+def selected_document_entity_rows_for_split(
+    connection: sqlite3.Connection,
+    *,
+    source_entity_id: int,
+    document_ids: list[int] | None,
+    roles: list[str] | None,
+) -> list[sqlite3.Row]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in document_ids or []))
+    normalized_roles = [normalize_document_entity_role(role) for role in roles or []]
+    if not normalized_document_ids:
+        return []
+    for document_id in normalized_document_ids:
+        ensure_document_row(connection, document_id)
+    params: list[object] = [int(source_entity_id), *normalized_document_ids]
+    role_clause = ""
+    if normalized_roles:
+        role_clause = f"AND role IN ({', '.join('?' for _ in normalized_roles)})"
+        params.extend(normalized_roles)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM document_entities
+        WHERE entity_id = ?
+          AND document_id IN ({', '.join('?' for _ in normalized_document_ids)})
+          {role_clause}
+        ORDER BY document_id ASC, role ASC, id ASC
+        """,
+        params,
+    ).fetchall()
+    if not rows:
+        raise RetrieverError("No matching document/entity links found to split.")
+    return rows
+
+
+def split_entity(
+    root: Path,
+    source_entity_id: int,
+    *,
+    target_entity_id: int | None = None,
+    identifier_ids: list[int] | None = None,
+    document_ids: list[int] | None = None,
+    roles: list[str] | None = None,
+    display_name: str | None = None,
+    reason: str | None = None,
+    block_merge: bool = True,
+) -> dict[str, object]:
+    if not identifier_ids and not document_ids:
+        raise RetrieverError("split-entity requires at least one --identifier-id or --doc-id.")
+    normalized_reason = normalize_whitespace(str(reason or "")) or None
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="split-entity"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            source_row = active_entity_row(connection, source_entity_id)
+            identifier_rows = selected_identifier_rows_for_split(
+                connection,
+                source_entity_id=int(source_entity_id),
+                identifier_ids=identifier_ids,
+            )
+            document_link_rows = selected_document_entity_rows_for_split(
+                connection,
+                source_entity_id=int(source_entity_id),
+                document_ids=document_ids,
+                roles=roles,
+            )
+            connection.execute("BEGIN")
+            try:
+                created_target = target_entity_id is None
+                if target_entity_id is None:
+                    target_id = create_split_target_entity(
+                        connection,
+                        source_row=source_row,
+                        display_name=display_name,
+                    )
+                else:
+                    target_id = int(target_entity_id)
+                    active_entity_row(connection, target_id)
+                identifier_counts = move_selected_identifiers_to_target(
+                    connection,
+                    source_entity_id=int(source_entity_id),
+                    target_entity_id=target_id,
+                    identifier_rows=identifier_rows,
+                )
+                moved_links = 0
+                deduped_links = 0
+                overrides_created = 0
+                affected_document_ids: list[int] = []
+                for link_row in document_link_rows:
+                    document_id = int(link_row["document_id"])
+                    role = str(link_row["role"])
+                    affected_document_ids.append(document_id)
+                    if link_row["assignment_mode"] == "auto":
+                        overrides_created += document_override_from_link(
+                            connection,
+                            document_id=document_id,
+                            role=role,
+                            source_entity_id=int(source_entity_id),
+                            override_effect="replace",
+                            replacement_entity_id=target_id,
+                            evidence_json=link_row["evidence_json"],
+                            reason=normalized_reason,
+                        )
+                    existing_target_link = connection.execute(
+                        """
+                        SELECT id
+                        FROM document_entities
+                        WHERE document_id = ?
+                          AND role = ?
+                          AND entity_id = ?
+                        ORDER BY id ASC
+                        LIMIT 1
+                        """,
+                        (document_id, role, target_id),
+                    ).fetchone()
+                    if existing_target_link is not None:
+                        connection.execute("DELETE FROM document_entities WHERE id = ?", (int(link_row["id"]),))
+                        deduped_links += 1
+                    else:
+                        connection.execute(
+                            """
+                            UPDATE document_entities
+                            SET entity_id = ?, assignment_mode = 'manual', updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (target_id, utc_now(), int(link_row["id"])),
+                        )
+                        moved_links += 1
+                if block_merge:
+                    left, right = entity_pair_key(int(source_entity_id), target_id)
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO entity_merge_blocks (
+                          left_entity_id, right_entity_id, reason, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (left, right, normalized_reason or "entity split", utc_now()),
+                    )
+                recompute_entity_caches(connection, int(source_entity_id))
+                recompute_entity_caches(connection, target_id)
+                refresh_documents_after_entity_graph_change(connection, affected_document_ids)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return {
+                "status": "ok",
+                "source_entity_id": int(source_entity_id),
+                "target_entity_id": target_id,
+                "created_target": created_target,
+                "display_name": normalize_whitespace(str(display_name or "")) or None,
+                "reason": normalized_reason,
+                "block_merge": bool(block_merge),
+                "moved_document_links": moved_links,
+                "deduped_document_links": deduped_links,
+                "overrides_created": overrides_created,
+                "affected_document_ids": sorted(set(affected_document_ids)),
+                **identifier_counts,
+            }
+        finally:
+            connection.close()
+
+
 def list_datasets(root: Path) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -31485,6 +33659,130 @@ def create_dataset(root: Path, dataset_name: str) -> dict[str, object]:
         return {
             "status": "ok",
             "dataset": dataset_summary_by_id(connection, dataset_id, root=root),
+        }
+    finally:
+        connection.close()
+
+
+def normalize_dataset_policy_bool(raw_value: object, *, field_name: str) -> bool:
+    if isinstance(raw_value, bool):
+        return raw_value
+    text = normalize_entity_lookup_text(raw_value)
+    if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    raise RetrieverError(f"Invalid boolean value for {field_name}: {raw_value!r}")
+
+
+def normalize_dataset_external_id_policy_names(raw_names: list[str] | None) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_name in raw_names or []:
+        name = normalize_entity_identifier_name(raw_name)
+        if not name:
+            raise RetrieverError(f"Invalid external-id merge policy name: {raw_name!r}")
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def show_dataset_policy(
+    root: Path,
+    *,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
+        return {
+            "status": "ok",
+            "dataset": dataset_summary_by_id(connection, int(dataset_row["id"]), root=root),
+            "merge_policy": dataset_merge_policy_payload_from_row(dataset_row),
+        }
+    finally:
+        connection.close()
+
+
+def set_dataset_policy(
+    root: Path,
+    *,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+    allow_auto_merge: object | None = None,
+    email_auto_merge: object | None = None,
+    handle_auto_merge: object | None = None,
+    phone_auto_merge: object | None = None,
+    name_auto_merge: object | None = None,
+    external_id_auto_merge_names: list[str] | None = None,
+    clear_external_id_auto_merge_names: bool = False,
+) -> dict[str, object]:
+    if clear_external_id_auto_merge_names and external_id_auto_merge_names is not None:
+        raise RetrieverError("Use either --external-id-auto-merge-name or --clear-external-id-auto-merge-names, not both.")
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
+        if normalize_whitespace(str(dataset_row["source_kind"] or "")).lower() == MANUAL_DATASET_SOURCE_KIND:
+            raise RetrieverError("Dataset merge policy controls apply only to source-backed datasets.")
+        before_policy = dataset_merge_policy_payload_from_row(dataset_row)
+        updates: dict[str, object] = {}
+        for column_name, raw_value in (
+            ("allow_auto_merge", allow_auto_merge),
+            ("email_auto_merge", email_auto_merge),
+            ("handle_auto_merge", handle_auto_merge),
+            ("phone_auto_merge", phone_auto_merge),
+            ("name_auto_merge", name_auto_merge),
+        ):
+            if raw_value is None:
+                continue
+            updates[column_name] = 1 if normalize_dataset_policy_bool(raw_value, field_name=column_name) else 0
+        if external_id_auto_merge_names is not None:
+            updates["external_id_auto_merge_names_json"] = json.dumps(
+                normalize_dataset_external_id_policy_names(external_id_auto_merge_names),
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        elif clear_external_id_auto_merge_names:
+            updates["external_id_auto_merge_names_json"] = "[]"
+        if not updates:
+            raise RetrieverError("set-dataset-policy requires at least one policy flag.")
+
+        connection.execute("BEGIN")
+        try:
+            updates["updated_at"] = utc_now()
+            set_clause = ", ".join(f"{quote_identifier(column)} = ?" for column in updates)
+            connection.execute(
+                f"""
+                UPDATE datasets
+                SET {set_clause}
+                WHERE id = ?
+                """,
+                [*updates.values(), int(dataset_row["id"])],
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        updated_row = get_dataset_row_by_id(connection, int(dataset_row["id"]))
+        assert updated_row is not None
+        after_policy = dataset_merge_policy_payload_from_row(updated_row)
+        return {
+            "status": "ok",
+            "dataset": dataset_summary_by_id(connection, int(updated_row["id"]), root=root),
+            "before_merge_policy": before_policy,
+            "merge_policy": after_policy,
+            "changed": before_policy != after_policy,
+            "rebuild_recommended": before_policy != after_policy,
+            "rebuild_command": f"rebuild-entities {shlex.quote(str(root))}",
         }
     finally:
         connection.close()
@@ -34247,6 +36545,37 @@ OCCURRENCE_FILTER_FIELDS = {
     "updated_at",
 }
 
+ENTITY_ROLE_FILTER_FIELDS = {
+    "author": "author",
+    "participant": "participant",
+    "participants": "participant",
+    "recipient": "recipient",
+    "recipients": "recipient",
+    "custodian": "custodian",
+}
+ENTITY_ROLE_ID_FILTER_FIELDS = {
+    "author_entity_id": "author",
+    "participant_entity_id": "participant",
+    "participants_entity_id": "participant",
+    "recipient_entity_id": "recipient",
+    "recipients_entity_id": "recipient",
+    "custodian_entity_id": "custodian",
+}
+RAW_ENTITY_METADATA_FILTER_FIELDS = {
+    "raw_author": "extracted_author",
+    "raw_participant": "extracted_participants",
+    "raw_participants": "extracted_participants",
+    "raw_recipient": "extracted_recipients",
+    "raw_recipients": "extracted_recipients",
+    "raw_custodian": "custodian",
+}
+ROLE_OCCURRENCE_METADATA_COLUMNS = {
+    "author": "extracted_author",
+    "participant": "extracted_participants",
+    "recipient": "extracted_recipients",
+    "custodian": "custodian",
+}
+
 
 def build_scalar_filter_clause(
     column_expr: str,
@@ -34860,6 +37189,252 @@ def build_custodian_sql_filter_clause(
     return f"EXISTS ({exists_sql} AND {clause})", params
 
 
+def entity_display_label_sql(alias: str) -> str:
+    return (
+        "CASE "
+        f"WHEN COALESCE({alias}.display_name, '') != '' AND COALESCE({alias}.primary_email, '') != '' "
+        f"THEN {alias}.display_name || ' <' || {alias}.primary_email || '>' "
+        f"WHEN COALESCE({alias}.display_name, '') != '' THEN {alias}.display_name "
+        f"WHEN COALESCE({alias}.primary_email, '') != '' THEN {alias}.primary_email "
+        f"WHEN COALESCE({alias}.primary_phone, '') != '' THEN {alias}.primary_phone "
+        f"ELSE 'Unknown Entity ' || {alias}.id END"
+    )
+
+
+def entity_role_exists_sql(alias: str, role: str, *, extra_clause: str | None = None) -> str:
+    sql = (
+        "SELECT 1 "
+        "FROM document_entities de "
+        "JOIN entities e ON e.id = de.entity_id "
+        f"WHERE de.document_id = {alias}.id "
+        "AND e.canonical_status = 'active' "
+        "AND de.role = ?"
+    )
+    if extra_clause:
+        sql += f" AND ({extra_clause})"
+    return sql
+
+
+def entity_exact_values_for_filter(role: str, raw_value: object) -> list[str]:
+    text = normalize_inline_whitespace(str(raw_value or ""))
+    values: set[str] = set()
+    if text:
+        values.add(text.lower())
+        lookup_value = normalize_entity_lookup_text(text)
+        if lookup_value:
+            values.add(lookup_value.lower())
+    parsed_email = normalize_entity_email(text)
+    if parsed_email:
+        values.add(parsed_email.lower())
+    parsed_phone = normalize_entity_phone(text)
+    if parsed_phone is not None:
+        values.add(str(parsed_phone["display_value"]).lower())
+        values.add(str(parsed_phone["normalized_value"]).lower())
+    for candidate in parse_entity_candidates(text, role=role):
+        for identifier in candidate.get("identifiers") or []:
+            if not isinstance(identifier, dict):
+                continue
+            for key in (
+                "display_value",
+                "normalized_value",
+                "normalized_full_name",
+                "normalized_sort_name",
+                "identifier_name",
+            ):
+                value = normalize_inline_whitespace(str(identifier.get(key) or ""))
+                if value:
+                    values.add(value.lower())
+    return sorted(values)
+
+
+def entity_exact_match_sql(role: str, operand: dict[str, object]) -> tuple[str, list[object]]:
+    raw_value = coerce_sql_literal("text", operand)
+    exact_values = entity_exact_values_for_filter(role, raw_value)
+    if not exact_values:
+        return "0", []
+    placeholders = ", ".join("?" for _ in exact_values)
+    label_expr = entity_display_label_sql("e")
+    expressions = [
+        f"LOWER(COALESCE({label_expr}, ''))",
+        "LOWER(COALESCE(e.display_name, ''))",
+        "LOWER(COALESCE(e.primary_email, ''))",
+        "LOWER(COALESCE(e.primary_phone, ''))",
+        "LOWER(COALESCE(ei.display_value, ''))",
+        "LOWER(COALESCE(ei.normalized_value, ''))",
+        "LOWER(COALESCE(ei.normalized_full_name, ''))",
+        "LOWER(COALESCE(ei.normalized_sort_name, ''))",
+    ]
+    clause = " OR ".join(f"{expression} IN ({placeholders})" for expression in expressions)
+    params: list[object] = []
+    for _ in expressions:
+        params.extend(exact_values)
+    return clause, params
+
+
+def entity_like_match_sql(operand: dict[str, object]) -> tuple[str, list[object]]:
+    value = str(coerce_sql_literal("text", operand))
+    label_expr = entity_display_label_sql("e")
+    expressions = [
+        f"LOWER(COALESCE({label_expr}, ''))",
+        "LOWER(COALESCE(e.display_name, ''))",
+        "LOWER(COALESCE(e.primary_email, ''))",
+        "LOWER(COALESCE(e.primary_phone, ''))",
+        "LOWER(COALESCE(ei.display_value, ''))",
+        "LOWER(COALESCE(ei.normalized_value, ''))",
+        "LOWER(COALESCE(ei.normalized_full_name, ''))",
+        "LOWER(COALESCE(ei.normalized_sort_name, ''))",
+    ]
+    return " OR ".join(f"{expression} LIKE LOWER(?)" for expression in expressions), [value] * len(expressions)
+
+
+def build_entity_role_sql_filter_clause(
+    alias: str,
+    role: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+) -> tuple[str, list[object]]:
+    supported = {"=", "!=", "<>", "IS NULL", "IS NOT NULL", "LIKE", "IN"}
+    if operator not in supported:
+        raise RetrieverError(
+            f"Entity role field '{field_def['field_name']}' supports: =, !=, IS NULL, IS NOT NULL, LIKE, IN."
+        )
+    exists_sql = entity_role_exists_sql(alias, role)
+    if operator == "IS NULL":
+        return f"NOT EXISTS ({exists_sql})", [role]
+    if operator == "IS NOT NULL":
+        return f"EXISTS ({exists_sql})", [role]
+    if operator in {"=", "!=", "<>"}:
+        assert isinstance(operand, dict)
+        match_clause, match_params = entity_exact_match_sql(role, operand)
+        matched_exists_sql = entity_role_exists_sql(
+            alias,
+            role,
+            extra_clause=(
+                "EXISTS ("
+                "SELECT 1 FROM entity_identifiers ei "
+                "WHERE ei.entity_id = e.id "
+                f"AND ({match_clause})"
+                ")"
+            ),
+        )
+        params = [role, *match_params]
+        if operator == "=":
+            return f"EXISTS ({matched_exists_sql})", params
+        return f"NOT EXISTS ({matched_exists_sql})", params
+    if operator == "LIKE":
+        assert isinstance(operand, dict)
+        match_clause, match_params = entity_like_match_sql(operand)
+        matched_exists_sql = entity_role_exists_sql(
+            alias,
+            role,
+            extra_clause=(
+                "EXISTS ("
+                "SELECT 1 FROM entity_identifiers ei "
+                "WHERE ei.entity_id = e.id "
+                f"AND ({match_clause})"
+                ")"
+            ),
+        )
+        return f"EXISTS ({matched_exists_sql})", [role, *match_params]
+    assert operator == "IN"
+    assert isinstance(operand, list)
+    if not operand:
+        raise RetrieverError("IN requires at least one value.")
+    if len(operand) > MAX_FILTER_IN_LIST_ITEMS:
+        raise RetrieverError(f"IN (...) is capped at {MAX_FILTER_IN_LIST_ITEMS} values.")
+    clauses: list[str] = []
+    params: list[object] = []
+    for literal in operand:
+        match_clause, match_params = entity_exact_match_sql(role, literal)
+        clauses.append(f"({match_clause})")
+        params.extend(match_params)
+    matched_exists_sql = entity_role_exists_sql(
+        alias,
+        role,
+        extra_clause=(
+            "EXISTS ("
+            "SELECT 1 FROM entity_identifiers ei "
+            "WHERE ei.entity_id = e.id "
+            f"AND ({' OR '.join(clauses)})"
+            ")"
+        ),
+    )
+    return f"EXISTS ({matched_exists_sql})", [role, *params]
+
+
+def build_entity_role_id_sql_filter_clause(
+    alias: str,
+    role: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+) -> tuple[str, list[object]]:
+    supported = {"=", "!=", "<>", "IS NULL", "IS NOT NULL", "IN"}
+    if operator not in supported:
+        raise RetrieverError(
+            f"Entity id field '{field_def['field_name']}' supports: =, !=, IS NULL, IS NOT NULL, IN."
+        )
+    exists_sql = entity_role_exists_sql(alias, role)
+    if operator == "IS NULL":
+        return f"NOT EXISTS ({exists_sql})", [role]
+    if operator == "IS NOT NULL":
+        return f"EXISTS ({exists_sql})", [role]
+    if operator == "IN":
+        assert isinstance(operand, list)
+        if len(operand) > MAX_FILTER_IN_LIST_ITEMS:
+            raise RetrieverError(f"IN (...) is capped at {MAX_FILTER_IN_LIST_ITEMS} values.")
+        values = [int(coerce_sql_literal("integer", literal)) for literal in operand]
+        placeholders = ", ".join("?" for _ in values)
+        matched_exists_sql = entity_role_exists_sql(alias, role, extra_clause=f"e.id IN ({placeholders})")
+        return f"EXISTS ({matched_exists_sql})", [role, *values]
+    assert isinstance(operand, dict)
+    value = int(coerce_sql_literal("integer", operand))
+    matched_exists_sql = entity_role_exists_sql(alias, role, extra_clause="e.id = ?")
+    params = [role, value]
+    if operator == "=":
+        return f"EXISTS ({matched_exists_sql})", params
+    return f"NOT EXISTS ({matched_exists_sql})", params
+
+
+def build_raw_entity_metadata_sql_filter_clause(
+    alias: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+    *,
+    occurrence_column: str,
+    occurrence_alias: str | None = None,
+) -> tuple[str, list[object]]:
+    raw_field_def = {**field_def, "field_type": "text"}
+    if occurrence_alias is not None:
+        return build_scalar_sql_filter_clause(
+            f"{occurrence_alias}.{quote_identifier(occurrence_column)}",
+            raw_field_def,
+            operator,
+            operand,
+        )
+
+    ensure_sql_filter_operator_supported(raw_field_def, operator)
+    exists_sql = (
+        "SELECT 1 "
+        "FROM document_occurrences o "
+        f"WHERE o.document_id = {alias}.id "
+        "AND o.lifecycle_status = 'active'"
+    )
+    column_expr = f"o.{quote_identifier(occurrence_column)}"
+    if operator == "IS NULL":
+        return f"NOT EXISTS ({exists_sql} AND COALESCE({column_expr}, '') != '')", []
+    if operator == "IS NOT NULL":
+        return f"EXISTS ({exists_sql} AND COALESCE({column_expr}, '') != '')", []
+    if operator in {"!=", "<>"}:
+        assert isinstance(operand, dict)
+        value = str(coerce_sql_literal("text", operand))
+        return f"NOT EXISTS ({exists_sql} AND COALESCE({column_expr}, '') = ?)", [value]
+    clause, params = build_scalar_sql_filter_clause(column_expr, raw_field_def, operator, operand)
+    return f"EXISTS ({exists_sql} AND {clause})", params
+
+
 def virtual_field_sql_expression(alias: str, field_name: str) -> str:
     if field_name == "production_name":
         return (
@@ -34888,6 +37463,41 @@ def build_sql_filter_clause(
     occurrence_alias: str | None = None,
 ) -> tuple[str, list[object]]:
     field_name = str(field_def["field_name"])
+    if occurrence_alias is not None and field_name in ENTITY_ROLE_FILTER_FIELDS:
+        role = ENTITY_ROLE_FILTER_FIELDS[field_name]
+        return build_raw_entity_metadata_sql_filter_clause(
+            alias,
+            field_def,
+            operator,
+            operand,
+            occurrence_column=ROLE_OCCURRENCE_METADATA_COLUMNS[role],
+            occurrence_alias=occurrence_alias,
+        )
+    if field_name in ENTITY_ROLE_FILTER_FIELDS:
+        return build_entity_role_sql_filter_clause(
+            alias,
+            ENTITY_ROLE_FILTER_FIELDS[field_name],
+            field_def,
+            operator,
+            operand,
+        )
+    if field_name in ENTITY_ROLE_ID_FILTER_FIELDS:
+        return build_entity_role_id_sql_filter_clause(
+            alias,
+            ENTITY_ROLE_ID_FILTER_FIELDS[field_name],
+            field_def,
+            operator,
+            operand,
+        )
+    if field_name in RAW_ENTITY_METADATA_FILTER_FIELDS:
+        return build_raw_entity_metadata_sql_filter_clause(
+            alias,
+            field_def,
+            operator,
+            operand,
+            occurrence_column=RAW_ENTITY_METADATA_FILTER_FIELDS[field_name],
+            occurrence_alias=occurrence_alias,
+        )
     if field_def.get("source") == "virtual":
         if field_name == "custodian":
             return build_custodian_sql_filter_clause(
@@ -40752,6 +43362,250 @@ def catalog(root: Path) -> dict[str, object]:
         connection.close()
 
 
+def normalize_entity_inventory_roles(raw_roles: list[str] | None) -> list[str]:
+    if not raw_roles:
+        return sorted(DOCUMENT_ENTITY_ROLES)
+    roles: list[str] = []
+    for raw_role in raw_roles:
+        normalized = normalize_entity_lookup_text(raw_role).replace(" ", "_")
+        role = ENTITY_ROLE_FILTER_FIELDS.get(normalized, normalized)
+        if role not in DOCUMENT_ENTITY_ROLES:
+            raise RetrieverError(
+                f"Unsupported entity role: {raw_role}. Supported roles: {', '.join(sorted(DOCUMENT_ENTITY_ROLES))}."
+            )
+        if role not in roles:
+            roles.append(role)
+    return roles
+
+
+def scoped_entity_inventory_document_filter(
+    connection: sqlite3.Connection,
+    *,
+    query: str = "",
+    raw_filters: object | None = None,
+    document_ids: list[int] | None = None,
+    dataset_id: int | None = None,
+    dataset_names: list[str] | None = None,
+    conversation_id: int | None = None,
+    from_run_id: int | None = None,
+) -> tuple[list[str], list[object], list[object], dict[str, object]]:
+    normalized_query = normalize_inline_whitespace(query)
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in document_ids or []))
+    normalized_dataset_names = [
+        name
+        for raw_name in dataset_names or []
+        for name in [normalize_inline_whitespace(str(raw_name or ""))]
+        if name
+    ]
+    scope: dict[str, object] = {}
+    filter_summary: list[object] = []
+    if normalized_query:
+        selection = resolve_document_search(connection, normalized_query, raw_filters, None, None)
+        selected_ids = [int(item["id"]) for item in selection["results"]]
+        filter_summary = list(selection["filters"])
+        if not selected_ids:
+            return ["0"], [], filter_summary, {"query": normalized_query, "matched_document_count": 0}
+        placeholders = ", ".join("?" for _ in selected_ids)
+        clauses = [f"d.id IN ({placeholders})"]
+        params: list[object] = selected_ids
+        scope["query"] = normalized_query
+        scope["matched_document_count"] = len(selected_ids)
+    else:
+        filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+
+    if normalized_document_ids:
+        placeholders = ", ".join("?" for _ in normalized_document_ids)
+        clauses.append(f"d.id IN ({placeholders})")
+        params.extend(normalized_document_ids)
+        scope["document_ids"] = normalized_document_ids
+    if dataset_id is not None:
+        clauses.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM dataset_documents dd
+              WHERE dd.document_id = d.id
+                AND dd.dataset_id = ?
+            )
+            """
+        )
+        params.append(int(dataset_id))
+        scope["dataset_id"] = int(dataset_id)
+    if normalized_dataset_names:
+        placeholders = ", ".join("?" for _ in normalized_dataset_names)
+        clauses.append(
+            f"""
+            EXISTS (
+              SELECT 1
+              FROM dataset_documents dd
+              JOIN datasets ds ON ds.id = dd.dataset_id
+              WHERE dd.document_id = d.id
+                AND ds.dataset_name IN ({placeholders})
+            )
+            """
+        )
+        params.extend(normalized_dataset_names)
+        scope["dataset_names"] = normalized_dataset_names
+    if conversation_id is not None:
+        clauses.append("d.conversation_id = ?")
+        params.append(int(conversation_id))
+        scope["conversation_id"] = int(conversation_id)
+    if from_run_id is not None:
+        run_id = resolve_scope_from_run_id(connection, from_run_id)
+        clauses.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM run_snapshot_documents rsd
+              WHERE rsd.document_id = d.id
+                AND rsd.run_id = ?
+            )
+            """
+        )
+        params.append(run_id)
+        scope["from_run_id"] = run_id
+    if filter_summary:
+        scope["filters"] = filter_summary
+    return clauses, params, filter_summary, scope
+
+
+def entity_inventory_examples(
+    connection: sqlite3.Connection,
+    *,
+    where_clause: str,
+    scope_params: list[object],
+    entity_id: int,
+    role: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    if limit <= 0:
+        return []
+    rows = connection.execute(
+        f"""
+        SELECT d.id, d.control_number, d.rel_path, d.title, d.date_created
+        FROM documents d
+        JOIN document_entities de ON de.document_id = d.id
+        JOIN entities e ON e.id = de.entity_id
+        WHERE {where_clause}
+          AND de.entity_id = ?
+          AND de.role = ?
+          AND e.canonical_status = ?
+        ORDER BY d.date_created DESC, d.id DESC
+        LIMIT ?
+        """,
+        [*scope_params, entity_id, role, ENTITY_STATUS_ACTIVE, limit],
+    ).fetchall()
+    return [
+        {
+            "document_id": int(row["id"]),
+            "control_number": row["control_number"],
+            "rel_path": row["rel_path"],
+            "title": row["title"],
+            "date_created": row["date_created"],
+        }
+        for row in rows
+    ]
+
+
+def list_entity_role_inventory(
+    root: Path,
+    *,
+    roles: list[str] | None = None,
+    query: str = "",
+    raw_filters: object | None = None,
+    document_ids: list[int] | None = None,
+    dataset_id: int | None = None,
+    dataset_names: list[str] | None = None,
+    conversation_id: int | None = None,
+    from_run_id: int | None = None,
+    limit: int = 100,
+    examples_per_entity: int = 3,
+) -> dict[str, object]:
+    normalized_roles = normalize_entity_inventory_roles(roles)
+    normalized_limit = max(1, min(int(limit or 100), 500))
+    normalized_examples_per_entity = max(0, min(int(examples_per_entity or 0), 10))
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        where_clauses, scope_params, filter_summary, scope = scoped_entity_inventory_document_filter(
+            connection,
+            query=query,
+            raw_filters=raw_filters,
+            document_ids=document_ids,
+            dataset_id=dataset_id,
+            dataset_names=dataset_names,
+            conversation_id=conversation_id,
+            from_run_id=from_run_id,
+        )
+        where_clause = " AND ".join(where_clauses)
+        role_placeholders = ", ".join("?" for _ in normalized_roles)
+        rows = connection.execute(
+            f"""
+            SELECT de.role AS role,
+                   de.role AS roles,
+                   e.*,
+                   COUNT(DISTINCT de.document_id) AS document_count
+            FROM documents d
+            JOIN document_entities de ON de.document_id = d.id
+            JOIN entities e ON e.id = de.entity_id
+            WHERE {where_clause}
+              AND de.role IN ({role_placeholders})
+              AND e.canonical_status = ?
+            GROUP BY de.role, e.id
+            ORDER BY de.role ASC,
+                     document_count DESC,
+                     COALESCE(e.sort_name, e.display_name, e.primary_email, e.primary_phone, '') ASC,
+                     e.id ASC
+            LIMIT ?
+            """,
+            [*scope_params, *normalized_roles, ENTITY_STATUS_ACTIVE, normalized_limit],
+        ).fetchall()
+        entity_ids = [int(row["id"]) for row in rows]
+        identifiers_by_entity = entity_identifiers_by_entity_id(connection, entity_ids)
+        inventory_rows: list[dict[str, object]] = []
+        for row in rows:
+            entity_id = int(row["id"])
+            role = str(row["role"])
+            identifiers = identifiers_by_entity.get(entity_id, [])
+            summary = serialize_entity_summary(row, identifiers)
+            inventory_rows.append(
+                {
+                    "role": role,
+                    "entity_id": entity_id,
+                    "label": summary["label"],
+                    "entity_origin": summary["entity_origin"],
+                    "entity_type": summary["entity_type"],
+                    "primary_email": summary["primary_email"],
+                    "primary_phone": summary["primary_phone"],
+                    "document_count": summary["document_count"],
+                    "emails": summary["emails"],
+                    "phones": summary["phones"],
+                    "names": summary["names"],
+                    "examples": entity_inventory_examples(
+                        connection,
+                        where_clause=where_clause,
+                        scope_params=scope_params,
+                        entity_id=entity_id,
+                        role=role,
+                        limit=normalized_examples_per_entity,
+                    ),
+                }
+            )
+        return {
+            "status": "ok",
+            "roles": normalized_roles,
+            "limit": normalized_limit,
+            "examples_per_entity": normalized_examples_per_entity,
+            "scope": scope,
+            "filters": filter_summary,
+            "rows": inventory_rows,
+        }
+    finally:
+        connection.close()
+
+
 def fetch_visible_document_rows_by_ids(
     connection: sqlite3.Connection,
     document_ids: list[int],
@@ -43187,6 +46041,19 @@ def add_dataset_selector_arguments(parser: argparse.ArgumentParser) -> None:
     selector_group.add_argument("--dataset-name", help="Exact dataset name")
 
 
+DATASET_POLICY_BOOLEAN_CHOICES = ("true", "false", "yes", "no", "1", "0", "on", "off", "enabled", "disabled")
+
+
+def add_dataset_policy_boolean_argument(
+    parser: argparse.ArgumentParser,
+    flag: str,
+    *,
+    dest: str,
+    help_text: str,
+) -> None:
+    parser.add_argument(flag, dest=dest, choices=DATASET_POLICY_BOOLEAN_CHOICES, help=help_text)
+
+
 def add_search_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("workspace", help="Workspace root path")
     parser.add_argument("query", nargs="?", default="", help="Keyword query text")
@@ -43540,6 +46407,55 @@ def build_parser() -> argparse.ArgumentParser:
     list_datasets_parser = subparsers.add_parser("list-datasets", help="List datasets in the workspace")
     list_datasets_parser.add_argument("workspace", help="Workspace root path")
 
+    show_dataset_policy_parser = subparsers.add_parser("show-dataset-policy", help="Show source-backed entity merge policy for a dataset")
+    show_dataset_policy_parser.add_argument("workspace", help="Workspace root path")
+    add_dataset_selector_arguments(show_dataset_policy_parser)
+
+    set_dataset_policy_parser = subparsers.add_parser("set-dataset-policy", help="Update source-backed entity merge policy for a dataset")
+    set_dataset_policy_parser.add_argument("workspace", help="Workspace root path")
+    add_dataset_selector_arguments(set_dataset_policy_parser)
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--allow-auto-merge",
+        dest="allow_auto_merge",
+        help_text="Enable or disable all auto-merge resolution for this dataset",
+    )
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--email-auto-merge",
+        dest="email_auto_merge",
+        help_text="Enable or disable exact email auto-merge",
+    )
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--handle-auto-merge",
+        dest="handle_auto_merge",
+        help_text="Enable or disable provider-scoped handle auto-merge",
+    )
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--phone-auto-merge",
+        dest="phone_auto_merge",
+        help_text="Enable or disable exact phone auto-merge",
+    )
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--name-auto-merge",
+        dest="name_auto_merge",
+        help_text="Enable or disable exact normalized-name auto-merge",
+    )
+    set_dataset_policy_parser.add_argument(
+        "--external-id-auto-merge-name",
+        dest="external_id_auto_merge_names",
+        action="append",
+        help="External identifier name eligible for exact auto-merge (repeatable; replaces the current list)",
+    )
+    set_dataset_policy_parser.add_argument(
+        "--clear-external-id-auto-merge-names",
+        action="store_true",
+        help="Clear all external-id auto-merge names",
+    )
+
     rebuild_entities_parser = subparsers.add_parser(
         "rebuild-entities",
         help="Rebuild entity recognition state from stored document metadata",
@@ -43573,6 +46489,167 @@ def build_parser() -> argparse.ArgumentParser:
     show_entity_parser.add_argument("workspace", help="Workspace root path")
     show_entity_parser.add_argument("entity_id", type=int, help="Entity id")
     show_entity_parser.add_argument("--limit", type=int, default=25, help="Maximum linked documents to return")
+
+    create_entity_parser = subparsers.add_parser("create-entity", help="Create a manual entity")
+    create_entity_parser.add_argument("workspace", help="Workspace root path")
+    create_entity_parser.add_argument(
+        "--entity-type",
+        default=ENTITY_TYPE_PERSON,
+        choices=sorted(ENTITY_TYPES),
+        help="Entity type",
+    )
+    create_entity_parser.add_argument("--display-name", help="Manual display name")
+    create_entity_parser.add_argument("--notes", help="Optional entity notes")
+    create_entity_parser.add_argument("--email", dest="emails", action="append", help="Email identifier (repeatable)")
+    create_entity_parser.add_argument("--phone", dest="phones", action="append", help="Phone identifier (repeatable)")
+    create_entity_parser.add_argument("--name", dest="names", action="append", help="Name identifier (repeatable)")
+    create_entity_parser.add_argument(
+        "--handle",
+        dest="handles",
+        action="append",
+        help="Handle identifier as provider:scope:handle (repeatable)",
+    )
+    create_entity_parser.add_argument(
+        "--external-id",
+        dest="external_ids",
+        action="append",
+        help="External identifier as name:value or name:scope:value (repeatable)",
+    )
+
+    edit_entity_parser = subparsers.add_parser("edit-entity", help="Edit a manual entity profile")
+    edit_entity_parser.add_argument("workspace", help="Workspace root path")
+    edit_entity_parser.add_argument("entity_id", type=int, help="Entity id")
+    edit_entity_parser.add_argument("--entity-type", choices=sorted(ENTITY_TYPES), help="Replacement entity type")
+    edit_entity_display_group = edit_entity_parser.add_mutually_exclusive_group()
+    edit_entity_display_group.add_argument("--display-name", help="Replacement manual display name")
+    edit_entity_display_group.add_argument("--clear-display-name", action="store_true", help="Return display name to auto")
+    edit_entity_notes_group = edit_entity_parser.add_mutually_exclusive_group()
+    edit_entity_notes_group.add_argument("--notes", help="Replacement entity notes")
+    edit_entity_notes_group.add_argument("--clear-notes", action="store_true", help="Clear entity notes")
+    edit_entity_parser.add_argument("--add-email", dest="add_emails", action="append", help="Email identifier to add (repeatable)")
+    edit_entity_parser.add_argument("--add-phone", dest="add_phones", action="append", help="Phone identifier to add (repeatable)")
+    edit_entity_parser.add_argument("--add-name", dest="add_names", action="append", help="Name identifier to add (repeatable)")
+    edit_entity_parser.add_argument(
+        "--add-handle",
+        dest="add_handles",
+        action="append",
+        help="Handle identifier as provider:scope:handle (repeatable)",
+    )
+    edit_entity_parser.add_argument(
+        "--add-external-id",
+        dest="add_external_ids",
+        action="append",
+        help="External identifier as name:value or name:scope:value (repeatable)",
+    )
+
+    entity_inventory_parser = subparsers.add_parser(
+        "list-entity-role-inventory",
+        help="List entity counts by role for a document scope",
+    )
+    entity_inventory_parser.add_argument("workspace", help="Workspace root path")
+    entity_inventory_parser.add_argument("query", nargs="?", default="", help="Optional keyword query text")
+    entity_inventory_parser.add_argument(
+        "--role",
+        dest="roles",
+        action="append",
+        help="Entity role to include, e.g. author, participant, recipient, custodian (repeatable)",
+    )
+    entity_inventory_parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        nargs="+",
+        help="Repeatable SQL-like filter expression",
+    )
+    entity_inventory_parser.add_argument(
+        "--dataset",
+        dest="dataset_names",
+        action="append",
+        help="Exact dataset name (repeatable)",
+    )
+    entity_inventory_parser.add_argument("--dataset-id", type=int, help="Dataset id")
+    entity_inventory_parser.add_argument("--conversation-id", type=int, help="Conversation id")
+    entity_inventory_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to include (repeatable)",
+    )
+    entity_inventory_parser.add_argument("--from-run-id", type=int, help="Restrict to documents from a prior run")
+    entity_inventory_parser.add_argument("--limit", type=int, default=100, help="Maximum inventory rows to return")
+    entity_inventory_parser.add_argument(
+        "--examples",
+        dest="examples_per_entity",
+        type=int,
+        default=3,
+        help="Recent document examples per entity row",
+    )
+
+    similar_entities_parser = subparsers.add_parser("similar-entities", help="Suggest active entities similar to one entity")
+    similar_entities_parser.add_argument("workspace", help="Workspace root path")
+    similar_entities_parser.add_argument("entity_id", type=int, help="Entity id")
+    similar_entities_parser.add_argument("--limit", type=int, default=25, help="Maximum suggestions to return")
+
+    merge_entities_parser = subparsers.add_parser("merge-entities", help="Merge one active entity into another")
+    merge_entities_parser.add_argument("workspace", help="Workspace root path")
+    merge_entities_parser.add_argument("source_entity_id", type=int, help="Entity id to merge away")
+    merge_entities_parser.add_argument("target_entity_id", type=int, help="Entity id to keep")
+    merge_entities_parser.add_argument("--force", action="store_true", help="Merge even when a merge block exists")
+    merge_entities_parser.add_argument("--reason", help="Optional merge reason")
+
+    block_entity_merge_parser = subparsers.add_parser("block-entity-merge", help="Prevent a suggested entity merge")
+    block_entity_merge_parser.add_argument("workspace", help="Workspace root path")
+    block_entity_merge_parser.add_argument("left_entity_id", type=int, help="First entity id")
+    block_entity_merge_parser.add_argument("right_entity_id", type=int, help="Second entity id")
+    block_entity_merge_parser.add_argument("--reason", help="Optional block reason")
+
+    ignore_entity_parser = subparsers.add_parser("ignore-entity", help="Ignore a junk or non-entity record")
+    ignore_entity_parser.add_argument("workspace", help="Workspace root path")
+    ignore_entity_parser.add_argument("entity_id", type=int, help="Entity id")
+    ignore_entity_parser.add_argument("--reason", help="Optional ignore reason")
+
+    split_entity_parser = subparsers.add_parser("split-entity", help="Move selected identifiers or document links to another entity")
+    split_entity_parser.add_argument("workspace", help="Workspace root path")
+    split_entity_parser.add_argument("source_entity_id", type=int, help="Entity id to split from")
+    split_entity_parser.add_argument("--target-entity-id", type=int, help="Existing target entity id; omitted creates a new entity")
+    split_entity_parser.add_argument(
+        "--identifier-id",
+        dest="identifier_ids",
+        action="append",
+        type=int,
+        help="Identifier id to move to the target (repeatable)",
+    )
+    split_entity_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id whose source entity links should move to the target (repeatable)",
+    )
+    split_entity_parser.add_argument(
+        "--role",
+        dest="roles",
+        action="append",
+        help="Role to move when --doc-id is used, e.g. author or recipient (repeatable)",
+    )
+    split_entity_parser.add_argument("--display-name", help="Display name for a newly created split target")
+    split_entity_parser.add_argument("--reason", help="Optional split reason")
+    split_entity_parser.add_argument("--no-block", action="store_true", help="Do not create a merge block between source and target")
+
+    assign_entity_parser = subparsers.add_parser("assign-entity", help="Manually assign an entity to a document role")
+    assign_entity_parser.add_argument("workspace", help="Workspace root path")
+    assign_entity_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
+    assign_entity_parser.add_argument("--role", required=True, help="Entity role, e.g. author, participant, recipient, custodian")
+    assign_entity_parser.add_argument("--entity-id", type=int, required=True, help="Entity id")
+    assign_entity_parser.add_argument("--reason", help="Optional assignment reason")
+
+    unassign_entity_parser = subparsers.add_parser("unassign-entity", help="Remove or suppress an entity link on a document role")
+    unassign_entity_parser.add_argument("workspace", help="Workspace root path")
+    unassign_entity_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
+    unassign_entity_parser.add_argument("--role", required=True, help="Entity role, e.g. author, participant, recipient, custodian")
+    unassign_entity_parser.add_argument("--entity-id", type=int, required=True, help="Entity id")
+    unassign_entity_parser.add_argument("--reason", help="Optional unassignment reason")
 
     create_dataset_parser = subparsers.add_parser("create-dataset", help="Create a manual dataset")
     create_dataset_parser.add_argument("workspace", help="Workspace root path")
@@ -44239,6 +47316,33 @@ def main() -> int:
         if args.command == "list-datasets":
             return emit_cli_payload("list-datasets", list_datasets(root))
 
+        if args.command == "show-dataset-policy":
+            return emit_cli_payload(
+                "show-dataset-policy",
+                show_dataset_policy(
+                    root,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                ),
+            )
+
+        if args.command == "set-dataset-policy":
+            return emit_cli_payload(
+                "set-dataset-policy",
+                set_dataset_policy(
+                    root,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                    allow_auto_merge=args.allow_auto_merge,
+                    email_auto_merge=args.email_auto_merge,
+                    handle_auto_merge=args.handle_auto_merge,
+                    phone_auto_merge=args.phone_auto_merge,
+                    name_auto_merge=args.name_auto_merge,
+                    external_id_auto_merge_names=args.external_id_auto_merge_names,
+                    clear_external_id_auto_merge_names=args.clear_external_id_auto_merge_names,
+                ),
+            )
+
         if args.command == "rebuild-entities":
             return emit_cli_payload(
                 "rebuild-entities",
@@ -44264,6 +47368,134 @@ def main() -> int:
             return emit_cli_payload(
                 "show-entity",
                 show_entity(root, args.entity_id, document_limit=args.limit),
+            )
+
+        if args.command == "create-entity":
+            return emit_cli_payload(
+                "create-entity",
+                create_entity(
+                    root,
+                    entity_type=args.entity_type,
+                    display_name=args.display_name,
+                    notes=args.notes,
+                    emails=args.emails,
+                    phones=args.phones,
+                    names=args.names,
+                    handles=args.handles,
+                    external_ids=args.external_ids,
+                ),
+            )
+
+        if args.command == "edit-entity":
+            return emit_cli_payload(
+                "edit-entity",
+                edit_entity(
+                    root,
+                    args.entity_id,
+                    entity_type=args.entity_type,
+                    display_name=args.display_name,
+                    clear_display_name=args.clear_display_name,
+                    notes=args.notes,
+                    clear_notes=args.clear_notes,
+                    add_emails=args.add_emails,
+                    add_phones=args.add_phones,
+                    add_names=args.add_names,
+                    add_handles=args.add_handles,
+                    add_external_ids=args.add_external_ids,
+                ),
+            )
+
+        if args.command == "list-entity-role-inventory":
+            return emit_cli_payload(
+                "list-entity-role-inventory",
+                list_entity_role_inventory(
+                    root,
+                    roles=args.roles,
+                    query=args.query,
+                    raw_filters=args.filters,
+                    document_ids=args.document_ids,
+                    dataset_id=args.dataset_id,
+                    dataset_names=args.dataset_names,
+                    conversation_id=args.conversation_id,
+                    from_run_id=args.from_run_id,
+                    limit=args.limit,
+                    examples_per_entity=args.examples_per_entity,
+                ),
+            )
+
+        if args.command == "similar-entities":
+            return emit_cli_payload(
+                "similar-entities",
+                similar_entities(root, args.entity_id, limit=args.limit),
+            )
+
+        if args.command == "merge-entities":
+            return emit_cli_payload(
+                "merge-entities",
+                merge_entities(
+                    root,
+                    args.source_entity_id,
+                    args.target_entity_id,
+                    force=args.force,
+                    reason=args.reason,
+                ),
+            )
+
+        if args.command == "block-entity-merge":
+            return emit_cli_payload(
+                "block-entity-merge",
+                block_entity_merge(
+                    root,
+                    args.left_entity_id,
+                    args.right_entity_id,
+                    reason=args.reason,
+                ),
+            )
+
+        if args.command == "ignore-entity":
+            return emit_cli_payload(
+                "ignore-entity",
+                ignore_entity(root, args.entity_id, reason=args.reason),
+            )
+
+        if args.command == "split-entity":
+            return emit_cli_payload(
+                "split-entity",
+                split_entity(
+                    root,
+                    args.source_entity_id,
+                    target_entity_id=args.target_entity_id,
+                    identifier_ids=args.identifier_ids,
+                    document_ids=args.document_ids,
+                    roles=args.roles,
+                    display_name=args.display_name,
+                    reason=args.reason,
+                    block_merge=not args.no_block,
+                ),
+            )
+
+        if args.command == "assign-entity":
+            return emit_cli_payload(
+                "assign-entity",
+                assign_entity(
+                    root,
+                    document_id=args.document_id,
+                    role=args.role,
+                    entity_id=args.entity_id,
+                    reason=args.reason,
+                ),
+            )
+
+        if args.command == "unassign-entity":
+            return emit_cli_payload(
+                "unassign-entity",
+                unassign_entity(
+                    root,
+                    document_id=args.document_id,
+                    role=args.role,
+                    entity_id=args.entity_id,
+                    reason=args.reason,
+                ),
             )
 
         if args.command == "create-dataset":

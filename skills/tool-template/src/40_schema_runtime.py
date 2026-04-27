@@ -1212,6 +1212,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "document_occurrences", "extracted_doc_modified_at TEXT")
     ensure_column(connection, "document_occurrences", "extracted_content_type TEXT")
     ensure_column(connection, "document_occurrences", "extracted_kind TEXT")
+    ensure_column(connection, "document_occurrences", "entity_hints_json TEXT NOT NULL DEFAULT '{}'")
     ensure_column(connection, "document_email_threading", "message_id TEXT")
     ensure_column(connection, "document_email_threading", "in_reply_to TEXT")
     ensure_column(connection, "document_email_threading", "references_json TEXT NOT NULL DEFAULT '[]'")

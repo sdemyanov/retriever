@@ -220,11 +220,37 @@ def parse_slack_int(value: object) -> int:
         return 0
 
 
+def slack_actor_entity_hint(
+    actor_info: dict[str, str | None],
+    *,
+    identifier_scope: str | None,
+) -> dict[str, object] | None:
+    slack_user_id = normalize_whitespace(str(actor_info.get("slack_user_id") or ""))
+    speaker_name = normalize_entity_text(actor_info.get("speaker_name") or "")
+    if not slack_user_id or not speaker_name:
+        return None
+    identifier: dict[str, object] = {
+        "identifier_type": "external_id",
+        "identifier_name": "slack_user_id",
+        "display_value": slack_user_id,
+        "normalized_value": normalize_entity_lookup_text(slack_user_id),
+        "is_verified": 1,
+    }
+    normalized_scope = normalize_entity_lookup_text(identifier_scope or "")
+    if normalized_scope:
+        identifier["identifier_scope"] = normalized_scope
+    return {
+        "display_value": speaker_name,
+        "identifiers": [identifier],
+    }
+
+
 def load_slack_day_messages(
     day_file: Path,
     *,
     rel_path: str,
     user_directory: dict[str, dict[str, str | None]],
+    entity_identifier_scope: str | None = None,
 ) -> list[dict[str, object]]:
     try:
         raw_value = json.loads(day_file.read_text(encoding="utf-8"))
@@ -248,6 +274,10 @@ def load_slack_day_messages(
             continue
         actor_info = slack_message_actor_info(item, user_directory)
         speaker = actor_info.get("speaker_name") or "Slack message"
+        entity_hint = slack_actor_entity_hint(
+            actor_info,
+            identifier_scope=entity_identifier_scope,
+        )
         timestamp = normalize_slack_timestamp(ts_raw)
         thread_ts_raw = choose_slack_text(item.get("thread_ts"))
         is_reply = bool(thread_ts_raw and thread_ts_raw != ts_raw)
@@ -267,6 +297,7 @@ def load_slack_day_messages(
                 "day_rel_path": rel_path,
                 "day_file_name": day_file.name,
                 "ordinal": ordinal,
+                "entity_hint": entity_hint,
             }
         )
     return sorted(
@@ -281,6 +312,8 @@ def load_slack_day_messages(
 def build_slack_transcript_components(messages: list[dict[str, object]]) -> dict[str, object]:
     participants: list[str] = []
     seen_participants: set[str] = set()
+    participant_entity_hints: list[dict[str, object]] = []
+    seen_participant_hint_keys: set[str] = set()
     transcript_lines: list[str] = []
     chat_entries: list[dict[str, object]] = []
     first_timestamp: str | None = None
@@ -293,6 +326,23 @@ def build_slack_transcript_components(messages: list[dict[str, object]]) -> dict
         if normalized_speaker not in seen_participants:
             seen_participants.add(normalized_speaker)
             participants.append(speaker)
+        entity_hint = message.get("entity_hint")
+        if isinstance(entity_hint, dict):
+            hint_key = normalize_entity_lookup_text(entity_hint.get("display_value") or "")
+            for identifier in list(entity_hint.get("identifiers") or []):
+                if isinstance(identifier, dict) and identifier.get("identifier_type") == "external_id":
+                    hint_key = "|".join(
+                        [
+                            "external_id",
+                            normalize_entity_lookup_text(identifier.get("identifier_name") or ""),
+                            normalize_entity_lookup_text(identifier.get("identifier_scope") or ""),
+                            normalize_entity_lookup_text(identifier.get("normalized_value") or identifier.get("display_value") or ""),
+                        ]
+                    )
+                    break
+            if hint_key and hint_key not in seen_participant_hint_keys:
+                seen_participant_hint_keys.add(hint_key)
+                participant_entity_hints.append(entity_hint)
         body = normalize_whitespace(str(message.get("body") or ""))
         timestamp = normalize_whitespace(str(message.get("timestamp") or "")) or None
         if timestamp:
@@ -322,6 +372,7 @@ def build_slack_transcript_components(messages: list[dict[str, object]]) -> dict
         "date_modified": last_timestamp if last_timestamp and last_timestamp != first_timestamp else None,
         "message_count": len(chat_entries),
         "timestamped_message_count": timestamped_message_count,
+        "entity_hints": {"participants": participant_entity_hints} if participant_entity_hints else {},
     }
 
 
@@ -353,7 +404,7 @@ def build_slack_chat_payload(
         "message_count": components["message_count"],
         "timestamped_message_count": components["timestamped_message_count"],
     }
-    return build_chat_extracted_payload(
+    payload = build_chat_extracted_payload(
         title=title,
         author=None,
         date_created=components["date_created"],
@@ -364,6 +415,9 @@ def build_slack_chat_payload(
         chat_metadata=chat_metadata,
         chat_entries=list(components["chat_entries"]),
     )
+    if components.get("entity_hints"):
+        payload["entity_hints"] = components["entity_hints"]
+    return payload
 
 
 def build_slack_day_record(
@@ -372,6 +426,7 @@ def build_slack_day_record(
     rel_path: str,
     conversation_meta: dict[str, str],
     user_directory: dict[str, dict[str, str | None]],
+    entity_identifier_scope: str | None = None,
 ) -> dict[str, object]:
     return {
         "day_file": day_file,
@@ -385,6 +440,7 @@ def build_slack_day_record(
             day_file,
             rel_path=rel_path,
             user_directory=user_directory,
+            entity_identifier_scope=entity_identifier_scope,
         ),
     }
 
@@ -539,6 +595,7 @@ def plan_slack_export_conversations(
                 rel_path=rel_path,
                 conversation_meta=conversation_meta,
                 user_directory=user_directory,
+                entity_identifier_scope=rel_root,
             )
         )
 
@@ -1976,6 +2033,66 @@ def pst_export_sidecar_custodian_candidate(message_metadata: dict[str, object] |
     return None
 
 
+def pst_export_custodian_entity_hint(
+    message_metadata: dict[str, object] | None,
+    *,
+    identifier_scope: str | None = None,
+) -> dict[str, object] | None:
+    custodian = pst_export_sidecar_custodian_candidate(message_metadata)
+    location = pst_export_normalized_text(dict(message_metadata or {}).get("location"))
+    if not custodian or not location:
+        return None
+    if normalize_entity_lookup_text(custodian) == normalize_entity_lookup_text(location):
+        return None
+    identifier: dict[str, object] = {
+        "identifier_type": "external_id",
+        "identifier_name": "pst_location",
+        "display_value": location,
+        "normalized_value": normalize_entity_lookup_text(location),
+        "is_verified": 1,
+    }
+    normalized_scope = normalize_entity_lookup_text(identifier_scope or "")
+    if normalized_scope:
+        identifier["identifier_scope"] = normalized_scope
+    return {
+        "display_value": custodian,
+        "identifiers": [identifier],
+    }
+
+
+def merge_entity_hint_payload(
+    existing_hints: object,
+    *,
+    role: str,
+    hint: dict[str, object] | None,
+) -> dict[str, object]:
+    hints = dict(existing_hints) if isinstance(existing_hints, dict) else {}
+    if hint is None:
+        return hints
+    role_hints = [
+        item
+        for item in list(hints.get(role) or [])
+        if isinstance(item, dict)
+    ]
+    hint_key = normalize_entity_lookup_text(hint.get("display_value") or "")
+    for identifier in list(hint.get("identifiers") or []):
+        if isinstance(identifier, dict):
+            hint_key = entity_candidate_identifier_key(identifier)
+            break
+    if hint_key:
+        for item in role_hints:
+            item_key = normalize_entity_lookup_text(item.get("display_value") or "")
+            for identifier in list(item.get("identifiers") or []):
+                if isinstance(identifier, dict):
+                    item_key = entity_candidate_identifier_key(identifier)
+                    break
+            if item_key == hint_key:
+                return hints
+    role_hints.append(hint)
+    hints[role] = role_hints
+    return hints
+
+
 def select_pst_export_message_metadata(
     normalized_message: dict[str, object],
     *,
@@ -2068,6 +2185,7 @@ def apply_pst_export_message_metadata(
     extracted: dict[str, object],
     *,
     message_metadata: dict[str, object] | None,
+    identifier_scope: str | None = None,
 ) -> dict[str, object]:
     if not message_metadata:
         return dict(extracted)
@@ -2091,6 +2209,16 @@ def apply_pst_export_message_metadata(
     current_custodian = normalize_whitespace(str(enriched.get("custodian") or ""))
     if custodian_candidate and (not current_custodian or ("@" in custodian_candidate and "@" not in current_custodian)):
         enriched["custodian"] = custodian_candidate
+    custodian_entity_hint = pst_export_custodian_entity_hint(
+        message_metadata,
+        identifier_scope=identifier_scope,
+    )
+    if custodian_entity_hint is not None:
+        enriched["entity_hints"] = merge_entity_hint_payload(
+            enriched.get("entity_hints"),
+            role="custodian",
+            hint=custodian_entity_hint,
+        )
     if normalize_whitespace(str(enriched.get("content_type") or "")).lower() == "email":
         email_threading = dict(enriched.get("email_threading") or {})
         if not normalize_email_message_id(email_threading.get("message_id")):

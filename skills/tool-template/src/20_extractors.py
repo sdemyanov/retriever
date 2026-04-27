@@ -471,6 +471,8 @@ def resolve_slack_user_info(
         resolved["speaker_name"] = user_id
     if user_id and not resolved.get("mention_name"):
         resolved["mention_name"] = user_id
+    if user_id:
+        resolved["slack_user_id"] = user_id
     return resolved
 
 
