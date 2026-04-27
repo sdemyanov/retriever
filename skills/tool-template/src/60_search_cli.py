@@ -9699,6 +9699,16 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_cancel_parser.add_argument("--run-id", required=True, help="Run id to cancel")
     ingest_cancel_parser.add_argument("--force", action="store_true", help="Compatibility flag reserved for future workers")
 
+    ingest_run_step_parser = subparsers.add_parser("ingest-run-step", help="Run one recommended resumable V2 ingest step")
+    ingest_run_step_parser.add_argument("workspace", help="Workspace root path")
+    ingest_run_step_parser.add_argument("--run-id", help="Run id to advance; defaults to the latest run")
+    ingest_run_step_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Per-call budget; values above the bounded-worker cap are rejected",
+    )
+
     for step_command, help_text in (
         ("ingest-plan-step", "Advance resumable V2 ingest planning"),
         ("ingest-prepare-step", "Prepare resumable V2 ingest work items"),
@@ -9714,6 +9724,12 @@ def build_parser() -> argparse.ArgumentParser:
             default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
             help="Per-call budget; values above the bounded-worker cap are rejected",
         )
+        if step_command == "ingest-commit-step":
+            step_parser.add_argument(
+                "--max-items",
+                type=int,
+                help="Maximum prepared items to commit in this call",
+            )
 
     ingest_production_parser = subparsers.add_parser("ingest-production", help="Ingest a processed production volume")
     ingest_production_parser.add_argument("workspace", help="Workspace root path")
@@ -10706,6 +10722,12 @@ def main() -> int:
                 ingest_v2_cancel(root, run_id=args.run_id, force=args.force),
             )
 
+        if args.command == "ingest-run-step":
+            return emit_cli_payload(
+                "ingest-run-step",
+                ingest_v2_run_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
         if args.command == "ingest-plan-step":
             return emit_cli_payload(
                 "ingest-plan-step",
@@ -10721,7 +10743,12 @@ def main() -> int:
         if args.command == "ingest-commit-step":
             return emit_cli_payload(
                 "ingest-commit-step",
-                ingest_v2_commit_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+                ingest_v2_commit_step(
+                    root,
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                    max_items=args.max_items,
+                ),
             )
 
         if args.command == "ingest-finalize-step":
