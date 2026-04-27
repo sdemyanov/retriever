@@ -43,6 +43,12 @@ SCHEMA_STATEMENTS = [
       dataset_locator TEXT NOT NULL,
       dataset_name TEXT NOT NULL,
       dataset_name_normalized TEXT,
+      allow_auto_merge INTEGER NOT NULL DEFAULT 1,
+      email_auto_merge INTEGER NOT NULL DEFAULT 1,
+      handle_auto_merge INTEGER NOT NULL DEFAULT 1,
+      phone_auto_merge INTEGER NOT NULL DEFAULT 0,
+      name_auto_merge INTEGER NOT NULL DEFAULT 0,
+      external_id_auto_merge_names_json TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
@@ -132,6 +138,7 @@ SCHEMA_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS document_occurrences (
       id INTEGER PRIMARY KEY,
       document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      dataset_source_id INTEGER REFERENCES dataset_sources(id) ON DELETE SET NULL,
       parent_occurrence_id INTEGER REFERENCES document_occurrences(id) ON DELETE SET NULL,
       occurrence_control_number TEXT,
       source_kind TEXT,
@@ -167,6 +174,126 @@ SCHEMA_STATEMENTS = [
       ingested_at TEXT,
       last_seen_at TEXT,
       updated_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS entities (
+      id INTEGER PRIMARY KEY,
+      entity_type TEXT NOT NULL DEFAULT 'person',
+      display_name TEXT,
+      primary_email TEXT,
+      primary_phone TEXT,
+      sort_name TEXT,
+      notes TEXT,
+      display_name_source TEXT NOT NULL DEFAULT 'auto',
+      entity_origin TEXT NOT NULL DEFAULT 'observed',
+      canonical_status TEXT NOT NULL DEFAULT 'active',
+      merged_into_entity_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK (entity_type IN ('person', 'organization', 'shared_mailbox', 'system_mailbox', 'unknown')),
+      CHECK (display_name_source IN ('auto', 'manual')),
+      CHECK (entity_origin IN ('observed', 'identified', 'manual')),
+      CHECK (canonical_status IN ('active', 'merged', 'ignored')),
+      CHECK (
+        (canonical_status = 'merged' AND merged_into_entity_id IS NOT NULL)
+        OR (canonical_status != 'merged' AND merged_into_entity_id IS NULL)
+      )
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS entity_identifiers (
+      id INTEGER PRIMARY KEY,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      identifier_type TEXT NOT NULL,
+      display_value TEXT NOT NULL,
+      normalized_value TEXT NOT NULL,
+      provider TEXT,
+      provider_scope TEXT,
+      identifier_name TEXT,
+      identifier_scope TEXT,
+      parsed_name_json TEXT,
+      parsed_phone_json TEXT,
+      normalized_full_name TEXT,
+      normalized_sort_name TEXT,
+      is_primary INTEGER NOT NULL DEFAULT 0,
+      is_verified INTEGER NOT NULL DEFAULT 0,
+      source_kind TEXT NOT NULL DEFAULT 'auto',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK (identifier_type IN ('email', 'phone', 'name', 'handle', 'external_id'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS entity_resolution_keys (
+      id INTEGER PRIMARY KEY,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      identifier_id INTEGER REFERENCES entity_identifiers(id) ON DELETE CASCADE,
+      key_type TEXT NOT NULL,
+      provider TEXT,
+      provider_scope TEXT,
+      identifier_name TEXT,
+      identifier_scope TEXT,
+      normalized_value TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_entities (
+      id INTEGER PRIMARY KEY,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      ordinal INTEGER NOT NULL DEFAULT 0,
+      assignment_mode TEXT NOT NULL DEFAULT 'auto',
+      observed_title TEXT,
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK (role IN ('author', 'participant', 'recipient', 'custodian')),
+      CHECK (assignment_mode IN ('auto', 'manual'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS entity_overrides (
+      id INTEGER PRIMARY KEY,
+      scope_type TEXT NOT NULL,
+      scope_id INTEGER,
+      role TEXT,
+      source_entity_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+      normalized_candidate_key TEXT,
+      replacement_entity_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+      override_effect TEXT NOT NULL,
+      source_hint TEXT,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK (scope_type IN ('document', 'global')),
+      CHECK (override_effect IN ('replace', 'remove', 'ignore')),
+      CHECK (
+        (scope_type = 'document' AND scope_id IS NOT NULL AND override_effect IN ('replace', 'remove'))
+        OR (scope_type = 'global' AND scope_id IS NULL AND override_effect = 'ignore')
+      ),
+      CHECK (
+        (override_effect = 'replace' AND replacement_entity_id IS NOT NULL)
+        OR (override_effect IN ('remove', 'ignore') AND replacement_entity_id IS NULL)
+      ),
+      CHECK (
+        override_effect != 'ignore'
+        OR source_entity_id IS NOT NULL
+        OR normalized_candidate_key IS NOT NULL
+      )
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS entity_merge_blocks (
+      id INTEGER PRIMARY KEY,
+      left_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      right_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      CHECK (left_entity_id < right_entity_id)
     )
     """,
     """
@@ -723,6 +850,7 @@ def workspace_paths(root: Path) -> dict[str, Path]:
         "ingest_tmp_dir": ingest_tmp_dir,
         "locks_dir": locks_dir,
         "ingest_lock_path": locks_dir / "ingest.lock",
+        "entity_rebuild_lock_path": locks_dir / "entity-rebuild.lock",
     }
 
 
@@ -958,6 +1086,49 @@ def release_workspace_ingest_lock(handle) -> None:
         release_os_file_lock(handle)
     finally:
         handle.close()
+
+
+def acquire_workspace_entity_rebuild_lock(paths: dict[str, Path]):
+    lock_path = paths["entity_rebuild_lock_path"]
+    handle = lock_path.open("a+b")
+    try:
+        acquire_os_file_lock(handle)
+    except RetrieverError:
+        handle.close()
+        raise
+    except OSError as exc:
+        handle.close()
+        if exc.errno in {errno.EACCES, errno.EAGAIN} or isinstance(exc, PermissionError):
+            raise RetrieverError(
+                "Another entity rebuild is already running in this workspace. Wait for it to finish and retry."
+            ) from exc
+        raise RetrieverError(
+            f"Unable to acquire workspace entity rebuild lock at {lock_path}: {type(exc).__name__}: {exc}"
+        ) from exc
+    return handle
+
+
+def release_workspace_entity_rebuild_lock(handle) -> None:
+    try:
+        release_os_file_lock(handle)
+    finally:
+        handle.close()
+
+
+@contextmanager
+def workspace_entity_rebuild_session(paths: dict[str, Path], *, command_name: str):
+    ensure_layout(paths)
+    ingest_lock_handle = acquire_workspace_ingest_lock(paths)
+    entity_lock_handle = None
+    benchmark_mark("workspace_ingest_lock_acquired", command=command_name)
+    try:
+        entity_lock_handle = acquire_workspace_entity_rebuild_lock(paths)
+        benchmark_mark("workspace_entity_rebuild_lock_acquired", command=command_name)
+        yield {"id": new_ingest_session_id()}
+    finally:
+        if entity_lock_handle is not None:
+            release_workspace_entity_rebuild_lock(entity_lock_handle)
+        release_workspace_ingest_lock(ingest_lock_handle)
 
 
 def acquire_plugin_runtime_install_lock(paths: dict[str, Path]):
@@ -3064,6 +3235,975 @@ def document_custodian_display_text_from_row(row: sqlite3.Row | dict[str, object
     return ", ".join(values)
 
 
+def normalize_entity_text(value: object) -> str:
+    return normalize_whitespace(unicodedata.normalize("NFKC", str(value or "")))
+
+
+def normalize_entity_lookup_text(value: object) -> str:
+    text = normalize_entity_text(value).lower()
+    text = re.sub(r"[^\w@.+#/-]+", " ", text, flags=re.UNICODE)
+    return normalize_whitespace(text)
+
+
+def normalize_entity_email(value: object) -> str | None:
+    text = normalize_entity_text(value).strip("<>;,")
+    if not text or "@" not in text:
+        return None
+    candidate = text.lower()
+    candidate = re.sub(r"^mailto:", "", candidate)
+    candidate = candidate.strip("<>;,")
+    if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", candidate):
+        return None
+    if "." not in candidate.rsplit("@", 1)[1]:
+        return None
+    return candidate
+
+
+def normalize_entity_identifier_name(value: object) -> str | None:
+    text = normalize_entity_lookup_text(value)
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text or None
+
+
+def normalize_entity_handle(value: object) -> str | None:
+    text = normalize_entity_text(value).strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        text = text[1:]
+    text = text.strip()
+    if not text:
+        return None
+    normalized = re.sub(r"\s+", "", text).lower()
+    if not re.fullmatch(r"[a-z0-9._-]{2,128}", normalized):
+        return None
+    return normalized
+
+
+def normalize_entity_phone(value: object) -> dict[str, object] | None:
+    text = normalize_entity_text(value)
+    if not text:
+        return None
+    extension = None
+    extension_match = re.search(r"(?i)(?:ext\.?|extension|x)\s*([0-9]{1,10})\b", text)
+    phone_text = text
+    if extension_match:
+        extension = extension_match.group(1)
+        phone_text = (text[:extension_match.start()] + text[extension_match.end():]).strip()
+    digits = re.sub(r"\D+", "", phone_text)
+    if len(digits) < 7 or len(digits) > 15:
+        return None
+    has_phone_shape = bool(re.search(r"[()+\-\s.]", phone_text)) or phone_text.strip().startswith("+")
+    if not has_phone_shape and len(digits) < 10:
+        return None
+    if phone_text.strip().startswith("+"):
+        base_phone = f"+{digits}"
+    elif len(digits) == 10:
+        base_phone = f"+1{digits}"
+    elif len(digits) == 11 and digits.startswith("1"):
+        base_phone = f"+{digits}"
+    else:
+        base_phone = digits
+    normalized = f"{base_phone}x{extension}" if extension else base_phone
+    return {
+        "display_value": text,
+        "normalized_value": normalized,
+        "parsed_phone": {
+            "base_phone": base_phone,
+            "extension": extension,
+        },
+    }
+
+
+def strip_entity_container_words(value: str) -> str:
+    text = normalize_entity_text(value)
+    stripped = normalize_whitespace(re.sub(r"(?i)\b(?:mailbox|archive|export|pst|mbox)\b", " ", text))
+    if len(entity_name_tokens(stripped)) >= 2:
+        return stripped
+    return text
+
+
+def entity_name_tokens(value: object) -> list[str]:
+    text = normalize_entity_text(value)
+    text = re.sub(r"[\"'()<>]", " ", text)
+    text = re.sub(r"\b(?:mr|mrs|ms|miss|dr|prof)\.?\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:jr|sr|ii|iii|iv|esq)\.?\b", " ", text, flags=re.IGNORECASE)
+    return [
+        token
+        for token in re.split(r"[\s.]+", text)
+        if token and re.search(r"[A-Za-z]", token)
+    ]
+
+
+def parse_entity_name(value: object) -> dict[str, object] | None:
+    text = strip_entity_container_words(str(value or ""))
+    if not text or "@" in text:
+        return None
+    compact = normalize_entity_lookup_text(text)
+    if not compact:
+        return None
+    parts = [normalize_entity_text(part) for part in text.split(",", 1)]
+    parsed: dict[str, object] = {}
+    display_name = normalize_entity_text(text)
+    if len(parts) == 2 and parts[0] and parts[1]:
+        family_tokens = entity_name_tokens(parts[0])
+        given_tokens = entity_name_tokens(parts[1])
+        if family_tokens and given_tokens:
+            tokens = [*given_tokens, *family_tokens]
+            display_name = " ".join(tokens)
+            parsed = {
+                "given": given_tokens[0],
+                "middle": " ".join(given_tokens[1:]) or None,
+                "family": " ".join(family_tokens),
+            }
+    if not parsed:
+        tokens = entity_name_tokens(text)
+        if not tokens:
+            return None
+        if len(tokens) >= 2:
+            parsed = {
+                "given": tokens[0],
+                "middle": " ".join(tokens[1:-1]) or None,
+                "family": tokens[-1],
+            }
+            display_name = " ".join(tokens)
+        else:
+            parsed = {
+                "given": tokens[0],
+                "middle": None,
+                "family": None,
+            }
+            display_name = tokens[0]
+    display_tokens = entity_name_tokens(display_name)
+    if not display_tokens:
+        return None
+    normalized_full_name = normalize_entity_lookup_text(" ".join(display_tokens))
+    family = normalize_entity_lookup_text(str(parsed.get("family") or ""))
+    given = normalize_entity_lookup_text(str(parsed.get("given") or ""))
+    middle = normalize_entity_lookup_text(str(parsed.get("middle") or ""))
+    sort_parts = [part for part in (family, given, middle) if part]
+    normalized_sort_name = normalize_entity_lookup_text(" ".join(sort_parts)) if sort_parts else normalized_full_name
+    return {
+        "display_value": display_name,
+        "normalized_value": normalized_full_name,
+        "parsed_name": {key: value for key, value in parsed.items() if value},
+        "normalized_full_name": normalized_full_name,
+        "normalized_sort_name": normalized_sort_name,
+        "is_full_name": len(display_tokens) >= 2 and bool(parsed.get("family")),
+    }
+
+
+def entity_type_from_candidate_parts(
+    *,
+    name_value: str | None,
+    email_value: str | None,
+    name_is_full: bool = False,
+) -> str:
+    email = normalize_entity_email(email_value)
+    if email:
+        local_part = email.split("@", 1)[0]
+        normalized_local = re.sub(r"[^a-z0-9]+", "", local_part.lower())
+        if normalized_local in {"noreply", "donotreply", "no-reply", "mailerdaemon", "postmaster"}:
+            return ENTITY_TYPE_SYSTEM_MAILBOX
+        if normalized_local in {"support", "sales", "legal", "info", "contact", "admin", "billing", "help"}:
+            return ENTITY_TYPE_SHARED_MAILBOX
+    name = normalize_entity_lookup_text(name_value or "")
+    if re.search(r"\b(inc|llc|llp|ltd|corp|corporation|company|co|plc|gmbh|sarl|partners|holdings)\b", name):
+        return ENTITY_TYPE_ORGANIZATION
+    if email or (name and name_is_full):
+        return ENTITY_TYPE_PERSON
+    if name:
+        return ENTITY_TYPE_UNKNOWN
+    return ENTITY_TYPE_UNKNOWN
+
+
+def entity_candidate_identifier_key(identifier: dict[str, object]) -> str:
+    identifier_type = str(identifier.get("identifier_type") or "")
+    pieces = [identifier_type]
+    for field_name in ("provider", "provider_scope", "identifier_name", "identifier_scope", "normalized_value"):
+        value = normalize_entity_lookup_text(identifier.get(field_name) or "")
+        if value:
+            pieces.append(value)
+    return ":".join(pieces)
+
+
+def entity_candidate_key(role: str, identifiers: list[dict[str, object]], fallback_value: object) -> str:
+    identifier_keys = sorted(entity_candidate_identifier_key(identifier) for identifier in identifiers)
+    if identifier_keys:
+        return "|".join([role, *identifier_keys])
+    return "|".join([role, "raw", normalize_entity_lookup_text(fallback_value)])
+
+
+def split_entity_like_values(raw_value: object, *, prefer_single_comma_name: bool = False) -> list[str]:
+    text = normalize_entity_text(raw_value)
+    if not text:
+        return []
+    semicolon_parts = [normalize_entity_text(part) for part in text.split(";")]
+    if len([part for part in semicolon_parts if part]) > 1:
+        return [part for part in semicolon_parts if part]
+    if "@" in text or "<" in text:
+        parsed_addresses = getaddresses([text])
+        parts: list[str] = []
+        for display_name, address in parsed_addresses:
+            normalized_email = normalize_entity_email(address)
+            display_name = normalize_entity_text(display_name)
+            if normalized_email:
+                parts.append(f"{display_name} <{normalized_email}>" if display_name else normalized_email)
+            elif display_name:
+                parts.append(display_name)
+        if parts:
+            return parts
+    comma_count = text.count(",")
+    if prefer_single_comma_name and comma_count == 1 and parse_entity_name(text):
+        return [text]
+    if comma_count:
+        return [part for part in (normalize_entity_text(part) for part in text.split(",")) if part]
+    return [text]
+
+
+def parse_labeled_external_ids(value: object) -> list[dict[str, object]]:
+    text = normalize_entity_text(value)
+    identifiers: list[dict[str, object]] = []
+    for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9 _/-]{1,40})\s*[:=#]\s*([A-Za-z0-9][A-Za-z0-9_.:/-]{2,80})", text):
+        identifier_name = normalize_entity_identifier_name(match.group(1))
+        normalized_value = normalize_entity_lookup_text(match.group(2))
+        if not identifier_name or not normalized_value:
+            continue
+        identifiers.append(
+            {
+                "identifier_type": "external_id",
+                "display_value": match.group(2),
+                "normalized_value": normalized_value,
+                "identifier_name": identifier_name,
+            }
+        )
+    return identifiers
+
+
+def parse_entity_candidate_text(
+    raw_value: object,
+    *,
+    role: str,
+    provider: str | None = None,
+    provider_scope: str | None = None,
+) -> dict[str, object] | None:
+    text = normalize_entity_text(raw_value)
+    if not text:
+        return None
+    emails: list[str] = []
+    names: list[str] = []
+    angle_address_match = re.match(r"^(?P<display>.*?)<(?P<address>[^>]+)>\s*$", text)
+    if angle_address_match:
+        email = normalize_entity_email(angle_address_match.group("address"))
+        display_name = normalize_entity_text(angle_address_match.group("display"))
+        if email:
+            emails.append(email)
+            if display_name:
+                names.append(display_name.strip("\"' "))
+    if not emails:
+        parsed_addresses = getaddresses([text])
+        for display_name, address in parsed_addresses:
+            email = normalize_entity_email(address)
+            if email and email not in emails:
+                emails.append(email)
+                if normalize_entity_text(display_name):
+                    names.append(normalize_entity_text(display_name))
+    if not emails:
+        for email_match in re.finditer(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text):
+            email = normalize_entity_email(email_match.group(0))
+            if email and email not in emails:
+                emails.append(email)
+    name_source = names[0] if names else re.sub(r"<[^>]+>", " ", text)
+    for email in emails:
+        name_source = re.sub(re.escape(email), " ", name_source, flags=re.IGNORECASE)
+    phone = normalize_entity_phone(text)
+    if phone:
+        name_source = normalize_whitespace(str(name_source).replace(str(phone["display_value"]), " "))
+    identifiers: list[dict[str, object]] = []
+    for email in emails:
+        identifiers.append(
+            {
+                "identifier_type": "email",
+                "display_value": email,
+                "normalized_value": email,
+                "is_verified": 1,
+            }
+        )
+    parsed_name = parse_entity_name(name_source)
+    if parsed_name is not None:
+        identifiers.append(
+            {
+                "identifier_type": "name",
+                "display_value": parsed_name["display_value"],
+                "normalized_value": parsed_name["normalized_value"],
+                "parsed_name_json": json.dumps(parsed_name["parsed_name"], ensure_ascii=True, sort_keys=True),
+                "normalized_full_name": parsed_name["normalized_full_name"],
+                "normalized_sort_name": parsed_name["normalized_sort_name"],
+                "is_primary": 1 if parsed_name["is_full_name"] else 0,
+            }
+        )
+    if phone is not None:
+        identifiers.append(
+            {
+                "identifier_type": "phone",
+                "display_value": phone["display_value"],
+                "normalized_value": phone["normalized_value"],
+                "parsed_phone_json": json.dumps(phone["parsed_phone"], ensure_ascii=True, sort_keys=True),
+            }
+        )
+    if provider and provider_scope:
+        handle = normalize_entity_handle(text)
+        if handle:
+            identifiers.append(
+                {
+                    "identifier_type": "handle",
+                    "display_value": text,
+                    "normalized_value": handle,
+                    "provider": normalize_entity_identifier_name(provider),
+                    "provider_scope": normalize_entity_lookup_text(provider_scope),
+                }
+            )
+    identifiers.extend(parse_labeled_external_ids(text))
+    if not identifiers:
+        return None
+    display_basis = (
+        str(parsed_name["display_value"])
+        if parsed_name is not None
+        else emails[0]
+        if emails
+        else str(phone["display_value"])
+        if phone is not None
+        else text
+    )
+    entity_type = entity_type_from_candidate_parts(
+        name_value=str(parsed_name["display_value"]) if parsed_name is not None else None,
+        email_value=emails[0] if emails else None,
+        name_is_full=bool(parsed_name.get("is_full_name")) if parsed_name is not None else False,
+    )
+    return {
+        "role": role,
+        "raw_value": text,
+        "display_value": display_basis,
+        "entity_type": entity_type,
+        "identifiers": identifiers,
+        "normalized_candidate_key": entity_candidate_key(role, identifiers, text),
+    }
+
+
+def parse_entity_candidates(
+    raw_value: object,
+    *,
+    role: str,
+    provider: str | None = None,
+    provider_scope: str | None = None,
+) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for part in split_entity_like_values(raw_value, prefer_single_comma_name=role in {"author", "custodian"}):
+        candidate = parse_entity_candidate_text(part, role=role, provider=provider, provider_scope=provider_scope)
+        if candidate is None:
+            continue
+        key = str(candidate["normalized_candidate_key"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        candidates.append(candidate)
+    return candidates
+
+
+def source_backed_dataset_policy_from_row(row: sqlite3.Row | None) -> dict[str, object]:
+    if row is None or normalize_whitespace(str(row["source_kind"] or "")).lower() == MANUAL_DATASET_SOURCE_KIND:
+        return {
+            "dataset_id": None,
+            "allow_auto_merge": False,
+            "email_auto_merge": False,
+            "handle_auto_merge": False,
+            "phone_auto_merge": False,
+            "name_auto_merge": False,
+            "external_id_auto_merge_names": set(),
+        }
+    names = normalize_string_list(row["external_id_auto_merge_names_json"])
+    return {
+        "dataset_id": int(row["id"]),
+        "allow_auto_merge": bool(int(row["allow_auto_merge"] or 0)),
+        "email_auto_merge": bool(int(row["email_auto_merge"] or 0)),
+        "handle_auto_merge": bool(int(row["handle_auto_merge"] or 0)),
+        "phone_auto_merge": bool(int(row["phone_auto_merge"] or 0)),
+        "name_auto_merge": bool(int(row["name_auto_merge"] or 0)),
+        "external_id_auto_merge_names": {
+            name
+            for raw_name in names
+            for name in [normalize_entity_identifier_name(raw_name)]
+            if name
+        },
+    }
+
+
+def source_backed_dataset_policy_for_source(
+    connection: sqlite3.Connection,
+    dataset_source_row: sqlite3.Row | None,
+) -> dict[str, object]:
+    if dataset_source_row is None:
+        return source_backed_dataset_policy_from_row(None)
+    dataset_row = get_dataset_row_by_id(connection, int(dataset_source_row["dataset_id"]))
+    return source_backed_dataset_policy_from_row(dataset_row)
+
+
+def identifier_auto_merge_enabled(identifier: dict[str, object], policy: dict[str, object]) -> bool:
+    if not bool(policy.get("allow_auto_merge")):
+        return False
+    identifier_type = str(identifier.get("identifier_type") or "")
+    if identifier_type == "email":
+        return bool(policy.get("email_auto_merge"))
+    if identifier_type == "handle":
+        return bool(policy.get("handle_auto_merge")) and bool(identifier.get("provider")) and bool(identifier.get("provider_scope"))
+    if identifier_type == "phone":
+        return bool(policy.get("phone_auto_merge"))
+    if identifier_type == "name":
+        return bool(policy.get("name_auto_merge")) and bool(identifier.get("normalized_full_name")) and bool(identifier.get("normalized_sort_name"))
+    if identifier_type == "external_id":
+        enabled_names = policy.get("external_id_auto_merge_names")
+        return isinstance(enabled_names, set) and str(identifier.get("identifier_name") or "") in enabled_names
+    return False
+
+
+def resolution_key_lookup_clause(identifier: dict[str, object]) -> tuple[str, list[object]]:
+    identifier_type = str(identifier.get("identifier_type") or "")
+    normalized_value = str(identifier.get("normalized_value") or "")
+    if identifier_type == "handle":
+        return (
+            """
+            key_type = ? AND provider = ? AND provider_scope = ? AND normalized_value = ?
+            """,
+            [
+                identifier_type,
+                identifier.get("provider"),
+                identifier.get("provider_scope"),
+                normalized_value,
+            ],
+        )
+    if identifier_type == "external_id":
+        return (
+            """
+            key_type = ? AND identifier_name = ? AND COALESCE(identifier_scope, '') = COALESCE(?, '') AND normalized_value = ?
+            """,
+            [
+                identifier_type,
+                identifier.get("identifier_name"),
+                identifier.get("identifier_scope"),
+                normalized_value,
+            ],
+        )
+    return "key_type = ? AND normalized_value = ?", [identifier_type, normalized_value]
+
+
+def canonicalize_entity_id(connection: sqlite3.Connection, entity_id: int) -> int | None:
+    seen: set[int] = set()
+    current_id = int(entity_id)
+    while current_id not in seen:
+        seen.add(current_id)
+        row = connection.execute(
+            """
+            SELECT id, canonical_status, merged_into_entity_id
+            FROM entities
+            WHERE id = ?
+            """,
+            (current_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["canonical_status"] != ENTITY_STATUS_MERGED:
+            return int(row["id"])
+        if row["merged_into_entity_id"] is None:
+            return None
+        current_id = int(row["merged_into_entity_id"])
+    return None
+
+
+def entity_types_conflict(left_type: object, right_type: object) -> bool:
+    left = normalize_entity_lookup_text(left_type)
+    right = normalize_entity_lookup_text(right_type)
+    if not left or not right or left == right:
+        return False
+    if ENTITY_TYPE_UNKNOWN in {left, right}:
+        return False
+    concrete = {ENTITY_TYPE_PERSON, ENTITY_TYPE_ORGANIZATION, ENTITY_TYPE_SHARED_MAILBOX, ENTITY_TYPE_SYSTEM_MAILBOX}
+    return left in concrete and right in concrete
+
+
+def active_entity_id_for_resolution_key(
+    connection: sqlite3.Connection,
+    identifier: dict[str, object],
+) -> int | None:
+    clause, params = resolution_key_lookup_clause(identifier)
+    row = connection.execute(
+        f"""
+        SELECT entity_id
+        FROM entity_resolution_keys
+        WHERE {clause}
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if row is None:
+        return None
+    entity_id = canonicalize_entity_id(connection, int(row["entity_id"]))
+    if entity_id is None:
+        return None
+    entity_row = connection.execute(
+        """
+        SELECT canonical_status
+        FROM entities
+        WHERE id = ?
+        """,
+        (entity_id,),
+    ).fetchone()
+    if entity_row is None or entity_row["canonical_status"] != ENTITY_STATUS_ACTIVE:
+        return None
+    return entity_id
+
+
+def create_entity_for_candidate(connection: sqlite3.Connection, candidate: dict[str, object]) -> int:
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO entities (
+          entity_type, display_name, display_name_source, entity_origin,
+          canonical_status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate.get("entity_type") or ENTITY_TYPE_UNKNOWN,
+            None,
+            ENTITY_DISPLAY_SOURCE_AUTO,
+            ENTITY_ORIGIN_OBSERVED,
+            ENTITY_STATUS_ACTIVE,
+            now,
+            now,
+        ),
+    )
+    return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def ensure_entity_identifier(
+    connection: sqlite3.Connection,
+    *,
+    entity_id: int,
+    identifier: dict[str, object],
+) -> int:
+    identifier_type = str(identifier.get("identifier_type") or "")
+    normalized_value = str(identifier.get("normalized_value") or "")
+    if not identifier_type or not normalized_value:
+        raise RetrieverError("Entity identifiers require type and normalized value.")
+    provider = identifier.get("provider")
+    provider_scope = identifier.get("provider_scope")
+    identifier_name = identifier.get("identifier_name")
+    identifier_scope = identifier.get("identifier_scope")
+    existing_row = connection.execute(
+        """
+        SELECT id
+        FROM entity_identifiers
+        WHERE entity_id = ?
+          AND identifier_type = ?
+          AND normalized_value = ?
+          AND COALESCE(provider, '') = COALESCE(?, '')
+          AND COALESCE(provider_scope, '') = COALESCE(?, '')
+          AND COALESCE(identifier_name, '') = COALESCE(?, '')
+          AND COALESCE(identifier_scope, '') = COALESCE(?, '')
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (entity_id, identifier_type, normalized_value, provider, provider_scope, identifier_name, identifier_scope),
+    ).fetchone()
+    now = utc_now()
+    if existing_row is not None:
+        connection.execute(
+            """
+            UPDATE entity_identifiers
+            SET display_value = COALESCE(NULLIF(display_value, ''), ?),
+                parsed_name_json = COALESCE(parsed_name_json, ?),
+                parsed_phone_json = COALESCE(parsed_phone_json, ?),
+                normalized_full_name = COALESCE(normalized_full_name, ?),
+                normalized_sort_name = COALESCE(normalized_sort_name, ?),
+                is_primary = CASE WHEN ? THEN 1 ELSE is_primary END,
+                is_verified = CASE WHEN ? THEN 1 ELSE is_verified END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                identifier.get("display_value") or normalized_value,
+                identifier.get("parsed_name_json"),
+                identifier.get("parsed_phone_json"),
+                identifier.get("normalized_full_name"),
+                identifier.get("normalized_sort_name"),
+                1 if int(identifier.get("is_primary") or 0) else 0,
+                1 if int(identifier.get("is_verified") or 0) else 0,
+                now,
+                int(existing_row["id"]),
+            ),
+        )
+        return int(existing_row["id"])
+    connection.execute(
+        """
+        INSERT INTO entity_identifiers (
+          entity_id, identifier_type, display_value, normalized_value,
+          provider, provider_scope, identifier_name, identifier_scope,
+          parsed_name_json, parsed_phone_json, normalized_full_name, normalized_sort_name,
+          is_primary, is_verified, source_kind, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            entity_id,
+            identifier_type,
+            str(identifier.get("display_value") or normalized_value),
+            normalized_value,
+            provider,
+            provider_scope,
+            identifier_name,
+            identifier_scope,
+            identifier.get("parsed_name_json"),
+            identifier.get("parsed_phone_json"),
+            identifier.get("normalized_full_name"),
+            identifier.get("normalized_sort_name"),
+            1 if int(identifier.get("is_primary") or 0) else 0,
+            1 if int(identifier.get("is_verified") or 0) else 0,
+            str(identifier.get("source_kind") or "auto"),
+            now,
+            now,
+        ),
+    )
+    return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def ensure_entity_resolution_key(
+    connection: sqlite3.Connection,
+    *,
+    entity_id: int,
+    identifier_id: int,
+    identifier: dict[str, object],
+) -> int | None:
+    now = utc_now()
+    try:
+        connection.execute(
+            """
+            INSERT INTO entity_resolution_keys (
+              entity_id, identifier_id, key_type, provider, provider_scope,
+              identifier_name, identifier_scope, normalized_value, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entity_id,
+                identifier_id,
+                identifier.get("identifier_type"),
+                identifier.get("provider"),
+                identifier.get("provider_scope"),
+                identifier.get("identifier_name"),
+                identifier.get("identifier_scope"),
+                identifier.get("normalized_value"),
+                now,
+                now,
+            ),
+        )
+        return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+    except sqlite3.IntegrityError:
+        existing_owner = active_entity_id_for_resolution_key(connection, identifier)
+        if existing_owner == entity_id:
+            return None
+        return None
+
+
+def recompute_entity_caches(connection: sqlite3.Connection, entity_id: int) -> None:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM entities
+        WHERE id = ?
+        """,
+        (entity_id,),
+    ).fetchone()
+    if row is None or row["canonical_status"] != ENTITY_STATUS_ACTIVE:
+        return
+    identifiers = connection.execute(
+        """
+        SELECT *
+        FROM entity_identifiers
+        WHERE entity_id = ?
+        ORDER BY is_primary DESC, is_verified DESC, id ASC
+        """,
+        (entity_id,),
+    ).fetchall()
+    emails = [item for item in identifiers if item["identifier_type"] == "email"]
+    phones = [item for item in identifiers if item["identifier_type"] == "phone"]
+    names = [item for item in identifiers if item["identifier_type"] == "name"]
+    primary_email = str(emails[0]["normalized_value"]) if emails else None
+    primary_phone = str(phones[0]["normalized_value"]) if phones else None
+    display_name = row["display_name"]
+    sort_name = row["sort_name"]
+    if row["display_name_source"] != ENTITY_DISPLAY_SOURCE_MANUAL:
+        full_name_rows = [
+            item
+            for item in names
+            if normalize_whitespace(str(item["normalized_full_name"] or ""))
+            and len(str(item["normalized_full_name"]).split()) >= 2
+        ]
+        display_name_rows = full_name_rows
+        if row["entity_type"] != ENTITY_TYPE_PERSON and not display_name_rows:
+            display_name_rows = names
+        if display_name_rows:
+            display_name = str(display_name_rows[0]["display_value"])
+            sort_name = str(display_name_rows[0]["normalized_sort_name"] or display_name_rows[0]["normalized_full_name"])
+        else:
+            display_name = None
+            sort_name = None
+    resolution_key_row = connection.execute(
+        """
+        SELECT 1
+        FROM entity_resolution_keys
+        WHERE entity_id = ?
+        LIMIT 1
+        """,
+        (entity_id,),
+    ).fetchone()
+    entity_origin = row["entity_origin"]
+    if entity_origin != ENTITY_ORIGIN_MANUAL:
+        entity_origin = ENTITY_ORIGIN_IDENTIFIED if resolution_key_row is not None else ENTITY_ORIGIN_OBSERVED
+    connection.execute(
+        """
+        UPDATE entities
+        SET display_name = ?, primary_email = ?, primary_phone = ?,
+            sort_name = ?, entity_origin = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (display_name, primary_email, primary_phone, sort_name, entity_origin, utc_now(), entity_id),
+    )
+
+
+def resolve_entity_candidate(
+    connection: sqlite3.Connection,
+    candidate: dict[str, object],
+    *,
+    policy: dict[str, object],
+) -> int:
+    identifiers = list(candidate.get("identifiers") or [])
+    enabled_identifiers = [
+        identifier for identifier in identifiers if identifier_auto_merge_enabled(identifier, policy)
+    ]
+    matched_entity_ids: set[int] = set()
+    for identifier in enabled_identifiers:
+        matched_entity_id = active_entity_id_for_resolution_key(connection, identifier)
+        if matched_entity_id is not None:
+            matched_entity_ids.add(matched_entity_id)
+    if len(matched_entity_ids) == 1:
+        entity_id = next(iter(matched_entity_ids))
+        entity_row = connection.execute(
+            "SELECT entity_type FROM entities WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        if entity_row is not None and entity_types_conflict(entity_row["entity_type"], candidate.get("entity_type")):
+            entity_id = create_entity_for_candidate(connection, candidate)
+            enabled_identifiers = []
+    else:
+        entity_id = create_entity_for_candidate(connection, candidate)
+        if len(matched_entity_ids) > 1:
+            enabled_identifiers = []
+    inserted_identifier_ids: dict[int, dict[str, object]] = {}
+    for identifier in identifiers:
+        identifier_id = ensure_entity_identifier(connection, entity_id=entity_id, identifier=identifier)
+        inserted_identifier_ids[identifier_id] = identifier
+    for identifier_id, identifier in inserted_identifier_ids.items():
+        if identifier in enabled_identifiers:
+            ensure_entity_resolution_key(
+                connection,
+                entity_id=entity_id,
+                identifier_id=identifier_id,
+                identifier=identifier,
+            )
+    recompute_entity_caches(connection, entity_id)
+    return entity_id
+
+
+def entity_display_label_from_row(row: sqlite3.Row | dict[str, object] | None) -> str:
+    if row is None:
+        return "Unknown Entity"
+    display_name = normalize_entity_text(row["display_name"] if "display_name" in row.keys() else None)  # type: ignore[attr-defined,index]
+    primary_email = normalize_entity_email(row["primary_email"] if "primary_email" in row.keys() else None)  # type: ignore[attr-defined,index]
+    primary_phone = normalize_entity_text(row["primary_phone"] if "primary_phone" in row.keys() else None)  # type: ignore[attr-defined,index]
+    entity_id = row["id"] if "id" in row.keys() else None  # type: ignore[attr-defined,index]
+    if display_name and primary_email:
+        return f"{display_name} <{primary_email}>"
+    if display_name:
+        return display_name
+    if primary_email:
+        return primary_email
+    if primary_phone:
+        return primary_phone
+    return f"Unknown Entity {entity_id}" if entity_id is not None else "Unknown Entity"
+
+
+def entity_display_label(connection: sqlite3.Connection, entity_id: int) -> str:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM entities
+        WHERE id = ?
+        """,
+        (entity_id,),
+    ).fetchone()
+    return entity_display_label_from_row(row)
+
+
+def rebuild_document_entity_caches(connection: sqlite3.Connection, document_id: int) -> dict[str, object]:
+    document_row = connection.execute(
+        f"""
+        SELECT id, {MANUAL_FIELD_LOCKS_COLUMN} AS locks_json
+        FROM documents
+        WHERE id = ?
+        """,
+        (document_id,),
+    ).fetchone()
+    if document_row is None:
+        raise RetrieverError(f"Unknown document id: {document_id}")
+    locked_fields = set(normalize_string_list(document_row["locks_json"]))
+    rows = connection.execute(
+        """
+        SELECT de.role, de.ordinal, e.*
+        FROM document_entities de
+        JOIN entities e ON e.id = de.entity_id
+        WHERE de.document_id = ?
+          AND e.canonical_status = ?
+        ORDER BY de.role ASC, de.ordinal ASC, de.id ASC
+        """,
+        (document_id, ENTITY_STATUS_ACTIVE),
+    ).fetchall()
+    labels_by_role: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        label = entity_display_label_from_row(row)
+        if label not in labels_by_role[row["role"]]:
+            labels_by_role[row["role"]].append(label)
+    updates: dict[str, object] = {}
+    if "author" not in locked_fields:
+        updates["author"] = labels_by_role.get("author", [None])[0] if labels_by_role.get("author") else None
+    if "participants" not in locked_fields:
+        updates["participants"] = ", ".join(labels_by_role.get("participant", [])) or None
+    if "recipients" not in locked_fields:
+        updates["recipients"] = ", ".join(labels_by_role.get("recipient", [])) or None
+    if "custodian" not in locked_fields:
+        updates["custodians_json"] = json.dumps(labels_by_role.get("custodian", []), ensure_ascii=True)
+    if updates:
+        set_clause = ", ".join(f"{quote_identifier(column)} = ?" for column in updates)
+        connection.execute(
+            f"""
+            UPDATE documents
+            SET {set_clause}, updated_at = ?
+            WHERE id = ?
+            """,
+            [*updates.values(), utc_now(), document_id],
+        )
+    return updates
+
+
+def entity_candidate_is_globally_ignored(connection: sqlite3.Connection, candidate: dict[str, object]) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM entity_overrides
+        WHERE scope_type = 'global'
+          AND override_effect = 'ignore'
+          AND (
+            normalized_candidate_key = ?
+            OR source_entity_id IS NULL AND normalized_candidate_key IS NULL AND source_hint = ?
+          )
+        LIMIT 1
+        """,
+        (candidate.get("normalized_candidate_key"), candidate.get("raw_value")),
+    ).fetchone()
+    return row is not None
+
+
+def sync_document_entities(
+    connection: sqlite3.Connection,
+    document_id: int,
+    *,
+    refresh_fts: bool = True,
+) -> dict[str, object]:
+    if not all(
+        table_exists(connection, table_name)
+        for table_name in ("entities", "entity_identifiers", "entity_resolution_keys", "document_entities")
+    ):
+        return {"document_id": document_id, "synced": False, "reason": "entity schema unavailable"}
+    active_rows = active_occurrence_rows_for_document(connection, document_id)
+    auto_links: list[tuple[int, int, str, int, str, str | None, str, str, str]] = []
+    seen_role_entities: set[tuple[str, int]] = set()
+    ordinals_by_role: dict[str, int] = defaultdict(int)
+    for occurrence_row in occurrence_rows_in_preferred_order(active_rows):
+        dataset_source_row = dataset_source_row_for_occurrence(connection, occurrence_row)
+        policy = source_backed_dataset_policy_for_source(connection, dataset_source_row)
+        role_values = (
+            ("author", occurrence_row["extracted_author"]),
+            ("participant", occurrence_row["extracted_participants"]),
+            ("recipient", occurrence_row["extracted_recipients"]),
+            ("custodian", occurrence_row["custodian"]),
+        )
+        for role, raw_value in role_values:
+            for candidate in parse_entity_candidates(raw_value, role=role):
+                if entity_candidate_is_globally_ignored(connection, candidate):
+                    continue
+                entity_id = resolve_entity_candidate(connection, candidate, policy=policy)
+                role_entity_key = (role, entity_id)
+                if role_entity_key in seen_role_entities:
+                    continue
+                seen_role_entities.add(role_entity_key)
+                ordinal = ordinals_by_role[role]
+                ordinals_by_role[role] += 1
+                evidence = {
+                    "raw_value": candidate.get("raw_value"),
+                    "occurrence_id": int(occurrence_row["id"]),
+                    "dataset_source_id": int(dataset_source_row["id"]) if dataset_source_row is not None else None,
+                    "normalized_candidate_key": candidate.get("normalized_candidate_key"),
+                }
+                auto_links.append(
+                    (
+                        document_id,
+                        entity_id,
+                        role,
+                        ordinal,
+                        "auto",
+                        None,
+                        json.dumps(evidence, ensure_ascii=True, sort_keys=True),
+                        utc_now(),
+                        utc_now(),
+                    )
+                )
+    connection.execute(
+        """
+        DELETE FROM document_entities
+        WHERE document_id = ?
+          AND assignment_mode = 'auto'
+        """,
+        (document_id,),
+    )
+    if auto_links:
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO document_entities (
+              document_id, entity_id, role, ordinal, assignment_mode,
+              observed_title, evidence_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            auto_links,
+        )
+    cache_updates = rebuild_document_entity_caches(connection, document_id)
+    if refresh_fts:
+        refresh_documents_fts_row(connection, document_id)
+    return {
+        "document_id": document_id,
+        "synced": True,
+        "auto_link_count": len(auto_links),
+        "cache_updates": cache_updates,
+    }
+
+
 def refresh_document_control_number_aliases(connection: sqlite3.Connection, document_id: int) -> None:
     now = utc_now()
     connection.execute(
@@ -3173,26 +4313,28 @@ def refresh_canonical_metadata_conflicts(
         )
 
 
-def dataset_source_row_for_occurrence(
+def dataset_source_row_for_occurrence_values(
     connection: sqlite3.Connection,
-    occurrence_row: sqlite3.Row,
+    *,
+    source_kind: object,
+    source_rel_path: object,
+    production_id: object = None,
 ) -> sqlite3.Row | None:
-    source_kind = normalize_whitespace(str(occurrence_row["source_kind"] or "")).lower()
-    source_rel_path = normalize_whitespace(str(occurrence_row["source_rel_path"] or ""))
-    if source_kind == FILESYSTEM_SOURCE_KIND:
+    normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
+    normalized_source_rel_path = normalize_whitespace(str(source_rel_path or ""))
+    if normalized_source_kind == FILESYSTEM_SOURCE_KIND:
         return get_dataset_source_row(
             connection,
             source_kind=FILESYSTEM_SOURCE_KIND,
             source_locator=filesystem_dataset_locator(),
         )
-    if source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and source_rel_path:
+    if normalized_source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and normalized_source_rel_path:
         return get_dataset_source_row(
             connection,
-            source_kind=source_kind,
-            source_locator=source_rel_path,
+            source_kind=normalized_source_kind,
+            source_locator=normalized_source_rel_path,
         )
-    if source_kind == PRODUCTION_SOURCE_KIND:
-        production_id = occurrence_row["production_id"]
+    if normalized_source_kind == PRODUCTION_SOURCE_KIND:
         if production_id is None:
             return None
         production_row = connection.execute(
@@ -3206,7 +4348,7 @@ def dataset_source_row_for_occurrence(
             source_kind=PRODUCTION_SOURCE_KIND,
             source_locator=str(production_row["rel_root"]),
         )
-    if source_kind == SLACK_EXPORT_SOURCE_KIND and source_rel_path:
+    if normalized_source_kind == SLACK_EXPORT_SOURCE_KIND and normalized_source_rel_path:
         return connection.execute(
             """
             SELECT *
@@ -3216,9 +4358,32 @@ def dataset_source_row_for_occurrence(
             ORDER BY LENGTH(source_locator) DESC, id ASC
             LIMIT 1
             """,
-            (SLACK_EXPORT_SOURCE_KIND, source_rel_path, source_rel_path),
+            (SLACK_EXPORT_SOURCE_KIND, normalized_source_rel_path, normalized_source_rel_path),
         ).fetchone()
     return None
+
+
+def dataset_source_row_for_occurrence(
+    connection: sqlite3.Connection,
+    occurrence_row: sqlite3.Row,
+) -> sqlite3.Row | None:
+    if "dataset_source_id" in occurrence_row.keys() and occurrence_row["dataset_source_id"] is not None:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM dataset_sources
+            WHERE id = ?
+            """,
+            (int(occurrence_row["dataset_source_id"]),),
+        ).fetchone()
+        if row is not None:
+            return row
+    return dataset_source_row_for_occurrence_values(
+        connection,
+        source_kind=occurrence_row["source_kind"],
+        source_rel_path=occurrence_row["source_rel_path"],
+        production_id=occurrence_row["production_id"],
+    )
 
 
 def refresh_source_backed_dataset_memberships_for_document(connection: sqlite3.Connection, document_id: int) -> None:
@@ -3450,6 +4615,7 @@ def refresh_document_from_occurrences(connection: sqlite3.Connection, document_i
     )
     refresh_canonical_metadata_conflicts(connection, document_id, active_rows)
     refresh_document_control_number_aliases(connection, document_id)
+    sync_document_entities(connection, document_id, refresh_fts=False)
     refresh_documents_fts_row(connection, document_id)
     return {
         "document_id": document_id,
@@ -3558,8 +4724,16 @@ def upsert_document_occurrence(
     last_seen_at: str,
     updated_at: str,
 ) -> int:
+    dataset_source_row = dataset_source_row_for_occurrence_values(
+        connection,
+        source_kind=source_kind,
+        source_rel_path=source_rel_path,
+        production_id=production_id,
+    )
+    dataset_source_id = int(dataset_source_row["id"]) if dataset_source_row is not None else None
     occurrence_values = (
         document_id,
+        dataset_source_id,
         parent_occurrence_id,
         occurrence_control_number,
         source_kind,
@@ -3604,13 +4778,13 @@ def upsert_document_occurrence(
         connection.execute(
             """
             INSERT INTO document_occurrences (
-              document_id, parent_occurrence_id, occurrence_control_number, source_kind, source_rel_path, source_item_id,
+              document_id, dataset_source_id, parent_occurrence_id, occurrence_control_number, source_kind, source_rel_path, source_item_id,
               source_folder_path, production_id, begin_bates, end_bates, begin_attachment, end_attachment,
               rel_path, file_name, file_type, mime_type, file_size, file_hash, custodian, fs_created_at, fs_modified_at,
               extracted_author, extracted_title, extracted_subject, extracted_participants, extracted_recipients,
               extracted_doc_authored_at, extracted_doc_modified_at, extracted_content_type, extracted_kind, text_status,
               lifecycle_status, has_preview, ingested_at, last_seen_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             occurrence_values,
         )
@@ -3619,7 +4793,7 @@ def upsert_document_occurrence(
     connection.execute(
         """
         UPDATE document_occurrences
-        SET document_id = ?, parent_occurrence_id = ?, occurrence_control_number = ?, source_kind = ?, source_rel_path = ?,
+        SET document_id = ?, dataset_source_id = ?, parent_occurrence_id = ?, occurrence_control_number = ?, source_kind = ?, source_rel_path = ?,
             source_item_id = ?, source_folder_path = ?, production_id = ?, begin_bates = ?, end_bates = ?,
             begin_attachment = ?, end_attachment = ?, rel_path = ?, file_name = ?, file_type = ?, mime_type = ?,
             file_size = ?, file_hash = ?, custodian = ?, fs_created_at = ?, fs_modified_at = ?, extracted_author = ?,
