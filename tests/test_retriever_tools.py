@@ -6962,14 +6962,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("ingest-run-step", start_payload["next_recommended_commands"][0])
         run_id = str(start_payload["run_id"])
 
-        exit_code, payload, _, _ = self.run_cli(
-            "ingest-run-step",
-            str(self.root),
-            "--run-id",
-            run_id,
-            "--budget-seconds",
-            "35",
-        )
+        with mock.patch.object(retriever_tools, "apply_schema", wraps=retriever_tools.apply_schema) as apply_schema_mock:
+            exit_code, payload, _, _ = self.run_cli(
+                "ingest-run-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(payload)
         self.assertTrue(payload["executed"])
@@ -6977,6 +6978,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["executed_steps"], ["plan", "prepare", "commit", "finalize"])
         self.assertEqual(payload["reason"], "run_terminal")
         self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(apply_schema_mock.call_count, 1)
+        self.assertGreaterEqual(payload["timings"]["schema_ms"], 0.0)
+        self.assertEqual(payload["timings"]["inner_step_ms"]["count"], 4)
         completed_row = self.fetch_document_row("raw/alpha.txt")
         self.assertEqual(completed_row["control_number"], "DOC001.00000001")
 
