@@ -31788,6 +31788,21 @@ def ingest_v2_status_payload_timed(
     return payload, ingest_v2_elapsed_ms(started)
 
 
+def ingest_v2_refresh_conversation_previews_best_effort(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+) -> tuple[int, str | None]:
+    connection.execute("SAVEPOINT ingest_v2_conversation_preview_refresh")
+    try:
+        previews_refreshed = refresh_conversation_previews(connection, paths)
+        connection.execute("RELEASE SAVEPOINT ingest_v2_conversation_preview_refresh")
+        return previews_refreshed, None
+    except PermissionError as exc:
+        connection.execute("ROLLBACK TO SAVEPOINT ingest_v2_conversation_preview_refresh")
+        connection.execute("RELEASE SAVEPOINT ingest_v2_conversation_preview_refresh")
+        return 0, f"{type(exc).__name__}: {exc}"
+
+
 def ingest_v2_start(
     root: Path,
     *,
@@ -32846,12 +32861,17 @@ def ingest_v2_finalize_step(
             connection.execute("BEGIN")
             try:
                 conversation_assignment = assign_supported_conversations(connection)
-                previews_refreshed = refresh_conversation_previews(connection, paths)
+                previews_refreshed, preview_refresh_error = ingest_v2_refresh_conversation_previews_best_effort(
+                    connection,
+                    paths,
+                )
                 cursor["conversation_assignment"] = {
                     key: int(value)
                     for key, value in dict(conversation_assignment).items()
                 }
                 cursor["conversation_previews_refreshed"] = int(previews_refreshed)
+                if preview_refresh_error:
+                    cursor["conversation_preview_refresh_error"] = preview_refresh_error
                 cursor["stage"] = "prune"
                 ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="pending")
                 connection.commit()

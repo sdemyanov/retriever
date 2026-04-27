@@ -7388,6 +7388,48 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(cursor_row["status"], "complete")
         self.assertEqual(json.loads(cursor_row["cursor_json"])["stage"], "complete")
 
+    def test_ingest_v2_finalize_records_conversation_preview_permission_error(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        for command in ("ingest-plan-step", "ingest-prepare-step", "ingest-commit-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        with mock.patch.object(
+            retriever_tools,
+            "refresh_conversation_previews",
+            side_effect=PermissionError("blocked preview write"),
+        ):
+            finalize_exit, finalize_payload, _, _ = self.run_cli(
+                "ingest-finalize-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
+
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertTrue(finalize_payload["finalization_complete"])
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+        self.assertEqual(finalize_payload["cursor"]["conversation_previews_refreshed"], 0)
+        self.assertIn("PermissionError", finalize_payload["cursor"]["conversation_preview_refresh_error"])
+
     def test_ingest_v2_reingest_skips_unchanged_loose_file(self) -> None:
         raw_dir = self.root / "raw"
         raw_dir.mkdir()
