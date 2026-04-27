@@ -11556,6 +11556,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
     def test_ingest_mbox_fixture_file_is_searchable(self) -> None:
         fixture_source = REGRESSION_CORPUS_ROOT / "sample_utf8.mbox"
+        if not fixture_source.exists():
+            self.skipTest(f"local regression corpus fixture unavailable: {fixture_source}")
         fixture_target = self.root / fixture_source.name
         fixture_target.write_bytes(fixture_source.read_bytes())
 
