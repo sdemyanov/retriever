@@ -6871,7 +6871,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         other_dir.mkdir()
         (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
         (nested_dir / "beta.md").write_text("# beta\n", encoding="utf-8")
-        (raw_dir / "mailbox.mbox").write_text("From test@example.com Sat Jan 01 00:00:00 2022\n\n", encoding="utf-8")
+        (raw_dir / "mailbox.pst").write_bytes(b"not a real pst")
         (other_dir / "outside.txt").write_text("outside body\n", encoding="utf-8")
 
         start_exit, start_payload, _, _ = self.run_cli(
@@ -6990,6 +6990,168 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertFalse(final_payload["executed"])
         self.assertEqual(final_payload["reason"], "run_terminal")
         self.assertEqual(final_payload["run"]["status"], "completed")
+
+    def test_ingest_v2_mbox_creates_message_rows_with_source_context(self) -> None:
+        mbox_path = self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="V2 MBOX Parent",
+                    body_text="V2 parent message body",
+                    message_id="<v2-mbox-msg-001@example.com>",
+                    attachment_name="notes.txt",
+                    attachment_text="v2 mbox attachment body",
+                ),
+                self.build_fake_mbox_message(
+                    subject="V2 MBOX Sibling",
+                    body_text="V2 sibling body text",
+                    message_id="<v2-mbox-msg-002@example.com>",
+                    date_created="Tue, 14 Apr 2026 10:05:00 +0000",
+                ),
+            ]
+        )
+
+        payloads = self.run_v2_loose_ingest()
+        run_id = str(payloads["run_id"])
+        commit_payload = dict(payloads["commit"])
+        finalize_payload = dict(payloads["finalize"])
+
+        self.assertEqual(commit_payload["failed"], 0)
+        self.assertEqual(commit_payload["committed"], 3)
+        self.assertEqual(commit_payload["actions"], {"new": 2, "finalized": 1})
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["mbox_message"]["committed"], 2)
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["mbox_source_finalizer"]["committed"], 1)
+
+        parent_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<v2-mbox-msg-001@example.com>")
+        sibling_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<v2-mbox-msg-002@example.com>")
+        parent_row = self.fetch_document_row(parent_rel_path)
+        sibling_row = self.fetch_document_row(sibling_rel_path)
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        dataset_row = self.fetch_dataset_row(int(parent_row["dataset_id"]))
+
+        self.assertEqual(parent_row["source_kind"], retriever_tools.MBOX_SOURCE_KIND)
+        self.assertEqual(parent_row["source_rel_path"], "mailbox.mbox")
+        self.assertEqual(parent_row["source_item_id"], "<v2-mbox-msg-001@example.com>")
+        self.assertEqual(parent_row["file_type"], "mbox")
+        self.assertEqual(parent_row["content_type"], "Email")
+        self.assertEqual(parent_row["custodian"], "mailbox")
+        self.assertEqual(sibling_row["dataset_id"], parent_row["dataset_id"])
+        self.assertEqual(child_row["dataset_id"], parent_row["dataset_id"])
+        self.assertEqual(dataset_row["source_kind"], retriever_tools.MBOX_SOURCE_KIND)
+        self.assertEqual(dataset_row["dataset_locator"], "mailbox.mbox")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            container_row = connection.execute(
+                "SELECT * FROM container_sources WHERE source_kind = ? AND source_rel_path = ?",
+                (retriever_tools.MBOX_SOURCE_KIND, "mailbox.mbox"),
+            ).fetchone()
+            work_items = connection.execute(
+                """
+                SELECT unit_type, status, affected_document_ids_json, artifact_manifest_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                ORDER BY commit_order ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'committing'
+                  AND cursor_key = 'loose_file_commit'
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(container_row)
+        self.assertEqual(container_row["dataset_id"], parent_row["dataset_id"])
+        self.assertEqual(container_row["message_count"], 2)
+        self.assertEqual(container_row["file_size"], mbox_path.stat().st_size)
+        self.assertIsNotNone(container_row["last_scan_completed_at"])
+        self.assertEqual([row["unit_type"] for row in work_items], ["mbox_message", "mbox_message", "mbox_source_finalizer"])
+        self.assertTrue(all(row["status"] == "committed" for row in work_items))
+        self.assertTrue(json.loads(work_items[0]["affected_document_ids_json"]))
+        self.assertEqual(json.loads(work_items[2]["artifact_manifest_json"])["commit_action"], "finalized")
+        self.assertIsNotNone(cursor_row)
+        mbox_stats = json.loads(cursor_row["cursor_json"])["mbox_stats"]
+        self.assertEqual(mbox_stats["mbox_messages_created"], 2)
+        self.assertEqual(mbox_stats["mbox_sources_finalized"], 1)
+
+    def test_ingest_v2_mbox_reingest_retires_removed_messages(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="V2 Original MBOX Parent",
+                    body_text="Parent v1",
+                    message_id="<v2-mbox-retire-001@example.com>",
+                    attachment_name="notes.txt",
+                    attachment_text="stable attachment body",
+                ),
+                self.build_fake_mbox_message(
+                    subject="V2 Removed later",
+                    body_text="Remove me",
+                    message_id="<v2-mbox-retire-002@example.com>",
+                    date_created="Tue, 14 Apr 2026 10:05:00 +0000",
+                ),
+            ]
+        )
+        first_payloads = self.run_v2_loose_ingest()
+        self.assertEqual(dict(first_payloads["finalize"])["run"]["status"], "completed")
+
+        parent_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<v2-mbox-retire-001@example.com>")
+        removed_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<v2-mbox-retire-002@example.com>")
+        parent_row = self.fetch_document_row(parent_rel_path)
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        retriever_tools.set_field(self.root, parent_row["id"], "title", "Manual V2 MBOX Title")
+
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="V2 Updated MBOX Parent",
+                    body_text="Parent v2",
+                    message_id="<v2-mbox-retire-001@example.com>",
+                    attachment_name="notes.txt",
+                    attachment_text="stable attachment body",
+                )
+            ]
+        )
+        second_payloads = self.run_v2_loose_ingest()
+        second_commit = dict(second_payloads["commit"])
+        self.assertEqual(second_commit["failed"], 0)
+        self.assertEqual(second_commit["actions"], {"updated": 1, "finalized": 1})
+
+        updated_parent = self.fetch_document_row(parent_rel_path)
+        updated_child = self.fetch_child_rows(updated_parent["id"])[0]
+        retired_row = self.fetch_document_row(removed_rel_path)
+        self.assertEqual(updated_parent["control_number"], parent_row["control_number"])
+        self.assertEqual(updated_parent["title"], "Manual V2 MBOX Title")
+        self.assertEqual(updated_child["id"], child_row["id"])
+        self.assertEqual(updated_child["control_number"], child_row["control_number"])
+        self.assertEqual(retired_row["lifecycle_status"], "deleted")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'committing'
+                  AND cursor_key = 'loose_file_commit'
+                """,
+                (str(second_payloads["run_id"]),),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(cursor_row)
+        mbox_stats = json.loads(cursor_row["cursor_json"])["mbox_stats"]
+        self.assertEqual(mbox_stats["mbox_messages_updated"], 1)
+        self.assertEqual(mbox_stats["mbox_messages_deleted"], 1)
 
     def test_ingest_v2_auto_routes_production_root(self) -> None:
         self.write_production_fixture()
