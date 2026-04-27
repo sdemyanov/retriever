@@ -114,6 +114,7 @@ you need to invoke a Tier 2 slash programmatically → slash — execute a scope
 Documents & text
 
 you need to switch a document's active search text to a specific revision → activate-text-revision — promote a stored text revision to active indexed text
+the user asks to delete, trash, remove, or purge specific documents or documents matching a filter/path/scope — phrasings like "delete these docs", "remove everything under raw/", "purge docs matching this filter", or "drop the selected documents from the index" → delete-docs — delete selected documents or matching occurrences
 you need full metadata, text, or chunks for one document → get-doc — fetch one document with optional summary text or exact chunks
 you need the chunk layout for one document → list-chunks — list chunk metadata for one document
 you need to see all text revisions stored for a document → list-text-revisions — list stored text revisions for a document
