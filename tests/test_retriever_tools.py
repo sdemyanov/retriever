@@ -6681,6 +6681,261 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["new"], 1)
         self.assertEqual(payload["scan_paths"], ["raw"])
 
+    def test_ingest_v2_start_status_and_cancel_foundation(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+            "--budget-seconds",
+            "35",
+        )
+
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertTrue(start_payload["ok"])
+        self.assertTrue(start_payload["created"])
+        self.assertEqual(start_payload["status"], "planning")
+        self.assertEqual(start_payload["phase"], "planning")
+        self.assertEqual(start_payload["scope"], ["raw"])
+        self.assertEqual(start_payload["budget_recommendation_seconds"], 35)
+        self.assertIn("ingest-plan-step", " ".join(start_payload["next_recommended_commands"]))
+        run_id = str(start_payload["run_id"])
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "ingest-status",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        self.assertEqual(status_payload["run_id"], run_id)
+        self.assertEqual(status_payload["counts"]["work_items"]["pending"], 0)
+        self.assertEqual(status_payload["artifacts"]["orphan_pending_sweep"], 0)
+        self.assertFalse(status_payload["entity"]["graph_stale"])
+
+        cancel_exit, cancel_payload, _, _ = self.run_cli(
+            "ingest-cancel",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(cancel_exit, 0)
+        self.assertIsNotNone(cancel_payload)
+        self.assertTrue(cancel_payload["cancel_requested"])
+        self.assertEqual(cancel_payload["status"], "canceled")
+        self.assertEqual(cancel_payload["phase"], "canceled")
+
+    def test_ingest_v2_plan_step_creates_loose_file_work_items(self) -> None:
+        raw_dir = self.root / "raw"
+        nested_dir = raw_dir / "nested"
+        other_dir = self.root / "other"
+        nested_dir.mkdir(parents=True)
+        other_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (nested_dir / "beta.md").write_text("# beta\n", encoding="utf-8")
+        (raw_dir / "mailbox.mbox").write_text("From test@example.com Sat Jan 01 00:00:00 2022\n\n", encoding="utf-8")
+        (other_dir / "outside.txt").write_text("outside body\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        plan_exit, plan_payload, _, _ = self.run_cli(
+            "ingest-plan-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+        self.assertTrue(plan_payload["implemented"])
+        self.assertFalse(plan_payload["more_planning_remaining"])
+        self.assertEqual(plan_payload["planned_loose_files"], 2)
+        self.assertEqual(plan_payload["cursor"]["skipped_container_files"], 1)
+        run_payload = plan_payload["run"]
+        self.assertEqual(run_payload["phase"], "preparing")
+        self.assertEqual(run_payload["status"], "preparing")
+        self.assertEqual(run_payload["counts"]["work_items"]["pending"], 2)
+        self.assertEqual(run_payload["counts"]["by_unit_type"]["loose_file"]["pending"], 2)
+        self.assertIn("ingest-prepare-step", " ".join(run_payload["next_recommended_commands"]))
+        self.assertNotIn("ingest-plan-step", " ".join(run_payload["next_recommended_commands"]))
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            rows = connection.execute(
+                """
+                SELECT rel_path, unit_type, source_kind, source_key, commit_order, payload_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                ORDER BY commit_order ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual([row["rel_path"] for row in rows], ["raw/alpha.txt", "raw/nested/beta.md"])
+        self.assertTrue(all(row["unit_type"] == "loose_file" for row in rows))
+        self.assertTrue(all(row["source_kind"] == retriever_tools.FILESYSTEM_SOURCE_KIND for row in rows))
+        self.assertEqual([int(row["commit_order"]) for row in rows], [1, 2])
+        payloads = [json.loads(row["payload_json"]) for row in rows]
+        self.assertEqual(payloads[0]["file_type"], "txt")
+        self.assertEqual(payloads[1]["file_type"], "md")
+        self.assertNotIn("file_hash", payloads[0])
+
+        second_plan_exit, second_plan_payload, _, _ = self.run_cli(
+            "ingest-plan-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(second_plan_exit, 0)
+        self.assertIsNotNone(second_plan_payload)
+        self.assertEqual(second_plan_payload["processed_paths"], 0)
+        self.assertEqual(second_plan_payload["planned_loose_files"], 0)
+        self.assertEqual(second_plan_payload["run"]["counts"]["work_items"]["pending"], 2)
+
+    def test_ingest_v2_prepare_step_prepares_loose_files_without_document_writes(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        alpha_text = "alpha body\n"
+        beta_text = "# beta\n\nbody\n"
+        (raw_dir / "alpha.txt").write_text(alpha_text, encoding="utf-8")
+        (raw_dir / "beta.md").write_text(beta_text, encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        plan_exit, plan_payload, _, _ = self.run_cli(
+            "ingest-plan-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+        self.assertEqual(plan_payload["run"]["phase"], "preparing")
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "ingest-prepare-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertTrue(prepare_payload["implemented"])
+        self.assertEqual(prepare_payload["claimed"], 2)
+        self.assertEqual(prepare_payload["prepared"], 2)
+        self.assertEqual(prepare_payload["deferred_timeout"], 0)
+        self.assertFalse(prepare_payload["more_prepare_remaining"])
+        self.assertTrue(prepare_payload["advanced_to_commit"])
+        run_payload = prepare_payload["run"]
+        self.assertEqual(run_payload["phase"], "committing")
+        self.assertEqual(run_payload["status"], "committing")
+        self.assertEqual(run_payload["counts"]["work_items"]["prepared"], 2)
+        self.assertIn("ingest-commit-step", " ".join(run_payload["next_recommended_commands"]))
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_count = int(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] or 0)
+            rows = connection.execute(
+                """
+                SELECT wi.rel_path, wi.status, pi.payload_kind, pi.payload_json, pi.source_fingerprint_json
+                FROM ingest_work_items wi
+                JOIN ingest_prepared_items pi ON pi.work_item_id = wi.id
+                WHERE wi.run_id = ?
+                ORDER BY wi.commit_order ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(document_count, 0)
+        self.assertEqual([row["rel_path"] for row in rows], ["raw/alpha.txt", "raw/beta.md"])
+        self.assertTrue(all(row["status"] == "prepared" for row in rows))
+        self.assertTrue(all(row["payload_kind"] == "loose_file" for row in rows))
+        first_payload = json.loads(rows[0]["payload_json"])["prepared_item"]
+        first_fingerprint = json.loads(rows[0]["source_fingerprint_json"])
+        self.assertEqual(first_payload["rel_path"], "raw/alpha.txt")
+        self.assertIn("alpha body", first_payload["extracted_payload"]["text_content"])
+        self.assertTrue(first_payload["prepared_chunks"])
+        self.assertEqual(
+            first_fingerprint["hash"],
+            hashlib.sha256(alpha_text.encode("utf-8")).hexdigest(),
+        )
+
+    def test_ingest_v2_rejects_budget_above_hard_cap(self) -> None:
+        exit_code, payload, _, stderr = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--budget-seconds",
+            "41",
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIsNotNone(payload)
+        self.assertIn("budget-seconds", payload["error"])
+        self.assertIn("40", payload["error"])
+        self.assertTrue(stderr)
+
+    def test_active_ingest_v2_run_blocks_conflicting_commands(self) -> None:
+        start_exit, start_payload, _, _ = self.run_cli("ingest-start", str(self.root))
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        second_exit, second_payload, _, _ = self.run_cli("ingest-start", str(self.root))
+        self.assertEqual(second_exit, 2)
+        self.assertIsNotNone(second_payload)
+        self.assertEqual(second_payload["error"], "active_ingest_run")
+        self.assertEqual(second_payload["active_run_id"], run_id)
+        self.assertIn("ingest-status", second_payload["status_command"])
+        self.assertIn("ingest-cancel", second_payload["cancel_command"])
+
+        entity_exit, entity_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--display-name",
+            "Alice Example",
+        )
+        self.assertEqual(entity_exit, 2)
+        self.assertIsNotNone(entity_payload)
+        self.assertEqual(entity_payload["error"], "active_ingest_run")
+        self.assertEqual(entity_payload["active_run_id"], run_id)
+
+        legacy_ingest_exit, legacy_ingest_payload, _, _ = self.run_cli("ingest", str(self.root))
+        self.assertEqual(legacy_ingest_exit, 2)
+        self.assertIsNotNone(legacy_ingest_payload)
+        self.assertEqual(legacy_ingest_payload["error"], "active_ingest_run")
+        self.assertEqual(legacy_ingest_payload["active_run_id"], run_id)
+
     def test_non_attachment_child_documents_are_not_treated_as_attachments(self) -> None:
         parent_path = self.root / "parent.txt"
         parent_path.write_text("parent body\n", encoding="utf-8")

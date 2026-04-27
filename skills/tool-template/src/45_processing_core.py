@@ -45,6 +45,30 @@ DEFAULT_WORKER_BACKGROUND_MAX_BATCHES = 3
 DEFAULT_WORKER_BACKGROUND_WAKE_INTERVAL_SECONDS = 60
 DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL = 4
 DEFAULT_OCR_RENDER_RESOLUTION = 150
+DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS = 35
+MAX_RESUMABLE_STEP_BUDGET_SECONDS = 40
+
+
+def normalize_resumable_step_budget(raw_budget_seconds: int | None, *, label: str = "budget-seconds") -> int:
+    budget_seconds = DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS if raw_budget_seconds is None else int(raw_budget_seconds)
+    if budget_seconds < 1:
+        raise RetrieverError(f"{label} must be >= 1.")
+    if budget_seconds > MAX_RESUMABLE_STEP_BUDGET_SECONDS:
+        raise RetrieverError(
+            f"{label} cannot exceed {MAX_RESUMABLE_STEP_BUDGET_SECONDS} seconds in bounded worker mode."
+        )
+    return budget_seconds
+
+
+def lease_expiration_after(seconds: int, *, now: datetime | None = None) -> str:
+    return format_utc_timestamp((now or datetime.now(timezone.utc)) + timedelta(seconds=max(1, int(seconds))))
+
+
+def lease_is_active(expires_at: object, *, now: datetime | None = None) -> bool:
+    parsed = parse_utc_timestamp(expires_at)
+    if parsed is None:
+        return False
+    return parsed > (now or datetime.now(timezone.utc))
 
 
 def sanitize_processing_identifier(raw_name: str, *, label: str, prefix: str) -> str:

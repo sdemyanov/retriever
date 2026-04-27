@@ -73,8 +73,8 @@ except Exception:  # pragma: no cover - platform-specific locking
     msvcrt = None
 
 
-TOOL_VERSION = "1.0.3"
-SCHEMA_VERSION = 24
+TOOL_VERSION = "1.0.4"
+SCHEMA_VERSION = 25
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/tools.py"
@@ -1559,17 +1559,151 @@ SCHEMA_STATEMENTS = [
       updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_runs (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL UNIQUE,
+      scope_json TEXT NOT NULL DEFAULT '{}',
+      recursive INTEGER NOT NULL DEFAULT 0,
+      raw_file_types TEXT,
+      pipeline_schema_version INTEGER NOT NULL,
+      phase TEXT NOT NULL DEFAULT 'planning',
+      status TEXT NOT NULL DEFAULT 'planning',
+      prepare_worker_soft_limit INTEGER NOT NULL DEFAULT 4,
+      committer_lease_owner TEXT,
+      committer_lease_expires_at TEXT,
+      committer_heartbeat_at TEXT,
+      entity_graph_stale INTEGER NOT NULL DEFAULT 0,
+      entity_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      cancel_requested_at TEXT,
+      last_heartbeat_at TEXT,
+      error TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_work_items (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      unit_type TEXT NOT NULL,
+      source_kind TEXT,
+      source_key TEXT,
+      rel_path TEXT,
+      commit_order INTEGER,
+      parent_order INTEGER,
+      spawned_by_work_item_id INTEGER REFERENCES ingest_work_items(id) ON DELETE SET NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      affected_document_ids_json TEXT NOT NULL DEFAULT '[]',
+      affected_conversation_keys_json TEXT NOT NULL DEFAULT '[]',
+      affected_entity_ids_json TEXT NOT NULL DEFAULT '[]',
+      artifact_manifest_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'pending',
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_prepared_items (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      work_item_id INTEGER NOT NULL REFERENCES ingest_work_items(id) ON DELETE CASCADE,
+      payload_kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      spill_rel_path TEXT,
+      payload_bytes INTEGER NOT NULL DEFAULT 0,
+      source_fingerprint_json TEXT NOT NULL DEFAULT '{}',
+      prepared_at TEXT NOT NULL,
+      error_json TEXT NOT NULL DEFAULT '{}',
+      UNIQUE(work_item_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_rename_consumptions (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      target_work_item_id INTEGER NOT NULL REFERENCES ingest_work_items(id) ON DELETE CASCADE,
+      source_document_id INTEGER,
+      source_occurrence_id INTEGER,
+      file_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(run_id, source_occurrence_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_phase_cursors (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      phase TEXT NOT NULL,
+      cursor_key TEXT NOT NULL,
+      cursor_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'pending',
+      updated_at TEXT NOT NULL,
+      UNIQUE(run_id, phase, cursor_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_worker_events (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      worker_id TEXT,
+      event_type TEXT NOT NULL,
+      work_item_id INTEGER REFERENCES ingest_work_items(id) ON DELETE SET NULL,
+      phase TEXT,
+      duration_ms REAL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_artifact_sweeps (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      work_item_id INTEGER REFERENCES ingest_work_items(id) ON DELETE SET NULL,
+      artifact_kind TEXT NOT NULL,
+      temp_rel_path TEXT,
+      canonical_rel_path TEXT,
+      content_hash TEXT,
+      state TEXT NOT NULL DEFAULT 'staged',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_documents_file_hash ON documents(file_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_lifecycle_status ON documents(lifecycle_status)",
     "CREATE INDEX IF NOT EXISTS idx_document_source_parts_document_id ON document_source_parts(document_id, part_kind, ordinal)",
     "CREATE INDEX IF NOT EXISTS idx_previews_document_id ON document_previews(document_id, ordinal)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id, chunk_index)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_runs_status ON ingest_runs(status, phase)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_runs_cancel_requested ON ingest_runs(cancel_requested_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_work_items_run_status ON ingest_work_items(run_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_work_items_commit_order ON ingest_work_items(run_id, commit_order, id)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_work_items_lease_expires ON ingest_work_items(lease_expires_at)",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_work_items_source_unique
+    ON ingest_work_items(run_id, unit_type, COALESCE(source_key, ''), COALESCE(rel_path, ''), COALESCE(parent_order, -1))
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ingest_prepared_items_run_work ON ingest_prepared_items(run_id, work_item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_phase_cursors_run_phase ON ingest_phase_cursors(run_id, phase, status)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_worker_events_run_created ON ingest_worker_events(run_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_artifact_sweeps_run_state ON ingest_artifact_sweeps(run_id, state)",
 ]
 
 
 class RetrieverError(RuntimeError):
     pass
+
+
+class RetrieverStructuredError(RetrieverError):
+    def __init__(self, message: str, payload: dict[str, object]):
+        super().__init__(message)
+        self.payload = payload
 
 
 def utc_now() -> str:
@@ -23968,6 +24102,30 @@ DEFAULT_WORKER_BACKGROUND_MAX_BATCHES = 3
 DEFAULT_WORKER_BACKGROUND_WAKE_INTERVAL_SECONDS = 60
 DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL = 4
 DEFAULT_OCR_RENDER_RESOLUTION = 150
+DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS = 35
+MAX_RESUMABLE_STEP_BUDGET_SECONDS = 40
+
+
+def normalize_resumable_step_budget(raw_budget_seconds: int | None, *, label: str = "budget-seconds") -> int:
+    budget_seconds = DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS if raw_budget_seconds is None else int(raw_budget_seconds)
+    if budget_seconds < 1:
+        raise RetrieverError(f"{label} must be >= 1.")
+    if budget_seconds > MAX_RESUMABLE_STEP_BUDGET_SECONDS:
+        raise RetrieverError(
+            f"{label} cannot exceed {MAX_RESUMABLE_STEP_BUDGET_SECONDS} seconds in bounded worker mode."
+        )
+    return budget_seconds
+
+
+def lease_expiration_after(seconds: int, *, now: datetime | None = None) -> str:
+    return format_utc_timestamp((now or datetime.now(timezone.utc)) + timedelta(seconds=max(1, int(seconds))))
+
+
+def lease_is_active(expires_at: object, *, now: datetime | None = None) -> bool:
+    parsed = parse_utc_timestamp(expires_at)
+    if parsed is None:
+        return False
+    return parsed > (now or datetime.now(timezone.utc))
 
 
 def sanitize_processing_identifier(raw_name: str, *, label: str, prefix: str) -> str:
@@ -29114,6 +29272,1585 @@ def default_ingest_stats(slack_export_count: int, gmail_export_count: int) -> di
     }
 
 
+INGEST_V2_PIPELINE_SCHEMA_VERSION = 1
+INGEST_V2_ACTIVE_STATUSES = {"planning", "preparing", "committing", "finalizing"}
+INGEST_V2_TERMINAL_STATUSES = {"completed", "canceled", "failed"}
+INGEST_V2_WORK_ITEM_STATUSES = (
+    "pending",
+    "leased",
+    "prepared",
+    "committing",
+    "committed",
+    "failed",
+    "deferred_timeout",
+    "cancelled",
+)
+INGEST_V2_WORK_ITEM_LEASE_SECONDS = 180
+INGEST_V2_PREPARE_BATCH_SIZE = DEFAULT_WORKER_BATCH_SIZE
+INGEST_V2_PREPARE_MIN_START_SECONDS = 1.0
+INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES = 2 * 1024 * 1024 * 1024
+INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
+
+
+def new_ingest_v2_run_id(now: datetime | None = None) -> str:
+    timestamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}-{secrets.token_hex(4)}"
+
+
+def ingest_v2_scope_payload(
+    root: Path,
+    *,
+    recursive: bool,
+    raw_file_types: str | None,
+    raw_paths: list[str] | None,
+) -> dict[str, object]:
+    allowed_types = parse_file_types(raw_file_types)
+    scan_scope = build_ingest_scan_scope(root, raw_paths)
+    return {
+        "recursive": bool(recursive),
+        "file_types": sorted(allowed_types) if allowed_types is not None else None,
+        "scan_paths": list(scan_scope.get("display_paths") or []),
+    }
+
+
+def ingest_v2_scan_scope_from_run(root: Path, row: sqlite3.Row) -> dict[str, object]:
+    scope = decode_json_text(row["scope_json"], default={}) or {}
+    raw_paths = list(scope.get("scan_paths") or []) if isinstance(scope, dict) else []
+    return build_ingest_scan_scope(root, [str(path) for path in raw_paths])
+
+
+def ingest_v2_cursor_rel_path(root: Path, path: Path) -> str:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    if resolved_path == resolved_root:
+        return ""
+    return resolved_path.relative_to(resolved_root).as_posix()
+
+
+def ingest_v2_cursor_path(root: Path, rel_path: object) -> Path:
+    normalized = normalize_whitespace(str(rel_path or "")).replace("\\", "/").strip("/")
+    return root if not normalized else root / normalized
+
+
+def ingest_v2_sorted_pending_paths(paths: list[str]) -> list[str]:
+    return sorted(dict.fromkeys(str(path).replace("\\", "/").strip("/") for path in paths))
+
+
+def ingest_v2_initial_pending_paths(root: Path, scan_scope: dict[str, object]) -> list[str]:
+    pending: list[str] = []
+    for scan_path in list(scan_scope.get("paths") or [root]):
+        pending.append(ingest_v2_cursor_rel_path(root, Path(scan_path)))
+    return ingest_v2_sorted_pending_paths(pending)
+
+
+def ingest_v2_add_excluded_path(root: Path, path: Path, *, exact: set[str], prefixes: set[str]) -> None:
+    if not path_is_at_or_under(path, root):
+        return
+    rel_path = ingest_v2_cursor_rel_path(root, path)
+    if not rel_path:
+        return
+    exact.add(rel_path)
+    if path.is_dir():
+        prefixes.add(rel_path.rstrip("/") + "/")
+
+
+def ingest_v2_planning_exclusions(
+    root: Path,
+    recursive: bool,
+    allowed_types: set[str] | None,
+    connection: sqlite3.Connection,
+    scan_scope: dict[str, object],
+) -> dict[str, object]:
+    exact: set[str] = set()
+    prefixes: set[str] = set()
+
+    production_signatures = find_production_root_signatures(root, recursive, connection, scan_scope=scan_scope)
+    for signature in production_signatures:
+        ingest_v2_add_excluded_path(root, Path(signature["root"]), exact=exact, prefixes=prefixes)
+
+    slack_export_descriptors = find_scoped_source_roots(
+        find_slack_export_roots,
+        root,
+        recursive,
+        scan_scope,
+        allowed_types,
+    )
+    for descriptor in slack_export_descriptors:
+        ingest_v2_add_excluded_path(root, Path(descriptor["root"]), exact=exact, prefixes=prefixes)
+
+    gmail_export_descriptors = find_scoped_source_roots(
+        find_gmail_export_roots,
+        root,
+        recursive,
+        scan_scope,
+        allowed_types,
+    )
+    for descriptor in gmail_export_descriptors:
+        ingest_v2_add_excluded_path(root, Path(descriptor["root"]), exact=exact, prefixes=prefixes)
+        for owned_path in list(descriptor.get("owned_paths") or []):
+            ingest_v2_add_excluded_path(root, Path(owned_path), exact=exact, prefixes=prefixes)
+
+    pst_export_descriptors = (
+        find_scoped_source_roots(find_pst_export_roots, root, recursive, scan_scope)
+        if allowed_types is None or PST_SOURCE_KIND in allowed_types
+        else []
+    )
+    for descriptor in pst_export_descriptors:
+        for owned_path in list(descriptor.get("owned_paths") or []):
+            ingest_v2_add_excluded_path(root, Path(owned_path), exact=exact, prefixes=prefixes)
+
+    return {
+        "exact_rel_paths": sorted(exact),
+        "dir_prefixes": sorted(prefixes),
+        "counts": {
+            "production_roots": len(production_signatures),
+            "slack_export_roots": len(slack_export_descriptors),
+            "gmail_export_roots": len(gmail_export_descriptors),
+            "pst_export_roots": len(pst_export_descriptors),
+        },
+    }
+
+
+def ingest_v2_rel_path_excluded(cursor: dict[str, object], rel_path: str) -> bool:
+    if not rel_path:
+        return False
+    exact = set(cursor.get("excluded_exact_rel_paths") or [])
+    prefixes = list(cursor.get("excluded_dir_prefixes") or [])
+    return rel_path in exact or any(rel_path.startswith(str(prefix)) for prefix in prefixes)
+
+
+def ingest_v2_save_phase_cursor(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    phase: str,
+    cursor_key: str,
+    cursor: dict[str, object],
+    status: str,
+) -> None:
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO ingest_phase_cursors (
+          run_id, phase, cursor_key, cursor_json, status, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id, phase, cursor_key) DO UPDATE SET
+          cursor_json = excluded.cursor_json,
+          status = excluded.status,
+          updated_at = excluded.updated_at
+        """,
+        (run_id, phase, cursor_key, compact_json_text(cursor), status, now),
+    )
+
+
+def ingest_v2_load_or_create_loose_file_plan_cursor(
+    connection: sqlite3.Connection,
+    root: Path,
+    row: sqlite3.Row,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    cursor_row = connection.execute(
+        """
+        SELECT cursor_json
+        FROM ingest_phase_cursors
+        WHERE run_id = ?
+          AND phase = 'planning'
+          AND cursor_key = 'loose_file_scan'
+        """,
+        (run_id,),
+    ).fetchone()
+    if cursor_row is not None:
+        cursor = decode_json_text(cursor_row["cursor_json"], default={}) or {}
+        if isinstance(cursor, dict):
+            return cursor
+
+    recursive = bool(row["recursive"])
+    allowed_types = parse_file_types(row["raw_file_types"])
+    scan_scope = ingest_v2_scan_scope_from_run(root, row)
+    exclusions = ingest_v2_planning_exclusions(root, recursive, allowed_types, connection, scan_scope)
+    next_order_row = connection.execute(
+        """
+        SELECT COALESCE(MAX(commit_order), 0) + 1 AS next_order
+        FROM ingest_work_items
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    cursor = {
+        "schema_version": 1,
+        "pending_paths": ingest_v2_initial_pending_paths(root, scan_scope),
+        "next_commit_order": int(next_order_row["next_order"] or 1),
+        "scanned_paths": 0,
+        "planned_loose_files": 0,
+        "skipped_container_files": 0,
+        "skipped_extensionless_files": 0,
+        "skipped_filtered_files": 0,
+        "skipped_excluded_paths": 0,
+        "skipped_missing_paths": 0,
+        "listed_directories": 0,
+        "excluded_exact_rel_paths": list(exclusions["exact_rel_paths"]),
+        "excluded_dir_prefixes": list(exclusions["dir_prefixes"]),
+        "special_source_counts": exclusions["counts"],
+    }
+    connection.execute("BEGIN")
+    try:
+        ingest_v2_save_phase_cursor(
+            connection,
+            run_id=run_id,
+            phase="planning",
+            cursor_key="loose_file_scan",
+            cursor=cursor,
+            status="pending",
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return cursor
+
+
+def ingest_v2_plan_loose_file_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    rel_path: str,
+    file_type: str,
+    file_size: int | None,
+    file_mtime_ns: int | None,
+    commit_order: int,
+) -> bool:
+    now = utc_now()
+    payload = {
+        "rel_path": rel_path,
+        "file_type": file_type,
+        "source_file_size": file_size,
+        "source_file_mtime_ns": file_mtime_ns,
+        "planned_at": now,
+    }
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO ingest_work_items (
+          run_id, unit_type, source_kind, source_key, rel_path, commit_order,
+          payload_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "loose_file",
+            FILESYSTEM_SOURCE_KIND,
+            rel_path,
+            rel_path,
+            int(commit_order),
+            compact_json_text(payload),
+            "pending",
+            now,
+            now,
+        ),
+    )
+    return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_planning_child_paths(root: Path, directory: Path, *, recursive: bool) -> list[str]:
+    child_paths: list[str] = []
+    for child in sorted(directory.iterdir(), key=lambda item: item.name):
+        if not path_is_at_or_under(child, root):
+            continue
+        rel_path = ingest_v2_cursor_rel_path(root, child)
+        if ".retriever" in child.resolve().relative_to(root.resolve()).parts:
+            continue
+        if child.is_dir() and not recursive:
+            continue
+        child_paths.append(rel_path)
+    return child_paths
+
+
+def ingest_v2_worker_id(prefix: str) -> str:
+    return f"{prefix}-{os.getpid()}-{secrets.token_hex(4)}"
+
+
+def ingest_v2_json_safe_value(value: object) -> object:
+    if isinstance(value, bytes):
+        return {INGEST_V2_BYTES_B64_KEY: base64.b64encode(value).decode("ascii")}
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, sqlite3.Row):
+        return {key: ingest_v2_json_safe_value(value[key]) for key in value.keys()}
+    if isinstance(value, dict):
+        return {str(key): ingest_v2_json_safe_value(child_value) for key, child_value in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [ingest_v2_json_safe_value(child_value) for child_value in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def ingest_v2_json_restore_value(value: object) -> object:
+    if isinstance(value, dict):
+        if set(value.keys()) == {INGEST_V2_BYTES_B64_KEY}:
+            try:
+                return base64.b64decode(str(value[INGEST_V2_BYTES_B64_KEY]).encode("ascii"))
+            except Exception:
+                return b""
+        return {str(key): ingest_v2_json_restore_value(child_value) for key, child_value in value.items()}
+    if isinstance(value, list):
+        return [ingest_v2_json_restore_value(child_value) for child_value in value]
+    return value
+
+
+def ingest_v2_deadline_remaining_seconds(deadline: float) -> float:
+    return max(0.0, deadline - time.perf_counter())
+
+
+def ingest_v2_reclaim_stale_prepare_items(connection: sqlite3.Connection, *, run_id: str) -> int:
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE ingest_work_items
+            SET status = 'pending',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?
+            WHERE run_id = ?
+              AND status = 'leased'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            """,
+            (now, run_id, now),
+        )
+        reclaimed = int(cursor.rowcount or 0)
+        if reclaimed:
+            connection.execute(
+                """
+                INSERT INTO ingest_worker_events (
+                  run_id, worker_id, event_type, phase, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    None,
+                    "reclaim_stale_prepare_items",
+                    "prepare",
+                    compact_json_text({"reclaimed": reclaimed}),
+                    now,
+                ),
+            )
+        connection.commit()
+        return reclaimed
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_claim_prepare_items(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    worker_id: str,
+    limit: int = INGEST_V2_PREPARE_BATCH_SIZE,
+) -> tuple[list[sqlite3.Row], bool]:
+    now_dt = datetime.now(timezone.utc)
+    now = format_utc_timestamp(now_dt)
+    lease_expires_at = lease_expiration_after(INGEST_V2_WORK_ITEM_LEASE_SECONDS, now=now_dt)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = require_ingest_v2_run_row(connection, run_id)
+        if (
+            str(row["phase"]) != "preparing"
+            or str(row["status"]) in INGEST_V2_TERMINAL_STATUSES
+            or row["cancel_requested_at"] is not None
+        ):
+            connection.rollback()
+            return [], False
+
+        active_workers = int(
+            connection.execute(
+                """
+                SELECT COUNT(DISTINCT lease_owner)
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND status = 'leased'
+                  AND lease_owner IS NOT NULL
+                  AND lease_owner != ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
+                """,
+                (run_id, worker_id, now),
+            ).fetchone()[0]
+            or 0
+        )
+        soft_limit = int(row["prepare_worker_soft_limit"] or DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL)
+        if active_workers >= soft_limit:
+            connection.execute(
+                """
+                UPDATE ingest_runs
+                SET last_heartbeat_at = ?
+                WHERE run_id = ?
+                """,
+                (now, run_id),
+            )
+            connection.commit()
+            return [], True
+
+        claim_rows = connection.execute(
+            """
+            SELECT *
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND unit_type = 'loose_file'
+              AND status = 'pending'
+            ORDER BY commit_order ASC, id ASC
+            LIMIT ?
+            """,
+            (run_id, max(1, int(limit))),
+        ).fetchall()
+        claim_ids = [int(claim_row["id"]) for claim_row in claim_rows]
+        if claim_ids:
+            placeholders = ",".join("?" for _ in claim_ids)
+            connection.execute(
+                f"""
+                UPDATE ingest_work_items
+                SET status = 'leased',
+                    lease_owner = ?,
+                    lease_expires_at = ?,
+                    attempts = attempts + 1,
+                    updated_at = ?
+                WHERE run_id = ?
+                  AND status = 'pending'
+                  AND id IN ({placeholders})
+                """,
+                (worker_id, lease_expires_at, now, run_id, *claim_ids),
+            )
+        connection.execute(
+            """
+            UPDATE ingest_runs
+            SET last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (now, run_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+    if not claim_ids:
+        return [], False
+    placeholders = ",".join("?" for _ in claim_ids)
+    claimed_rows = connection.execute(
+        f"""
+        SELECT *
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND lease_owner = ?
+          AND status = 'leased'
+          AND id IN ({placeholders})
+        ORDER BY commit_order ASC, id ASC
+        """,
+        (run_id, worker_id, *claim_ids),
+    ).fetchall()
+    return list(claimed_rows), False
+
+
+def ingest_v2_release_prepare_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    worker_id: str,
+    reason: str,
+) -> bool:
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE ingest_work_items
+            SET status = 'pending',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?,
+                last_error = ?
+            WHERE run_id = ?
+              AND id = ?
+              AND status = 'leased'
+              AND lease_owner = ?
+            """,
+            (now, reason, run_id, work_item_id, worker_id),
+        )
+        released = int(cursor.rowcount or 0) > 0
+        connection.commit()
+        return released
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_mark_prepare_deferred_timeout(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    worker_id: str,
+    message: str,
+) -> bool:
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE ingest_work_items
+            SET status = 'deferred_timeout',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?,
+                last_error = ?
+            WHERE run_id = ?
+              AND id = ?
+              AND status = 'leased'
+              AND lease_owner = ?
+            """,
+            (now, message, run_id, work_item_id, worker_id),
+        )
+        marked = int(cursor.rowcount or 0) > 0
+        if marked:
+            connection.execute(
+                """
+                INSERT INTO ingest_worker_events (
+                  run_id, worker_id, event_type, work_item_id, phase, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    worker_id,
+                    "prepare_deferred_timeout",
+                    work_item_id,
+                    "prepare",
+                    compact_json_text({"message": message}),
+                    now,
+                ),
+            )
+        connection.commit()
+        return marked
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_prepare_loose_file_item(
+    root: Path,
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    rel_path = str(work_item_row["rel_path"] or payload_dict.get("rel_path") or "")
+    path = ingest_v2_cursor_path(root, rel_path)
+    file_size, file_mtime_ns = source_file_snapshot(path)
+    source_fingerprint = {
+        "rel_path": rel_path,
+        "size": file_size,
+        "mtime_ns": file_mtime_ns,
+        "hash": None,
+    }
+    if file_size is not None and file_size > INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES:
+        return (
+            None,
+            source_fingerprint,
+            (
+                f"File is too large for one bounded prepare step ({file_size} bytes > "
+                f"{INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES} bytes)."
+            ),
+        )
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return None, source_fingerprint, "Not enough budget remaining to start prepare."
+
+    file_type = str(payload_dict.get("file_type") or normalize_extension(path))
+    item = {
+        "rel_path": rel_path,
+        "path": str(path),
+        "file_type": file_type,
+        "source_file_size": file_size,
+        "source_file_mtime_ns": file_mtime_ns,
+        "file_hash": sha256_file(path),
+    }
+    source_fingerprint["hash"] = item["file_hash"]
+    prepared_item = prepare_loose_file_item(item)
+    return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_store_prepared_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    worker_id: str,
+    payload_kind: str,
+    prepared_item: dict[str, object],
+    source_fingerprint: dict[str, object],
+) -> bool:
+    now = utc_now()
+    payload_json = compact_json_text(ingest_v2_json_safe_value({"prepared_item": prepared_item}))
+    prepare_error = prepared_item.get("prepare_error")
+    error_json = compact_json_text({"prepare_error": prepare_error} if prepare_error else {})
+    connection.execute("BEGIN")
+    try:
+        run_row = require_ingest_v2_run_row(connection, run_id)
+        if str(run_row["status"]) in INGEST_V2_TERMINAL_STATUSES or run_row["cancel_requested_at"] is not None:
+            connection.rollback()
+            return False
+        item_row = connection.execute(
+            """
+            SELECT status, lease_owner
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND id = ?
+            """,
+            (run_id, work_item_id),
+        ).fetchone()
+        if item_row is None or item_row["status"] != "leased" or item_row["lease_owner"] != worker_id:
+            connection.rollback()
+            return False
+        connection.execute(
+            """
+            INSERT INTO ingest_prepared_items (
+              run_id, work_item_id, payload_kind, payload_json, spill_rel_path,
+              payload_bytes, source_fingerprint_json, prepared_at, error_json
+            ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+            ON CONFLICT(work_item_id) DO UPDATE SET
+              payload_kind = excluded.payload_kind,
+              payload_json = excluded.payload_json,
+              spill_rel_path = excluded.spill_rel_path,
+              payload_bytes = excluded.payload_bytes,
+              source_fingerprint_json = excluded.source_fingerprint_json,
+              prepared_at = excluded.prepared_at,
+              error_json = excluded.error_json
+            """,
+            (
+                run_id,
+                work_item_id,
+                payload_kind,
+                payload_json,
+                len(payload_json.encode("utf-8")),
+                compact_json_text(ingest_v2_json_safe_value(source_fingerprint)),
+                now,
+                error_json,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE ingest_work_items
+            SET status = 'prepared',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?,
+                last_error = ?
+            WHERE run_id = ?
+              AND id = ?
+            """,
+            (now, str(prepare_error) if prepare_error else None, run_id, work_item_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO ingest_worker_events (
+              run_id, worker_id, event_type, work_item_id, phase, duration_ms, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                worker_id,
+                "prepare_item",
+                work_item_id,
+                "prepare",
+                prepared_item.get("prepare_ms"),
+                compact_json_text(
+                    {
+                        "payload_kind": payload_kind,
+                        "rel_path": prepared_item.get("rel_path"),
+                        "prepare_error": prepare_error,
+                    }
+                ),
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE ingest_runs
+            SET last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (now, run_id),
+        )
+        connection.commit()
+        return True
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ingest_v2_maybe_advance_after_prepare(connection: sqlite3.Connection, *, run_id: str) -> bool:
+    row = require_ingest_v2_run_row(connection, run_id)
+    if str(row["phase"]) != "preparing" or row["cancel_requested_at"] is not None:
+        return False
+    remaining_prepare_items = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND status IN ('pending', 'leased')
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        or 0
+    )
+    if remaining_prepare_items:
+        return False
+    prepared_items = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND status = 'prepared'
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        or 0
+    )
+    next_phase = "committing" if prepared_items else "finalizing"
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE ingest_runs
+            SET phase = ?,
+                status = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND phase = 'preparing'
+              AND cancel_requested_at IS NULL
+            """,
+            (next_phase, next_phase, now, run_id),
+        )
+        advanced = int(cursor.rowcount or 0) > 0
+        connection.commit()
+        return advanced
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def active_ingest_v2_run_row(connection: sqlite3.Connection) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM ingest_runs
+        WHERE status NOT IN ('completed', 'canceled', 'failed')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def require_ingest_v2_run_row(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM ingest_runs
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise RetrieverError(f"Unknown resumable ingest run: {run_id}")
+    return row
+
+
+def latest_ingest_v2_run_row(connection: sqlite3.Connection) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM ingest_runs
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def ingest_v2_conflict_payload(root: Path, active_row: sqlite3.Row, *, message: str) -> dict[str, object]:
+    run_id = str(active_row["run_id"])
+    quoted_root = shlex.quote(str(root))
+    quoted_run_id = shlex.quote(run_id)
+    return {
+        "ok": False,
+        "error": "active_ingest_run",
+        "active_run_id": run_id,
+        "message": message,
+        "status_command": f"ingest-status {quoted_root} --run-id {quoted_run_id}",
+        "cancel_command": f"ingest-cancel {quoted_root} --run-id {quoted_run_id}",
+    }
+
+
+def raise_if_ingest_v2_active(connection: sqlite3.Connection, root: Path, *, command_name: str) -> None:
+    active_row = active_ingest_v2_run_row(connection)
+    if active_row is None:
+        return
+    raise RetrieverStructuredError(
+        f"{command_name} cannot run while resumable ingest run {active_row['run_id']} is active.",
+        ingest_v2_conflict_payload(
+            root,
+            active_row,
+            message=f"{command_name} cannot run while a resumable ingest run is active.",
+        ),
+    )
+
+
+def ingest_v2_status_counts(connection: sqlite3.Connection, *, run_id: str) -> dict[str, int]:
+    counts = {status: 0 for status in INGEST_V2_WORK_ITEM_STATUSES}
+    rows = connection.execute(
+        """
+        SELECT status, COUNT(*) AS count
+        FROM ingest_work_items
+        WHERE run_id = ?
+        GROUP BY status
+        """,
+        (run_id,),
+    ).fetchall()
+    for row in rows:
+        counts[str(row["status"])] = int(row["count"] or 0)
+    return counts
+
+
+def ingest_v2_unit_type_counts(connection: sqlite3.Connection, *, run_id: str) -> dict[str, dict[str, int]]:
+    rows = connection.execute(
+        """
+        SELECT unit_type, status, COUNT(*) AS count
+        FROM ingest_work_items
+        WHERE run_id = ?
+        GROUP BY unit_type, status
+        ORDER BY unit_type ASC, status ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    counts: dict[str, dict[str, int]] = {}
+    for row in rows:
+        unit_type = str(row["unit_type"] or "unknown")
+        counts.setdefault(unit_type, {status: 0 for status in INGEST_V2_WORK_ITEM_STATUSES})
+        counts[unit_type][str(row["status"])] = int(row["count"] or 0)
+    return counts
+
+
+def ingest_v2_artifact_counts(connection: sqlite3.Connection, *, run_id: str) -> dict[str, object]:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS count, MIN(updated_at) AS oldest_updated_at
+        FROM ingest_artifact_sweeps
+        WHERE run_id = ?
+          AND state = 'orphan_pending_sweep'
+        """,
+        (run_id,),
+    ).fetchone()
+    orphan_count = int(row["count"] or 0) if row is not None else 0
+    oldest_age: int | None = None
+    if row is not None and row["oldest_updated_at"]:
+        parsed = parse_utc_timestamp(row["oldest_updated_at"])
+        if parsed is not None:
+            oldest_age = max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+    return {
+        "orphan_pending_sweep": orphan_count,
+        "oldest_unswept_age_seconds": oldest_age,
+    }
+
+
+def ingest_v2_lease_health(connection: sqlite3.Connection, row: sqlite3.Row, *, run_id: str) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    now_text = format_utc_timestamp(now)
+    active_prepare_workers = int(
+        connection.execute(
+            """
+            SELECT COUNT(DISTINCT lease_owner)
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND status = 'leased'
+              AND lease_owner IS NOT NULL
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > ?
+            """,
+            (run_id, now_text),
+        ).fetchone()[0]
+        or 0
+    )
+    active_lease_row = connection.execute(
+        """
+        SELECT MIN(updated_at) AS oldest_updated_at
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND status IN ('leased', 'committing')
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > ?
+        """,
+        (run_id, now_text),
+    ).fetchone()
+    stale_lease_row = connection.execute(
+        """
+        SELECT MIN(lease_expires_at) AS oldest_expired_at
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND status IN ('leased', 'committing')
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at <= ?
+        """,
+        (run_id, now_text),
+    ).fetchone()
+
+    def age_seconds(raw_value: object) -> int | None:
+        parsed = parse_utc_timestamp(raw_value)
+        if parsed is None:
+            return None
+        return max(0, int((now - parsed).total_seconds()))
+
+    return {
+        "oldest_active_lease_age_seconds": age_seconds(active_lease_row["oldest_updated_at"] if active_lease_row else None),
+        "oldest_stale_lease_age_seconds": age_seconds(stale_lease_row["oldest_expired_at"] if stale_lease_row else None),
+        "writer_busy": lease_is_active(row["committer_lease_expires_at"], now=now),
+        "active_prepare_workers": active_prepare_workers,
+        "prepare_worker_soft_limit": int(row["prepare_worker_soft_limit"] or DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL),
+    }
+
+
+def ingest_v2_next_commands(
+    root: Path,
+    row: sqlite3.Row,
+    *,
+    counts: dict[str, int],
+    leases: dict[str, object],
+    artifacts: dict[str, object],
+    budget_seconds: int,
+) -> list[str]:
+    if row["cancel_requested_at"] is not None or str(row["status"]) in INGEST_V2_TERMINAL_STATUSES:
+        return [f"ingest-status {shlex.quote(str(root))} --run-id {shlex.quote(str(row['run_id']))}"]
+    run_id_arg = shlex.quote(str(row["run_id"]))
+    root_arg = shlex.quote(str(root))
+    budget_arg = str(int(budget_seconds))
+    commands: list[str] = []
+    phase = str(row["phase"] or "")
+    if phase == "planning":
+        commands.append(f"ingest-plan-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+    if counts.get("pending", 0) > 0 and int(leases.get("active_prepare_workers") or 0) < int(leases.get("prepare_worker_soft_limit") or 0):
+        commands.append(f"ingest-prepare-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+    if counts.get("prepared", 0) > 0 and not bool(leases.get("writer_busy")):
+        commands.append(f"ingest-commit-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+    if phase == "finalizing" or int(artifacts.get("orphan_pending_sweep") or 0) > 0:
+        commands.append(f"ingest-finalize-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+    if leases.get("oldest_stale_lease_age_seconds") is not None:
+        commands.append(f"ingest-status {root_arg} --run-id {run_id_arg}")
+    return commands
+
+
+def ingest_v2_status_payload(
+    connection: sqlite3.Connection,
+    root: Path,
+    row: sqlite3.Row,
+    *,
+    budget_seconds: int = DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    scope = decode_json_text(row["scope_json"], default={}) or {}
+    counts = ingest_v2_status_counts(connection, run_id=run_id)
+    unit_type_counts = ingest_v2_unit_type_counts(connection, run_id=run_id)
+    leases = ingest_v2_lease_health(connection, row, run_id=run_id)
+    artifacts = ingest_v2_artifact_counts(connection, run_id=run_id)
+    prepared_order_row = connection.execute(
+        """
+        SELECT MIN(commit_order) AS next_commit_order
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND status = 'prepared'
+        """,
+        (run_id,),
+    ).fetchone()
+    next_commands = ingest_v2_next_commands(
+        root,
+        row,
+        counts=counts,
+        leases=leases,
+        artifacts=artifacts,
+        budget_seconds=budget_seconds,
+    )
+    return {
+        "run_id": run_id,
+        "status": row["status"],
+        "phase": row["phase"],
+        "scope": list((scope if isinstance(scope, dict) else {}).get("scan_paths") or []),
+        "scope_details": scope,
+        "budget_recommendation_seconds": int(budget_seconds),
+        "counts": {
+            "work_items": counts,
+            "by_unit_type": unit_type_counts,
+        },
+        "leases": leases,
+        "entity": {
+            "graph_stale": bool(row["entity_graph_stale"]),
+            "sync_pending": 0,
+            "sync_completed": 0,
+            "entity_writer_busy": False,
+            "policy_changed_during_run": False,
+        },
+        "artifacts": artifacts,
+        "progress": {
+            "planning_complete": str(row["phase"]) != "planning",
+            "commit_order_next": (
+                int(prepared_order_row["next_commit_order"])
+                if prepared_order_row is not None and prepared_order_row["next_commit_order"] is not None
+                else None
+            ),
+            "finalize_phase": str(row["phase"]) if str(row["phase"]) == "finalizing" else None,
+        },
+        "stalled": leases.get("oldest_stale_lease_age_seconds") is not None,
+        "last_error": row["error"],
+        "next_recommended_commands": next_commands,
+    }
+
+
+def ingest_v2_start(
+    root: Path,
+    *,
+    recursive: bool,
+    raw_file_types: str | None,
+    raw_paths: list[str] | None = None,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    scope = ingest_v2_scope_payload(root, recursive=recursive, raw_file_types=raw_file_types, raw_paths=raw_paths)
+    with workspace_ingest_session(paths, command_name="ingest-start"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            active_row = active_ingest_v2_run_row(connection)
+            if active_row is not None:
+                raise RetrieverStructuredError(
+                    f"Resumable ingest run {active_row['run_id']} is already active.",
+                    ingest_v2_conflict_payload(
+                        root,
+                        active_row,
+                        message="A resumable ingest run is active in this workspace.",
+                    ),
+                )
+            run_id = new_ingest_v2_run_id()
+            now = utc_now()
+            connection.execute("BEGIN")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO ingest_runs (
+                      run_id, scope_json, recursive, raw_file_types, pipeline_schema_version,
+                      phase, status, prepare_worker_soft_limit, entity_policy_snapshot_json,
+                      created_at, started_at, last_heartbeat_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        compact_json_text(scope),
+                        1 if recursive else 0,
+                        raw_file_types,
+                        INGEST_V2_PIPELINE_SCHEMA_VERSION,
+                        "planning",
+                        "planning",
+                        DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL,
+                        "{}",
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            row = require_ingest_v2_run_row(connection, run_id)
+            return {
+                "ok": True,
+                "created": True,
+                **ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+            }
+        finally:
+            connection.close()
+
+
+def ingest_v2_status(root: Path, *, run_id: str | None = None, budget_seconds: int | None = None) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = require_ingest_v2_run_row(connection, run_id) if run_id else latest_ingest_v2_run_row(connection)
+        if row is None:
+            return {
+                "ok": True,
+                "status": "none",
+                "phase": None,
+                "run_id": None,
+                "counts": {"work_items": {status: 0 for status in INGEST_V2_WORK_ITEM_STATUSES}, "by_unit_type": {}},
+                "leases": {
+                    "oldest_active_lease_age_seconds": None,
+                    "oldest_stale_lease_age_seconds": None,
+                    "writer_busy": False,
+                    "active_prepare_workers": 0,
+                    "prepare_worker_soft_limit": DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL,
+                },
+                "entity": {
+                    "graph_stale": False,
+                    "sync_pending": 0,
+                    "sync_completed": 0,
+                    "entity_writer_busy": False,
+                    "policy_changed_during_run": False,
+                },
+                "artifacts": {
+                    "orphan_pending_sweep": 0,
+                    "oldest_unswept_age_seconds": None,
+                },
+                "progress": {
+                    "planning_complete": False,
+                    "commit_order_next": None,
+                    "finalize_phase": None,
+                },
+                "stalled": False,
+                "last_error": None,
+                "next_recommended_commands": [],
+            }
+        return {"ok": True, **ingest_v2_status_payload(connection, root, row, budget_seconds=budget)}
+    finally:
+        connection.close()
+
+
+def ingest_v2_cancel(root: Path, *, run_id: str, force: bool = False) -> dict[str, object]:
+    set_active_workspace_root(root)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_ingest_session(paths, command_name="ingest-cancel"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            row = require_ingest_v2_run_row(connection, run_id)
+            now = utc_now()
+            connection.execute("BEGIN")
+            try:
+                connection.execute(
+                    """
+                    UPDATE ingest_runs
+                    SET cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                        status = CASE
+                          WHEN status IN ('completed', 'failed') THEN status
+                          ELSE 'canceled'
+                        END,
+                        phase = CASE
+                          WHEN status IN ('completed', 'failed') THEN phase
+                          ELSE 'canceled'
+                        END,
+                        completed_at = COALESCE(completed_at, ?),
+                        last_heartbeat_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (now, now, now, run_id),
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE ingest_work_items
+                    SET status = 'cancelled',
+                        updated_at = ?,
+                        last_error = COALESCE(last_error, 'Ingest run canceled.')
+                    WHERE run_id = ?
+                      AND status IN ('pending', 'leased', 'prepared')
+                    """,
+                    (now, run_id),
+                )
+                cancelled_items = int(cursor.rowcount or 0)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            updated_row = require_ingest_v2_run_row(connection, run_id)
+            return {
+                "ok": True,
+                "cancel_requested": True,
+                "force": bool(force),
+                "cancelled_work_items": cancelled_items,
+                **ingest_v2_status_payload(connection, root, updated_row),
+            }
+        finally:
+            connection.close()
+
+
+def ingest_v2_plan_step(
+    root: Path,
+    *,
+    run_id: str,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    processed_paths = 0
+    planned_loose_files = 0
+    with workspace_ingest_session(paths, command_name="ingest-plan-step"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            row = require_ingest_v2_run_row(connection, run_id)
+            if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
+                return {
+                    "ok": True,
+                    "implemented": True,
+                    "step": "plan",
+                    "processed_paths": 0,
+                    "planned_loose_files": 0,
+                    "more_planning_remaining": False,
+                    "more_work_remaining": False,
+                    "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+                }
+            if str(row["phase"]) != "planning":
+                return {
+                    "ok": True,
+                    "implemented": True,
+                    "step": "plan",
+                    "processed_paths": 0,
+                    "planned_loose_files": 0,
+                    "more_planning_remaining": False,
+                    "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+                    "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+                }
+
+            cursor = ingest_v2_load_or_create_loose_file_plan_cursor(connection, root, row)
+            recursive = bool(row["recursive"])
+            allowed_types = parse_file_types(row["raw_file_types"])
+            scan_scope = ingest_v2_scan_scope_from_run(root, row)
+
+            while time.perf_counter() < deadline:
+                pending_paths = list(cursor.get("pending_paths") or [])
+                if not pending_paths:
+                    break
+                rel_path = str(pending_paths.pop(0))
+                cursor["pending_paths"] = pending_paths
+                cursor["scanned_paths"] = int(cursor.get("scanned_paths") or 0) + 1
+                processed_paths += 1
+
+                candidate_path = ingest_v2_cursor_path(root, rel_path)
+                if rel_path and ingest_v2_rel_path_excluded(cursor, rel_path):
+                    cursor["skipped_excluded_paths"] = int(cursor.get("skipped_excluded_paths") or 0) + 1
+                elif not candidate_path.exists():
+                    cursor["skipped_missing_paths"] = int(cursor.get("skipped_missing_paths") or 0) + 1
+                elif not path_is_at_or_under(candidate_path, root):
+                    cursor["skipped_excluded_paths"] = int(cursor.get("skipped_excluded_paths") or 0) + 1
+                elif candidate_path.is_dir():
+                    child_paths = ingest_v2_planning_child_paths(root, candidate_path, recursive=recursive)
+                    cursor["pending_paths"] = ingest_v2_sorted_pending_paths(
+                        [*list(cursor.get("pending_paths") or []), *child_paths]
+                    )
+                    cursor["listed_directories"] = int(cursor.get("listed_directories") or 0) + 1
+                elif candidate_path.is_file():
+                    if ".retriever" in candidate_path.resolve().relative_to(root.resolve()).parts:
+                        cursor["skipped_excluded_paths"] = int(cursor.get("skipped_excluded_paths") or 0) + 1
+                    elif not ingest_scan_scope_contains_rel_path(scan_scope, rel_path):
+                        cursor["skipped_excluded_paths"] = int(cursor.get("skipped_excluded_paths") or 0) + 1
+                    else:
+                        file_type = normalize_extension(candidate_path)
+                        if not file_type:
+                            cursor["skipped_extensionless_files"] = int(cursor.get("skipped_extensionless_files") or 0) + 1
+                        elif allowed_types is not None and file_type not in allowed_types:
+                            cursor["skipped_filtered_files"] = int(cursor.get("skipped_filtered_files") or 0) + 1
+                        elif file_type in CONTAINER_SOURCE_FILE_TYPES:
+                            cursor["skipped_container_files"] = int(cursor.get("skipped_container_files") or 0) + 1
+                        else:
+                            file_size, file_mtime_ns = source_file_snapshot(candidate_path)
+                            inserted = ingest_v2_plan_loose_file_item(
+                                connection,
+                                run_id=run_id,
+                                rel_path=rel_path,
+                                file_type=file_type,
+                                file_size=file_size,
+                                file_mtime_ns=file_mtime_ns,
+                                commit_order=int(cursor.get("next_commit_order") or 1),
+                            )
+                            cursor["next_commit_order"] = int(cursor.get("next_commit_order") or 1) + 1
+                            if inserted:
+                                planned_loose_files += 1
+                                cursor["planned_loose_files"] = int(cursor.get("planned_loose_files") or 0) + 1
+
+                if not connection.in_transaction:
+                    connection.execute("BEGIN")
+                try:
+                    ingest_v2_save_phase_cursor(
+                        connection,
+                        run_id=run_id,
+                        phase="planning",
+                        cursor_key="loose_file_scan",
+                        cursor=cursor,
+                        status="pending",
+                    )
+                    connection.execute(
+                        """
+                        UPDATE ingest_runs
+                        SET last_heartbeat_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (utc_now(), run_id),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+            planning_complete = not list(cursor.get("pending_paths") or [])
+            if planning_complete:
+                total_work_items = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM ingest_work_items
+                        WHERE run_id = ?
+                        """,
+                        (run_id,),
+                    ).fetchone()[0]
+                    or 0
+                )
+                next_phase = "preparing" if total_work_items else "finalizing"
+                connection.execute("BEGIN")
+                try:
+                    ingest_v2_save_phase_cursor(
+                        connection,
+                        run_id=run_id,
+                        phase="planning",
+                        cursor_key="loose_file_scan",
+                        cursor=cursor,
+                        status="complete",
+                    )
+                    connection.execute(
+                        """
+                        UPDATE ingest_runs
+                        SET phase = ?,
+                            status = ?,
+                            last_heartbeat_at = ?
+                        WHERE run_id = ?
+                          AND cancel_requested_at IS NULL
+                        """,
+                        (next_phase, next_phase, utc_now(), run_id),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+            updated_row = require_ingest_v2_run_row(connection, run_id)
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "plan",
+                "processed_paths": processed_paths,
+                "planned_loose_files": planned_loose_files,
+                "cursor": {
+                    "pending_paths": len(list(cursor.get("pending_paths") or [])),
+                    "scanned_paths": int(cursor.get("scanned_paths") or 0),
+                    "planned_loose_files": int(cursor.get("planned_loose_files") or 0),
+                    "skipped_container_files": int(cursor.get("skipped_container_files") or 0),
+                    "skipped_filtered_files": int(cursor.get("skipped_filtered_files") or 0),
+                    "skipped_excluded_paths": int(cursor.get("skipped_excluded_paths") or 0),
+                    "special_source_counts": cursor.get("special_source_counts") or {},
+                },
+                "more_planning_remaining": not planning_complete,
+                "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+                "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+            }
+        finally:
+            connection.close()
+
+
+def ingest_v2_prepare_step(
+    root: Path,
+    *,
+    run_id: str,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    worker_id = ingest_v2_worker_id("prepare")
+    claimed = 0
+    prepared = 0
+    deferred_timeout = 0
+    released = 0
+    stale_reclaimed = 0
+    throttled = False
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = require_ingest_v2_run_row(connection, run_id)
+        if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "prepare",
+                "worker_id": worker_id,
+                "claimed": 0,
+                "prepared": 0,
+                "deferred_timeout": 0,
+                "released": 0,
+                "stale_reclaimed": 0,
+                "throttled": False,
+                "more_prepare_remaining": False,
+                "more_work_remaining": False,
+                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+            }
+        if str(row["phase"]) != "preparing":
+            return {
+                "ok": True,
+                "implemented": True,
+                "step": "prepare",
+                "worker_id": worker_id,
+                "claimed": 0,
+                "prepared": 0,
+                "deferred_timeout": 0,
+                "released": 0,
+                "stale_reclaimed": 0,
+                "throttled": False,
+                "more_prepare_remaining": str(row["phase"]) == "planning",
+                "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+            }
+
+        stale_reclaimed = ingest_v2_reclaim_stale_prepare_items(connection, run_id=run_id)
+        claimed_rows, throttled = ingest_v2_claim_prepare_items(
+            connection,
+            run_id=run_id,
+            worker_id=worker_id,
+            limit=INGEST_V2_PREPARE_BATCH_SIZE,
+        )
+        claimed = len(claimed_rows)
+
+        for work_item_row in claimed_rows:
+            work_item_id = int(work_item_row["id"])
+            if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+                if ingest_v2_release_prepare_item(
+                    connection,
+                    run_id=run_id,
+                    work_item_id=work_item_id,
+                    worker_id=worker_id,
+                    reason="Released because prepare-step budget was nearly exhausted.",
+                ):
+                    released += 1
+                continue
+
+            prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_loose_file_item(
+                root,
+                work_item_row,
+                deadline=deadline,
+            )
+            if prepared_item is None:
+                if defer_message == "Not enough budget remaining to start prepare.":
+                    if ingest_v2_release_prepare_item(
+                        connection,
+                        run_id=run_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        reason=defer_message,
+                    ):
+                        released += 1
+                else:
+                    if ingest_v2_mark_prepare_deferred_timeout(
+                        connection,
+                        run_id=run_id,
+                        work_item_id=work_item_id,
+                        worker_id=worker_id,
+                        message=defer_message or "Prepare could not complete within the step budget.",
+                    ):
+                        deferred_timeout += 1
+                continue
+
+            if ingest_v2_store_prepared_item(
+                connection,
+                run_id=run_id,
+                work_item_id=work_item_id,
+                worker_id=worker_id,
+                payload_kind="loose_file",
+                prepared_item=prepared_item,
+                source_fingerprint=source_fingerprint,
+            ):
+                prepared += 1
+
+        advanced_to_commit = ingest_v2_maybe_advance_after_prepare(connection, run_id=run_id)
+        updated_row = require_ingest_v2_run_row(connection, run_id)
+        remaining_prepare_items = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND status IN ('pending', 'leased')
+                """,
+                (run_id,),
+            ).fetchone()[0]
+            or 0
+        )
+        return {
+            "ok": True,
+            "implemented": True,
+            "step": "prepare",
+            "worker_id": worker_id,
+            "claimed": claimed,
+            "prepared": prepared,
+            "deferred_timeout": deferred_timeout,
+            "released": released,
+            "stale_reclaimed": stale_reclaimed,
+            "throttled": throttled,
+            "advanced_to_commit": advanced_to_commit,
+            "more_prepare_remaining": remaining_prepare_items > 0,
+            "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+            "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+        }
+    finally:
+        connection.close()
+
+
+def ingest_v2_step_not_implemented(
+    root: Path,
+    *,
+    run_id: str,
+    phase: str,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = require_ingest_v2_run_row(connection, run_id)
+        return {
+            "ok": True,
+            "implemented": False,
+            "step": phase,
+            "processed": 0,
+            "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
+            "message": "This V2 step command is reserved by the foundation slice and will be implemented in the next ingest slice.",
+            "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+        }
+    finally:
+        connection.close()
+
+
 def source_file_snapshot(path: Path) -> tuple[int | None, int | None]:
     try:
         stat = path.stat()
@@ -30046,6 +31783,7 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
         try:
             setup_started = time.perf_counter()
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="ingest-production")
             reconcile_custom_fields_registry(connection, repair=True)
             resolved_production_root = resolve_production_root_argument(root, production_root)
             benchmark_mark(
@@ -30107,6 +31845,7 @@ def ingest(
         try:
             setup_started = time.perf_counter()
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="ingest")
             reconcile_custom_fields_registry(connection, repair=True)
             benchmark_mark(
                 "ingest_setup_done",
@@ -31622,6 +33361,7 @@ def rebuild_entities(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="rebuild-entities")
             ids_to_rebuild = entity_rebuild_document_ids(connection, document_ids)
             full_rebuild = not document_ids
             reset_counts = {
@@ -32154,6 +33894,7 @@ def create_entity(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="create-entity")
             connection.execute("BEGIN")
             try:
                 assert_manual_resolution_identifiers_available(connection, identifiers)
@@ -32245,6 +33986,7 @@ def edit_entity(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="edit-entity")
             active_entity_row(connection, entity_id)
             affected_document_ids = [
                 int(row["document_id"])
@@ -32347,6 +34089,7 @@ def block_entity_merge(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        raise_if_ingest_v2_active(connection, root, command_name="block-entity-merge")
         active_entity_row(connection, left)
         active_entity_row(connection, right)
         normalized_reason = normalize_whitespace(str(reason or "")) or None
@@ -32837,6 +34580,7 @@ def merge_entities(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="merge-entities")
             loser_row = active_entity_row(connection, loser_entity_id)
             survivor_row = active_entity_row(connection, survivor_entity_id)
             if entity_merge_block_exists(connection, loser_entity_id, survivor_entity_id) and not force:
@@ -32999,6 +34743,7 @@ def ignore_entity(root: Path, entity_id: int, *, reason: str | None = None) -> d
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="ignore-entity")
             entity_row = active_entity_row(connection, entity_id)
             affected_document_ids = [
                 int(row["document_id"])
@@ -33131,6 +34876,7 @@ def assign_entity(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="assign-entity")
             ensure_document_row(connection, document_id)
             entity_row = active_entity_row(connection, entity_id)
             connection.execute("BEGIN")
@@ -33262,6 +35008,7 @@ def unassign_entity(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="unassign-entity")
             ensure_document_row(connection, document_id)
             active_entity_row(connection, entity_id)
             link_rows = connection.execute(
@@ -33510,6 +35257,7 @@ def split_entity(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="split-entity")
             source_row = active_entity_row(connection, source_entity_id)
             identifier_rows = selected_identifier_rows_for_split(
                 connection,
@@ -33700,6 +35448,7 @@ def show_dataset_policy(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        raise_if_ingest_v2_active(connection, root, command_name="set-dataset-policy")
         dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
         return {
             "status": "ok",
@@ -46172,6 +47921,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated file types to include, e.g. pdf,docx,eml",
     )
 
+    ingest_start_parser = subparsers.add_parser("ingest-start", help="Start a resumable V2 ingest run")
+    ingest_start_parser.add_argument("workspace", help="Workspace root path")
+    ingest_start_parser.add_argument("--recursive", action="store_true", help="Scan directories recursively")
+    ingest_start_parser.add_argument(
+        "--path",
+        dest="paths",
+        action="append",
+        help="Limit ingest to a file or directory inside the workspace; repeat to scan multiple paths",
+    )
+    ingest_start_parser.add_argument(
+        "--file-types",
+        help="Comma-separated file types to include, e.g. pdf,docx,eml",
+    )
+    ingest_start_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Recommended per-step budget; values above the bounded-worker cap are rejected",
+    )
+
+    ingest_status_parser = subparsers.add_parser("ingest-status", help="Show resumable V2 ingest status")
+    ingest_status_parser.add_argument("workspace", help="Workspace root path")
+    ingest_status_parser.add_argument("--run-id", help="Run id; defaults to the latest resumable ingest run")
+    ingest_status_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Budget used when computing next recommended commands",
+    )
+
+    ingest_cancel_parser = subparsers.add_parser("ingest-cancel", help="Cancel a resumable V2 ingest run")
+    ingest_cancel_parser.add_argument("workspace", help="Workspace root path")
+    ingest_cancel_parser.add_argument("--run-id", required=True, help="Run id to cancel")
+    ingest_cancel_parser.add_argument("--force", action="store_true", help="Compatibility flag reserved for future workers")
+
+    for step_command, help_text in (
+        ("ingest-plan-step", "Advance resumable V2 ingest planning"),
+        ("ingest-prepare-step", "Prepare resumable V2 ingest work items"),
+        ("ingest-commit-step", "Commit prepared resumable V2 ingest work items"),
+        ("ingest-finalize-step", "Advance resumable V2 ingest finalization"),
+    ):
+        step_parser = subparsers.add_parser(step_command, help=help_text)
+        step_parser.add_argument("workspace", help="Workspace root path")
+        step_parser.add_argument("--run-id", required=True, help="Run id to advance")
+        step_parser.add_argument(
+            "--budget-seconds",
+            type=int,
+            default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+            help="Per-call budget; values above the bounded-worker cap are rejected",
+        )
+
     ingest_production_parser = subparsers.add_parser("ingest-production", help="Ingest a processed production volume")
     ingest_production_parser.add_argument("workspace", help="Workspace root path")
     ingest_production_parser.add_argument("production_root", help="Production root directory inside the workspace")
@@ -47139,6 +48939,53 @@ def main() -> int:
         if args.command == "ingest":
             return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types, raw_paths=args.paths))
 
+        if args.command == "ingest-start":
+            return emit_cli_payload(
+                "ingest-start",
+                ingest_v2_start(
+                    root,
+                    recursive=args.recursive,
+                    raw_file_types=args.file_types,
+                    raw_paths=args.paths,
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
+        if args.command == "ingest-status":
+            return emit_cli_payload(
+                "ingest-status",
+                ingest_v2_status(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
+        if args.command == "ingest-cancel":
+            return emit_cli_payload(
+                "ingest-cancel",
+                ingest_v2_cancel(root, run_id=args.run_id, force=args.force),
+            )
+
+        if args.command == "ingest-plan-step":
+            return emit_cli_payload(
+                "ingest-plan-step",
+                ingest_v2_plan_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
+        if args.command == "ingest-prepare-step":
+            return emit_cli_payload(
+                "ingest-prepare-step",
+                ingest_v2_prepare_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
+        if args.command in {"ingest-commit-step", "ingest-finalize-step"}:
+            return emit_cli_payload(
+                args.command,
+                ingest_v2_step_not_implemented(
+                    root,
+                    run_id=args.run_id,
+                    phase=args.command.removeprefix("ingest-").removesuffix("-step"),
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
         if args.command == "ingest-production":
             return emit_cli_payload("ingest-production", ingest_production(root, args.production_root))
 
@@ -47894,6 +49741,9 @@ def main() -> int:
             )
 
         parser.error(f"Unknown command: {args.command}")
+        return 2
+    except RetrieverStructuredError as exc:
+        print(json.dumps({"tool_version": TOOL_VERSION, **exc.payload}, indent=2, sort_keys=True), file=sys.stderr)
         return 2
     except RetrieverError as exc:
         print(json.dumps({"error": str(exc), "tool_version": TOOL_VERSION}), file=sys.stderr)

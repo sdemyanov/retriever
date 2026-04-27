@@ -73,8 +73,8 @@ except Exception:  # pragma: no cover - platform-specific locking
     msvcrt = None
 
 
-TOOL_VERSION = "1.0.3"
-SCHEMA_VERSION = 24
+TOOL_VERSION = "1.0.4"
+SCHEMA_VERSION = 25
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/tools.py"
