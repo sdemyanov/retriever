@@ -6710,6 +6710,7 @@ def commit_prepared_production_row(
     dataset_id: int,
     dataset_source_id: int,
     production_id: int,
+    before_transaction_commit=None,
 ) -> dict[str, object]:
     control_number = str(prepared_item["control_number"])
     prepare_error = prepared_item.get("prepare_error")
@@ -6789,18 +6790,23 @@ def commit_prepared_production_row(
             preview_rows,
         )
         replace_document_source_parts(connection, document_id, list(prepared_item.get("source_parts", [])))
-        connection.commit()
         if existing_row is None:
             action = "created"
         elif existing_row["lifecycle_status"] == "active" and existing_signature == desired_signature:
             action = "unchanged"
         else:
             action = "updated"
-        return {
+        result = {
             "action": action,
             "control_number": control_number,
             "page_images_linked": len(list(prepared_item.get("matching_image_paths", []))),
+            "document_id": document_id,
+            "production_id": production_id,
         }
+        if before_transaction_commit is not None:
+            before_transaction_commit(connection, result)
+        connection.commit()
+        return result
     except Exception as exc:
         connection.rollback()
         return {
