@@ -74,7 +74,7 @@ except Exception:  # pragma: no cover - platform-specific locking
 
 
 TOOL_VERSION = "1.0.3"
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
 TEMPLATE_SOURCE = "skills/tool-template/tools.py"
@@ -689,6 +689,53 @@ OCCURRENCE_LIFECYCLE_STATUSES = {"active", "superseded", "missing", "deleted"}
 CANONICAL_STATUS_ACTIVE = "active"
 CANONICAL_STATUS_DERELICT = "derelict"
 CANONICAL_STATUS_MERGED = "merged"
+ENTITY_TYPE_PERSON = "person"
+ENTITY_TYPE_ORGANIZATION = "organization"
+ENTITY_TYPE_SHARED_MAILBOX = "shared_mailbox"
+ENTITY_TYPE_SYSTEM_MAILBOX = "system_mailbox"
+ENTITY_TYPE_UNKNOWN = "unknown"
+ENTITY_TYPES = {
+    ENTITY_TYPE_PERSON,
+    ENTITY_TYPE_ORGANIZATION,
+    ENTITY_TYPE_SHARED_MAILBOX,
+    ENTITY_TYPE_SYSTEM_MAILBOX,
+    ENTITY_TYPE_UNKNOWN,
+}
+ENTITY_ORIGIN_OBSERVED = "observed"
+ENTITY_ORIGIN_IDENTIFIED = "identified"
+ENTITY_ORIGIN_MANUAL = "manual"
+ENTITY_ORIGINS = {
+    ENTITY_ORIGIN_OBSERVED,
+    ENTITY_ORIGIN_IDENTIFIED,
+    ENTITY_ORIGIN_MANUAL,
+}
+ENTITY_STATUS_ACTIVE = "active"
+ENTITY_STATUS_MERGED = "merged"
+ENTITY_STATUS_IGNORED = "ignored"
+ENTITY_STATUSES = {
+    ENTITY_STATUS_ACTIVE,
+    ENTITY_STATUS_MERGED,
+    ENTITY_STATUS_IGNORED,
+}
+ENTITY_DISPLAY_SOURCE_AUTO = "auto"
+ENTITY_DISPLAY_SOURCE_MANUAL = "manual"
+ENTITY_DISPLAY_SOURCES = {
+    ENTITY_DISPLAY_SOURCE_AUTO,
+    ENTITY_DISPLAY_SOURCE_MANUAL,
+}
+ENTITY_IDENTIFIER_TYPES = {
+    "email",
+    "phone",
+    "name",
+    "handle",
+    "external_id",
+}
+DOCUMENT_ENTITY_ROLES = {
+    "author",
+    "participant",
+    "recipient",
+    "custodian",
+}
 CANONICAL_KIND_VALUES = {
     "email",
     "document",

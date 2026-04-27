@@ -9330,6 +9330,40 @@ def build_parser() -> argparse.ArgumentParser:
     list_datasets_parser = subparsers.add_parser("list-datasets", help="List datasets in the workspace")
     list_datasets_parser.add_argument("workspace", help="Workspace root path")
 
+    rebuild_entities_parser = subparsers.add_parser(
+        "rebuild-entities",
+        help="Rebuild entity recognition state from stored document metadata",
+    )
+    rebuild_entities_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Rebuild entity links for one document id (repeatable); omit for a full graph rebuild",
+    )
+    rebuild_entities_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Documents to refresh per transaction",
+    )
+
+    list_entities_parser = subparsers.add_parser("list-entities", help="List recognized entities")
+    list_entities_parser.add_argument("workspace", help="Workspace root path")
+    list_entities_parser.add_argument("--query", help="Filter entities by display name or identifier")
+    list_entities_parser.add_argument("--limit", type=int, default=50, help="Maximum entities to return")
+    list_entities_parser.add_argument(
+        "--include-ignored",
+        action="store_true",
+        help="Include ignored entities; merged entities are still omitted",
+    )
+
+    show_entity_parser = subparsers.add_parser("show-entity", help="Show one recognized entity")
+    show_entity_parser.add_argument("workspace", help="Workspace root path")
+    show_entity_parser.add_argument("entity_id", type=int, help="Entity id")
+    show_entity_parser.add_argument("--limit", type=int, default=25, help="Maximum linked documents to return")
+
     create_dataset_parser = subparsers.add_parser("create-dataset", help="Create a manual dataset")
     create_dataset_parser.add_argument("workspace", help="Workspace root path")
     create_dataset_parser.add_argument("dataset_name", help="Dataset name")
@@ -9994,6 +10028,33 @@ def main() -> int:
 
         if args.command == "list-datasets":
             return emit_cli_payload("list-datasets", list_datasets(root))
+
+        if args.command == "rebuild-entities":
+            return emit_cli_payload(
+                "rebuild-entities",
+                rebuild_entities(
+                    root,
+                    document_ids=args.document_ids,
+                    batch_size=args.batch_size,
+                ),
+            )
+
+        if args.command == "list-entities":
+            return emit_cli_payload(
+                "list-entities",
+                list_entities(
+                    root,
+                    query=args.query,
+                    limit=args.limit,
+                    include_ignored=args.include_ignored,
+                ),
+            )
+
+        if args.command == "show-entity":
+            return emit_cli_payload(
+                "show-entity",
+                show_entity(root, args.entity_id, document_limit=args.limit),
+            )
 
         if args.command == "create-dataset":
             return emit_cli_payload("create-dataset", create_dataset(root, args.dataset_name))

@@ -7,7 +7,7 @@
 - requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `bab5762ee1acd94b6d37ee8292304e307432f6a4d52397416053aeb6931241dd`
+- source checksum (SHA256): `f38056115759bbbc6ee525af8532bf1337dac640bc50b92b198926c158ab82c2`
 
 ## Current command surface
 

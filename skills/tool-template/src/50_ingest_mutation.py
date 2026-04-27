@@ -2354,6 +2354,493 @@ def reconcile_duplicates(
         connection.close()
 
 
+def counted_delete(
+    connection: sqlite3.Connection,
+    *,
+    count_sql: str,
+    delete_sql: str,
+    params: tuple[object, ...] = (),
+) -> int:
+    row = connection.execute(count_sql, params).fetchone()
+    deleted_count = int(row[0] or 0) if row is not None else 0
+    connection.execute(delete_sql, params)
+    return deleted_count
+
+
+def reset_auto_entity_graph(connection: sqlite3.Connection) -> dict[str, int]:
+    auto_document_links_deleted = counted_delete(
+        connection,
+        count_sql="SELECT COUNT(*) FROM document_entities WHERE assignment_mode = 'auto'",
+        delete_sql="DELETE FROM document_entities WHERE assignment_mode = 'auto'",
+    )
+    auto_resolution_keys_deleted = counted_delete(
+        connection,
+        count_sql="""
+            SELECT COUNT(*)
+            FROM entity_resolution_keys
+            WHERE identifier_id IS NULL
+               OR identifier_id IN (
+                 SELECT id
+                 FROM entity_identifiers
+                 WHERE COALESCE(source_kind, 'auto') = 'auto'
+               )
+        """,
+        delete_sql="""
+            DELETE FROM entity_resolution_keys
+            WHERE identifier_id IS NULL
+               OR identifier_id IN (
+                 SELECT id
+                 FROM entity_identifiers
+                 WHERE COALESCE(source_kind, 'auto') = 'auto'
+               )
+        """,
+    )
+    auto_identifiers_deleted = counted_delete(
+        connection,
+        count_sql="SELECT COUNT(*) FROM entity_identifiers WHERE COALESCE(source_kind, 'auto') = 'auto'",
+        delete_sql="DELETE FROM entity_identifiers WHERE COALESCE(source_kind, 'auto') = 'auto'",
+    )
+    auto_entities_deleted = counted_delete(
+        connection,
+        count_sql="""
+            SELECT COUNT(*)
+            FROM entities
+            WHERE entity_origin IN ('observed', 'identified')
+              AND display_name_source = 'auto'
+              AND canonical_status = 'active'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entity_identifiers ei
+                WHERE ei.entity_id = entities.id
+                  AND COALESCE(ei.source_kind, 'auto') != 'auto'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM document_entities de
+                WHERE de.entity_id = entities.id
+                  AND de.assignment_mode != 'auto'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entity_resolution_keys erk
+                WHERE erk.entity_id = entities.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entity_overrides eo
+                WHERE eo.source_entity_id = entities.id
+                   OR eo.replacement_entity_id = entities.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entity_merge_blocks emb
+                WHERE emb.left_entity_id = entities.id
+                   OR emb.right_entity_id = entities.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entities merged_child
+                WHERE merged_child.merged_into_entity_id = entities.id
+              )
+        """,
+        delete_sql="""
+            DELETE FROM entities
+            WHERE entity_origin IN ('observed', 'identified')
+              AND display_name_source = 'auto'
+              AND canonical_status = 'active'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entity_identifiers ei
+                WHERE ei.entity_id = entities.id
+                  AND COALESCE(ei.source_kind, 'auto') != 'auto'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM document_entities de
+                WHERE de.entity_id = entities.id
+                  AND de.assignment_mode != 'auto'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entity_resolution_keys erk
+                WHERE erk.entity_id = entities.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entity_overrides eo
+                WHERE eo.source_entity_id = entities.id
+                   OR eo.replacement_entity_id = entities.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entity_merge_blocks emb
+                WHERE emb.left_entity_id = entities.id
+                   OR emb.right_entity_id = entities.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM entities merged_child
+                WHERE merged_child.merged_into_entity_id = entities.id
+              )
+        """,
+    )
+    return {
+        "auto_document_links_deleted": auto_document_links_deleted,
+        "auto_resolution_keys_deleted": auto_resolution_keys_deleted,
+        "auto_identifiers_deleted": auto_identifiers_deleted,
+        "auto_entities_deleted": auto_entities_deleted,
+    }
+
+
+def entity_rebuild_document_ids(
+    connection: sqlite3.Connection,
+    document_ids: list[int] | None,
+) -> list[int]:
+    if document_ids:
+        normalized_ids = list(dict.fromkeys(int(document_id) for document_id in document_ids))
+        placeholders = ",".join("?" for _ in normalized_ids)
+        rows = connection.execute(
+            f"""
+            SELECT id
+            FROM documents
+            WHERE id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            tuple(normalized_ids),
+        ).fetchall()
+        found_ids = [int(row["id"]) for row in rows]
+        found_id_set = set(found_ids)
+        missing_ids = [document_id for document_id in normalized_ids if document_id not in found_id_set]
+        if missing_ids:
+            raise RetrieverError(f"Unknown document id(s): {', '.join(str(item) for item in missing_ids)}")
+        return found_ids
+    return [
+        int(row["id"])
+        for row in connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE canonical_status != ?
+            ORDER BY id ASC
+            """,
+            (CANONICAL_STATUS_MERGED,),
+        ).fetchall()
+    ]
+
+
+def entity_graph_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    return {
+        "entity_count": int(connection.execute("SELECT COUNT(*) FROM entities").fetchone()[0] or 0),
+        "active_entity_count": int(
+            connection.execute(
+                "SELECT COUNT(*) FROM entities WHERE canonical_status = ?",
+                (ENTITY_STATUS_ACTIVE,),
+            ).fetchone()[0]
+            or 0
+        ),
+        "document_entity_count": int(connection.execute("SELECT COUNT(*) FROM document_entities").fetchone()[0] or 0),
+        "resolution_key_count": int(connection.execute("SELECT COUNT(*) FROM entity_resolution_keys").fetchone()[0] or 0),
+    }
+
+
+def rebuild_entities(
+    root: Path,
+    *,
+    document_ids: list[int] | None = None,
+    batch_size: int = 500,
+) -> dict[str, object]:
+    normalized_batch_size = max(1, min(int(batch_size or 500), 5000))
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="rebuild-entities") as rebuild_session:
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            ids_to_rebuild = entity_rebuild_document_ids(connection, document_ids)
+            full_rebuild = not document_ids
+            reset_counts = {
+                "auto_document_links_deleted": 0,
+                "auto_resolution_keys_deleted": 0,
+                "auto_identifiers_deleted": 0,
+                "auto_entities_deleted": 0,
+            }
+            if full_rebuild:
+                connection.execute("BEGIN")
+                try:
+                    reset_counts = reset_auto_entity_graph(connection)
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+            documents_synced = 0
+            auto_links_created = 0
+            for offset in range(0, len(ids_to_rebuild), normalized_batch_size):
+                batch_document_ids = ids_to_rebuild[offset : offset + normalized_batch_size]
+                connection.execute("BEGIN")
+                try:
+                    for document_id in batch_document_ids:
+                        result = refresh_document_from_occurrences(connection, document_id)
+                        if result.get("canonical_status") == CANONICAL_STATUS_ACTIVE:
+                            documents_synced += 1
+                            row = connection.execute(
+                                """
+                                SELECT COUNT(*)
+                                FROM document_entities
+                                WHERE document_id = ?
+                                  AND assignment_mode = 'auto'
+                                """,
+                                (document_id,),
+                            ).fetchone()
+                            auto_links_created += int(row[0] or 0) if row is not None else 0
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+            return {
+                "status": "ok",
+                "session_id": rebuild_session["id"],
+                "mode": "full" if full_rebuild else "selected",
+                "documents_scanned": len(ids_to_rebuild),
+                "documents_synced": documents_synced,
+                "auto_links_created": auto_links_created,
+                "batch_size": normalized_batch_size,
+                **reset_counts,
+                **entity_graph_counts(connection),
+            }
+        finally:
+            connection.close()
+
+
+def serialize_entity_identifier(row: sqlite3.Row) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": int(row["id"]),
+        "identifier_type": row["identifier_type"],
+        "display_value": row["display_value"],
+        "normalized_value": row["normalized_value"],
+        "is_primary": bool(row["is_primary"]),
+        "is_verified": bool(row["is_verified"]),
+        "source_kind": row["source_kind"],
+    }
+    for key in (
+        "provider",
+        "provider_scope",
+        "identifier_name",
+        "identifier_scope",
+        "normalized_full_name",
+        "normalized_sort_name",
+    ):
+        if payload_has_meaningful_value(row[key]):
+            payload[key] = row[key]
+    return payload
+
+
+def entity_identifiers_by_entity_id(
+    connection: sqlite3.Connection,
+    entity_ids: list[int],
+) -> dict[int, list[dict[str, object]]]:
+    if not entity_ids:
+        return {}
+    placeholders = ",".join("?" for _ in entity_ids)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM entity_identifiers
+        WHERE entity_id IN ({placeholders})
+        ORDER BY entity_id ASC, is_primary DESC, is_verified DESC, id ASC
+        """,
+        tuple(entity_ids),
+    ).fetchall()
+    grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[int(row["entity_id"])].append(serialize_entity_identifier(row))
+    return grouped
+
+
+def serialize_entity_summary(
+    row: sqlite3.Row,
+    identifiers: list[dict[str, object]],
+) -> dict[str, object]:
+    roles = sorted({role for role in str(row["roles"] or "").split(",") if role})
+    emails = [
+        str(identifier["normalized_value"])
+        for identifier in identifiers
+        if identifier.get("identifier_type") == "email"
+    ]
+    phones = [
+        str(identifier["display_value"])
+        for identifier in identifiers
+        if identifier.get("identifier_type") == "phone"
+    ]
+    names = [
+        str(identifier["display_value"])
+        for identifier in identifiers
+        if identifier.get("identifier_type") == "name"
+    ]
+    return {
+        "id": int(row["id"]),
+        "label": entity_display_label_from_row(row),
+        "entity_type": row["entity_type"],
+        "entity_origin": row["entity_origin"],
+        "canonical_status": row["canonical_status"],
+        "display_name": row["display_name"],
+        "primary_email": row["primary_email"],
+        "primary_phone": row["primary_phone"],
+        "sort_name": row["sort_name"],
+        "document_count": int(row["document_count"] or 0),
+        "roles": roles,
+        "emails": emails,
+        "phones": phones,
+        "names": names,
+    }
+
+
+def list_entities(
+    root: Path,
+    *,
+    query: str | None = None,
+    limit: int = 50,
+    include_ignored: bool = False,
+) -> dict[str, object]:
+    normalized_limit = max(1, min(int(limit or 50), 200))
+    normalized_query = normalize_whitespace(str(query or "")).lower()
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        where_clauses = ["e.canonical_status != ?"] if include_ignored else ["e.canonical_status = ?"]
+        params: list[object] = [ENTITY_STATUS_MERGED if include_ignored else ENTITY_STATUS_ACTIVE]
+        if normalized_query:
+            like_query = f"%{normalized_query}%"
+            where_clauses.append(
+                """
+                (
+                  LOWER(COALESCE(e.display_name, '')) LIKE ?
+                  OR LOWER(COALESCE(e.primary_email, '')) LIKE ?
+                  OR LOWER(COALESCE(e.primary_phone, '')) LIKE ?
+                  OR EXISTS (
+                    SELECT 1
+                    FROM entity_identifiers ei
+                    WHERE ei.entity_id = e.id
+                      AND (
+                        LOWER(COALESCE(ei.display_value, '')) LIKE ?
+                        OR LOWER(COALESCE(ei.normalized_value, '')) LIKE ?
+                      )
+                  )
+                )
+                """
+            )
+            params.extend([like_query, like_query, like_query, like_query, like_query])
+        where_sql = " AND ".join(where_clauses)
+        rows = connection.execute(
+            f"""
+            SELECT e.*,
+                   COUNT(DISTINCT de.document_id) AS document_count,
+                   GROUP_CONCAT(DISTINCT de.role) AS roles
+            FROM entities e
+            LEFT JOIN document_entities de ON de.entity_id = e.id
+            WHERE {where_sql}
+            GROUP BY e.id
+            ORDER BY document_count DESC,
+                     COALESCE(e.sort_name, e.display_name, e.primary_email, e.primary_phone, '') ASC,
+                     e.id ASC
+            LIMIT ?
+            """,
+            (*params, normalized_limit),
+        ).fetchall()
+        entity_ids = [int(row["id"]) for row in rows]
+        identifiers_by_entity = entity_identifiers_by_entity_id(connection, entity_ids)
+        entities = [
+            serialize_entity_summary(row, identifiers_by_entity.get(int(row["id"]), []))
+            for row in rows
+        ]
+        return {
+            "status": "ok",
+            "query": normalized_query,
+            "limit": normalized_limit,
+            "include_ignored": include_ignored,
+            "entities": entities,
+            **entity_graph_counts(connection),
+        }
+    finally:
+        connection.close()
+
+
+def show_entity(root: Path, entity_id: int, *, document_limit: int = 25) -> dict[str, object]:
+    normalized_document_limit = max(1, min(int(document_limit or 25), 200))
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = connection.execute(
+            """
+            SELECT e.*,
+                   COUNT(DISTINCT de.document_id) AS document_count,
+                   GROUP_CONCAT(DISTINCT de.role) AS roles
+            FROM entities e
+            LEFT JOIN document_entities de ON de.entity_id = e.id
+            WHERE e.id = ?
+            GROUP BY e.id
+            """,
+            (int(entity_id),),
+        ).fetchone()
+        if row is None:
+            raise RetrieverError(f"Unknown entity id: {entity_id}")
+        identifiers = entity_identifiers_by_entity_id(connection, [int(entity_id)]).get(int(entity_id), [])
+        role_counts = [
+            {"role": role_row["role"], "document_count": int(role_row["document_count"] or 0)}
+            for role_row in connection.execute(
+                """
+                SELECT role, COUNT(DISTINCT document_id) AS document_count
+                FROM document_entities
+                WHERE entity_id = ?
+                GROUP BY role
+                ORDER BY role ASC
+                """,
+                (int(entity_id),),
+            ).fetchall()
+        ]
+        document_rows = connection.execute(
+            """
+            SELECT de.role, de.ordinal, de.assignment_mode, de.observed_title,
+                   d.id AS document_id, d.control_number, d.rel_path, d.title, d.date_created
+            FROM document_entities de
+            JOIN documents d ON d.id = de.document_id
+            WHERE de.entity_id = ?
+            ORDER BY de.role ASC, de.ordinal ASC, d.id ASC
+            LIMIT ?
+            """,
+            (int(entity_id), normalized_document_limit),
+        ).fetchall()
+        documents = [
+            {
+                "document_id": int(document_row["document_id"]),
+                "role": document_row["role"],
+                "ordinal": int(document_row["ordinal"] or 0),
+                "assignment_mode": document_row["assignment_mode"],
+                "control_number": document_row["control_number"],
+                "rel_path": document_row["rel_path"],
+                "title": document_row["title"],
+                "date_created": document_row["date_created"],
+                "observed_title": document_row["observed_title"],
+            }
+            for document_row in document_rows
+        ]
+        return {
+            "status": "ok",
+            "entity": serialize_entity_summary(row, identifiers),
+            "identifiers": identifiers,
+            "role_counts": role_counts,
+            "documents": documents,
+            "document_limit": normalized_document_limit,
+        }
+    finally:
+        connection.close()
+
+
 def list_datasets(root: Path) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)

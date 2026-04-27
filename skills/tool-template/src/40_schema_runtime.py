@@ -459,6 +459,37 @@ def backfill_dataset_memberships(connection: sqlite3.Connection) -> int:
     return updated
 
 
+def backfill_occurrence_dataset_source_ids(connection: sqlite3.Connection) -> int:
+    if not table_exists(connection, "document_occurrences") or not table_exists(connection, "dataset_sources"):
+        return 0
+    columns = table_columns(connection, "document_occurrences")
+    if "dataset_source_id" not in columns:
+        return 0
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM document_occurrences
+        WHERE dataset_source_id IS NULL
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        dataset_source_row = dataset_source_row_for_occurrence(connection, row)
+        if dataset_source_row is None:
+            continue
+        connection.execute(
+            """
+            UPDATE document_occurrences
+            SET dataset_source_id = ?, updated_at = COALESCE(updated_at, ?)
+            WHERE id = ?
+            """,
+            (int(dataset_source_row["id"]), utc_now(), int(row["id"])),
+        )
+        updated += 1
+    return updated
+
+
 def backfill_dataset_name_normalized(connection: sqlite3.Connection) -> int:
     if not table_exists(connection, "datasets"):
         return 0
@@ -1168,6 +1199,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "documents", "active_text_language TEXT")
     ensure_column(connection, "documents", "active_text_quality_score REAL")
     ensure_column(connection, "document_occurrences", "mime_type TEXT")
+    ensure_column(connection, "document_occurrences", "dataset_source_id INTEGER REFERENCES dataset_sources(id) ON DELETE SET NULL")
     ensure_column(connection, "document_occurrences", "fs_created_at TEXT")
     ensure_column(connection, "document_occurrences", "fs_modified_at TEXT")
     ensure_column(connection, "document_occurrences", "has_preview INTEGER NOT NULL DEFAULT 0")
@@ -1205,6 +1237,12 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     ensure_column(connection, "productions", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     ensure_column(connection, "container_sources", "dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL")
     ensure_column(connection, "datasets", "dataset_name_normalized TEXT")
+    ensure_column(connection, "datasets", "allow_auto_merge INTEGER NOT NULL DEFAULT 1")
+    ensure_column(connection, "datasets", "email_auto_merge INTEGER NOT NULL DEFAULT 1")
+    ensure_column(connection, "datasets", "handle_auto_merge INTEGER NOT NULL DEFAULT 1")
+    ensure_column(connection, "datasets", "phone_auto_merge INTEGER NOT NULL DEFAULT 0")
+    ensure_column(connection, "datasets", "name_auto_merge INTEGER NOT NULL DEFAULT 0")
+    ensure_column(connection, "datasets", "external_id_auto_merge_names_json TEXT NOT NULL DEFAULT '[]'")
     backfilled_legacy_control_number = backfill_legacy_column(
         connection,
         "documents",
@@ -1272,6 +1310,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_document_kind_status ON document_occurrences(document_id, extracted_kind, text_status)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_file_hash ON document_occurrences(file_hash)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_source_rel_path ON document_occurrences(source_rel_path)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_occurrences_dataset_source_id ON document_occurrences(dataset_source_id)")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_document_occurrences_active_rel_path ON document_occurrences(rel_path) WHERE lifecycle_status = 'active'")
     connection.execute(
         """
@@ -1308,6 +1347,88 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     connection.execute("CREATE INDEX IF NOT EXISTS idx_productions_dataset_id ON productions(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_container_sources_dataset_id ON container_sources(dataset_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_container_sources_source_kind ON container_sources(source_kind)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entities_status_type ON entities(canonical_status, entity_type)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(merged_into_entity_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entities_label ON entities(display_name, primary_email)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entity_identifiers_entity_type ON entity_identifiers(entity_id, identifier_type)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entity_identifiers_lookup ON entity_identifiers(identifier_type, normalized_value)")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_identifiers_scoped_handle
+        ON entity_identifiers(provider, provider_scope, normalized_value)
+        WHERE identifier_type = 'handle'
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_identifiers_external_id
+        ON entity_identifiers(identifier_name, identifier_scope, normalized_value)
+        WHERE identifier_type = 'external_id'
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entity_resolution_keys_entity ON entity_resolution_keys(entity_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entity_resolution_keys_lookup ON entity_resolution_keys(key_type, normalized_value)")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_resolution_keys_email_unique
+        ON entity_resolution_keys(key_type, normalized_value)
+        WHERE key_type = 'email'
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_resolution_keys_handle_unique
+        ON entity_resolution_keys(key_type, provider, provider_scope, normalized_value)
+        WHERE key_type = 'handle'
+        """
+    )
+    connection.execute("DROP INDEX IF EXISTS idx_entity_resolution_keys_external_id_unique")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_resolution_keys_external_id_unique
+        ON entity_resolution_keys(key_type, identifier_name, COALESCE(identifier_scope, ''), normalized_value)
+        WHERE key_type = 'external_id'
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_entities_document_role ON document_entities(document_id, role, ordinal)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_document_entities_entity_role ON document_entities(entity_id, role)")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_document_entities_unique
+        ON document_entities(document_id, role, entity_id)
+        """
+    )
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_merge_blocks_pair ON entity_merge_blocks(left_entity_id, right_entity_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entity_overrides_source_entity ON entity_overrides(source_entity_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_entity_overrides_replacement_entity ON entity_overrides(replacement_entity_id)")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_overrides_document_effect
+        ON entity_overrides(
+          scope_type,
+          COALESCE(scope_id, 0),
+          COALESCE(role, ''),
+          COALESCE(source_entity_id, 0),
+          COALESCE(normalized_candidate_key, ''),
+          override_effect
+        )
+        WHERE scope_type = 'document'
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_overrides_global_ignore
+        ON entity_overrides(
+          scope_type,
+          COALESCE(role, ''),
+          COALESCE(source_entity_id, 0),
+          COALESCE(normalized_candidate_key, ''),
+          COALESCE(source_hint, ''),
+          override_effect
+        )
+        WHERE scope_type = 'global' AND override_effect = 'ignore'
+        """
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_document_email_threading_message_id ON document_email_threading(message_id)")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_document_email_threading_conversation_index ON document_email_threading(conversation_index)"
@@ -1431,6 +1552,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     dataset_membership_migration_needed = prior_schema_version is None or prior_schema_version < 12
     backfilled_dataset_ids = backfill_dataset_ids(connection, root) if dataset_membership_migration_needed else 0
     backfilled_dataset_memberships = backfill_dataset_memberships(connection) if dataset_membership_migration_needed else 0
+    backfilled_occurrence_dataset_source_ids = backfill_occurrence_dataset_source_ids(connection)
     backfilled_dataset_name_normalized = backfill_dataset_name_normalized(connection)
     merged_duplicate_dataset_identities = merge_dataset_identity_duplicates(connection)
     suffixed_dataset_name_collisions = suffix_dataset_name_collisions(connection)
@@ -1454,6 +1576,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         "backfilled_custodian": backfilled_custodian,
         "backfilled_dataset_ids": backfilled_dataset_ids,
         "backfilled_dataset_memberships": backfilled_dataset_memberships,
+        "backfilled_occurrence_dataset_source_ids": backfilled_occurrence_dataset_source_ids,
         "backfilled_dataset_name_normalized": backfilled_dataset_name_normalized,
         "merged_duplicate_dataset_identities": merged_duplicate_dataset_identities,
         "suffixed_dataset_name_collisions": suffixed_dataset_name_collisions,

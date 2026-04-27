@@ -1241,6 +1241,192 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(runtime["schema_version"], retriever_tools.SCHEMA_VERSION)
         self.assertEqual(runtime["template_sha256"], retriever_tools.sha256_file(TOOL_PATH))
 
+    def test_entity_schema_and_parser_foundation(self) -> None:
+        result = retriever_tools.bootstrap(self.root)
+        self.assertEqual(result["schema_version"], retriever_tools.SCHEMA_VERSION)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            self.assertIn("dataset_source_id", retriever_tools.table_columns(connection, "document_occurrences"))
+            dataset_columns = retriever_tools.table_columns(connection, "datasets")
+            for column_name in (
+                "allow_auto_merge",
+                "email_auto_merge",
+                "handle_auto_merge",
+                "phone_auto_merge",
+                "name_auto_merge",
+                "external_id_auto_merge_names_json",
+            ):
+                self.assertIn(column_name, dataset_columns)
+            for table_name in (
+                "entities",
+                "entity_identifiers",
+                "entity_resolution_keys",
+                "document_entities",
+                "entity_overrides",
+                "entity_merge_blocks",
+            ):
+                self.assertTrue(retriever_tools.table_exists(connection, table_name), table_name)
+        finally:
+            connection.close()
+
+        candidates = retriever_tools.parse_entity_candidates(
+            "Doe, Jane <jane@example.com>; Support <support@example.com>",
+            role="recipient",
+        )
+        self.assertEqual(len(candidates), 2)
+        jane = candidates[0]
+        self.assertEqual(jane["entity_type"], retriever_tools.ENTITY_TYPE_PERSON)
+        jane_identifiers = {item["identifier_type"]: item for item in jane["identifiers"]}
+        self.assertEqual(jane_identifiers["email"]["normalized_value"], "jane@example.com")
+        self.assertEqual(jane_identifiers["name"]["normalized_full_name"], "jane doe")
+        self.assertEqual(jane_identifiers["name"]["normalized_sort_name"], "doe jane")
+        self.assertEqual(candidates[1]["entity_type"], retriever_tools.ENTITY_TYPE_SHARED_MAILBOX)
+
+    def test_ingest_syncs_author_entities_by_email_resolution_key(self) -> None:
+        self.write_email_message(
+            self.root / "first.eml",
+            subject="First entity thread",
+            body_text="First body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<first-entity@example.com>",
+        )
+        self.write_email_message(
+            self.root / "second.eml",
+            subject="Second entity thread",
+            body_text="Second body",
+            author="Alice A. <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<second-entity@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_row = self.fetch_document_row("first.eml")
+        second_row = self.fetch_document_row("second.eml")
+        self.assertEqual(first_row["author"], "Alice Example <alice@example.com>")
+        self.assertEqual(second_row["author"], "Alice Example <alice@example.com>")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            author_rows = connection.execute(
+                """
+                SELECT DISTINCT de.entity_id
+                FROM document_entities de
+                WHERE de.role = 'author'
+                ORDER BY de.entity_id ASC
+                """
+            ).fetchall()
+            self.assertEqual(len(author_rows), 1)
+            author_entity_id = int(author_rows[0]["entity_id"])
+            key_row = connection.execute(
+                """
+                SELECT *
+                FROM entity_resolution_keys
+                WHERE key_type = 'email' AND normalized_value = 'alice@example.com'
+                """
+            ).fetchone()
+            self.assertIsNotNone(key_row)
+            self.assertEqual(int(key_row["entity_id"]), author_entity_id)
+            identifier_rows = connection.execute(
+                """
+                SELECT identifier_type, normalized_value
+                FROM entity_identifiers
+                WHERE entity_id = ?
+                ORDER BY identifier_type ASC, normalized_value ASC
+                """,
+                (author_entity_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        identifier_pairs = {(row["identifier_type"], row["normalized_value"]) for row in identifier_rows}
+        self.assertIn(("email", "alice@example.com"), identifier_pairs)
+        self.assertIn(("name", "alice example"), identifier_pairs)
+
+    def test_entity_rebuild_and_read_commands(self) -> None:
+        self.write_email_message(
+            self.root / "first.eml",
+            subject="First entity command thread",
+            body_text="First body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<first-entity-command@example.com>",
+        )
+        self.write_email_message(
+            self.root / "second.eml",
+            subject="Second entity command thread",
+            body_text="Second body",
+            author="Alice A. <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<second-entity-command@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        exit_code, rebuild_payload, _, _ = self.run_cli(
+            "rebuild-entities",
+            str(self.root),
+            "--batch-size",
+            "1",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(rebuild_payload)
+        assert rebuild_payload is not None
+        self.assertEqual(rebuild_payload["status"], "ok")
+        self.assertEqual(rebuild_payload["mode"], "full")
+        self.assertEqual(rebuild_payload["documents_scanned"], 2)
+        self.assertEqual(rebuild_payload["documents_synced"], 2)
+        self.assertGreaterEqual(rebuild_payload["auto_links_created"], 4)
+        self.assertGreaterEqual(rebuild_payload["active_entity_count"], 2)
+
+        exit_code, list_payload, _, _ = self.run_cli(
+            "list-entities",
+            str(self.root),
+            "--query",
+            "alice@example.com",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(list_payload)
+        assert list_payload is not None
+        alice_entities = [
+            entity
+            for entity in list_payload["entities"]
+            if entity["primary_email"] == "alice@example.com"
+        ]
+        self.assertEqual(len(alice_entities), 1)
+        alice_entity = alice_entities[0]
+        self.assertEqual(alice_entity["label"], "Alice Example <alice@example.com>")
+        self.assertEqual(alice_entity["document_count"], 2)
+        self.assertIn("author", alice_entity["roles"])
+
+        exit_code, show_payload, _, _ = self.run_cli(
+            "show-entity",
+            str(self.root),
+            str(alice_entity["id"]),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(show_payload)
+        assert show_payload is not None
+        self.assertEqual(show_payload["entity"]["primary_email"], "alice@example.com")
+        role_counts = {item["role"]: item["document_count"] for item in show_payload["role_counts"]}
+        self.assertEqual(role_counts["author"], 2)
+        self.assertEqual(
+            {
+                (identifier["identifier_type"], identifier["normalized_value"])
+                for identifier in show_payload["identifiers"]
+            }
+            & {("email", "alice@example.com"), ("name", "alice example")},
+            {("email", "alice@example.com"), ("name", "alice example")},
+        )
+        author_links = [item for item in show_payload["documents"] if item["role"] == "author"]
+        self.assertEqual(len(author_links), 2)
+
     def test_bootstrap_initializes_processing_schema_and_job_crud(self) -> None:
         result = retriever_tools.bootstrap(self.root)
         self.assertEqual(result["schema_version"], retriever_tools.SCHEMA_VERSION)
