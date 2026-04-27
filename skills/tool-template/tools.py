@@ -1623,17 +1623,33 @@ def new_ingest_session_id(now: datetime | None = None) -> str:
     return f"{timestamp}-{secrets.token_hex(4)}"
 
 
-def sweep_stale_ingest_tmp_dirs(paths: dict[str, Path]) -> int:
+def sweep_stale_ingest_tmp_dirs(paths: dict[str, Path]) -> dict[str, object]:
     ingest_tmp_dir = paths["ingest_tmp_dir"]
     if not ingest_tmp_dir.exists():
-        return 0
+        return {"removed": 0, "failures": []}
     removed = 0
-    for child in sorted(ingest_tmp_dir.iterdir(), key=lambda path: path.name):
+    failures: list[dict[str, str]] = []
+    try:
+        children = sorted(ingest_tmp_dir.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        return {
+            "removed": 0,
+            "failures": [{"path": str(ingest_tmp_dir), "error": f"{type(exc).__name__}: {exc}"}],
+        }
+    for child in children:
         if not child.is_dir():
             continue
-        if remove_directory_tree(child):
-            removed += 1
-    return removed
+        try:
+            if remove_directory_tree(child):
+                removed += 1
+        except OSError as exc:
+            failures.append(
+                {
+                    "path": str(child),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return {"removed": removed, "failures": failures}
 
 
 def acquire_os_file_lock(handle) -> None:
@@ -1725,21 +1741,38 @@ def workspace_ingest_session(paths: dict[str, Path], *, command_name: str):
     session_id = new_ingest_session_id()
     session_dir = paths["ingest_tmp_dir"] / session_id
     try:
-        stale_tmp_dirs_removed = sweep_stale_ingest_tmp_dirs(paths)
+        stale_tmp_sweep = sweep_stale_ingest_tmp_dirs(paths)
+        stale_tmp_dirs_removed = int(stale_tmp_sweep["removed"])
+        stale_tmp_dir_failures = list(stale_tmp_sweep.get("failures") or [])
+        warnings = [
+            f"Could not remove stale ingest tmp dir {failure['path']}: {failure['error']}"
+            for failure in stale_tmp_dir_failures
+        ]
         session_dir.mkdir(parents=True, exist_ok=True)
         benchmark_mark(
             "workspace_ingest_session_ready",
             command=command_name,
             session_id=session_id,
             stale_tmp_dirs_removed=stale_tmp_dirs_removed,
+            stale_tmp_dirs_failed=len(stale_tmp_dir_failures),
         )
         yield {
             "id": session_id,
             "tmp_dir": session_dir,
             "stale_tmp_dirs_removed": stale_tmp_dirs_removed,
+            "stale_tmp_dirs_failed": len(stale_tmp_dir_failures),
+            "warnings": warnings,
         }
     finally:
-        remove_directory_tree(session_dir)
+        try:
+            remove_directory_tree(session_dir)
+        except OSError as exc:
+            benchmark_mark(
+                "workspace_ingest_session_cleanup_failed",
+                command=command_name,
+                session_id=session_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         release_workspace_ingest_lock(lock_handle)
 
 
@@ -12921,25 +12954,189 @@ def relative_document_path(root: Path, path: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
-def collect_files(root: Path, recursive: bool, allowed_file_types: set[str] | None) -> list[Path]:
-    iterator = root.rglob("*") if recursive else root.iterdir()
-    files: list[Path] = []
-    for path in iterator:
-        if path.is_dir():
-            if path.name == ".retriever":
+def path_is_at_or_under(path: Path, parent: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_parent = parent.resolve()
+    return resolved_path == resolved_parent or resolved_parent in resolved_path.parents
+
+
+def build_ingest_scan_scope(root: Path, raw_paths: list[str] | None) -> dict[str, object]:
+    root = root.resolve()
+    if not raw_paths:
+        return {
+            "is_full_workspace": True,
+            "paths": [root],
+            "dir_prefixes": [],
+            "exact_rel_paths": set(),
+            "display_paths": [],
+        }
+
+    scan_paths: list[Path] = []
+    dir_prefixes: set[str] = set()
+    exact_rel_paths: set[str] = set()
+    display_paths: list[str] = []
+    for raw_path in raw_paths:
+        raw_text = normalize_whitespace(str(raw_path or ""))
+        if not raw_text:
+            raise RetrieverError("Ingest --path cannot be blank.")
+        candidate = Path(raw_text).expanduser()
+        candidate = candidate if candidate.is_absolute() else root / candidate
+        if not candidate.exists():
+            raise RetrieverError(f"Ingest path does not exist: {raw_text}")
+        resolved_candidate = candidate.resolve()
+        if not path_is_at_or_under(resolved_candidate, root):
+            raise RetrieverError(f"Ingest path must be inside the workspace root: {raw_text}")
+        rel_path = resolved_candidate.relative_to(root).as_posix()
+        rel_parts = resolved_candidate.relative_to(root).parts
+        if ".retriever" in rel_parts:
+            raise RetrieverError("Ingest --path cannot target the .retriever state directory.")
+        if rel_path in {"", "."}:
+            return {
+                "is_full_workspace": True,
+                "paths": [root],
+                "dir_prefixes": [],
+                "exact_rel_paths": set(),
+                "display_paths": [],
+            }
+        scan_paths.append(resolved_candidate)
+        display_paths.append(rel_path)
+        if resolved_candidate.is_dir():
+            dir_prefixes.add(rel_path.rstrip("/") + "/")
+        else:
+            exact_rel_paths.add(rel_path)
+
+    deduped_scan_paths: list[Path] = []
+    for scan_path in sorted(set(scan_paths), key=lambda item: (len(item.parts), item.as_posix())):
+        if any(parent == scan_path or parent in scan_path.parents for parent in deduped_scan_paths if parent.is_dir()):
+            continue
+        deduped_scan_paths.append(scan_path)
+
+    return {
+        "is_full_workspace": False,
+        "paths": deduped_scan_paths,
+        "dir_prefixes": sorted(dir_prefixes),
+        "exact_rel_paths": exact_rel_paths,
+        "display_paths": sorted(set(display_paths)),
+    }
+
+
+def ingest_scan_scope_contains_rel_path(scan_scope: dict[str, object] | None, rel_path: str | None) -> bool:
+    if scan_scope is None or bool(scan_scope.get("is_full_workspace")):
+        return True
+    normalized = normalize_whitespace(str(rel_path or "")).replace("\\", "/").lstrip("/")
+    if not normalized:
+        return False
+    if normalized in set(scan_scope.get("exact_rel_paths") or set()):
+        return True
+    return any(normalized.startswith(str(prefix)) for prefix in list(scan_scope.get("dir_prefixes") or []))
+
+
+def collect_files(
+    root: Path,
+    recursive: bool,
+    allowed_file_types: set[str] | None,
+    scan_scope: dict[str, object] | None = None,
+) -> list[Path]:
+    scan_paths = list((scan_scope or {}).get("paths") or [root])
+    files: set[Path] = set()
+    for scan_path in scan_paths:
+        if scan_path.is_file():
+            candidates = [scan_path]
+        else:
+            candidates = scan_path.rglob("*") if recursive else scan_path.iterdir()
+        for path in candidates:
+            if not path_is_at_or_under(path, root):
                 continue
-            if not recursive:
+            if not ingest_scan_scope_contains_rel_path(scan_scope, relative_document_path(root, path)):
                 continue
-            continue
-        if ".retriever" in path.parts:
-            continue
-        file_type = normalize_extension(path)
-        if allowed_file_types and file_type not in allowed_file_types:
-            continue
-        if not file_type:
-            continue
-        files.append(path)
+            if path.is_dir():
+                if path.name == ".retriever":
+                    continue
+                if not recursive:
+                    continue
+                continue
+            if ".retriever" in path.resolve().relative_to(root.resolve()).parts:
+                continue
+            file_type = normalize_extension(path)
+            if allowed_file_types and file_type not in allowed_file_types:
+                continue
+            if not file_type:
+                continue
+            files.add(path)
     return sorted(files)
+
+
+def collect_ingest_scope_directories(scan_scope: dict[str, object]) -> list[Path]:
+    return [Path(path) for path in list(scan_scope.get("paths") or []) if Path(path).is_dir()]
+
+
+def dedupe_source_descriptors_by_root(descriptors: list[dict[str, object]]) -> list[dict[str, object]]:
+    descriptors_by_root: dict[str, dict[str, object]] = {}
+    for descriptor in descriptors:
+        root = descriptor.get("root")
+        if root is None:
+            continue
+        descriptors_by_root[Path(root).resolve().as_posix()] = descriptor
+    return [descriptors_by_root[key] for key in sorted(descriptors_by_root)]
+
+
+def find_scoped_source_roots(
+    finder,
+    root: Path,
+    recursive: bool,
+    scan_scope: dict[str, object],
+    *args,
+) -> list[dict[str, object]]:
+    if bool(scan_scope.get("is_full_workspace")):
+        return finder(root, recursive, *args)
+    descriptors: list[dict[str, object]] = []
+    for scan_dir in collect_ingest_scope_directories(scan_scope):
+        descriptors.extend(finder(scan_dir, recursive, *args))
+    return dedupe_source_descriptors_by_root(descriptors)
+
+
+def collect_production_dat_paths(root: Path, recursive: bool, scan_scope: dict[str, object]) -> list[Path]:
+    if bool(scan_scope.get("is_full_workspace")):
+        dat_paths = list(root.rglob("*.dat")) if recursive else list(root.glob("*.dat"))
+        if not recursive:
+            for child in root.iterdir():
+                if child.is_dir() and child.name != ".retriever":
+                    data_dir = child / "DATA"
+                    if data_dir.is_dir():
+                        dat_paths.extend(sorted(data_dir.glob("*.dat")))
+        return dat_paths
+
+    dat_paths: list[Path] = []
+    for scan_dir in collect_ingest_scope_directories(scan_scope):
+        if recursive:
+            dat_paths.extend(scan_dir.rglob("*.dat"))
+        else:
+            dat_paths.extend(scan_dir.glob("*.dat"))
+            for child in scan_dir.iterdir():
+                if child.is_dir() and child.name != ".retriever":
+                    data_dir = child / "DATA"
+                    if data_dir.is_dir():
+                        dat_paths.extend(sorted(data_dir.glob("*.dat")))
+    return dat_paths
+
+
+def collect_scoped_existing_production_rows(
+    workspace_root: Path,
+    rows: list[sqlite3.Row],
+    scan_scope: dict[str, object],
+) -> list[sqlite3.Row]:
+    if bool(scan_scope.get("is_full_workspace")):
+        return rows
+    scoped_rows: list[sqlite3.Row] = []
+    for row in rows:
+        rel_root = str(row["rel_root"])
+        candidate_root = workspace_root / rel_root
+        if ingest_scan_scope_contains_rel_path(scan_scope, rel_root) or any(
+            path_is_at_or_under(Path(path), candidate_root)
+            for path in list(scan_scope.get("paths") or [])
+        ):
+            scoped_rows.append(row)
+    return scoped_rows
 
 
 def normalize_production_header(raw_header: str) -> str:
@@ -13063,11 +13260,13 @@ def find_production_root_signatures(
     workspace_root: Path,
     recursive: bool,
     connection: sqlite3.Connection | None = None,
+    scan_scope: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
+    scan_scope = scan_scope or build_ingest_scan_scope(workspace_root, None)
     signatures: dict[str, dict[str, object]] = {}
     if connection is not None and table_exists(connection, "productions"):
         rows = connection.execute("SELECT rel_root, production_name, metadata_load_rel_path, image_load_rel_path, source_type FROM productions").fetchall()
-        for row in rows:
+        for row in collect_scoped_existing_production_rows(workspace_root, rows, scan_scope):
             candidate_root = workspace_root / row["rel_root"]
             if candidate_root.exists():
                 signatures[row["rel_root"]] = {
@@ -13079,13 +13278,7 @@ def find_production_root_signatures(
                     "source_type": row["source_type"],
                 }
 
-    dat_paths = list(workspace_root.rglob("*.dat")) if recursive else list(workspace_root.glob("*.dat"))
-    if not recursive:
-        for child in workspace_root.iterdir():
-            if child.is_dir() and child.name != ".retriever":
-                data_dir = child / "DATA"
-                if data_dir.is_dir():
-                    dat_paths.extend(sorted(data_dir.glob("*.dat")))
+    dat_paths = collect_production_dat_paths(workspace_root, recursive, scan_scope)
     for dat_path in dat_paths:
         if ".retriever" in dat_path.parts:
             continue
@@ -17254,7 +17447,11 @@ def refresh_conversation_previews(
     return refreshed
 
 
-def mark_missing_documents(connection: sqlite3.Connection, scanned_rel_paths: set[str]) -> int:
+def mark_missing_documents(
+    connection: sqlite3.Connection,
+    scanned_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
+) -> int:
     occurrence_rows = connection.execute(
         """
         SELECT id, document_id, rel_path, lifecycle_status
@@ -17267,7 +17464,9 @@ def mark_missing_documents(connection: sqlite3.Connection, scanned_rel_paths: se
     missing_occurrence_ids = [
         int(row["id"])
         for row in occurrence_rows
-        if row["rel_path"] not in scanned_rel_paths and row["lifecycle_status"] != "missing"
+        if ingest_scan_scope_contains_rel_path(scan_scope, row["rel_path"])
+        and row["rel_path"] not in scanned_rel_paths
+        and row["lifecycle_status"] != "missing"
     ]
     if not missing_occurrence_ids:
         return 0
@@ -17776,6 +17975,7 @@ def mark_missing_container_documents(
     *,
     source_kind: str,
     scanned_source_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
 ) -> tuple[int, int]:
     source_rows = connection.execute(
         """
@@ -17791,6 +17991,8 @@ def mark_missing_container_documents(
     now = utc_now()
     for source_row in source_rows:
         source_rel_path = str(source_row["source_rel_path"])
+        if not ingest_scan_scope_contains_rel_path(scan_scope, source_rel_path):
+            continue
         if source_rel_path in scanned_source_rel_paths:
             continue
         parent_rows = connection.execute(
@@ -18304,22 +18506,26 @@ def ingest_container_source(
 def mark_missing_pst_documents(
     connection: sqlite3.Connection,
     scanned_source_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
 ) -> tuple[int, int]:
     return mark_missing_container_documents(
         connection,
         source_kind=PST_SOURCE_KIND,
         scanned_source_rel_paths=scanned_source_rel_paths,
+        scan_scope=scan_scope,
     )
 
 
 def mark_missing_mbox_documents(
     connection: sqlite3.Connection,
     scanned_source_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
 ) -> tuple[int, int]:
     return mark_missing_container_documents(
         connection,
         source_kind=MBOX_SOURCE_KIND,
         scanned_source_rel_paths=scanned_source_rel_paths,
+        scan_scope=scan_scope,
     )
 
 
@@ -27136,14 +27342,31 @@ def plan_ingest_work(
     recursive: bool,
     allowed_types: set[str] | None,
     connection: sqlite3.Connection,
+    scan_scope: dict[str, object],
 ) -> dict[str, object]:
     scan_hash_ms = 0.0
-    production_signatures = find_production_root_signatures(root, recursive, connection)
+    production_signatures = find_production_root_signatures(root, recursive, connection, scan_scope=scan_scope)
     production_root_paths = [Path(signature["root"]).resolve() for signature in production_signatures]
-    slack_export_descriptors = find_slack_export_roots(root, recursive, allowed_types)
+    slack_export_descriptors = find_scoped_source_roots(
+        find_slack_export_roots,
+        root,
+        recursive,
+        scan_scope,
+        allowed_types,
+    )
     slack_export_root_paths = [Path(descriptor["root"]).resolve() for descriptor in slack_export_descriptors]
-    gmail_export_descriptors = find_gmail_export_roots(root, recursive, allowed_types)
-    pst_export_descriptors = find_pst_export_roots(root, recursive) if allowed_types is None or PST_SOURCE_KIND in allowed_types else []
+    gmail_export_descriptors = find_scoped_source_roots(
+        find_gmail_export_roots,
+        root,
+        recursive,
+        scan_scope,
+        allowed_types,
+    )
+    pst_export_descriptors = (
+        find_scoped_source_roots(find_pst_export_roots, root, recursive, scan_scope)
+        if allowed_types is None or PST_SOURCE_KIND in allowed_types
+        else []
+    )
     gmail_owned_paths = {
         Path(path).resolve()
         for descriptor in gmail_export_descriptors
@@ -27171,7 +27394,7 @@ def plan_ingest_work(
     }
     scanned_files = [
         path
-        for path in collect_files(root, recursive, allowed_types)
+        for path in collect_files(root, recursive, allowed_types, scan_scope=scan_scope)
         if not any(production_root == path.resolve() or production_root in path.resolve().parents for production_root in production_root_paths)
         and not any(slack_root == path.resolve() or slack_root in path.resolve().parents for slack_root in slack_export_root_paths)
         and path.resolve() not in gmail_owned_paths
@@ -27392,6 +27615,7 @@ def load_loose_file_commit_state(
     scanned_rel_paths: set[str],
     gmail_owned_rel_paths: set[str],
     pst_export_owned_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
 ) -> tuple[dict[str, sqlite3.Row], dict[str, list[sqlite3.Row]]]:
     existing_occurrence_rows = connection.execute(
         """
@@ -27412,7 +27636,11 @@ def load_loose_file_commit_state(
     existing_by_rel = {str(row["rel_path"]): row for row in existing_occurrence_rows}
     unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
     for row in existing_occurrence_rows:
-        if str(row["rel_path"]) not in scanned_rel_paths and row["file_hash"]:
+        if (
+            ingest_scan_scope_contains_rel_path(scan_scope, str(row["rel_path"]))
+            and str(row["rel_path"]) not in scanned_rel_paths
+            and row["file_hash"]
+        ):
             unseen_existing_by_hash[row["file_hash"]].append(row)
     return existing_by_rel, unseen_existing_by_hash
 
@@ -27940,6 +28168,7 @@ def finalize_ingest_postpass(
     slack_day_documents_missing: int,
     stats: dict[str, int],
     pst_export_owned_rel_paths: set[str] | None = None,
+    scan_scope: dict[str, object] | None = None,
 ) -> int:
     if pst_export_owned_rel_paths:
         connection.execute("BEGIN")
@@ -27953,15 +28182,23 @@ def finalize_ingest_postpass(
         except Exception:
             connection.rollback()
             raise
-    filesystem_missing = mark_missing_documents(connection, scanned_rel_paths)
+    filesystem_missing = mark_missing_documents(connection, scanned_rel_paths, scan_scope=scan_scope)
     pst_sources_missing = 0
     pst_documents_missing = 0
     mbox_sources_missing = 0
     mbox_documents_missing = 0
     if allowed_types is None or PST_SOURCE_KIND in allowed_types:
-        pst_sources_missing, pst_documents_missing = mark_missing_pst_documents(connection, scanned_pst_source_rel_paths)
+        pst_sources_missing, pst_documents_missing = mark_missing_pst_documents(
+            connection,
+            scanned_pst_source_rel_paths,
+            scan_scope=scan_scope,
+        )
     if allowed_types is None or MBOX_SOURCE_KIND in allowed_types:
-        mbox_sources_missing, mbox_documents_missing = mark_missing_mbox_documents(connection, scanned_mbox_source_rel_paths)
+        mbox_sources_missing, mbox_documents_missing = mark_missing_mbox_documents(
+            connection,
+            scanned_mbox_source_rel_paths,
+            scan_scope=scan_scope,
+        )
     stats["pst_sources_missing"] = pst_sources_missing
     stats["pst_documents_missing"] = pst_documents_missing
     stats["mbox_sources_missing"] = mbox_sources_missing
@@ -28018,6 +28255,9 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
                 resolved_production_root,
                 staging_root=Path(ingest_session["tmp_dir"]),
             )
+            session_warnings = list(ingest_session.get("warnings") or [])
+            if session_warnings:
+                result = {**result, "warnings": [*list(result.get("warnings", [])), *session_warnings]}
             benchmark_mark(
                 "ingest_production_done",
                 production_ms=round((time.perf_counter() - production_started) * 1000.0, 3),
@@ -28038,16 +28278,23 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
             connection.close()
 
 
-def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str, object]:
+def ingest(
+    root: Path,
+    recursive: bool,
+    raw_file_types: str | None,
+    raw_paths: list[str] | None = None,
+) -> dict[str, object]:
     set_active_workspace_root(root)
     paths = workspace_paths(root)
     ensure_layout(paths)
     allowed_types = parse_file_types(raw_file_types)
+    scan_scope = build_ingest_scan_scope(root, raw_paths)
     total_started = time.perf_counter()
     benchmark_mark(
         "ingest_begin",
         recursive=recursive,
         file_type_filter_count=(len(allowed_types) if allowed_types is not None else 0),
+        scan_paths=list(scan_scope.get("display_paths") or []),
     )
     with workspace_ingest_session(paths, command_name="ingest") as ingest_session:
         connection = connect_db(paths["db_path"])
@@ -28075,7 +28322,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 return filesystem_dataset_id, filesystem_dataset_source_id
 
             scan_started = time.perf_counter()
-            ingest_plan = plan_ingest_work(root, recursive, allowed_types, connection)
+            ingest_plan = plan_ingest_work(root, recursive, allowed_types, connection, scan_scope)
             production_signatures = list(ingest_plan["production_signatures"])
             slack_export_descriptors = list(ingest_plan["slack_export_descriptors"])
             gmail_export_descriptors = list(ingest_plan["gmail_export_descriptors"])
@@ -28119,7 +28366,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             slack_day_documents_missing = int(special_source_state["slack_day_documents_missing"])
             ingested_production_roots = list(special_source_state["ingested_production_roots"])
             skipped_production_roots = list(special_source_state["skipped_production_roots"])
-            warnings = list(special_source_state["warnings"])
+            warnings = [*list(ingest_session.get("warnings") or []), *list(special_source_state["warnings"])]
             benchmark_mark(
                 "ingest_special_sources_done",
                 gmail_ms=round(float(special_source_state["gmail_ms"]), 3),
@@ -28133,6 +28380,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 scanned_rel_paths,
                 gmail_owned_rel_paths,
                 pst_export_owned_rel_paths,
+                scan_scope=scan_scope,
             )
 
             loop_started = time.perf_counter()
@@ -28281,6 +28529,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 slack_day_documents_missing,
                 stats,
                 pst_export_owned_rel_paths=pst_export_owned_rel_paths,
+                scan_scope=scan_scope,
             )
             benchmark_mark(
                 "ingest_postpass_done",
@@ -28294,6 +28543,8 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             result["failures"] = failures
             result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
             result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
+            if not bool(scan_scope.get("is_full_workspace")):
+                result["scan_paths"] = list(scan_scope.get("display_paths") or [])
             result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
             result["ingested_production_roots"] = ingested_production_roots
             result["skipped_production_roots"] = skipped_production_roots
@@ -41213,6 +41464,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_parser.add_argument("workspace", help="Workspace root path")
     ingest_parser.add_argument("--recursive", action="store_true", help="Scan directories recursively")
     ingest_parser.add_argument(
+        "--path",
+        dest="paths",
+        action="append",
+        help="Limit ingest to a file or directory inside the workspace; repeat to scan multiple paths",
+    )
+    ingest_parser.add_argument(
         "--file-types",
         help="Comma-separated file types to include, e.g. pdf,docx,eml",
     )
@@ -41938,7 +42195,7 @@ def main() -> int:
         _auto_upgrade_and_maybe_reexec(root, args.command)
 
         if args.command == "ingest":
-            return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types))
+            return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types, raw_paths=args.paths))
 
         if args.command == "ingest-production":
             return emit_cli_payload("ingest-production", ingest_production(root, args.production_root))

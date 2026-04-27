@@ -4521,6 +4521,26 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertFalse(session_dir.exists())
 
+    def test_workspace_ingest_session_warns_when_stale_tmp_dir_cannot_be_removed(self) -> None:
+        stale_dir = self.paths["ingest_tmp_dir"] / "stale-session"
+        stale_dir.mkdir(parents=True, exist_ok=True)
+        (stale_dir / "payload.txt").write_text("stale\n", encoding="utf-8")
+        real_remove_directory_tree = retriever_tools.remove_directory_tree
+
+        def remove_directory_tree(path: Path) -> bool:
+            if Path(path) == stale_dir:
+                raise PermissionError("sandbox denied delete")
+            return real_remove_directory_tree(path)
+
+        with mock.patch.object(retriever_tools, "remove_directory_tree", side_effect=remove_directory_tree):
+            with retriever_tools.workspace_ingest_session(self.paths, command_name="ingest") as session:
+                self.assertEqual(session["stale_tmp_dirs_removed"], 0)
+                self.assertEqual(session["stale_tmp_dirs_failed"], 1)
+                self.assertIn("PermissionError", session["warnings"][0])
+                self.assertTrue(Path(session["tmp_dir"]).exists())
+
+        self.assertTrue(stale_dir.exists())
+
     def test_acquire_workspace_ingest_lock_raises_clear_error_on_lock_conflict(self) -> None:
         blocking_error = BlockingIOError(errno.EAGAIN, "already locked")
         with mock.patch.object(retriever_tools, "acquire_os_file_lock", side_effect=blocking_error):
@@ -5087,6 +5107,93 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNone(updated_row["conversation_id"])
         self.assertEqual(updated_row["conversation_assignment_mode"], retriever_tools.CONVERSATION_ASSIGNMENT_MODE_AUTO)
         self.assertIsNone(updated_row["participants"])
+
+    def test_scoped_ingest_only_marks_missing_documents_inside_scope(self) -> None:
+        raw_dir = self.root / "raw"
+        other_dir = self.root / "other"
+        raw_dir.mkdir()
+        other_dir.mkdir()
+        (raw_dir / "remove-me.txt").write_text("raw body\n", encoding="utf-8")
+        (other_dir / "keep-me.txt").write_text("outside body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_ingest["new"], 2)
+        self.assertEqual(first_ingest["failed"], 0)
+
+        (raw_dir / "remove-me.txt").unlink()
+        scoped_ingest = retriever_tools.ingest(
+            self.root,
+            recursive=True,
+            raw_file_types=None,
+            raw_paths=["raw"],
+        )
+
+        self.assertEqual(scoped_ingest["scan_paths"], ["raw"])
+        self.assertEqual(scoped_ingest["missing"], 1)
+        self.assertEqual(self.fetch_document_row("raw/remove-me.txt")["lifecycle_status"], "missing")
+        self.assertEqual(self.fetch_document_row("other/keep-me.txt")["lifecycle_status"], "active")
+
+    def test_scoped_ingest_does_not_rename_from_outside_scope_by_hash(self) -> None:
+        raw_dir = self.root / "raw"
+        other_dir = self.root / "other"
+        raw_dir.mkdir()
+        other_dir.mkdir()
+        (other_dir / "original.txt").write_text("same body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        first_ingest = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(first_ingest["new"], 1)
+
+        (raw_dir / "copy.txt").write_text("same body\n", encoding="utf-8")
+        scoped_ingest = retriever_tools.ingest(
+            self.root,
+            recursive=True,
+            raw_file_types=None,
+            raw_paths=["raw"],
+        )
+
+        self.assertEqual(scoped_ingest["new"], 1)
+        self.assertEqual(scoped_ingest["renamed"], 0)
+        self.assertEqual(scoped_ingest["missing"], 0)
+        self.assertEqual(self.fetch_document_row("other/original.txt")["lifecycle_status"], "active")
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            copied_occurrence = connection.execute(
+                "SELECT * FROM document_occurrences WHERE rel_path = ?",
+                ("raw/copy.txt",),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(copied_occurrence)
+
+    def test_scoped_ingest_rejects_paths_outside_workspace_or_state_dir(self) -> None:
+        outside_path = self.root.parent / f"{self.root.name}-outside.txt"
+        outside_path.write_text("outside\n", encoding="utf-8")
+        self.addCleanup(lambda: outside_path.exists() and outside_path.unlink())
+
+        with self.assertRaisesRegex(retriever_tools.RetrieverError, "inside the workspace root"):
+            retriever_tools.ingest(self.root, recursive=True, raw_file_types=None, raw_paths=[str(outside_path)])
+        with self.assertRaisesRegex(retriever_tools.RetrieverError, ".retriever"):
+            retriever_tools.ingest(self.root, recursive=True, raw_file_types=None, raw_paths=[".retriever"])
+
+    def test_ingest_cli_accepts_scoped_path(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "sample.txt").write_text("scoped body\n", encoding="utf-8")
+
+        exit_code, payload, _, _ = self.run_cli(
+            "ingest",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["new"], 1)
+        self.assertEqual(payload["scan_paths"], ["raw"])
 
     def test_non_attachment_child_documents_are_not_treated_as_attachments(self) -> None:
         parent_path = self.root / "parent.txt"

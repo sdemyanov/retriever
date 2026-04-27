@@ -82,14 +82,31 @@ def plan_ingest_work(
     recursive: bool,
     allowed_types: set[str] | None,
     connection: sqlite3.Connection,
+    scan_scope: dict[str, object],
 ) -> dict[str, object]:
     scan_hash_ms = 0.0
-    production_signatures = find_production_root_signatures(root, recursive, connection)
+    production_signatures = find_production_root_signatures(root, recursive, connection, scan_scope=scan_scope)
     production_root_paths = [Path(signature["root"]).resolve() for signature in production_signatures]
-    slack_export_descriptors = find_slack_export_roots(root, recursive, allowed_types)
+    slack_export_descriptors = find_scoped_source_roots(
+        find_slack_export_roots,
+        root,
+        recursive,
+        scan_scope,
+        allowed_types,
+    )
     slack_export_root_paths = [Path(descriptor["root"]).resolve() for descriptor in slack_export_descriptors]
-    gmail_export_descriptors = find_gmail_export_roots(root, recursive, allowed_types)
-    pst_export_descriptors = find_pst_export_roots(root, recursive) if allowed_types is None or PST_SOURCE_KIND in allowed_types else []
+    gmail_export_descriptors = find_scoped_source_roots(
+        find_gmail_export_roots,
+        root,
+        recursive,
+        scan_scope,
+        allowed_types,
+    )
+    pst_export_descriptors = (
+        find_scoped_source_roots(find_pst_export_roots, root, recursive, scan_scope)
+        if allowed_types is None or PST_SOURCE_KIND in allowed_types
+        else []
+    )
     gmail_owned_paths = {
         Path(path).resolve()
         for descriptor in gmail_export_descriptors
@@ -117,7 +134,7 @@ def plan_ingest_work(
     }
     scanned_files = [
         path
-        for path in collect_files(root, recursive, allowed_types)
+        for path in collect_files(root, recursive, allowed_types, scan_scope=scan_scope)
         if not any(production_root == path.resolve() or production_root in path.resolve().parents for production_root in production_root_paths)
         and not any(slack_root == path.resolve() or slack_root in path.resolve().parents for slack_root in slack_export_root_paths)
         and path.resolve() not in gmail_owned_paths
@@ -338,6 +355,7 @@ def load_loose_file_commit_state(
     scanned_rel_paths: set[str],
     gmail_owned_rel_paths: set[str],
     pst_export_owned_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
 ) -> tuple[dict[str, sqlite3.Row], dict[str, list[sqlite3.Row]]]:
     existing_occurrence_rows = connection.execute(
         """
@@ -358,7 +376,11 @@ def load_loose_file_commit_state(
     existing_by_rel = {str(row["rel_path"]): row for row in existing_occurrence_rows}
     unseen_existing_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
     for row in existing_occurrence_rows:
-        if str(row["rel_path"]) not in scanned_rel_paths and row["file_hash"]:
+        if (
+            ingest_scan_scope_contains_rel_path(scan_scope, str(row["rel_path"]))
+            and str(row["rel_path"]) not in scanned_rel_paths
+            and row["file_hash"]
+        ):
             unseen_existing_by_hash[row["file_hash"]].append(row)
     return existing_by_rel, unseen_existing_by_hash
 
@@ -886,6 +908,7 @@ def finalize_ingest_postpass(
     slack_day_documents_missing: int,
     stats: dict[str, int],
     pst_export_owned_rel_paths: set[str] | None = None,
+    scan_scope: dict[str, object] | None = None,
 ) -> int:
     if pst_export_owned_rel_paths:
         connection.execute("BEGIN")
@@ -899,15 +922,23 @@ def finalize_ingest_postpass(
         except Exception:
             connection.rollback()
             raise
-    filesystem_missing = mark_missing_documents(connection, scanned_rel_paths)
+    filesystem_missing = mark_missing_documents(connection, scanned_rel_paths, scan_scope=scan_scope)
     pst_sources_missing = 0
     pst_documents_missing = 0
     mbox_sources_missing = 0
     mbox_documents_missing = 0
     if allowed_types is None or PST_SOURCE_KIND in allowed_types:
-        pst_sources_missing, pst_documents_missing = mark_missing_pst_documents(connection, scanned_pst_source_rel_paths)
+        pst_sources_missing, pst_documents_missing = mark_missing_pst_documents(
+            connection,
+            scanned_pst_source_rel_paths,
+            scan_scope=scan_scope,
+        )
     if allowed_types is None or MBOX_SOURCE_KIND in allowed_types:
-        mbox_sources_missing, mbox_documents_missing = mark_missing_mbox_documents(connection, scanned_mbox_source_rel_paths)
+        mbox_sources_missing, mbox_documents_missing = mark_missing_mbox_documents(
+            connection,
+            scanned_mbox_source_rel_paths,
+            scan_scope=scan_scope,
+        )
     stats["pst_sources_missing"] = pst_sources_missing
     stats["pst_documents_missing"] = pst_documents_missing
     stats["mbox_sources_missing"] = mbox_sources_missing
@@ -964,6 +995,9 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
                 resolved_production_root,
                 staging_root=Path(ingest_session["tmp_dir"]),
             )
+            session_warnings = list(ingest_session.get("warnings") or [])
+            if session_warnings:
+                result = {**result, "warnings": [*list(result.get("warnings", [])), *session_warnings]}
             benchmark_mark(
                 "ingest_production_done",
                 production_ms=round((time.perf_counter() - production_started) * 1000.0, 3),
@@ -984,16 +1018,23 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
             connection.close()
 
 
-def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str, object]:
+def ingest(
+    root: Path,
+    recursive: bool,
+    raw_file_types: str | None,
+    raw_paths: list[str] | None = None,
+) -> dict[str, object]:
     set_active_workspace_root(root)
     paths = workspace_paths(root)
     ensure_layout(paths)
     allowed_types = parse_file_types(raw_file_types)
+    scan_scope = build_ingest_scan_scope(root, raw_paths)
     total_started = time.perf_counter()
     benchmark_mark(
         "ingest_begin",
         recursive=recursive,
         file_type_filter_count=(len(allowed_types) if allowed_types is not None else 0),
+        scan_paths=list(scan_scope.get("display_paths") or []),
     )
     with workspace_ingest_session(paths, command_name="ingest") as ingest_session:
         connection = connect_db(paths["db_path"])
@@ -1021,7 +1062,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 return filesystem_dataset_id, filesystem_dataset_source_id
 
             scan_started = time.perf_counter()
-            ingest_plan = plan_ingest_work(root, recursive, allowed_types, connection)
+            ingest_plan = plan_ingest_work(root, recursive, allowed_types, connection, scan_scope)
             production_signatures = list(ingest_plan["production_signatures"])
             slack_export_descriptors = list(ingest_plan["slack_export_descriptors"])
             gmail_export_descriptors = list(ingest_plan["gmail_export_descriptors"])
@@ -1065,7 +1106,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             slack_day_documents_missing = int(special_source_state["slack_day_documents_missing"])
             ingested_production_roots = list(special_source_state["ingested_production_roots"])
             skipped_production_roots = list(special_source_state["skipped_production_roots"])
-            warnings = list(special_source_state["warnings"])
+            warnings = [*list(ingest_session.get("warnings") or []), *list(special_source_state["warnings"])]
             benchmark_mark(
                 "ingest_special_sources_done",
                 gmail_ms=round(float(special_source_state["gmail_ms"]), 3),
@@ -1079,6 +1120,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 scanned_rel_paths,
                 gmail_owned_rel_paths,
                 pst_export_owned_rel_paths,
+                scan_scope=scan_scope,
             )
 
             loop_started = time.perf_counter()
@@ -1227,6 +1269,7 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
                 slack_day_documents_missing,
                 stats,
                 pst_export_owned_rel_paths=pst_export_owned_rel_paths,
+                scan_scope=scan_scope,
             )
             benchmark_mark(
                 "ingest_postpass_done",
@@ -1240,6 +1283,8 @@ def ingest(root: Path, recursive: bool, raw_file_types: str | None) -> dict[str,
             result["failures"] = failures
             result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
             result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
+            if not bool(scan_scope.get("is_full_workspace")):
+                result["scan_paths"] = list(scan_scope.get("display_paths") or [])
             result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
             result["ingested_production_roots"] = ingested_production_roots
             result["skipped_production_roots"] = skipped_production_roots

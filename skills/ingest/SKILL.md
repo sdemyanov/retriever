@@ -44,6 +44,7 @@ Use this skill when the user says things like:
 - Keep `ingest-production` as the precise entrypoint for targeted reruns, scripts, or one-off production-only ingest.
 - Treat `DAT` + companion `TEXT/`, `IMAGES/`, and optional `NATIVES/` folders as a production signature, not as loose files.
 - Run plain `ingest` with `--recursive` when the user wants the whole tree scanned.
+- When the user asks to reingest only a subtree or file inside the workspace, keep the positional workspace root unchanged and pass one or more `--path <relative-path>` flags.
 - Plain `ingest` without `--file-types` now auto-routes detected production roots through the production ingest pipeline while still indexing loose files elsewhere in the tree.
 - If plain `ingest` reports `skipped_production_roots`, explain that Retriever detected a processed production but skipped it because a file-type filter was present; use `ingest-production` when the user's intent is to index that production root explicitly.
 - Summarize `new`, `updated`, `renamed`, `missing`, `skipped`, and `failed` for plain ingest.

@@ -28,25 +28,189 @@ def relative_document_path(root: Path, path: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
-def collect_files(root: Path, recursive: bool, allowed_file_types: set[str] | None) -> list[Path]:
-    iterator = root.rglob("*") if recursive else root.iterdir()
-    files: list[Path] = []
-    for path in iterator:
-        if path.is_dir():
-            if path.name == ".retriever":
+def path_is_at_or_under(path: Path, parent: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_parent = parent.resolve()
+    return resolved_path == resolved_parent or resolved_parent in resolved_path.parents
+
+
+def build_ingest_scan_scope(root: Path, raw_paths: list[str] | None) -> dict[str, object]:
+    root = root.resolve()
+    if not raw_paths:
+        return {
+            "is_full_workspace": True,
+            "paths": [root],
+            "dir_prefixes": [],
+            "exact_rel_paths": set(),
+            "display_paths": [],
+        }
+
+    scan_paths: list[Path] = []
+    dir_prefixes: set[str] = set()
+    exact_rel_paths: set[str] = set()
+    display_paths: list[str] = []
+    for raw_path in raw_paths:
+        raw_text = normalize_whitespace(str(raw_path or ""))
+        if not raw_text:
+            raise RetrieverError("Ingest --path cannot be blank.")
+        candidate = Path(raw_text).expanduser()
+        candidate = candidate if candidate.is_absolute() else root / candidate
+        if not candidate.exists():
+            raise RetrieverError(f"Ingest path does not exist: {raw_text}")
+        resolved_candidate = candidate.resolve()
+        if not path_is_at_or_under(resolved_candidate, root):
+            raise RetrieverError(f"Ingest path must be inside the workspace root: {raw_text}")
+        rel_path = resolved_candidate.relative_to(root).as_posix()
+        rel_parts = resolved_candidate.relative_to(root).parts
+        if ".retriever" in rel_parts:
+            raise RetrieverError("Ingest --path cannot target the .retriever state directory.")
+        if rel_path in {"", "."}:
+            return {
+                "is_full_workspace": True,
+                "paths": [root],
+                "dir_prefixes": [],
+                "exact_rel_paths": set(),
+                "display_paths": [],
+            }
+        scan_paths.append(resolved_candidate)
+        display_paths.append(rel_path)
+        if resolved_candidate.is_dir():
+            dir_prefixes.add(rel_path.rstrip("/") + "/")
+        else:
+            exact_rel_paths.add(rel_path)
+
+    deduped_scan_paths: list[Path] = []
+    for scan_path in sorted(set(scan_paths), key=lambda item: (len(item.parts), item.as_posix())):
+        if any(parent == scan_path or parent in scan_path.parents for parent in deduped_scan_paths if parent.is_dir()):
+            continue
+        deduped_scan_paths.append(scan_path)
+
+    return {
+        "is_full_workspace": False,
+        "paths": deduped_scan_paths,
+        "dir_prefixes": sorted(dir_prefixes),
+        "exact_rel_paths": exact_rel_paths,
+        "display_paths": sorted(set(display_paths)),
+    }
+
+
+def ingest_scan_scope_contains_rel_path(scan_scope: dict[str, object] | None, rel_path: str | None) -> bool:
+    if scan_scope is None or bool(scan_scope.get("is_full_workspace")):
+        return True
+    normalized = normalize_whitespace(str(rel_path or "")).replace("\\", "/").lstrip("/")
+    if not normalized:
+        return False
+    if normalized in set(scan_scope.get("exact_rel_paths") or set()):
+        return True
+    return any(normalized.startswith(str(prefix)) for prefix in list(scan_scope.get("dir_prefixes") or []))
+
+
+def collect_files(
+    root: Path,
+    recursive: bool,
+    allowed_file_types: set[str] | None,
+    scan_scope: dict[str, object] | None = None,
+) -> list[Path]:
+    scan_paths = list((scan_scope or {}).get("paths") or [root])
+    files: set[Path] = set()
+    for scan_path in scan_paths:
+        if scan_path.is_file():
+            candidates = [scan_path]
+        else:
+            candidates = scan_path.rglob("*") if recursive else scan_path.iterdir()
+        for path in candidates:
+            if not path_is_at_or_under(path, root):
                 continue
-            if not recursive:
+            if not ingest_scan_scope_contains_rel_path(scan_scope, relative_document_path(root, path)):
                 continue
-            continue
-        if ".retriever" in path.parts:
-            continue
-        file_type = normalize_extension(path)
-        if allowed_file_types and file_type not in allowed_file_types:
-            continue
-        if not file_type:
-            continue
-        files.append(path)
+            if path.is_dir():
+                if path.name == ".retriever":
+                    continue
+                if not recursive:
+                    continue
+                continue
+            if ".retriever" in path.resolve().relative_to(root.resolve()).parts:
+                continue
+            file_type = normalize_extension(path)
+            if allowed_file_types and file_type not in allowed_file_types:
+                continue
+            if not file_type:
+                continue
+            files.add(path)
     return sorted(files)
+
+
+def collect_ingest_scope_directories(scan_scope: dict[str, object]) -> list[Path]:
+    return [Path(path) for path in list(scan_scope.get("paths") or []) if Path(path).is_dir()]
+
+
+def dedupe_source_descriptors_by_root(descriptors: list[dict[str, object]]) -> list[dict[str, object]]:
+    descriptors_by_root: dict[str, dict[str, object]] = {}
+    for descriptor in descriptors:
+        root = descriptor.get("root")
+        if root is None:
+            continue
+        descriptors_by_root[Path(root).resolve().as_posix()] = descriptor
+    return [descriptors_by_root[key] for key in sorted(descriptors_by_root)]
+
+
+def find_scoped_source_roots(
+    finder,
+    root: Path,
+    recursive: bool,
+    scan_scope: dict[str, object],
+    *args,
+) -> list[dict[str, object]]:
+    if bool(scan_scope.get("is_full_workspace")):
+        return finder(root, recursive, *args)
+    descriptors: list[dict[str, object]] = []
+    for scan_dir in collect_ingest_scope_directories(scan_scope):
+        descriptors.extend(finder(scan_dir, recursive, *args))
+    return dedupe_source_descriptors_by_root(descriptors)
+
+
+def collect_production_dat_paths(root: Path, recursive: bool, scan_scope: dict[str, object]) -> list[Path]:
+    if bool(scan_scope.get("is_full_workspace")):
+        dat_paths = list(root.rglob("*.dat")) if recursive else list(root.glob("*.dat"))
+        if not recursive:
+            for child in root.iterdir():
+                if child.is_dir() and child.name != ".retriever":
+                    data_dir = child / "DATA"
+                    if data_dir.is_dir():
+                        dat_paths.extend(sorted(data_dir.glob("*.dat")))
+        return dat_paths
+
+    dat_paths: list[Path] = []
+    for scan_dir in collect_ingest_scope_directories(scan_scope):
+        if recursive:
+            dat_paths.extend(scan_dir.rglob("*.dat"))
+        else:
+            dat_paths.extend(scan_dir.glob("*.dat"))
+            for child in scan_dir.iterdir():
+                if child.is_dir() and child.name != ".retriever":
+                    data_dir = child / "DATA"
+                    if data_dir.is_dir():
+                        dat_paths.extend(sorted(data_dir.glob("*.dat")))
+    return dat_paths
+
+
+def collect_scoped_existing_production_rows(
+    workspace_root: Path,
+    rows: list[sqlite3.Row],
+    scan_scope: dict[str, object],
+) -> list[sqlite3.Row]:
+    if bool(scan_scope.get("is_full_workspace")):
+        return rows
+    scoped_rows: list[sqlite3.Row] = []
+    for row in rows:
+        rel_root = str(row["rel_root"])
+        candidate_root = workspace_root / rel_root
+        if ingest_scan_scope_contains_rel_path(scan_scope, rel_root) or any(
+            path_is_at_or_under(Path(path), candidate_root)
+            for path in list(scan_scope.get("paths") or [])
+        ):
+            scoped_rows.append(row)
+    return scoped_rows
 
 
 def normalize_production_header(raw_header: str) -> str:
@@ -170,11 +334,13 @@ def find_production_root_signatures(
     workspace_root: Path,
     recursive: bool,
     connection: sqlite3.Connection | None = None,
+    scan_scope: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
+    scan_scope = scan_scope or build_ingest_scan_scope(workspace_root, None)
     signatures: dict[str, dict[str, object]] = {}
     if connection is not None and table_exists(connection, "productions"):
         rows = connection.execute("SELECT rel_root, production_name, metadata_load_rel_path, image_load_rel_path, source_type FROM productions").fetchall()
-        for row in rows:
+        for row in collect_scoped_existing_production_rows(workspace_root, rows, scan_scope):
             candidate_root = workspace_root / row["rel_root"]
             if candidate_root.exists():
                 signatures[row["rel_root"]] = {
@@ -186,13 +352,7 @@ def find_production_root_signatures(
                     "source_type": row["source_type"],
                 }
 
-    dat_paths = list(workspace_root.rglob("*.dat")) if recursive else list(workspace_root.glob("*.dat"))
-    if not recursive:
-        for child in workspace_root.iterdir():
-            if child.is_dir() and child.name != ".retriever":
-                data_dir = child / "DATA"
-                if data_dir.is_dir():
-                    dat_paths.extend(sorted(data_dir.glob("*.dat")))
+    dat_paths = collect_production_dat_paths(workspace_root, recursive, scan_scope)
     for dat_path in dat_paths:
         if ".retriever" in dat_path.parts:
             continue
@@ -4361,7 +4521,11 @@ def refresh_conversation_previews(
     return refreshed
 
 
-def mark_missing_documents(connection: sqlite3.Connection, scanned_rel_paths: set[str]) -> int:
+def mark_missing_documents(
+    connection: sqlite3.Connection,
+    scanned_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
+) -> int:
     occurrence_rows = connection.execute(
         """
         SELECT id, document_id, rel_path, lifecycle_status
@@ -4374,7 +4538,9 @@ def mark_missing_documents(connection: sqlite3.Connection, scanned_rel_paths: se
     missing_occurrence_ids = [
         int(row["id"])
         for row in occurrence_rows
-        if row["rel_path"] not in scanned_rel_paths and row["lifecycle_status"] != "missing"
+        if ingest_scan_scope_contains_rel_path(scan_scope, row["rel_path"])
+        and row["rel_path"] not in scanned_rel_paths
+        and row["lifecycle_status"] != "missing"
     ]
     if not missing_occurrence_ids:
         return 0
@@ -4883,6 +5049,7 @@ def mark_missing_container_documents(
     *,
     source_kind: str,
     scanned_source_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
 ) -> tuple[int, int]:
     source_rows = connection.execute(
         """
@@ -4898,6 +5065,8 @@ def mark_missing_container_documents(
     now = utc_now()
     for source_row in source_rows:
         source_rel_path = str(source_row["source_rel_path"])
+        if not ingest_scan_scope_contains_rel_path(scan_scope, source_rel_path):
+            continue
         if source_rel_path in scanned_source_rel_paths:
             continue
         parent_rows = connection.execute(
@@ -5411,22 +5580,26 @@ def ingest_container_source(
 def mark_missing_pst_documents(
     connection: sqlite3.Connection,
     scanned_source_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
 ) -> tuple[int, int]:
     return mark_missing_container_documents(
         connection,
         source_kind=PST_SOURCE_KIND,
         scanned_source_rel_paths=scanned_source_rel_paths,
+        scan_scope=scan_scope,
     )
 
 
 def mark_missing_mbox_documents(
     connection: sqlite3.Connection,
     scanned_source_rel_paths: set[str],
+    scan_scope: dict[str, object] | None = None,
 ) -> tuple[int, int]:
     return mark_missing_container_documents(
         connection,
         source_kind=MBOX_SOURCE_KIND,
         scanned_source_rel_paths=scanned_source_rel_paths,
+        scan_scope=scan_scope,
     )
 
 

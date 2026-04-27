@@ -878,17 +878,33 @@ def new_ingest_session_id(now: datetime | None = None) -> str:
     return f"{timestamp}-{secrets.token_hex(4)}"
 
 
-def sweep_stale_ingest_tmp_dirs(paths: dict[str, Path]) -> int:
+def sweep_stale_ingest_tmp_dirs(paths: dict[str, Path]) -> dict[str, object]:
     ingest_tmp_dir = paths["ingest_tmp_dir"]
     if not ingest_tmp_dir.exists():
-        return 0
+        return {"removed": 0, "failures": []}
     removed = 0
-    for child in sorted(ingest_tmp_dir.iterdir(), key=lambda path: path.name):
+    failures: list[dict[str, str]] = []
+    try:
+        children = sorted(ingest_tmp_dir.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        return {
+            "removed": 0,
+            "failures": [{"path": str(ingest_tmp_dir), "error": f"{type(exc).__name__}: {exc}"}],
+        }
+    for child in children:
         if not child.is_dir():
             continue
-        if remove_directory_tree(child):
-            removed += 1
-    return removed
+        try:
+            if remove_directory_tree(child):
+                removed += 1
+        except OSError as exc:
+            failures.append(
+                {
+                    "path": str(child),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return {"removed": removed, "failures": failures}
 
 
 def acquire_os_file_lock(handle) -> None:
@@ -980,21 +996,38 @@ def workspace_ingest_session(paths: dict[str, Path], *, command_name: str):
     session_id = new_ingest_session_id()
     session_dir = paths["ingest_tmp_dir"] / session_id
     try:
-        stale_tmp_dirs_removed = sweep_stale_ingest_tmp_dirs(paths)
+        stale_tmp_sweep = sweep_stale_ingest_tmp_dirs(paths)
+        stale_tmp_dirs_removed = int(stale_tmp_sweep["removed"])
+        stale_tmp_dir_failures = list(stale_tmp_sweep.get("failures") or [])
+        warnings = [
+            f"Could not remove stale ingest tmp dir {failure['path']}: {failure['error']}"
+            for failure in stale_tmp_dir_failures
+        ]
         session_dir.mkdir(parents=True, exist_ok=True)
         benchmark_mark(
             "workspace_ingest_session_ready",
             command=command_name,
             session_id=session_id,
             stale_tmp_dirs_removed=stale_tmp_dirs_removed,
+            stale_tmp_dirs_failed=len(stale_tmp_dir_failures),
         )
         yield {
             "id": session_id,
             "tmp_dir": session_dir,
             "stale_tmp_dirs_removed": stale_tmp_dirs_removed,
+            "stale_tmp_dirs_failed": len(stale_tmp_dir_failures),
+            "warnings": warnings,
         }
     finally:
-        remove_directory_tree(session_dir)
+        try:
+            remove_directory_tree(session_dir)
+        except OSError as exc:
+            benchmark_mark(
+                "workspace_ingest_session_cleanup_failed",
+                command=command_name,
+                session_id=session_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         release_workspace_ingest_lock(lock_handle)
 
 
