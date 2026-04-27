@@ -65,6 +65,8 @@ INGEST_V2_WORK_ITEM_LEASE_SECONDS = 180
 INGEST_V2_PREPARE_BATCH_SIZE = DEFAULT_WORKER_BATCH_SIZE
 INGEST_V2_PREPARE_MIN_START_SECONDS = 1.0
 INGEST_V2_COMMIT_MIN_START_SECONDS = 1.0
+INGEST_V2_RUN_STEP_MIN_REMAINING_SECONDS = 1.25
+INGEST_V2_RUN_STEP_MAX_INNER_STEPS = 100
 INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES = 2 * 1024 * 1024 * 1024
 INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
 
@@ -2474,6 +2476,35 @@ def ingest_v2_finalize_step(
         connection.close()
 
 
+def ingest_v2_select_runnable_step(status_payload: dict[str, object]) -> str | None:
+    for command in list(status_payload.get("next_recommended_commands") or []):
+        try:
+            command_name = shlex.split(str(command))[0]
+        except (IndexError, ValueError):
+            continue
+        if command_name == "ingest-run-step":
+            continue
+        if command_name == "ingest-plan-step":
+            return "plan"
+        if command_name == "ingest-prepare-step":
+            return "prepare"
+        if command_name == "ingest-commit-step":
+            return "commit"
+        if command_name == "ingest-finalize-step":
+            return "finalize"
+    return None
+
+
+def ingest_v2_runner_step_budget(remaining_seconds: float) -> int:
+    return max(
+        1,
+        min(
+            MAX_RESUMABLE_STEP_BUDGET_SECONDS,
+            int(max(1.0, remaining_seconds)),
+        ),
+    )
+
+
 def ingest_v2_run_step(
     root: Path,
     *,
@@ -2482,6 +2513,7 @@ def ingest_v2_run_step(
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
+    deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -2498,73 +2530,77 @@ def ingest_v2_run_step(
                 "step": "run",
                 "executed": False,
                 "selected_step": None,
+                "executed_steps": [],
                 "reason": "no_ingest_run",
                 "step_result": None,
+                "step_results": [],
                 "more_work_remaining": False,
                 "run": run_payload,
+                "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
             }
         resolved_run_id = str(row["run_id"])
         status_payload = ingest_v2_status_payload(connection, root, row, budget_seconds=budget)
-        selected_step: str | None = None
-        for command in list(status_payload.get("next_recommended_commands") or []):
-            try:
-                command_name = shlex.split(str(command))[0]
-            except (IndexError, ValueError):
-                continue
-            if command_name == "ingest-run-step":
-                continue
-            if command_name == "ingest-plan-step":
-                selected_step = "plan"
-                break
-            if command_name == "ingest-prepare-step":
-                selected_step = "prepare"
-                break
-            if command_name == "ingest-commit-step":
-                selected_step = "commit"
-                break
-            if command_name == "ingest-finalize-step":
-                selected_step = "finalize"
-                break
-        if selected_step is None:
-            return {
-                "ok": True,
-                "implemented": True,
-                "step": "run",
-                "executed": False,
-                "selected_step": None,
-                "reason": (
-                    "run_terminal"
-                    if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None
-                    else "no_runnable_step"
-                ),
-                "step_result": None,
-                "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-                "run": status_payload,
-            }
     finally:
         connection.close()
 
-    if selected_step == "plan":
-        step_result = ingest_v2_plan_step(root, run_id=resolved_run_id, budget_seconds=budget)
-    elif selected_step == "prepare":
-        step_result = ingest_v2_prepare_step(root, run_id=resolved_run_id, budget_seconds=budget)
-    elif selected_step == "commit":
-        step_result = ingest_v2_commit_step(root, run_id=resolved_run_id, budget_seconds=budget)
-    elif selected_step == "finalize":
-        step_result = ingest_v2_finalize_step(root, run_id=resolved_run_id, budget_seconds=budget)
+    executed_steps: list[str] = []
+    step_results: list[dict[str, object]] = []
+    stop_reason: str | None = None
+    run_payload = status_payload
+    while len(executed_steps) < INGEST_V2_RUN_STEP_MAX_INNER_STEPS:
+        remaining_seconds = ingest_v2_deadline_remaining_seconds(deadline)
+        if remaining_seconds < INGEST_V2_RUN_STEP_MIN_REMAINING_SECONDS:
+            stop_reason = "budget_exhausted"
+            break
+        selected_step = ingest_v2_select_runnable_step(run_payload)
+        if selected_step is None:
+            stop_reason = (
+                "run_terminal"
+                if str(run_payload.get("status")) in INGEST_V2_TERMINAL_STATUSES
+                else "no_runnable_step"
+            )
+            break
+        inner_budget = ingest_v2_runner_step_budget(remaining_seconds)
+        if selected_step == "plan":
+            step_result = ingest_v2_plan_step(root, run_id=resolved_run_id, budget_seconds=inner_budget)
+        elif selected_step == "prepare":
+            step_result = ingest_v2_prepare_step(root, run_id=resolved_run_id, budget_seconds=inner_budget)
+        elif selected_step == "commit":
+            step_result = ingest_v2_commit_step(root, run_id=resolved_run_id, budget_seconds=inner_budget)
+        elif selected_step == "finalize":
+            step_result = ingest_v2_finalize_step(root, run_id=resolved_run_id, budget_seconds=inner_budget)
+        else:
+            raise RetrieverError(f"Unsupported resumable ingest step selection: {selected_step}")
+
+        executed_steps.append(selected_step)
+        step_results.append(step_result)
+        if isinstance(step_result.get("run"), dict):
+            run_payload = dict(step_result["run"])
+        if selected_step == "prepare" and bool(step_result.get("throttled")):
+            stop_reason = "prepare_throttled"
+            break
+        if selected_step == "commit" and bool(step_result.get("writer_busy")):
+            stop_reason = "writer_busy"
+            break
+        if not bool(step_result.get("more_work_remaining")):
+            stop_reason = "run_terminal"
+            break
     else:
-        raise RetrieverError(f"Unsupported resumable ingest step selection: {selected_step}")
+        stop_reason = "max_inner_steps"
 
     return {
         "ok": True,
         "implemented": True,
         "step": "run",
-        "executed": True,
-        "selected_step": selected_step,
-        "reason": None,
-        "step_result": step_result,
-        "more_work_remaining": bool(step_result.get("more_work_remaining")),
-        "run": step_result.get("run"),
+        "executed": bool(executed_steps),
+        "selected_step": executed_steps[0] if executed_steps else None,
+        "executed_steps": executed_steps,
+        "reason": stop_reason,
+        "step_result": step_results[-1] if step_results else None,
+        "step_results": step_results,
+        "more_work_remaining": str(run_payload.get("status")) not in INGEST_V2_TERMINAL_STATUSES,
+        "run": run_payload,
+        "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
     }
 
 

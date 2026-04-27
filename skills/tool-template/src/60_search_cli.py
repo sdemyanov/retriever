@@ -9699,7 +9699,10 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_cancel_parser.add_argument("--run-id", required=True, help="Run id to cancel")
     ingest_cancel_parser.add_argument("--force", action="store_true", help="Compatibility flag reserved for future workers")
 
-    ingest_run_step_parser = subparsers.add_parser("ingest-run-step", help="Run one recommended resumable V2 ingest step")
+    ingest_run_step_parser = subparsers.add_parser(
+        "ingest-run-step",
+        help="Run recommended resumable V2 ingest steps until the bounded call budget is nearly exhausted",
+    )
     ingest_run_step_parser.add_argument("workspace", help="Workspace root path")
     ingest_run_step_parser.add_argument("--run-id", help="Run id to advance; defaults to the latest run")
     ingest_run_step_parser.add_argument(

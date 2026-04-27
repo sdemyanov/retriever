@@ -6762,6 +6762,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertTrue(payload["implemented"])
         self.assertFalse(payload["executed"])
+        self.assertEqual(payload["executed_steps"], [])
         self.assertEqual(payload["reason"], "no_ingest_run")
         self.assertEqual(payload["run"]["status"], "none")
 
@@ -6844,7 +6845,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(second_plan_payload["planned_loose_files"], 0)
         self.assertEqual(second_plan_payload["run"]["counts"]["work_items"]["pending"], 2)
 
-    def test_ingest_v2_run_step_advances_one_recommended_step_at_a_time(self) -> None:
+    def test_ingest_v2_run_step_chains_recommended_steps_within_budget(self) -> None:
         raw_dir = self.root / "raw"
         raw_dir.mkdir()
         (raw_dir / "alpha.txt").write_text("alpha runner body\n", encoding="utf-8")
@@ -6861,19 +6862,21 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("ingest-run-step", start_payload["next_recommended_commands"][0])
         run_id = str(start_payload["run_id"])
 
-        selected_steps: list[str] = []
-        for expected_step in ("plan", "prepare", "commit", "finalize"):
-            args = ["ingest-run-step", str(self.root), "--budget-seconds", "35"]
-            if expected_step != "plan":
-                args.extend(["--run-id", run_id])
-            exit_code, payload, _, _ = self.run_cli(*args)
-            self.assertEqual(exit_code, 0)
-            self.assertIsNotNone(payload)
-            self.assertTrue(payload["executed"])
-            self.assertEqual(payload["selected_step"], expected_step)
-            selected_steps.append(str(payload["selected_step"]))
-
-        self.assertEqual(selected_steps, ["plan", "prepare", "commit", "finalize"])
+        exit_code, payload, _, _ = self.run_cli(
+            "ingest-run-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertTrue(payload["executed"])
+        self.assertEqual(payload["selected_step"], "plan")
+        self.assertEqual(payload["executed_steps"], ["plan", "prepare", "commit", "finalize"])
+        self.assertEqual(payload["reason"], "run_terminal")
+        self.assertEqual(payload["run"]["status"], "completed")
         completed_row = self.fetch_document_row("raw/alpha.txt")
         self.assertEqual(completed_row["control_number"], "DOC001.00000001")
 
