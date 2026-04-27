@@ -2,12 +2,12 @@
 
 ## Template metadata
 
-- tool version: `1.0.3`
-- schema version: `22`
+- tool version: `1.0.4`
+- schema version: `25`
 - requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `5329ad35118d15ebcdcb838a721992ae27d9ff1c19286f524047896e7496c2aa`
+- source checksum (SHA256): `836121e4ae8815d0405d45af4e4c421ea7868297c3c660bd2552e55da03e3c40`
 
 ## Current command surface
 
@@ -17,6 +17,13 @@ The current template implements:
 - `bootstrap`
 - `schema-version`
 - `ingest`
+- `ingest-start`
+- `ingest-status`
+- `ingest-cancel`
+- `ingest-plan-step`
+- `ingest-prepare-step`
+- `ingest-commit-step`
+- `ingest-finalize-step`
 - `ingest-production`
 - `inspect-pst-properties`
 - `search`

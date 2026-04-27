@@ -9664,6 +9664,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated file types to include, e.g. pdf,docx,eml",
     )
 
+    ingest_start_parser = subparsers.add_parser("ingest-start", help="Start a resumable V2 ingest run")
+    ingest_start_parser.add_argument("workspace", help="Workspace root path")
+    ingest_start_parser.add_argument("--recursive", action="store_true", help="Scan directories recursively")
+    ingest_start_parser.add_argument(
+        "--path",
+        dest="paths",
+        action="append",
+        help="Limit ingest to a file or directory inside the workspace; repeat to scan multiple paths",
+    )
+    ingest_start_parser.add_argument(
+        "--file-types",
+        help="Comma-separated file types to include, e.g. pdf,docx,eml",
+    )
+    ingest_start_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Recommended per-step budget; values above the bounded-worker cap are rejected",
+    )
+
+    ingest_status_parser = subparsers.add_parser("ingest-status", help="Show resumable V2 ingest status")
+    ingest_status_parser.add_argument("workspace", help="Workspace root path")
+    ingest_status_parser.add_argument("--run-id", help="Run id; defaults to the latest resumable ingest run")
+    ingest_status_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Budget used when computing next recommended commands",
+    )
+
+    ingest_cancel_parser = subparsers.add_parser("ingest-cancel", help="Cancel a resumable V2 ingest run")
+    ingest_cancel_parser.add_argument("workspace", help="Workspace root path")
+    ingest_cancel_parser.add_argument("--run-id", required=True, help="Run id to cancel")
+    ingest_cancel_parser.add_argument("--force", action="store_true", help="Compatibility flag reserved for future workers")
+
+    for step_command, help_text in (
+        ("ingest-plan-step", "Advance resumable V2 ingest planning"),
+        ("ingest-prepare-step", "Prepare resumable V2 ingest work items"),
+        ("ingest-commit-step", "Commit prepared resumable V2 ingest work items"),
+        ("ingest-finalize-step", "Advance resumable V2 ingest finalization"),
+    ):
+        step_parser = subparsers.add_parser(step_command, help=help_text)
+        step_parser.add_argument("workspace", help="Workspace root path")
+        step_parser.add_argument("--run-id", required=True, help="Run id to advance")
+        step_parser.add_argument(
+            "--budget-seconds",
+            type=int,
+            default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+            help="Per-call budget; values above the bounded-worker cap are rejected",
+        )
+
     ingest_production_parser = subparsers.add_parser("ingest-production", help="Ingest a processed production volume")
     ingest_production_parser.add_argument("workspace", help="Workspace root path")
     ingest_production_parser.add_argument("production_root", help="Production root directory inside the workspace")
@@ -10631,6 +10682,53 @@ def main() -> int:
         if args.command == "ingest":
             return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types, raw_paths=args.paths))
 
+        if args.command == "ingest-start":
+            return emit_cli_payload(
+                "ingest-start",
+                ingest_v2_start(
+                    root,
+                    recursive=args.recursive,
+                    raw_file_types=args.file_types,
+                    raw_paths=args.paths,
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
+        if args.command == "ingest-status":
+            return emit_cli_payload(
+                "ingest-status",
+                ingest_v2_status(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
+        if args.command == "ingest-cancel":
+            return emit_cli_payload(
+                "ingest-cancel",
+                ingest_v2_cancel(root, run_id=args.run_id, force=args.force),
+            )
+
+        if args.command == "ingest-plan-step":
+            return emit_cli_payload(
+                "ingest-plan-step",
+                ingest_v2_plan_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
+        if args.command == "ingest-prepare-step":
+            return emit_cli_payload(
+                "ingest-prepare-step",
+                ingest_v2_prepare_step(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+            )
+
+        if args.command in {"ingest-commit-step", "ingest-finalize-step"}:
+            return emit_cli_payload(
+                args.command,
+                ingest_v2_step_not_implemented(
+                    root,
+                    run_id=args.run_id,
+                    phase=args.command.removeprefix("ingest-").removesuffix("-step"),
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
         if args.command == "ingest-production":
             return emit_cli_payload("ingest-production", ingest_production(root, args.production_root))
 
@@ -11386,6 +11484,9 @@ def main() -> int:
             )
 
         parser.error(f"Unknown command: {args.command}")
+        return 2
+    except RetrieverStructuredError as exc:
+        print(json.dumps({"tool_version": TOOL_VERSION, **exc.payload}, indent=2, sort_keys=True), file=sys.stderr)
         return 2
     except RetrieverError as exc:
         print(json.dumps({"error": str(exc), "tool_version": TOOL_VERSION}), file=sys.stderr)

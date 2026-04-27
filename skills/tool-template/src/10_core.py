@@ -753,17 +753,151 @@ SCHEMA_STATEMENTS = [
       updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_runs (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL UNIQUE,
+      scope_json TEXT NOT NULL DEFAULT '{}',
+      recursive INTEGER NOT NULL DEFAULT 0,
+      raw_file_types TEXT,
+      pipeline_schema_version INTEGER NOT NULL,
+      phase TEXT NOT NULL DEFAULT 'planning',
+      status TEXT NOT NULL DEFAULT 'planning',
+      prepare_worker_soft_limit INTEGER NOT NULL DEFAULT 4,
+      committer_lease_owner TEXT,
+      committer_lease_expires_at TEXT,
+      committer_heartbeat_at TEXT,
+      entity_graph_stale INTEGER NOT NULL DEFAULT 0,
+      entity_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      cancel_requested_at TEXT,
+      last_heartbeat_at TEXT,
+      error TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_work_items (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      unit_type TEXT NOT NULL,
+      source_kind TEXT,
+      source_key TEXT,
+      rel_path TEXT,
+      commit_order INTEGER,
+      parent_order INTEGER,
+      spawned_by_work_item_id INTEGER REFERENCES ingest_work_items(id) ON DELETE SET NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      affected_document_ids_json TEXT NOT NULL DEFAULT '[]',
+      affected_conversation_keys_json TEXT NOT NULL DEFAULT '[]',
+      affected_entity_ids_json TEXT NOT NULL DEFAULT '[]',
+      artifact_manifest_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'pending',
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_prepared_items (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      work_item_id INTEGER NOT NULL REFERENCES ingest_work_items(id) ON DELETE CASCADE,
+      payload_kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      spill_rel_path TEXT,
+      payload_bytes INTEGER NOT NULL DEFAULT 0,
+      source_fingerprint_json TEXT NOT NULL DEFAULT '{}',
+      prepared_at TEXT NOT NULL,
+      error_json TEXT NOT NULL DEFAULT '{}',
+      UNIQUE(work_item_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_rename_consumptions (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      target_work_item_id INTEGER NOT NULL REFERENCES ingest_work_items(id) ON DELETE CASCADE,
+      source_document_id INTEGER,
+      source_occurrence_id INTEGER,
+      file_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(run_id, source_occurrence_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_phase_cursors (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      phase TEXT NOT NULL,
+      cursor_key TEXT NOT NULL,
+      cursor_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'pending',
+      updated_at TEXT NOT NULL,
+      UNIQUE(run_id, phase, cursor_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_worker_events (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      worker_id TEXT,
+      event_type TEXT NOT NULL,
+      work_item_id INTEGER REFERENCES ingest_work_items(id) ON DELETE SET NULL,
+      phase TEXT,
+      duration_ms REAL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_artifact_sweeps (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+      work_item_id INTEGER REFERENCES ingest_work_items(id) ON DELETE SET NULL,
+      artifact_kind TEXT NOT NULL,
+      temp_rel_path TEXT,
+      canonical_rel_path TEXT,
+      content_hash TEXT,
+      state TEXT NOT NULL DEFAULT 'staged',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_documents_file_hash ON documents(file_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_lifecycle_status ON documents(lifecycle_status)",
     "CREATE INDEX IF NOT EXISTS idx_document_source_parts_document_id ON document_source_parts(document_id, part_kind, ordinal)",
     "CREATE INDEX IF NOT EXISTS idx_previews_document_id ON document_previews(document_id, ordinal)",
     "CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id, chunk_index)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_runs_status ON ingest_runs(status, phase)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_runs_cancel_requested ON ingest_runs(cancel_requested_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_work_items_run_status ON ingest_work_items(run_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_work_items_commit_order ON ingest_work_items(run_id, commit_order, id)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_work_items_lease_expires ON ingest_work_items(lease_expires_at)",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_work_items_source_unique
+    ON ingest_work_items(run_id, unit_type, COALESCE(source_key, ''), COALESCE(rel_path, ''), COALESCE(parent_order, -1))
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ingest_prepared_items_run_work ON ingest_prepared_items(run_id, work_item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_phase_cursors_run_phase ON ingest_phase_cursors(run_id, phase, status)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_worker_events_run_created ON ingest_worker_events(run_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_artifact_sweeps_run_state ON ingest_artifact_sweeps(run_id, state)",
 ]
 
 
 class RetrieverError(RuntimeError):
     pass
+
+
+class RetrieverStructuredError(RetrieverError):
+    def __init__(self, message: str, payload: dict[str, object]):
+        super().__init__(message)
+        self.payload = payload
 
 
 def utc_now() -> str:
