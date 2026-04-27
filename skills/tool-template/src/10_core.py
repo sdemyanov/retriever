@@ -4008,8 +4008,16 @@ def extract_email_header_blocks(text: str, max_lines: int | None = None) -> list
 
     def flush_headers() -> None:
         nonlocal headers, current_key, started
-        if "from" in headers and any(key in headers for key in ("to", "cc", "bcc", "subject", "sent", "date")):
-            blocks.append(dict(headers))
+        normalized_headers = {
+            key: normalize_whitespace(value)
+            for key, value in headers.items()
+            if normalize_whitespace(value)
+        }
+        if "from" in normalized_headers and any(
+            key in normalized_headers
+            for key in ("to", "cc", "bcc", "subject", "sent", "date")
+        ):
+            blocks.append(dict(normalized_headers))
         headers = {}
         current_key = None
         started = False
@@ -4749,10 +4757,13 @@ def extract_chat_participants(text: str) -> str | None:
     participants: list[str] = []
     seen: set[str] = set()
     speaker_counts: dict[str, int] = {}
+    timestamped_matches = 0
     for entry in iter_chat_transcript_entries(text):
         candidate = str(entry["speaker"])
         key = candidate.lower().strip("[]()")
         speaker_counts[key] = speaker_counts.get(key, 0) + 1
+        if isinstance(entry.get("timestamp"), str):
+            timestamped_matches += 1
         if key not in seen:
             seen.add(key)
             participants.append(candidate)
@@ -4760,7 +4771,11 @@ def extract_chat_participants(text: str) -> str | None:
     total_matches = sum(speaker_counts.values())
     if total_matches < 2:
         return None
-    if len(participants) < 2 and total_matches < 3:
+    if timestamped_matches < 2:
+        repeated_speaker = any(count >= 2 for count in speaker_counts.values())
+        if total_matches < 3 or not repeated_speaker:
+            return None
+    elif len(participants) < 2 and total_matches < 3:
         return None
     return ", ".join(participants)
 
