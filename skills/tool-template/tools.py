@@ -29739,6 +29739,39 @@ INGEST_V2_RUN_STEP_MIN_REMAINING_SECONDS = 1.25
 INGEST_V2_RUN_STEP_MAX_INNER_STEPS = 100
 INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES = 2 * 1024 * 1024 * 1024
 INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
+INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL = 25
+
+
+def ingest_v2_elapsed_ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000.0
+
+
+def ingest_v2_percentile_ms(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    sorted_values = sorted(float(value) for value in values)
+    index = int(((percentile / 100.0) * len(sorted_values)) + 0.999999) - 1
+    index = max(0, min(len(sorted_values) - 1, index))
+    return round(sorted_values[index], 3)
+
+
+def ingest_v2_timing_summary(values: list[float]) -> dict[str, object]:
+    if not values:
+        return {
+            "count": 0,
+            "total_ms": 0.0,
+            "avg_ms": None,
+            "p95_ms": None,
+            "max_ms": None,
+        }
+    total = sum(float(value) for value in values)
+    return {
+        "count": len(values),
+        "total_ms": round(total, 3),
+        "avg_ms": round(total / len(values), 3),
+        "p95_ms": ingest_v2_percentile_ms(values, 95.0),
+        "max_ms": round(max(float(value) for value in values), 3),
+    }
 
 
 def new_ingest_v2_run_id(now: datetime | None = None) -> str:
@@ -29890,6 +29923,40 @@ def ingest_v2_save_phase_cursor(
         """,
         (run_id, phase, cursor_key, compact_json_text(cursor), status, now),
     )
+
+
+def ingest_v2_save_planning_cursor_heartbeat(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    cursor: dict[str, object],
+    status: str = "pending",
+) -> float:
+    started = time.perf_counter()
+    if not connection.in_transaction:
+        connection.execute("BEGIN")
+    try:
+        ingest_v2_save_phase_cursor(
+            connection,
+            run_id=run_id,
+            phase="planning",
+            cursor_key="loose_file_scan",
+            cursor=cursor,
+            status=status,
+        )
+        connection.execute(
+            """
+            UPDATE ingest_runs
+            SET last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (utc_now(), run_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return ingest_v2_elapsed_ms(started)
 
 
 def ingest_v2_load_or_create_loose_file_plan_cursor(
@@ -30473,10 +30540,13 @@ def ingest_v2_prepare_loose_file_item(
         "file_type": file_type,
         "source_file_size": file_size,
         "source_file_mtime_ns": file_mtime_ns,
-        "file_hash": sha256_file(path),
     }
+    hash_started = time.perf_counter()
+    item["file_hash"] = sha256_file(path)
+    hash_ms = ingest_v2_elapsed_ms(hash_started)
     source_fingerprint["hash"] = item["file_hash"]
     prepared_item = prepare_loose_file_item(item)
+    prepared_item["prepare_hash_ms"] = hash_ms
     return prepared_item, source_fingerprint, None
 
 
@@ -30499,6 +30569,7 @@ def ingest_v2_prepare_production_row_item(
     if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
         return None, source_fingerprint, "Not enough budget remaining to start prepare."
     prepared_item = prepare_production_row_plan(root, payload_dict)
+    prepared_item["prepare_hash_ms"] = 0.0
     return prepared_item, source_fingerprint, None
 
 
@@ -30523,6 +30594,175 @@ def ingest_v2_hydrate_prepared_production_item(prepared_item: dict[str, object])
     return hydrated
 
 
+def ingest_v2_store_prepared_items_batch(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    worker_id: str,
+    entries: list[dict[str, object]],
+) -> dict[str, object]:
+    if not entries:
+        return {
+            "stored": 0,
+            "serialize_ms_values": [],
+            "prepared_write_ms_values": [],
+            "payload_bytes": 0,
+        }
+
+    serialized_entries: list[dict[str, object]] = []
+    serialize_ms_values: list[float] = []
+    payload_bytes_total = 0
+    for entry in entries:
+        prepared_item = dict(entry["prepared_item"])  # type: ignore[index]
+        source_fingerprint = dict(entry["source_fingerprint"])  # type: ignore[index]
+        serialize_started = time.perf_counter()
+        payload_json = compact_json_text(ingest_v2_json_safe_value({"prepared_item": prepared_item}))
+        source_fingerprint_json = compact_json_text(ingest_v2_json_safe_value(source_fingerprint))
+        serialize_ms_values.append(ingest_v2_elapsed_ms(serialize_started))
+        payload_bytes = len(payload_json.encode("utf-8"))
+        payload_bytes_total += payload_bytes
+        prepare_error = prepared_item.get("prepare_error")
+        serialized_entries.append(
+            {
+                "work_item_id": int(entry["work_item_id"]),
+                "payload_kind": str(entry["payload_kind"]),
+                "prepared_item": prepared_item,
+                "payload_json": payload_json,
+                "payload_bytes": payload_bytes,
+                "source_fingerprint_json": source_fingerprint_json,
+                "error_json": compact_json_text({"prepare_error": prepare_error} if prepare_error else {}),
+                "prepare_error": prepare_error,
+            }
+        )
+
+    now = utc_now()
+    write_started = time.perf_counter()
+    connection.execute("BEGIN")
+    try:
+        run_row = require_ingest_v2_run_row(connection, run_id)
+        if str(run_row["status"]) in INGEST_V2_TERMINAL_STATUSES or run_row["cancel_requested_at"] is not None:
+            connection.rollback()
+            return {
+                "stored": 0,
+                "serialize_ms_values": serialize_ms_values,
+                "prepared_write_ms_values": [],
+                "payload_bytes": payload_bytes_total,
+            }
+        work_item_ids = [int(entry["work_item_id"]) for entry in serialized_entries]
+        placeholders = ",".join("?" for _ in work_item_ids)
+        item_rows = connection.execute(
+            f"""
+            SELECT id, status, lease_owner
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND id IN ({placeholders})
+            """,
+            (run_id, *work_item_ids),
+        ).fetchall()
+        eligible_ids = {
+            int(row["id"])
+            for row in item_rows
+            if row["status"] == "leased" and row["lease_owner"] == worker_id
+        }
+        if not eligible_ids:
+            connection.rollback()
+            return {
+                "stored": 0,
+                "serialize_ms_values": serialize_ms_values,
+                "prepared_write_ms_values": [],
+                "payload_bytes": payload_bytes_total,
+            }
+
+        stored = 0
+        for entry in serialized_entries:
+            work_item_id = int(entry["work_item_id"])
+            if work_item_id not in eligible_ids:
+                continue
+            prepared_item = dict(entry["prepared_item"])  # type: ignore[index]
+            prepare_error = entry["prepare_error"]
+            connection.execute(
+                """
+                INSERT INTO ingest_prepared_items (
+                  run_id, work_item_id, payload_kind, payload_json, spill_rel_path,
+                  payload_bytes, source_fingerprint_json, prepared_at, error_json
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                ON CONFLICT(work_item_id) DO UPDATE SET
+                  payload_kind = excluded.payload_kind,
+                  payload_json = excluded.payload_json,
+                  spill_rel_path = excluded.spill_rel_path,
+                  payload_bytes = excluded.payload_bytes,
+                  source_fingerprint_json = excluded.source_fingerprint_json,
+                  prepared_at = excluded.prepared_at,
+                  error_json = excluded.error_json
+                """,
+                (
+                    run_id,
+                    work_item_id,
+                    entry["payload_kind"],
+                    entry["payload_json"],
+                    entry["payload_bytes"],
+                    entry["source_fingerprint_json"],
+                    now,
+                    entry["error_json"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE ingest_work_items
+                SET status = 'prepared',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    last_error = ?
+                WHERE run_id = ?
+                  AND id = ?
+                """,
+                (now, str(prepare_error) if prepare_error else None, run_id, work_item_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO ingest_worker_events (
+                  run_id, worker_id, event_type, work_item_id, phase, duration_ms, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    worker_id,
+                    "prepare_item",
+                    work_item_id,
+                    "prepare",
+                    prepared_item.get("prepare_ms"),
+                    compact_json_text(
+                        {
+                            "payload_kind": entry["payload_kind"],
+                            "rel_path": prepared_item.get("rel_path"),
+                            "prepare_error": prepare_error,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            stored += 1
+        connection.execute(
+            """
+            UPDATE ingest_runs
+            SET last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (now, run_id),
+        )
+        connection.commit()
+        return {
+            "stored": stored,
+            "serialize_ms_values": serialize_ms_values,
+            "prepared_write_ms_values": [ingest_v2_elapsed_ms(write_started)],
+            "payload_bytes": payload_bytes_total,
+        }
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def ingest_v2_store_prepared_item(
     connection: sqlite3.Connection,
     *,
@@ -30533,103 +30773,20 @@ def ingest_v2_store_prepared_item(
     prepared_item: dict[str, object],
     source_fingerprint: dict[str, object],
 ) -> bool:
-    now = utc_now()
-    payload_json = compact_json_text(ingest_v2_json_safe_value({"prepared_item": prepared_item}))
-    prepare_error = prepared_item.get("prepare_error")
-    error_json = compact_json_text({"prepare_error": prepare_error} if prepare_error else {})
-    connection.execute("BEGIN")
-    try:
-        run_row = require_ingest_v2_run_row(connection, run_id)
-        if str(run_row["status"]) in INGEST_V2_TERMINAL_STATUSES or run_row["cancel_requested_at"] is not None:
-            connection.rollback()
-            return False
-        item_row = connection.execute(
-            """
-            SELECT status, lease_owner
-            FROM ingest_work_items
-            WHERE run_id = ?
-              AND id = ?
-            """,
-            (run_id, work_item_id),
-        ).fetchone()
-        if item_row is None or item_row["status"] != "leased" or item_row["lease_owner"] != worker_id:
-            connection.rollback()
-            return False
-        connection.execute(
-            """
-            INSERT INTO ingest_prepared_items (
-              run_id, work_item_id, payload_kind, payload_json, spill_rel_path,
-              payload_bytes, source_fingerprint_json, prepared_at, error_json
-            ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
-            ON CONFLICT(work_item_id) DO UPDATE SET
-              payload_kind = excluded.payload_kind,
-              payload_json = excluded.payload_json,
-              spill_rel_path = excluded.spill_rel_path,
-              payload_bytes = excluded.payload_bytes,
-              source_fingerprint_json = excluded.source_fingerprint_json,
-              prepared_at = excluded.prepared_at,
-              error_json = excluded.error_json
-            """,
-            (
-                run_id,
-                work_item_id,
-                payload_kind,
-                payload_json,
-                len(payload_json.encode("utf-8")),
-                compact_json_text(ingest_v2_json_safe_value(source_fingerprint)),
-                now,
-                error_json,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE ingest_work_items
-            SET status = 'prepared',
-                lease_owner = NULL,
-                lease_expires_at = NULL,
-                updated_at = ?,
-                last_error = ?
-            WHERE run_id = ?
-              AND id = ?
-            """,
-            (now, str(prepare_error) if prepare_error else None, run_id, work_item_id),
-        )
-        connection.execute(
-            """
-            INSERT INTO ingest_worker_events (
-              run_id, worker_id, event_type, work_item_id, phase, duration_ms, details_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run_id,
-                worker_id,
-                "prepare_item",
-                work_item_id,
-                "prepare",
-                prepared_item.get("prepare_ms"),
-                compact_json_text(
-                    {
-                        "payload_kind": payload_kind,
-                        "rel_path": prepared_item.get("rel_path"),
-                        "prepare_error": prepare_error,
-                    }
-                ),
-                now,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE ingest_runs
-            SET last_heartbeat_at = ?
-            WHERE run_id = ?
-            """,
-            (now, run_id),
-        )
-        connection.commit()
-        return True
-    except Exception:
-        connection.rollback()
-        raise
+    result = ingest_v2_store_prepared_items_batch(
+        connection,
+        run_id=run_id,
+        worker_id=worker_id,
+        entries=[
+            {
+                "work_item_id": work_item_id,
+                "payload_kind": payload_kind,
+                "prepared_item": prepared_item,
+                "source_fingerprint": source_fingerprint,
+            }
+        ],
+    )
+    return int(result.get("stored") or 0) > 0
 
 
 def ingest_v2_maybe_advance_after_prepare(connection: sqlite3.Connection, *, run_id: str) -> bool:
@@ -31722,6 +31879,18 @@ def ingest_v2_status_payload(
     }
 
 
+def ingest_v2_status_payload_timed(
+    connection: sqlite3.Connection,
+    root: Path,
+    row: sqlite3.Row,
+    *,
+    budget_seconds: int = DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+) -> tuple[dict[str, object], float]:
+    started = time.perf_counter()
+    payload = ingest_v2_status_payload(connection, root, row, budget_seconds=budget_seconds)
+    return payload, ingest_v2_elapsed_ms(started)
+
+
 def ingest_v2_start(
     root: Path,
     *,
@@ -31911,6 +32080,9 @@ def ingest_v2_plan_step(
     planned_loose_files = 0
     planned_production_roots = 0
     planned_production_rows = 0
+    unsaved_plan_steps = 0
+    cursor_save_ms_values: list[float] = []
+    work_item_insert_ms_values: list[float] = []
     with workspace_ingest_session(paths, command_name="ingest-plan-step"):
         connection = connect_db(paths["db_path"])
         try:
@@ -31958,6 +32130,7 @@ def ingest_v2_plan_step(
                     )
                     if signature_payload:
                         try:
+                            insert_started = time.perf_counter()
                             production_plan = ingest_v2_plan_production_root(
                                 connection,
                                 root,
@@ -31965,6 +32138,7 @@ def ingest_v2_plan_step(
                                 signature_payload=signature_payload,
                                 next_commit_order=int(cursor.get("next_commit_order") or 1),
                             )
+                            work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
                         except Exception as exc:
                             rollback_open_transaction(connection)
                             failures = list(cursor.get("production_failures") or [])
@@ -31977,21 +32151,14 @@ def ingest_v2_plan_step(
                             cursor["production_failures"] = failures
                             production_plan = None
                         if production_plan is None:
-                            if not connection.in_transaction:
-                                connection.execute("BEGIN")
-                            try:
-                                ingest_v2_save_phase_cursor(
+                            cursor_save_ms_values.append(
+                                ingest_v2_save_planning_cursor_heartbeat(
                                     connection,
                                     run_id=run_id,
-                                    phase="planning",
-                                    cursor_key="loose_file_scan",
                                     cursor=cursor,
                                     status="pending",
                                 )
-                                connection.commit()
-                            except Exception:
-                                connection.rollback()
-                                raise
+                            )
                             continue
                         cursor["next_commit_order"] = int(production_plan["next_commit_order"])
                         cursor["planned_production_rows"] = (
@@ -32026,29 +32193,14 @@ def ingest_v2_plan_step(
                             cursor["planned_production_roots"] = planned_roots
                             planned_production_roots += 1
                         planned_production_rows += int(production_plan["planned_rows"] or 0)
-                    if not connection.in_transaction:
-                        connection.execute("BEGIN")
-                    try:
-                        ingest_v2_save_phase_cursor(
+                    cursor_save_ms_values.append(
+                        ingest_v2_save_planning_cursor_heartbeat(
                             connection,
                             run_id=run_id,
-                            phase="planning",
-                            cursor_key="loose_file_scan",
                             cursor=cursor,
                             status="pending",
                         )
-                        connection.execute(
-                            """
-                            UPDATE ingest_runs
-                            SET last_heartbeat_at = ?
-                            WHERE run_id = ?
-                            """,
-                            (utc_now(), run_id),
-                        )
-                        connection.commit()
-                    except Exception:
-                        connection.rollback()
-                        raise
+                    )
                     continue
 
                 pending_paths = list(cursor.get("pending_paths") or [])
@@ -32087,6 +32239,7 @@ def ingest_v2_plan_step(
                             cursor["skipped_container_files"] = int(cursor.get("skipped_container_files") or 0) + 1
                         else:
                             file_size, file_mtime_ns = source_file_snapshot(candidate_path)
+                            insert_started = time.perf_counter()
                             inserted = ingest_v2_plan_loose_file_item(
                                 connection,
                                 run_id=run_id,
@@ -32096,39 +32249,41 @@ def ingest_v2_plan_step(
                                 file_mtime_ns=file_mtime_ns,
                                 commit_order=int(cursor.get("next_commit_order") or 1),
                             )
+                            work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
                             cursor["next_commit_order"] = int(cursor.get("next_commit_order") or 1) + 1
                             if inserted:
                                 planned_loose_files += 1
                                 cursor["planned_loose_files"] = int(cursor.get("planned_loose_files") or 0) + 1
 
-                if not connection.in_transaction:
-                    connection.execute("BEGIN")
-                try:
-                    ingest_v2_save_phase_cursor(
-                        connection,
-                        run_id=run_id,
-                        phase="planning",
-                        cursor_key="loose_file_scan",
-                        cursor=cursor,
-                        status="pending",
+                unsaved_plan_steps += 1
+                if (
+                    unsaved_plan_steps >= INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL
+                    or ingest_v2_deadline_remaining_seconds(deadline) < 1.0
+                ):
+                    cursor_save_ms_values.append(
+                        ingest_v2_save_planning_cursor_heartbeat(
+                            connection,
+                            run_id=run_id,
+                            cursor=cursor,
+                            status="pending",
+                        )
                     )
-                    connection.execute(
-                        """
-                        UPDATE ingest_runs
-                        SET last_heartbeat_at = ?
-                        WHERE run_id = ?
-                        """,
-                        (utc_now(), run_id),
-                    )
-                    connection.commit()
-                except Exception:
-                    connection.rollback()
-                    raise
+                    unsaved_plan_steps = 0
 
             planning_complete = (
                 not list(cursor.get("pending_production_rel_roots") or [])
                 and not list(cursor.get("pending_paths") or [])
             )
+            if not planning_complete and unsaved_plan_steps:
+                cursor_save_ms_values.append(
+                    ingest_v2_save_planning_cursor_heartbeat(
+                        connection,
+                        run_id=run_id,
+                        cursor=cursor,
+                        status="pending",
+                    )
+                )
+                unsaved_plan_steps = 0
             if planning_complete:
                 total_work_items = int(
                     connection.execute(
@@ -32142,7 +32297,9 @@ def ingest_v2_plan_step(
                     or 0
                 )
                 next_phase = "preparing" if total_work_items else "finalizing"
-                connection.execute("BEGIN")
+                save_started = time.perf_counter()
+                if not connection.in_transaction:
+                    connection.execute("BEGIN")
                 try:
                     ingest_v2_save_phase_cursor(
                         connection,
@@ -32164,11 +32321,19 @@ def ingest_v2_plan_step(
                         (next_phase, next_phase, utc_now(), run_id),
                     )
                     connection.commit()
+                    cursor_save_ms_values.append(ingest_v2_elapsed_ms(save_started))
+                    unsaved_plan_steps = 0
                 except Exception:
                     connection.rollback()
                     raise
 
             updated_row = require_ingest_v2_run_row(connection, run_id)
+            run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+                connection,
+                root,
+                updated_row,
+                budget_seconds=budget,
+            )
             return {
                 "ok": True,
                 "implemented": True,
@@ -32196,7 +32361,12 @@ def ingest_v2_plan_step(
                 },
                 "more_planning_remaining": not planning_complete,
                 "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-                "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+                "timings": {
+                    "work_item_insert_ms": ingest_v2_timing_summary(work_item_insert_ms_values),
+                    "cursor_save_ms": ingest_v2_timing_summary(cursor_save_ms_values),
+                    "status_payload_ms": round(status_payload_ms, 3),
+                },
+                "run": run_payload,
             }
         finally:
             connection.close()
@@ -32220,6 +32390,14 @@ def ingest_v2_prepare_step(
     released = 0
     stale_reclaimed = 0
     throttled = False
+    prepared_entries: list[dict[str, object]] = []
+    prepare_ms_values: list[float] = []
+    prepare_hash_ms_values: list[float] = []
+    prepare_extract_ms_values: list[float] = []
+    prepare_chunk_ms_values: list[float] = []
+    prepared_serialize_ms_values: list[float] = []
+    prepared_write_ms_values: list[float] = []
+    prepared_payload_bytes = 0
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
@@ -32315,16 +32493,29 @@ def ingest_v2_prepare_step(
                         deferred_timeout += 1
                 continue
 
-            if ingest_v2_store_prepared_item(
-                connection,
-                run_id=run_id,
-                work_item_id=work_item_id,
-                worker_id=worker_id,
-                payload_kind=payload_kind,
-                prepared_item=prepared_item,
-                source_fingerprint=source_fingerprint,
-            ):
-                prepared += 1
+            prepare_ms_values.append(float(prepared_item.get("prepare_ms") or 0.0))
+            prepare_hash_ms_values.append(float(prepared_item.get("prepare_hash_ms") or 0.0))
+            prepare_extract_ms_values.append(float(prepared_item.get("prepare_extract_ms") or 0.0))
+            prepare_chunk_ms_values.append(float(prepared_item.get("prepare_chunk_ms") or 0.0))
+            prepared_entries.append(
+                {
+                    "work_item_id": work_item_id,
+                    "payload_kind": payload_kind,
+                    "prepared_item": prepared_item,
+                    "source_fingerprint": source_fingerprint,
+                }
+            )
+
+        store_result = ingest_v2_store_prepared_items_batch(
+            connection,
+            run_id=run_id,
+            worker_id=worker_id,
+            entries=prepared_entries,
+        )
+        prepared = int(store_result.get("stored") or 0)
+        prepared_serialize_ms_values.extend(list(store_result.get("serialize_ms_values") or []))
+        prepared_write_ms_values.extend(list(store_result.get("prepared_write_ms_values") or []))
+        prepared_payload_bytes = int(store_result.get("payload_bytes") or 0)
 
         advanced_to_commit = ingest_v2_maybe_advance_after_prepare(connection, run_id=run_id)
         updated_row = require_ingest_v2_run_row(connection, run_id)
@@ -32340,6 +32531,12 @@ def ingest_v2_prepare_step(
             ).fetchone()[0]
             or 0
         )
+        run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+            connection,
+            root,
+            updated_row,
+            budget_seconds=budget,
+        )
         return {
             "ok": True,
             "implemented": True,
@@ -32354,7 +32551,17 @@ def ingest_v2_prepare_step(
             "advanced_to_commit": advanced_to_commit,
             "more_prepare_remaining": remaining_prepare_items > 0,
             "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-            "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+            "timings": {
+                "prepare_ms": ingest_v2_timing_summary(prepare_ms_values),
+                "hash_ms": ingest_v2_timing_summary(prepare_hash_ms_values),
+                "extract_ms": ingest_v2_timing_summary(prepare_extract_ms_values),
+                "chunk_ms": ingest_v2_timing_summary(prepare_chunk_ms_values),
+                "prepared_serialize_ms": ingest_v2_timing_summary(prepared_serialize_ms_values),
+                "prepared_write_ms": ingest_v2_timing_summary(prepared_write_ms_values),
+                "prepared_payload_bytes": prepared_payload_bytes,
+                "status_payload_ms": round(status_payload_ms, 3),
+            },
+            "run": run_payload,
         }
     finally:
         connection.close()
@@ -33511,7 +33718,9 @@ def prepare_loose_file_item(item: dict[str, object]) -> dict[str, object]:
     prepared_item = dict(item)
     prepare_started = time.perf_counter()
     try:
+        extract_started = time.perf_counter()
         extracted_payload = extract_document(Path(item["path"]), include_attachments=True)
+        prepared_item["prepare_extract_ms"] = ingest_v2_elapsed_ms(extract_started)
         attachments = list(extracted_payload.get("attachments", []))
         extracted_payload = dict(extracted_payload)
         extracted_payload.pop("attachments", None)
@@ -33526,6 +33735,7 @@ def prepare_loose_file_item(item: dict[str, object]) -> dict[str, object]:
         prepared_item["extracted_payload"] = None
         prepared_item["attachments"] = []
         prepared_item["prepared_chunks"] = []
+        prepared_item["prepare_extract_ms"] = 0.0
         prepared_item["prepare_chunk_ms"] = 0.0
         prepared_item["prepare_error"] = f"{type(exc).__name__}: {exc}"
     prepared_item["prepare_ms"] = (time.perf_counter() - prepare_started) * 1000.0
