@@ -5235,6 +5235,7 @@ def commit_prepared_container_message(
     source_rel_path: str,
     file_type_override: str,
     scan_started_at: str,
+    before_transaction_commit=None,
 ) -> dict[str, object]:
     file_hash = (
         str(prepared_item["file_hash"])
@@ -5310,11 +5311,15 @@ def commit_prepared_container_message(
                     document_id=int(exact_duplicate_document["id"]),
                     dataset_source_id=dataset_source_id,
                 )
-                connection.commit()
-                return {
+                duplicate_result = {
                     "action": "new",
                     "current_ingestion_batch": current_ingestion_batch,
+                    "document_id": int(exact_duplicate_document["id"]),
                 }
+                if before_transaction_commit is not None:
+                    before_transaction_commit(connection, duplicate_result)
+                connection.commit()
+                return duplicate_result
             except Exception:
                 connection.rollback()
                 raise
@@ -5484,15 +5489,19 @@ def commit_prepared_container_message(
         if superseded_document_id is not None and superseded_document_id != document_id:
             refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
             refresh_document_from_occurrences(connection, superseded_document_id)
+        result = {
+            "action": "new" if existing_document_row is None else "updated",
+            "current_ingestion_batch": current_ingestion_batch,
+            "document_id": document_id,
+        }
+        if before_transaction_commit is not None:
+            before_transaction_commit(connection, result)
         connection.commit()
     except Exception:
         connection.rollback()
         raise
 
-    return {
-        "action": "new" if existing_document_row is None else "updated",
-        "current_ingestion_batch": current_ingestion_batch,
-    }
+    return result
 
 
 def ingest_container_source(

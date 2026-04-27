@@ -20063,6 +20063,7 @@ def commit_prepared_container_message(
     source_rel_path: str,
     file_type_override: str,
     scan_started_at: str,
+    before_transaction_commit=None,
 ) -> dict[str, object]:
     file_hash = (
         str(prepared_item["file_hash"])
@@ -20138,11 +20139,15 @@ def commit_prepared_container_message(
                     document_id=int(exact_duplicate_document["id"]),
                     dataset_source_id=dataset_source_id,
                 )
-                connection.commit()
-                return {
+                duplicate_result = {
                     "action": "new",
                     "current_ingestion_batch": current_ingestion_batch,
+                    "document_id": int(exact_duplicate_document["id"]),
                 }
+                if before_transaction_commit is not None:
+                    before_transaction_commit(connection, duplicate_result)
+                connection.commit()
+                return duplicate_result
             except Exception:
                 connection.rollback()
                 raise
@@ -20312,15 +20317,19 @@ def commit_prepared_container_message(
         if superseded_document_id is not None and superseded_document_id != document_id:
             refresh_source_backed_dataset_memberships_for_document(connection, superseded_document_id)
             refresh_document_from_occurrences(connection, superseded_document_id)
+        result = {
+            "action": "new" if existing_document_row is None else "updated",
+            "current_ingestion_batch": current_ingestion_batch,
+            "document_id": document_id,
+        }
+        if before_transaction_commit is not None:
+            before_transaction_commit(connection, result)
         connection.commit()
     except Exception:
         connection.rollback()
         raise
 
-    return {
-        "action": "new" if existing_document_row is None else "updated",
-        "current_ingestion_batch": current_ingestion_batch,
-    }
+    return result
 
 
 def ingest_container_source(
@@ -29637,6 +29646,7 @@ INGEST_V2_RUN_STEP_MAX_INNER_STEPS = 100
 INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES = 2 * 1024 * 1024 * 1024
 INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
 INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL = 25
+INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
 
 
 def ingest_v2_elapsed_ms(started: float) -> float:
@@ -29884,6 +29894,12 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
             cursor.setdefault("production_docs_missing_linked_text", 0)
             cursor.setdefault("production_docs_missing_linked_images", 0)
             cursor.setdefault("production_docs_missing_linked_natives", 0)
+            cursor.setdefault("current_mbox_source", None)
+            cursor.setdefault("planned_mbox_sources", [])
+            cursor.setdefault("planned_mbox_messages", 0)
+            cursor.setdefault("skipped_mbox_sources", 0)
+            cursor.setdefault("scanned_mbox_source_rel_paths", [])
+            cursor.setdefault("mbox_failures", [])
             return cursor
 
     recursive = bool(row["recursive"])
@@ -29935,6 +29951,12 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
         "production_docs_missing_linked_text": 0,
         "production_docs_missing_linked_images": 0,
         "production_docs_missing_linked_natives": 0,
+        "current_mbox_source": None,
+        "planned_mbox_sources": [],
+        "planned_mbox_messages": 0,
+        "skipped_mbox_sources": 0,
+        "scanned_mbox_source_rel_paths": [],
+        "mbox_failures": [],
         "excluded_exact_rel_paths": list(exclusions["exact_rel_paths"]),
         "excluded_dir_prefixes": list(exclusions["dir_prefixes"]),
         "special_source_counts": exclusions["counts"],
@@ -29995,6 +30017,296 @@ def ingest_v2_plan_loose_file_item(
         ),
     )
     return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_mbox_source_scan_hash(path: Path) -> str:
+    return sha256_text(f"mbox-ingest-v1:{sha256_file(path) or ''}")
+
+
+def ingest_v2_plan_mbox_message_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    source_rel_path: str,
+    message_index: int,
+    message_key: object,
+    source_item_id: str,
+    payload_hash: str,
+    source_file_size: int | None,
+    source_file_mtime: str | None,
+    source_file_hash: str,
+    scan_started_at: str,
+    commit_order: int,
+) -> bool:
+    now = utc_now()
+    rel_path = mbox_message_rel_path(source_rel_path, source_item_id)
+    payload = {
+        "source_rel_path": source_rel_path,
+        "message_index": int(message_index),
+        "message_key": message_key,
+        "source_item_id": source_item_id,
+        "payload_hash": payload_hash,
+        "source_file_size": source_file_size,
+        "source_file_mtime": source_file_mtime,
+        "source_file_hash": source_file_hash,
+        "scan_started_at": scan_started_at,
+        "planned_at": now,
+    }
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO ingest_work_items (
+          run_id, unit_type, source_kind, source_key, rel_path, commit_order, parent_order,
+          payload_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "mbox_message",
+            MBOX_SOURCE_KIND,
+            f"{source_rel_path}:{source_item_id}",
+            rel_path,
+            int(commit_order),
+            int(message_index),
+            compact_json_text(ingest_v2_json_safe_value(payload)),
+            "pending",
+            now,
+            now,
+        ),
+    )
+    return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_plan_mbox_source_finalizer_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    source_rel_path: str,
+    source_file_size: int | None,
+    source_file_mtime: str | None,
+    source_file_hash: str,
+    scan_started_at: str,
+    message_count: int,
+    skip_source: bool,
+    commit_order: int,
+) -> bool:
+    now = utc_now()
+    payload = {
+        "source_rel_path": source_rel_path,
+        "source_file_size": source_file_size,
+        "source_file_mtime": source_file_mtime,
+        "source_file_hash": source_file_hash,
+        "scan_started_at": scan_started_at,
+        "message_count": int(message_count),
+        "skip_source": bool(skip_source),
+        "planned_at": now,
+    }
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO ingest_work_items (
+          run_id, unit_type, source_kind, source_key, rel_path, commit_order,
+          payload_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "mbox_source_finalizer",
+            MBOX_SOURCE_KIND,
+            f"{source_rel_path}:__finalize__",
+            source_rel_path,
+            int(commit_order),
+            compact_json_text(ingest_v2_json_safe_value(payload)),
+            "pending",
+            now,
+            now,
+        ),
+    )
+    return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_existing_mbox_message_count(
+    connection: sqlite3.Connection,
+    *,
+    source_rel_path: str,
+) -> int:
+    source_row = get_container_source_row(connection, MBOX_SOURCE_KIND, source_rel_path)
+    if source_row is not None and int(source_row["message_count"] or 0) > 0:
+        return int(source_row["message_count"] or 0)
+    return len(
+        container_root_occurrence_rows_for_source(
+            connection,
+            source_kind=MBOX_SOURCE_KIND,
+            source_rel_path=source_rel_path,
+        )
+    )
+
+
+def ingest_v2_begin_mbox_source_plan(
+    connection: sqlite3.Connection,
+    root: Path,
+    *,
+    run_id: str,
+    rel_path: str,
+    commit_order: int,
+) -> tuple[dict[str, object] | None, int, bool]:
+    path = ingest_v2_cursor_path(root, rel_path)
+    source_file_size = file_size_bytes(path)
+    source_file_mtime = file_mtime_timestamp(path)
+    source_file_hash = ingest_v2_mbox_source_scan_hash(path)
+    existing_source = get_container_source_row(connection, MBOX_SOURCE_KIND, rel_path)
+    scan_started_at = next_monotonic_utc_timestamp(
+        [
+            existing_source["last_scan_started_at"] if existing_source is not None else None,
+            existing_source["last_scan_completed_at"] if existing_source is not None else None,
+        ]
+    )
+    if (
+        existing_source is not None
+        and container_source_scan_completed(existing_source)
+        and not container_documents_missing_text_revisions(
+            connection,
+            source_kind=MBOX_SOURCE_KIND,
+            source_rel_path=rel_path,
+        )
+        and not container_email_documents_missing_threading(
+            connection,
+            source_kind=MBOX_SOURCE_KIND,
+            source_rel_path=rel_path,
+        )
+        and existing_source["file_size"] == source_file_size
+        and existing_source["file_hash"] == source_file_hash
+        and (existing_source["file_mtime"] == source_file_mtime or existing_source["file_hash"])
+    ):
+        message_count = ingest_v2_existing_mbox_message_count(connection, source_rel_path=rel_path)
+        ingest_v2_plan_mbox_source_finalizer_item(
+            connection,
+            run_id=run_id,
+            source_rel_path=rel_path,
+            source_file_size=source_file_size,
+            source_file_mtime=source_file_mtime,
+            source_file_hash=source_file_hash,
+            scan_started_at=scan_started_at,
+            message_count=message_count,
+            skip_source=True,
+            commit_order=commit_order,
+        )
+        return None, commit_order + 1, True
+    return (
+        {
+            "source_rel_path": rel_path,
+            "source_file_size": source_file_size,
+            "source_file_mtime": source_file_mtime,
+            "source_file_hash": source_file_hash,
+            "scan_started_at": scan_started_at,
+            "next_message_index": 0,
+            "planned_message_count": 0,
+            "duplicate_source_item_counts": {},
+            "next_commit_order": int(commit_order),
+        },
+        commit_order,
+        False,
+    )
+
+
+def ingest_v2_plan_current_mbox_source(
+    connection: sqlite3.Connection,
+    root: Path,
+    *,
+    run_id: str,
+    current_mbox_source: dict[str, object],
+    deadline: float,
+) -> tuple[dict[str, object] | None, int, int, bool]:
+    source_rel_path = str(current_mbox_source["source_rel_path"])
+    path = ingest_v2_cursor_path(root, source_rel_path)
+    next_message_index = int(current_mbox_source.get("next_message_index") or 0)
+    next_commit_order = int(current_mbox_source.get("next_commit_order") or 1)
+    planned_this_step = 0
+    duplicate_counts = {
+        str(key): int(value)
+        for key, value in dict(current_mbox_source.get("duplicate_source_item_counts") or {}).items()
+    }
+    archive = mailbox.mbox(str(path), factory=mailbox.mboxMessage, create=False)
+    reached_end = True
+    try:
+        for message_index, (message_key, raw_message) in enumerate(archive.iteritems()):
+            if message_index < next_message_index:
+                continue
+            if (
+                planned_this_step >= INGEST_V2_MBOX_PLAN_BATCH_SIZE
+                or ingest_v2_deadline_remaining_seconds(deadline) < 1.0
+            ):
+                reached_end = False
+                break
+            payload_bytes = raw_message.as_bytes(policy=policy.default, unixfrom=False)
+            payload_hash = sha256_bytes(payload_bytes)
+            parsed_message = BytesParser(policy=policy.default).parsebytes(payload_bytes)
+            explicit_source_item_id = normalize_whitespace(
+                str(parsed_message.get("Message-ID") or parsed_message.get("Message-Id") or "")
+            ) or None
+            base_source_item_id = explicit_source_item_id or f"mbox-hash:{payload_hash}"
+            duplicate_counts[base_source_item_id] = int(duplicate_counts.get(base_source_item_id) or 0) + 1
+            occurrence = int(duplicate_counts[base_source_item_id])
+            source_item_id = base_source_item_id if occurrence == 1 else f"{base_source_item_id}#{occurrence}"
+            if ingest_v2_plan_mbox_message_item(
+                connection,
+                run_id=run_id,
+                source_rel_path=source_rel_path,
+                message_index=message_index,
+                message_key=message_key,
+                source_item_id=source_item_id,
+                payload_hash=payload_hash,
+                source_file_size=(
+                    int(current_mbox_source["source_file_size"])
+                    if current_mbox_source.get("source_file_size") is not None
+                    else None
+                ),
+                source_file_mtime=(
+                    str(current_mbox_source["source_file_mtime"])
+                    if current_mbox_source.get("source_file_mtime") is not None
+                    else None
+                ),
+                source_file_hash=str(current_mbox_source["source_file_hash"]),
+                scan_started_at=str(current_mbox_source["scan_started_at"]),
+                commit_order=next_commit_order,
+            ):
+                planned_this_step += 1
+            next_commit_order += 1
+            next_message_index = message_index + 1
+    finally:
+        try:
+            archive.close()
+        except Exception:
+            pass
+
+    current_mbox_source["next_message_index"] = next_message_index
+    current_mbox_source["next_commit_order"] = next_commit_order
+    current_mbox_source["planned_message_count"] = (
+        int(current_mbox_source.get("planned_message_count") or 0) + planned_this_step
+    )
+    current_mbox_source["duplicate_source_item_counts"] = duplicate_counts
+    if not reached_end:
+        return current_mbox_source, next_commit_order, planned_this_step, False
+
+    ingest_v2_plan_mbox_source_finalizer_item(
+        connection,
+        run_id=run_id,
+        source_rel_path=source_rel_path,
+        source_file_size=(
+            int(current_mbox_source["source_file_size"])
+            if current_mbox_source.get("source_file_size") is not None
+            else None
+        ),
+        source_file_mtime=(
+            str(current_mbox_source["source_file_mtime"])
+            if current_mbox_source.get("source_file_mtime") is not None
+            else None
+        ),
+        source_file_hash=str(current_mbox_source["source_file_hash"]),
+        scan_started_at=str(current_mbox_source["scan_started_at"]),
+        message_count=int(current_mbox_source.get("planned_message_count") or 0),
+        skip_source=False,
+        commit_order=next_commit_order,
+    )
+    return None, next_commit_order + 1, planned_this_step, True
 
 
 def ingest_v2_production_signature_payload(root: Path, signature: dict[str, object]) -> dict[str, object]:
@@ -30261,7 +30573,7 @@ def ingest_v2_claim_prepare_items(
             SELECT *
             FROM ingest_work_items
             WHERE run_id = ?
-              AND unit_type IN ('loose_file', 'production_row')
+              AND unit_type IN ('loose_file', 'production_row', 'mbox_message', 'mbox_source_finalizer')
               AND status = 'pending'
             ORDER BY commit_order ASC, id ASC
             LIMIT ?
@@ -30467,6 +30779,126 @@ def ingest_v2_prepare_production_row_item(
         return None, source_fingerprint, "Not enough budget remaining to start prepare."
     prepared_item = prepare_production_row_plan(root, payload_dict)
     prepared_item["prepare_hash_ms"] = 0.0
+    return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_mbox_message_from_payload(root: Path, payload: dict[str, object]) -> dict[str, object]:
+    source_rel_path = str(payload["source_rel_path"])
+    path = ingest_v2_cursor_path(root, source_rel_path)
+    message_key = payload.get("message_key")
+    message_index = int(payload.get("message_index") or 0)
+    source_item_id = str(payload["source_item_id"])
+    archive = mailbox.mbox(str(path), factory=mailbox.mboxMessage, create=False)
+    try:
+        raw_message = None
+        if message_key is not None:
+            try:
+                raw_message = archive.get_message(message_key)
+            except Exception:
+                try:
+                    raw_message = archive.get_message(int(message_key))
+                except Exception:
+                    raw_message = None
+        if raw_message is None:
+            for index, candidate in enumerate(archive):
+                if index == message_index:
+                    raw_message = candidate
+                    break
+        if raw_message is None:
+            raise RetrieverError(f"MBOX message {message_index} is missing from {source_rel_path}.")
+        payload_bytes = raw_message.as_bytes(policy=policy.default, unixfrom=False)
+        payload_hash = sha256_bytes(payload_bytes)
+        parsed_message = BytesParser(policy=policy.default).parsebytes(payload_bytes)
+        return {
+            "source_item_id": source_item_id,
+            "payload_hash": payload_hash,
+            "parsed_message": parsed_message,
+        }
+    finally:
+        try:
+            archive.close()
+        except Exception:
+            pass
+
+
+def ingest_v2_prepare_mbox_message_item(
+    root: Path,
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    source_rel_path = str(payload_dict.get("source_rel_path") or "")
+    path = ingest_v2_cursor_path(root, source_rel_path)
+    source_fingerprint = {
+        "source_rel_path": source_rel_path,
+        "message_index": payload_dict.get("message_index"),
+        "message_key": payload_dict.get("message_key"),
+        "source_item_id": payload_dict.get("source_item_id"),
+        "size": file_size_bytes(path),
+        "mtime": file_mtime_timestamp(path),
+        "hash": payload_dict.get("source_file_hash"),
+    }
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return None, source_fingerprint, "Not enough budget remaining to start prepare."
+    if (
+        payload_dict.get("source_file_size") is not None
+        and int(payload_dict.get("source_file_size") or 0) != int(source_fingerprint["size"] or 0)
+    ):
+        return (
+            {
+                "prepare_error": f"MBOX source changed after planning: {source_rel_path}",
+                "prepare_ms": 0.0,
+                "prepare_hash_ms": 0.0,
+                "prepare_extract_ms": 0.0,
+                "prepare_chunk_ms": 0.0,
+                "source_rel_path": source_rel_path,
+                "source_item_id": str(payload_dict.get("source_item_id") or ""),
+            },
+            source_fingerprint,
+            None,
+        )
+    prepare_started = time.perf_counter()
+    raw_message = ingest_v2_mbox_message_from_payload(root, payload_dict)
+    prepared_item = prepare_container_message_item(
+        source_rel_path,
+        raw_message,
+        normalize_mbox_message,
+    )
+    prepared_item["source_kind"] = MBOX_SOURCE_KIND
+    prepared_item["source_rel_path"] = source_rel_path
+    prepared_item["scan_started_at"] = str(payload_dict["scan_started_at"])
+    prepared_item["source_file_size"] = payload_dict.get("source_file_size")
+    prepared_item["source_file_mtime"] = payload_dict.get("source_file_mtime")
+    prepared_item["source_file_hash"] = payload_dict.get("source_file_hash")
+    prepared_item["prepare_hash_ms"] = 0.0
+    prepared_item["prepare_extract_ms"] = max(0.0, float(prepared_item.get("prepare_ms") or 0.0) - float(prepared_item.get("prepare_chunk_ms") or 0.0))
+    prepared_item["prepare_total_step_ms"] = ingest_v2_elapsed_ms(prepare_started)
+    return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_prepare_mbox_source_finalizer_item(
+    work_item_row: sqlite3.Row,
+) -> tuple[dict[str, object], dict[str, object], None]:
+    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    prepared_item = {
+        **payload_dict,
+        "source_kind": MBOX_SOURCE_KIND,
+        "prepare_ms": 0.0,
+        "prepare_hash_ms": 0.0,
+        "prepare_extract_ms": 0.0,
+        "prepare_chunk_ms": 0.0,
+        "prepare_error": None,
+    }
+    source_fingerprint = {
+        "source_rel_path": payload_dict.get("source_rel_path"),
+        "size": payload_dict.get("source_file_size"),
+        "mtime": payload_dict.get("source_file_mtime"),
+        "hash": payload_dict.get("source_file_hash"),
+        "message_count": payload_dict.get("message_count"),
+    }
     return prepared_item, source_fingerprint, None
 
 
@@ -30867,6 +31299,8 @@ def ingest_v2_load_commit_cursor(connection: sqlite3.Connection, *, run_id: str)
             cursor.setdefault("actions", {})
             cursor.setdefault("freshness_fallbacks", 0)
             cursor.setdefault("production_stats", {})
+            cursor.setdefault("mbox_stats", {})
+            cursor.setdefault("container_current_ingestion_batches", {})
             return cursor
     return {
         "schema_version": 1,
@@ -30874,6 +31308,8 @@ def ingest_v2_load_commit_cursor(connection: sqlite3.Connection, *, run_id: str)
         "actions": {},
         "freshness_fallbacks": 0,
         "production_stats": {},
+        "mbox_stats": {},
+        "container_current_ingestion_batches": {},
     }
 
 
@@ -30889,6 +31325,74 @@ def ingest_v2_run_loose_rel_paths(connection: sqlite3.Connection, *, run_id: str
         (run_id,),
     ).fetchall()
     return {str(row["rel_path"]) for row in rows}
+
+
+def ingest_v2_run_mbox_source_rel_paths(connection: sqlite3.Connection, *, run_id: str) -> set[str]:
+    cursor_row = connection.execute(
+        """
+        SELECT cursor_json
+        FROM ingest_phase_cursors
+        WHERE run_id = ?
+          AND phase = 'planning'
+          AND cursor_key = 'loose_file_scan'
+        """,
+        (run_id,),
+    ).fetchone()
+    source_rel_paths: set[str] = set()
+    if cursor_row is not None:
+        cursor = decode_json_text(cursor_row["cursor_json"], default={}) or {}
+        if isinstance(cursor, dict):
+            source_rel_paths.update(
+                str(rel_path)
+                for rel_path in list(cursor.get("scanned_mbox_source_rel_paths") or [])
+                if normalize_whitespace(str(rel_path or ""))
+            )
+    rows = connection.execute(
+        """
+        SELECT rel_path
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND unit_type = 'mbox_source_finalizer'
+          AND rel_path IS NOT NULL
+        """,
+        (run_id,),
+    ).fetchall()
+    source_rel_paths.update(str(row["rel_path"]) for row in rows)
+    return source_rel_paths
+
+
+def ingest_v2_redelete_retired_mbox_documents(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+) -> int:
+    source_rel_paths = sorted(ingest_v2_run_mbox_source_rel_paths(connection, run_id=run_id))
+    if not source_rel_paths:
+        return 0
+    placeholders = ", ".join("?" for _ in source_rel_paths)
+    root_occurrence_rows = connection.execute(
+        f"""
+        SELECT id
+        FROM document_occurrences
+        WHERE parent_occurrence_id IS NULL
+          AND source_kind = ?
+          AND source_rel_path IN ({placeholders})
+          AND lifecycle_status = 'deleted'
+        ORDER BY id ASC
+        """,
+        [MBOX_SOURCE_KIND, *source_rel_paths],
+    ).fetchall()
+    root_occurrence_ids = [int(row["id"]) for row in root_occurrence_rows]
+    if not root_occurrence_ids:
+        return 0
+    document_ids = container_document_ids_for_root_occurrence_ids(connection, root_occurrence_ids)
+    return delete_documents_with_only_deleted_occurrences(
+        connection,
+        paths,
+        document_ids,
+        deleted_at=utc_now(),
+    )
 
 
 def ingest_v2_load_loose_file_commit_state(
@@ -31257,6 +31761,283 @@ def ingest_v2_commit_production_work_item_hook(
     )
 
 
+def ingest_v2_commit_mbox_work_item_hook(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    result: dict[str, object],
+) -> None:
+    now = utc_now()
+    action = str(result.get("action") or "")
+    source_rel_path = str(result.get("source_rel_path") or "")
+    affected_document_ids = [
+        int(result["document_id"])
+    ] if result.get("document_id") is not None else []
+    current_batch = result.get("current_ingestion_batch")
+    if source_rel_path and current_batch is not None:
+        current_batches = cursor.setdefault("container_current_ingestion_batches", {})
+        if isinstance(current_batches, dict):
+            current_batches[source_rel_path] = int(current_batch)
+    mbox_stats = cursor.setdefault("mbox_stats", {})
+    if isinstance(mbox_stats, dict):
+        if action == "new":
+            mbox_stats["mbox_messages_created"] = int(mbox_stats.get("mbox_messages_created") or 0) + 1
+        elif action == "updated":
+            mbox_stats["mbox_messages_updated"] = int(mbox_stats.get("mbox_messages_updated") or 0) + 1
+        for key in ("mbox_sources_skipped", "mbox_sources_finalized", "mbox_messages_deleted"):
+            if result.get(key) is not None:
+                mbox_stats[key] = int(mbox_stats.get(key) or 0) + int(result.get(key) or 0)
+    ingest_v2_save_phase_cursor(
+        connection,
+        run_id=run_id,
+        phase="committing",
+        cursor_key="loose_file_commit",
+        cursor=cursor,
+        status="pending",
+    )
+    update_cursor = connection.execute(
+        """
+        UPDATE ingest_work_items
+        SET status = 'committed',
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            affected_document_ids_json = ?,
+            affected_entity_ids_json = ?,
+            artifact_manifest_json = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE run_id = ?
+          AND id = ?
+          AND status = 'committing'
+          AND lease_owner = ?
+        """,
+        (
+            compact_json_text(affected_document_ids),
+            compact_json_text([]),
+            compact_json_text(
+                {
+                    "commit_action": action,
+                    "document_id": result.get("document_id"),
+                    "source_kind": MBOX_SOURCE_KIND,
+                    "source_rel_path": source_rel_path,
+                    "source_item_id": result.get("source_item_id"),
+                    "mbox_messages_deleted": int(result.get("mbox_messages_deleted") or 0),
+                }
+            ),
+            now,
+            run_id,
+            work_item_id,
+            writer_id,
+        ),
+    )
+    if int(update_cursor.rowcount or 0) != 1:
+        raise RetrieverError(f"Could not mark V2 ingest MBOX work item {work_item_id} committed.")
+    connection.execute(
+        """
+        UPDATE ingest_runs
+        SET committer_heartbeat_at = ?,
+            last_heartbeat_at = ?
+        WHERE run_id = ?
+          AND committer_lease_owner = ?
+        """,
+        (now, now, run_id, writer_id),
+    )
+
+
+def ingest_v2_ensure_mbox_commit_context(
+    connection: sqlite3.Connection,
+    root: Path,
+    *,
+    prepared_item: dict[str, object],
+    cursor: dict[str, object],
+    contexts: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    source_rel_path = str(prepared_item["source_rel_path"])
+    if source_rel_path in contexts:
+        return contexts[source_rel_path]
+    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+        connection,
+        source_kind=MBOX_SOURCE_KIND,
+        source_locator=source_rel_path,
+        dataset_name=mbox_dataset_name(source_rel_path),
+    )
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN")
+    try:
+        write_container_source_scan_started(
+            connection,
+            dataset_id=dataset_id,
+            source_kind=MBOX_SOURCE_KIND,
+            source_rel_path=source_rel_path,
+            file_size=(
+                int(prepared_item["source_file_size"])
+                if prepared_item.get("source_file_size") is not None
+                else None
+            ),
+            file_mtime=(
+                str(prepared_item["source_file_mtime"])
+                if prepared_item.get("source_file_mtime") is not None
+                else None
+            ),
+            file_hash=str(prepared_item.get("source_file_hash") or ""),
+            scan_started_at=str(prepared_item["scan_started_at"]),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    current_batches = cursor.setdefault("container_current_ingestion_batches", {})
+    current_batch = None
+    if isinstance(current_batches, dict) and current_batches.get(source_rel_path) is not None:
+        current_batch = int(current_batches[source_rel_path])
+    context = {
+        "dataset_id": int(dataset_id),
+        "dataset_source_id": int(dataset_source_id) if dataset_source_id is not None else None,
+        "current_ingestion_batch": current_batch,
+        "existing_entries_by_source_item": existing_container_entries_by_source_item(
+            connection,
+            source_kind=MBOX_SOURCE_KIND,
+            source_rel_path=source_rel_path,
+        ),
+    }
+    contexts[source_rel_path] = context
+    return context
+
+
+def ingest_v2_mbox_failed_message_count(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    source_rel_path: str,
+) -> int:
+    prefix = f"{source_rel_path}:"
+    row = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND unit_type = 'mbox_message'
+          AND status = 'failed'
+          AND SUBSTR(COALESCE(source_key, ''), 1, ?) = ?
+        """,
+        (run_id, len(prefix), prefix),
+    ).fetchone()
+    return int(row[0] or 0) if row is not None else 0
+
+
+def ingest_v2_commit_mbox_source_finalizer(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    prepared_item: dict[str, object],
+) -> dict[str, object]:
+    source_rel_path = str(prepared_item["source_rel_path"])
+    failed_messages = ingest_v2_mbox_failed_message_count(
+        connection,
+        run_id=run_id,
+        source_rel_path=source_rel_path,
+    )
+    if failed_messages:
+        raise RetrieverError(
+            f"Cannot finalize MBOX source {source_rel_path}: {failed_messages} message work item(s) failed."
+        )
+    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+        connection,
+        source_kind=MBOX_SOURCE_KIND,
+        source_locator=source_rel_path,
+        dataset_name=mbox_dataset_name(source_rel_path),
+    )
+    if connection.in_transaction:
+        connection.commit()
+    source_file_size = (
+        int(prepared_item["source_file_size"])
+        if prepared_item.get("source_file_size") is not None
+        else None
+    )
+    source_file_mtime = (
+        str(prepared_item["source_file_mtime"])
+        if prepared_item.get("source_file_mtime") is not None
+        else None
+    )
+    source_file_hash = str(prepared_item.get("source_file_hash") or "")
+    scan_started_at = str(prepared_item["scan_started_at"])
+    message_count = int(prepared_item.get("message_count") or 0)
+    skip_source = bool(prepared_item.get("skip_source"))
+    connection.execute("BEGIN")
+    try:
+        if skip_source:
+            mark_container_source_documents_active(
+                connection,
+                source_kind=MBOX_SOURCE_KIND,
+                source_rel_path=source_rel_path,
+                seen_at=scan_started_at,
+            )
+            assign_dataset_to_container_documents(
+                connection,
+                source_kind=MBOX_SOURCE_KIND,
+                source_rel_path=source_rel_path,
+                dataset_id=dataset_id,
+                dataset_source_id=dataset_source_id,
+            )
+            messages_deleted = 0
+            action = "skipped"
+            source_stats = {"mbox_sources_skipped": 1}
+            scan_completed_at = scan_started_at
+        else:
+            messages_deleted = retire_unseen_container_messages(
+                connection,
+                paths,
+                source_kind=MBOX_SOURCE_KIND,
+                source_rel_path=source_rel_path,
+                scan_started_at=scan_started_at,
+            )
+            action = "finalized"
+            source_stats = {"mbox_sources_finalized": 1}
+            scan_completed_at = next_monotonic_utc_timestamp([scan_started_at])
+        write_container_source_scan_completed(
+            connection,
+            dataset_id=dataset_id,
+            source_kind=MBOX_SOURCE_KIND,
+            source_rel_path=source_rel_path,
+            file_size=source_file_size,
+            file_mtime=source_file_mtime,
+            file_hash=source_file_hash,
+            message_count=message_count,
+            scan_started_at=scan_started_at,
+            scan_completed_at=scan_completed_at,
+        )
+        result = {
+            "action": action,
+            "source_kind": MBOX_SOURCE_KIND,
+            "source_rel_path": source_rel_path,
+            "current_ingestion_batch": None,
+            "document_id": None,
+            "mbox_messages_deleted": messages_deleted,
+            **source_stats,
+        }
+        ingest_v2_commit_mbox_work_item_hook(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            writer_id=writer_id,
+            cursor=cursor,
+            result=result,
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return result
+
+
 def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_id: str) -> bool:
     row = require_ingest_v2_run_row(connection, run_id)
     if str(row["phase"]) != "committing" or row["cancel_requested_at"] is not None:
@@ -31456,6 +32237,9 @@ def ingest_v2_load_finalize_cursor(connection: sqlite3.Connection, *, run_id: st
             cursor.setdefault("production_finalized_roots", [])
             cursor.setdefault("production_stats", {})
             cursor.setdefault("filesystem_missing", 0)
+            cursor.setdefault("mbox_sources_missing", 0)
+            cursor.setdefault("mbox_documents_missing", 0)
+            cursor.setdefault("mbox_documents_redeleted", 0)
             cursor.setdefault("conversation_assignment", {})
             cursor.setdefault("conversation_previews_refreshed", 0)
             cursor.setdefault("pruned_unused_filesystem_dataset", False)
@@ -31469,6 +32253,9 @@ def ingest_v2_load_finalize_cursor(connection: sqlite3.Connection, *, run_id: st
         "production_finalized_roots": [],
         "production_stats": {},
         "filesystem_missing": 0,
+        "mbox_sources_missing": 0,
+        "mbox_documents_missing": 0,
+        "mbox_documents_redeleted": 0,
         "conversation_assignment": {},
         "conversation_previews_refreshed": 0,
         "pruned_unused_filesystem_dataset": False,
@@ -32035,6 +32822,61 @@ def ingest_v2_plan_step(
             scan_scope = ingest_v2_scan_scope_from_run(root, row)
 
             while time.perf_counter() < deadline:
+                current_mbox_source = cursor.get("current_mbox_source")
+                if isinstance(current_mbox_source, dict):
+                    try:
+                        updated_mbox_source, next_commit_order, planned_messages, source_complete = (
+                            ingest_v2_plan_current_mbox_source(
+                                connection,
+                                root,
+                                run_id=run_id,
+                                current_mbox_source=current_mbox_source,
+                                deadline=deadline,
+                            )
+                        )
+                    except Exception as exc:
+                        rollback_open_transaction(connection)
+                        failures = list(cursor.get("mbox_failures") or [])
+                        failures.append(
+                            {
+                                "source_rel_path": str(current_mbox_source.get("source_rel_path") or ""),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        cursor["mbox_failures"] = failures
+                        cursor["current_mbox_source"] = None
+                        cursor["next_commit_order"] = int(current_mbox_source.get("next_commit_order") or cursor.get("next_commit_order") or 1)
+                        cursor_save_ms_values.append(
+                            ingest_v2_save_planning_cursor_heartbeat(
+                                connection,
+                                run_id=run_id,
+                                cursor=cursor,
+                                status="pending",
+                            )
+                        )
+                        continue
+                    cursor["next_commit_order"] = int(next_commit_order)
+                    cursor["planned_mbox_messages"] = int(cursor.get("planned_mbox_messages") or 0) + int(planned_messages)
+                    cursor["current_mbox_source"] = updated_mbox_source
+                    if source_complete:
+                        source_rel_path = str(current_mbox_source.get("source_rel_path") or "")
+                        planned_sources = list(cursor.get("planned_mbox_sources") or [])
+                        if source_rel_path and source_rel_path not in planned_sources:
+                            planned_sources.append(source_rel_path)
+                            cursor["planned_mbox_sources"] = planned_sources
+                    if source_complete or ingest_v2_deadline_remaining_seconds(deadline) < 1.0:
+                        cursor_save_ms_values.append(
+                            ingest_v2_save_planning_cursor_heartbeat(
+                                connection,
+                                run_id=run_id,
+                                cursor=cursor,
+                                status="pending",
+                            )
+                        )
+                    if not source_complete:
+                        break
+                    continue
+
                 pending_production_rel_roots = list(cursor.get("pending_production_rel_roots") or [])
                 if pending_production_rel_roots:
                     production_rel_root = str(pending_production_rel_roots.pop(0))
@@ -32149,6 +32991,29 @@ def ingest_v2_plan_step(
                             cursor["skipped_extensionless_files"] = int(cursor.get("skipped_extensionless_files") or 0) + 1
                         elif allowed_types is not None and file_type not in allowed_types:
                             cursor["skipped_filtered_files"] = int(cursor.get("skipped_filtered_files") or 0) + 1
+                        elif file_type == MBOX_SOURCE_KIND:
+                            scanned_mbox_paths = list(cursor.get("scanned_mbox_source_rel_paths") or [])
+                            if rel_path not in scanned_mbox_paths:
+                                scanned_mbox_paths.append(rel_path)
+                                cursor["scanned_mbox_source_rel_paths"] = scanned_mbox_paths
+                            insert_started = time.perf_counter()
+                            current_mbox_source, next_commit_order, skipped_source = ingest_v2_begin_mbox_source_plan(
+                                connection,
+                                root,
+                                run_id=run_id,
+                                rel_path=rel_path,
+                                commit_order=int(cursor.get("next_commit_order") or 1),
+                            )
+                            work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
+                            cursor["next_commit_order"] = int(next_commit_order)
+                            if skipped_source:
+                                cursor["skipped_mbox_sources"] = int(cursor.get("skipped_mbox_sources") or 0) + 1
+                                planned_sources = list(cursor.get("planned_mbox_sources") or [])
+                                if rel_path not in planned_sources:
+                                    planned_sources.append(rel_path)
+                                    cursor["planned_mbox_sources"] = planned_sources
+                            else:
+                                cursor["current_mbox_source"] = current_mbox_source
                         elif file_type in CONTAINER_SOURCE_FILE_TYPES:
                             cursor["skipped_container_files"] = int(cursor.get("skipped_container_files") or 0) + 1
                         else:
@@ -32187,6 +33052,7 @@ def ingest_v2_plan_step(
             planning_complete = (
                 not list(cursor.get("pending_production_rel_roots") or [])
                 and not list(cursor.get("pending_paths") or [])
+                and not isinstance(cursor.get("current_mbox_source"), dict)
             )
             if not planning_complete and unsaved_plan_steps:
                 cursor_save_ms_values.append(
@@ -32263,6 +33129,16 @@ def ingest_v2_plan_step(
                     "planned_loose_files": int(cursor.get("planned_loose_files") or 0),
                     "planned_production_roots": len(list(cursor.get("planned_production_roots") or [])),
                     "planned_production_rows": int(cursor.get("planned_production_rows") or 0),
+                    "current_mbox_source": (
+                        str(dict(cursor.get("current_mbox_source") or {}).get("source_rel_path") or "")
+                        if isinstance(cursor.get("current_mbox_source"), dict)
+                        else None
+                    ),
+                    "planned_mbox_sources": list(cursor.get("planned_mbox_sources") or []),
+                    "planned_mbox_messages": int(cursor.get("planned_mbox_messages") or 0),
+                    "skipped_mbox_sources": int(cursor.get("skipped_mbox_sources") or 0),
+                    "scanned_mbox_source_rel_paths": list(cursor.get("scanned_mbox_source_rel_paths") or []),
+                    "mbox_failures": list(cursor.get("mbox_failures") or []),
                     "skipped_production_roots": list(cursor.get("skipped_production_roots") or []),
                     "production_failures": list(cursor.get("production_failures") or []),
                     "production_docs_missing_linked_text": int(cursor.get("production_docs_missing_linked_text") or 0),
@@ -32381,6 +33257,18 @@ def ingest_v2_prepare_step(
                     deadline=deadline,
                 )
                 payload_kind = "production_row"
+            elif unit_type == "mbox_message":
+                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_mbox_message_item(
+                    root,
+                    work_item_row,
+                    deadline=deadline,
+                )
+                payload_kind = "mbox_message"
+            elif unit_type == "mbox_source_finalizer":
+                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_mbox_source_finalizer_item(
+                    work_item_row,
+                )
+                payload_kind = "mbox_source_finalizer"
             else:
                 prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_loose_file_item(
                     root,
@@ -32576,6 +33464,7 @@ def ingest_v2_commit_step(
         cursor = ingest_v2_load_commit_cursor(connection, run_id=run_id)
         filesystem_dataset_id: int | None = None
         filesystem_dataset_source_id: int | None = None
+        mbox_contexts: dict[str, dict[str, object]] = {}
 
         def ensure_filesystem_dataset() -> tuple[int, int]:
             nonlocal filesystem_dataset_id, filesystem_dataset_source_id
@@ -32638,6 +33527,97 @@ def ingest_v2_commit_step(
                             cursor=cursor,
                             result=result,
                         ),
+                    )
+                elif payload_kind == "mbox_message" or str(claimed_row["unit_type"] or "") == "mbox_message":
+                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
+                    if prepare_error:
+                        raise RetrieverError(prepare_error)
+                    if prepared_item.get("skip"):
+                        connection.execute("BEGIN")
+                        try:
+                            commit_result = {
+                                "action": "skipped",
+                                "source_kind": MBOX_SOURCE_KIND,
+                                "source_rel_path": str(prepared_item.get("source_rel_path") or ""),
+                                "source_item_id": str(prepared_item.get("source_item_id") or ""),
+                                "current_ingestion_batch": None,
+                                "document_id": None,
+                            }
+                            ingest_v2_commit_mbox_work_item_hook(
+                                connection,
+                                run_id=run_id,
+                                work_item_id=work_item_id,
+                                writer_id=writer_id,
+                                cursor=cursor,
+                                result=commit_result,
+                            )
+                            connection.commit()
+                        except Exception:
+                            connection.rollback()
+                            raise
+                    else:
+                        source_rel_path = str(prepared_item["source_rel_path"])
+                        context = ingest_v2_ensure_mbox_commit_context(
+                            connection,
+                            root,
+                            prepared_item=prepared_item,
+                            cursor=cursor,
+                            contexts=mbox_contexts,
+                        )
+                        existing_entry = dict(
+                            dict(context.get("existing_entries_by_source_item") or {}).get(
+                                str(prepared_item["source_item_id"])
+                            )
+                            or {}
+                        )
+                        commit_result = commit_prepared_container_message(
+                            connection,
+                            paths,
+                            prepared_item,
+                            existing_entry.get("document_row"),
+                            existing_entry.get("occurrence_row"),
+                            current_ingestion_batch=(
+                                int(context["current_ingestion_batch"])
+                                if context.get("current_ingestion_batch") is not None
+                                else None
+                            ),
+                            dataset_id=int(context["dataset_id"]),
+                            dataset_source_id=(
+                                int(context["dataset_source_id"])
+                                if context.get("dataset_source_id") is not None
+                                else None
+                            ),
+                            source_kind=MBOX_SOURCE_KIND,
+                            source_rel_path=source_rel_path,
+                            file_type_override=MBOX_SOURCE_KIND,
+                            scan_started_at=str(prepared_item["scan_started_at"]),
+                            before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_mbox_work_item_hook(
+                                commit_connection,
+                                run_id=run_id,
+                                work_item_id=work_item_id,
+                                writer_id=writer_id,
+                                cursor=cursor,
+                                result={
+                                    **result,
+                                    "source_kind": MBOX_SOURCE_KIND,
+                                    "source_rel_path": source_rel_path,
+                                    "source_item_id": str(prepared_item["source_item_id"]),
+                                },
+                            ),
+                        )
+                        context["current_ingestion_batch"] = commit_result.get("current_ingestion_batch")
+                elif payload_kind == "mbox_source_finalizer" or str(claimed_row["unit_type"] or "") == "mbox_source_finalizer":
+                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
+                    if prepare_error:
+                        raise RetrieverError(prepare_error)
+                    commit_result = ingest_v2_commit_mbox_source_finalizer(
+                        connection,
+                        paths,
+                        run_id=run_id,
+                        work_item_id=work_item_id,
+                        writer_id=writer_id,
+                        cursor=cursor,
+                        prepared_item=prepared_item,
                     )
                 else:
                     commit_result = commit_prepared_loose_file(
@@ -32845,7 +33825,15 @@ def ingest_v2_finalize_step(
             scanned_rel_paths = ingest_v2_run_loose_rel_paths(connection, run_id=run_id)
             scan_scope = ingest_v2_scan_scope_from_run(root, row)
             filesystem_missing = mark_missing_documents(connection, scanned_rel_paths, scan_scope=scan_scope)
+            scanned_mbox_source_rel_paths = ingest_v2_run_mbox_source_rel_paths(connection, run_id=run_id)
+            mbox_sources_missing, mbox_documents_missing = mark_missing_mbox_documents(
+                connection,
+                scanned_mbox_source_rel_paths,
+                scan_scope=scan_scope,
+            )
             cursor["filesystem_missing"] = int(filesystem_missing)
+            cursor["mbox_sources_missing"] = int(mbox_sources_missing)
+            cursor["mbox_documents_missing"] = int(mbox_documents_missing)
             cursor["stage"] = "conversations"
             connection.execute("BEGIN")
             try:
@@ -32865,11 +33853,17 @@ def ingest_v2_finalize_step(
                     connection,
                     paths,
                 )
+                mbox_documents_redeleted = ingest_v2_redelete_retired_mbox_documents(
+                    connection,
+                    paths,
+                    run_id=run_id,
+                )
                 cursor["conversation_assignment"] = {
                     key: int(value)
                     for key, value in dict(conversation_assignment).items()
                 }
                 cursor["conversation_previews_refreshed"] = int(previews_refreshed)
+                cursor["mbox_documents_redeleted"] = int(mbox_documents_redeleted)
                 if preview_refresh_error:
                     cursor["conversation_preview_refresh_error"] = preview_refresh_error
                 cursor["stage"] = "prune"
