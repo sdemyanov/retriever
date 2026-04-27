@@ -5642,6 +5642,7 @@ def ingest_pst_source(
         enriched["extracted"] = apply_pst_export_message_metadata(
             dict(normalized["extracted"]),
             message_metadata=message_metadata,
+            identifier_scope=source_rel_path_for_message,
         )
         enriched["file_hash"] = pst_export_enriched_message_file_hash(
             normalized.get("file_hash"),

@@ -37,6 +37,37 @@ OCCURRENCE_FILTER_FIELDS = {
     "updated_at",
 }
 
+ENTITY_ROLE_FILTER_FIELDS = {
+    "author": "author",
+    "participant": "participant",
+    "participants": "participant",
+    "recipient": "recipient",
+    "recipients": "recipient",
+    "custodian": "custodian",
+}
+ENTITY_ROLE_ID_FILTER_FIELDS = {
+    "author_entity_id": "author",
+    "participant_entity_id": "participant",
+    "participants_entity_id": "participant",
+    "recipient_entity_id": "recipient",
+    "recipients_entity_id": "recipient",
+    "custodian_entity_id": "custodian",
+}
+RAW_ENTITY_METADATA_FILTER_FIELDS = {
+    "raw_author": "extracted_author",
+    "raw_participant": "extracted_participants",
+    "raw_participants": "extracted_participants",
+    "raw_recipient": "extracted_recipients",
+    "raw_recipients": "extracted_recipients",
+    "raw_custodian": "custodian",
+}
+ROLE_OCCURRENCE_METADATA_COLUMNS = {
+    "author": "extracted_author",
+    "participant": "extracted_participants",
+    "recipient": "extracted_recipients",
+    "custodian": "custodian",
+}
+
 
 def build_scalar_filter_clause(
     column_expr: str,
@@ -650,6 +681,252 @@ def build_custodian_sql_filter_clause(
     return f"EXISTS ({exists_sql} AND {clause})", params
 
 
+def entity_display_label_sql(alias: str) -> str:
+    return (
+        "CASE "
+        f"WHEN COALESCE({alias}.display_name, '') != '' AND COALESCE({alias}.primary_email, '') != '' "
+        f"THEN {alias}.display_name || ' <' || {alias}.primary_email || '>' "
+        f"WHEN COALESCE({alias}.display_name, '') != '' THEN {alias}.display_name "
+        f"WHEN COALESCE({alias}.primary_email, '') != '' THEN {alias}.primary_email "
+        f"WHEN COALESCE({alias}.primary_phone, '') != '' THEN {alias}.primary_phone "
+        f"ELSE 'Unknown Entity ' || {alias}.id END"
+    )
+
+
+def entity_role_exists_sql(alias: str, role: str, *, extra_clause: str | None = None) -> str:
+    sql = (
+        "SELECT 1 "
+        "FROM document_entities de "
+        "JOIN entities e ON e.id = de.entity_id "
+        f"WHERE de.document_id = {alias}.id "
+        "AND e.canonical_status = 'active' "
+        "AND de.role = ?"
+    )
+    if extra_clause:
+        sql += f" AND ({extra_clause})"
+    return sql
+
+
+def entity_exact_values_for_filter(role: str, raw_value: object) -> list[str]:
+    text = normalize_inline_whitespace(str(raw_value or ""))
+    values: set[str] = set()
+    if text:
+        values.add(text.lower())
+        lookup_value = normalize_entity_lookup_text(text)
+        if lookup_value:
+            values.add(lookup_value.lower())
+    parsed_email = normalize_entity_email(text)
+    if parsed_email:
+        values.add(parsed_email.lower())
+    parsed_phone = normalize_entity_phone(text)
+    if parsed_phone is not None:
+        values.add(str(parsed_phone["display_value"]).lower())
+        values.add(str(parsed_phone["normalized_value"]).lower())
+    for candidate in parse_entity_candidates(text, role=role):
+        for identifier in candidate.get("identifiers") or []:
+            if not isinstance(identifier, dict):
+                continue
+            for key in (
+                "display_value",
+                "normalized_value",
+                "normalized_full_name",
+                "normalized_sort_name",
+                "identifier_name",
+            ):
+                value = normalize_inline_whitespace(str(identifier.get(key) or ""))
+                if value:
+                    values.add(value.lower())
+    return sorted(values)
+
+
+def entity_exact_match_sql(role: str, operand: dict[str, object]) -> tuple[str, list[object]]:
+    raw_value = coerce_sql_literal("text", operand)
+    exact_values = entity_exact_values_for_filter(role, raw_value)
+    if not exact_values:
+        return "0", []
+    placeholders = ", ".join("?" for _ in exact_values)
+    label_expr = entity_display_label_sql("e")
+    expressions = [
+        f"LOWER(COALESCE({label_expr}, ''))",
+        "LOWER(COALESCE(e.display_name, ''))",
+        "LOWER(COALESCE(e.primary_email, ''))",
+        "LOWER(COALESCE(e.primary_phone, ''))",
+        "LOWER(COALESCE(ei.display_value, ''))",
+        "LOWER(COALESCE(ei.normalized_value, ''))",
+        "LOWER(COALESCE(ei.normalized_full_name, ''))",
+        "LOWER(COALESCE(ei.normalized_sort_name, ''))",
+    ]
+    clause = " OR ".join(f"{expression} IN ({placeholders})" for expression in expressions)
+    params: list[object] = []
+    for _ in expressions:
+        params.extend(exact_values)
+    return clause, params
+
+
+def entity_like_match_sql(operand: dict[str, object]) -> tuple[str, list[object]]:
+    value = str(coerce_sql_literal("text", operand))
+    label_expr = entity_display_label_sql("e")
+    expressions = [
+        f"LOWER(COALESCE({label_expr}, ''))",
+        "LOWER(COALESCE(e.display_name, ''))",
+        "LOWER(COALESCE(e.primary_email, ''))",
+        "LOWER(COALESCE(e.primary_phone, ''))",
+        "LOWER(COALESCE(ei.display_value, ''))",
+        "LOWER(COALESCE(ei.normalized_value, ''))",
+        "LOWER(COALESCE(ei.normalized_full_name, ''))",
+        "LOWER(COALESCE(ei.normalized_sort_name, ''))",
+    ]
+    return " OR ".join(f"{expression} LIKE LOWER(?)" for expression in expressions), [value] * len(expressions)
+
+
+def build_entity_role_sql_filter_clause(
+    alias: str,
+    role: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+) -> tuple[str, list[object]]:
+    supported = {"=", "!=", "<>", "IS NULL", "IS NOT NULL", "LIKE", "IN"}
+    if operator not in supported:
+        raise RetrieverError(
+            f"Entity role field '{field_def['field_name']}' supports: =, !=, IS NULL, IS NOT NULL, LIKE, IN."
+        )
+    exists_sql = entity_role_exists_sql(alias, role)
+    if operator == "IS NULL":
+        return f"NOT EXISTS ({exists_sql})", [role]
+    if operator == "IS NOT NULL":
+        return f"EXISTS ({exists_sql})", [role]
+    if operator in {"=", "!=", "<>"}:
+        assert isinstance(operand, dict)
+        match_clause, match_params = entity_exact_match_sql(role, operand)
+        matched_exists_sql = entity_role_exists_sql(
+            alias,
+            role,
+            extra_clause=(
+                "EXISTS ("
+                "SELECT 1 FROM entity_identifiers ei "
+                "WHERE ei.entity_id = e.id "
+                f"AND ({match_clause})"
+                ")"
+            ),
+        )
+        params = [role, *match_params]
+        if operator == "=":
+            return f"EXISTS ({matched_exists_sql})", params
+        return f"NOT EXISTS ({matched_exists_sql})", params
+    if operator == "LIKE":
+        assert isinstance(operand, dict)
+        match_clause, match_params = entity_like_match_sql(operand)
+        matched_exists_sql = entity_role_exists_sql(
+            alias,
+            role,
+            extra_clause=(
+                "EXISTS ("
+                "SELECT 1 FROM entity_identifiers ei "
+                "WHERE ei.entity_id = e.id "
+                f"AND ({match_clause})"
+                ")"
+            ),
+        )
+        return f"EXISTS ({matched_exists_sql})", [role, *match_params]
+    assert operator == "IN"
+    assert isinstance(operand, list)
+    if not operand:
+        raise RetrieverError("IN requires at least one value.")
+    if len(operand) > MAX_FILTER_IN_LIST_ITEMS:
+        raise RetrieverError(f"IN (...) is capped at {MAX_FILTER_IN_LIST_ITEMS} values.")
+    clauses: list[str] = []
+    params: list[object] = []
+    for literal in operand:
+        match_clause, match_params = entity_exact_match_sql(role, literal)
+        clauses.append(f"({match_clause})")
+        params.extend(match_params)
+    matched_exists_sql = entity_role_exists_sql(
+        alias,
+        role,
+        extra_clause=(
+            "EXISTS ("
+            "SELECT 1 FROM entity_identifiers ei "
+            "WHERE ei.entity_id = e.id "
+            f"AND ({' OR '.join(clauses)})"
+            ")"
+        ),
+    )
+    return f"EXISTS ({matched_exists_sql})", [role, *params]
+
+
+def build_entity_role_id_sql_filter_clause(
+    alias: str,
+    role: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+) -> tuple[str, list[object]]:
+    supported = {"=", "!=", "<>", "IS NULL", "IS NOT NULL", "IN"}
+    if operator not in supported:
+        raise RetrieverError(
+            f"Entity id field '{field_def['field_name']}' supports: =, !=, IS NULL, IS NOT NULL, IN."
+        )
+    exists_sql = entity_role_exists_sql(alias, role)
+    if operator == "IS NULL":
+        return f"NOT EXISTS ({exists_sql})", [role]
+    if operator == "IS NOT NULL":
+        return f"EXISTS ({exists_sql})", [role]
+    if operator == "IN":
+        assert isinstance(operand, list)
+        if len(operand) > MAX_FILTER_IN_LIST_ITEMS:
+            raise RetrieverError(f"IN (...) is capped at {MAX_FILTER_IN_LIST_ITEMS} values.")
+        values = [int(coerce_sql_literal("integer", literal)) for literal in operand]
+        placeholders = ", ".join("?" for _ in values)
+        matched_exists_sql = entity_role_exists_sql(alias, role, extra_clause=f"e.id IN ({placeholders})")
+        return f"EXISTS ({matched_exists_sql})", [role, *values]
+    assert isinstance(operand, dict)
+    value = int(coerce_sql_literal("integer", operand))
+    matched_exists_sql = entity_role_exists_sql(alias, role, extra_clause="e.id = ?")
+    params = [role, value]
+    if operator == "=":
+        return f"EXISTS ({matched_exists_sql})", params
+    return f"NOT EXISTS ({matched_exists_sql})", params
+
+
+def build_raw_entity_metadata_sql_filter_clause(
+    alias: str,
+    field_def: dict[str, object],
+    operator: str,
+    operand: object | None,
+    *,
+    occurrence_column: str,
+    occurrence_alias: str | None = None,
+) -> tuple[str, list[object]]:
+    raw_field_def = {**field_def, "field_type": "text"}
+    if occurrence_alias is not None:
+        return build_scalar_sql_filter_clause(
+            f"{occurrence_alias}.{quote_identifier(occurrence_column)}",
+            raw_field_def,
+            operator,
+            operand,
+        )
+
+    ensure_sql_filter_operator_supported(raw_field_def, operator)
+    exists_sql = (
+        "SELECT 1 "
+        "FROM document_occurrences o "
+        f"WHERE o.document_id = {alias}.id "
+        "AND o.lifecycle_status = 'active'"
+    )
+    column_expr = f"o.{quote_identifier(occurrence_column)}"
+    if operator == "IS NULL":
+        return f"NOT EXISTS ({exists_sql} AND COALESCE({column_expr}, '') != '')", []
+    if operator == "IS NOT NULL":
+        return f"EXISTS ({exists_sql} AND COALESCE({column_expr}, '') != '')", []
+    if operator in {"!=", "<>"}:
+        assert isinstance(operand, dict)
+        value = str(coerce_sql_literal("text", operand))
+        return f"NOT EXISTS ({exists_sql} AND COALESCE({column_expr}, '') = ?)", [value]
+    clause, params = build_scalar_sql_filter_clause(column_expr, raw_field_def, operator, operand)
+    return f"EXISTS ({exists_sql} AND {clause})", params
+
+
 def virtual_field_sql_expression(alias: str, field_name: str) -> str:
     if field_name == "production_name":
         return (
@@ -678,6 +955,41 @@ def build_sql_filter_clause(
     occurrence_alias: str | None = None,
 ) -> tuple[str, list[object]]:
     field_name = str(field_def["field_name"])
+    if occurrence_alias is not None and field_name in ENTITY_ROLE_FILTER_FIELDS:
+        role = ENTITY_ROLE_FILTER_FIELDS[field_name]
+        return build_raw_entity_metadata_sql_filter_clause(
+            alias,
+            field_def,
+            operator,
+            operand,
+            occurrence_column=ROLE_OCCURRENCE_METADATA_COLUMNS[role],
+            occurrence_alias=occurrence_alias,
+        )
+    if field_name in ENTITY_ROLE_FILTER_FIELDS:
+        return build_entity_role_sql_filter_clause(
+            alias,
+            ENTITY_ROLE_FILTER_FIELDS[field_name],
+            field_def,
+            operator,
+            operand,
+        )
+    if field_name in ENTITY_ROLE_ID_FILTER_FIELDS:
+        return build_entity_role_id_sql_filter_clause(
+            alias,
+            ENTITY_ROLE_ID_FILTER_FIELDS[field_name],
+            field_def,
+            operator,
+            operand,
+        )
+    if field_name in RAW_ENTITY_METADATA_FILTER_FIELDS:
+        return build_raw_entity_metadata_sql_filter_clause(
+            alias,
+            field_def,
+            operator,
+            operand,
+            occurrence_column=RAW_ENTITY_METADATA_FILTER_FIELDS[field_name],
+            occurrence_alias=occurrence_alias,
+        )
     if field_def.get("source") == "virtual":
         if field_name == "custodian":
             return build_custodian_sql_filter_clause(
@@ -6542,6 +6854,250 @@ def catalog(root: Path) -> dict[str, object]:
         connection.close()
 
 
+def normalize_entity_inventory_roles(raw_roles: list[str] | None) -> list[str]:
+    if not raw_roles:
+        return sorted(DOCUMENT_ENTITY_ROLES)
+    roles: list[str] = []
+    for raw_role in raw_roles:
+        normalized = normalize_entity_lookup_text(raw_role).replace(" ", "_")
+        role = ENTITY_ROLE_FILTER_FIELDS.get(normalized, normalized)
+        if role not in DOCUMENT_ENTITY_ROLES:
+            raise RetrieverError(
+                f"Unsupported entity role: {raw_role}. Supported roles: {', '.join(sorted(DOCUMENT_ENTITY_ROLES))}."
+            )
+        if role not in roles:
+            roles.append(role)
+    return roles
+
+
+def scoped_entity_inventory_document_filter(
+    connection: sqlite3.Connection,
+    *,
+    query: str = "",
+    raw_filters: object | None = None,
+    document_ids: list[int] | None = None,
+    dataset_id: int | None = None,
+    dataset_names: list[str] | None = None,
+    conversation_id: int | None = None,
+    from_run_id: int | None = None,
+) -> tuple[list[str], list[object], list[object], dict[str, object]]:
+    normalized_query = normalize_inline_whitespace(query)
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in document_ids or []))
+    normalized_dataset_names = [
+        name
+        for raw_name in dataset_names or []
+        for name in [normalize_inline_whitespace(str(raw_name or ""))]
+        if name
+    ]
+    scope: dict[str, object] = {}
+    filter_summary: list[object] = []
+    if normalized_query:
+        selection = resolve_document_search(connection, normalized_query, raw_filters, None, None)
+        selected_ids = [int(item["id"]) for item in selection["results"]]
+        filter_summary = list(selection["filters"])
+        if not selected_ids:
+            return ["0"], [], filter_summary, {"query": normalized_query, "matched_document_count": 0}
+        placeholders = ", ".join("?" for _ in selected_ids)
+        clauses = [f"d.id IN ({placeholders})"]
+        params: list[object] = selected_ids
+        scope["query"] = normalized_query
+        scope["matched_document_count"] = len(selected_ids)
+    else:
+        filter_summary, clauses, params = build_search_filters(connection, raw_filters)
+
+    if normalized_document_ids:
+        placeholders = ", ".join("?" for _ in normalized_document_ids)
+        clauses.append(f"d.id IN ({placeholders})")
+        params.extend(normalized_document_ids)
+        scope["document_ids"] = normalized_document_ids
+    if dataset_id is not None:
+        clauses.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM dataset_documents dd
+              WHERE dd.document_id = d.id
+                AND dd.dataset_id = ?
+            )
+            """
+        )
+        params.append(int(dataset_id))
+        scope["dataset_id"] = int(dataset_id)
+    if normalized_dataset_names:
+        placeholders = ", ".join("?" for _ in normalized_dataset_names)
+        clauses.append(
+            f"""
+            EXISTS (
+              SELECT 1
+              FROM dataset_documents dd
+              JOIN datasets ds ON ds.id = dd.dataset_id
+              WHERE dd.document_id = d.id
+                AND ds.dataset_name IN ({placeholders})
+            )
+            """
+        )
+        params.extend(normalized_dataset_names)
+        scope["dataset_names"] = normalized_dataset_names
+    if conversation_id is not None:
+        clauses.append("d.conversation_id = ?")
+        params.append(int(conversation_id))
+        scope["conversation_id"] = int(conversation_id)
+    if from_run_id is not None:
+        run_id = resolve_scope_from_run_id(connection, from_run_id)
+        clauses.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM run_snapshot_documents rsd
+              WHERE rsd.document_id = d.id
+                AND rsd.run_id = ?
+            )
+            """
+        )
+        params.append(run_id)
+        scope["from_run_id"] = run_id
+    if filter_summary:
+        scope["filters"] = filter_summary
+    return clauses, params, filter_summary, scope
+
+
+def entity_inventory_examples(
+    connection: sqlite3.Connection,
+    *,
+    where_clause: str,
+    scope_params: list[object],
+    entity_id: int,
+    role: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    if limit <= 0:
+        return []
+    rows = connection.execute(
+        f"""
+        SELECT d.id, d.control_number, d.rel_path, d.title, d.date_created
+        FROM documents d
+        JOIN document_entities de ON de.document_id = d.id
+        JOIN entities e ON e.id = de.entity_id
+        WHERE {where_clause}
+          AND de.entity_id = ?
+          AND de.role = ?
+          AND e.canonical_status = ?
+        ORDER BY d.date_created DESC, d.id DESC
+        LIMIT ?
+        """,
+        [*scope_params, entity_id, role, ENTITY_STATUS_ACTIVE, limit],
+    ).fetchall()
+    return [
+        {
+            "document_id": int(row["id"]),
+            "control_number": row["control_number"],
+            "rel_path": row["rel_path"],
+            "title": row["title"],
+            "date_created": row["date_created"],
+        }
+        for row in rows
+    ]
+
+
+def list_entity_role_inventory(
+    root: Path,
+    *,
+    roles: list[str] | None = None,
+    query: str = "",
+    raw_filters: object | None = None,
+    document_ids: list[int] | None = None,
+    dataset_id: int | None = None,
+    dataset_names: list[str] | None = None,
+    conversation_id: int | None = None,
+    from_run_id: int | None = None,
+    limit: int = 100,
+    examples_per_entity: int = 3,
+) -> dict[str, object]:
+    normalized_roles = normalize_entity_inventory_roles(roles)
+    normalized_limit = max(1, min(int(limit or 100), 500))
+    normalized_examples_per_entity = max(0, min(int(examples_per_entity or 0), 10))
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        where_clauses, scope_params, filter_summary, scope = scoped_entity_inventory_document_filter(
+            connection,
+            query=query,
+            raw_filters=raw_filters,
+            document_ids=document_ids,
+            dataset_id=dataset_id,
+            dataset_names=dataset_names,
+            conversation_id=conversation_id,
+            from_run_id=from_run_id,
+        )
+        where_clause = " AND ".join(where_clauses)
+        role_placeholders = ", ".join("?" for _ in normalized_roles)
+        rows = connection.execute(
+            f"""
+            SELECT de.role AS role,
+                   de.role AS roles,
+                   e.*,
+                   COUNT(DISTINCT de.document_id) AS document_count
+            FROM documents d
+            JOIN document_entities de ON de.document_id = d.id
+            JOIN entities e ON e.id = de.entity_id
+            WHERE {where_clause}
+              AND de.role IN ({role_placeholders})
+              AND e.canonical_status = ?
+            GROUP BY de.role, e.id
+            ORDER BY de.role ASC,
+                     document_count DESC,
+                     COALESCE(e.sort_name, e.display_name, e.primary_email, e.primary_phone, '') ASC,
+                     e.id ASC
+            LIMIT ?
+            """,
+            [*scope_params, *normalized_roles, ENTITY_STATUS_ACTIVE, normalized_limit],
+        ).fetchall()
+        entity_ids = [int(row["id"]) for row in rows]
+        identifiers_by_entity = entity_identifiers_by_entity_id(connection, entity_ids)
+        inventory_rows: list[dict[str, object]] = []
+        for row in rows:
+            entity_id = int(row["id"])
+            role = str(row["role"])
+            identifiers = identifiers_by_entity.get(entity_id, [])
+            summary = serialize_entity_summary(row, identifiers)
+            inventory_rows.append(
+                {
+                    "role": role,
+                    "entity_id": entity_id,
+                    "label": summary["label"],
+                    "entity_origin": summary["entity_origin"],
+                    "entity_type": summary["entity_type"],
+                    "primary_email": summary["primary_email"],
+                    "primary_phone": summary["primary_phone"],
+                    "document_count": summary["document_count"],
+                    "emails": summary["emails"],
+                    "phones": summary["phones"],
+                    "names": summary["names"],
+                    "examples": entity_inventory_examples(
+                        connection,
+                        where_clause=where_clause,
+                        scope_params=scope_params,
+                        entity_id=entity_id,
+                        role=role,
+                        limit=normalized_examples_per_entity,
+                    ),
+                }
+            )
+        return {
+            "status": "ok",
+            "roles": normalized_roles,
+            "limit": normalized_limit,
+            "examples_per_entity": normalized_examples_per_entity,
+            "scope": scope,
+            "filters": filter_summary,
+            "rows": inventory_rows,
+        }
+    finally:
+        connection.close()
+
+
 def fetch_visible_document_rows_by_ids(
     connection: sqlite3.Connection,
     document_ids: list[int],
@@ -8977,6 +9533,19 @@ def add_dataset_selector_arguments(parser: argparse.ArgumentParser) -> None:
     selector_group.add_argument("--dataset-name", help="Exact dataset name")
 
 
+DATASET_POLICY_BOOLEAN_CHOICES = ("true", "false", "yes", "no", "1", "0", "on", "off", "enabled", "disabled")
+
+
+def add_dataset_policy_boolean_argument(
+    parser: argparse.ArgumentParser,
+    flag: str,
+    *,
+    dest: str,
+    help_text: str,
+) -> None:
+    parser.add_argument(flag, dest=dest, choices=DATASET_POLICY_BOOLEAN_CHOICES, help=help_text)
+
+
 def add_search_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("workspace", help="Workspace root path")
     parser.add_argument("query", nargs="?", default="", help="Keyword query text")
@@ -9330,6 +9899,55 @@ def build_parser() -> argparse.ArgumentParser:
     list_datasets_parser = subparsers.add_parser("list-datasets", help="List datasets in the workspace")
     list_datasets_parser.add_argument("workspace", help="Workspace root path")
 
+    show_dataset_policy_parser = subparsers.add_parser("show-dataset-policy", help="Show source-backed entity merge policy for a dataset")
+    show_dataset_policy_parser.add_argument("workspace", help="Workspace root path")
+    add_dataset_selector_arguments(show_dataset_policy_parser)
+
+    set_dataset_policy_parser = subparsers.add_parser("set-dataset-policy", help="Update source-backed entity merge policy for a dataset")
+    set_dataset_policy_parser.add_argument("workspace", help="Workspace root path")
+    add_dataset_selector_arguments(set_dataset_policy_parser)
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--allow-auto-merge",
+        dest="allow_auto_merge",
+        help_text="Enable or disable all auto-merge resolution for this dataset",
+    )
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--email-auto-merge",
+        dest="email_auto_merge",
+        help_text="Enable or disable exact email auto-merge",
+    )
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--handle-auto-merge",
+        dest="handle_auto_merge",
+        help_text="Enable or disable provider-scoped handle auto-merge",
+    )
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--phone-auto-merge",
+        dest="phone_auto_merge",
+        help_text="Enable or disable exact phone auto-merge",
+    )
+    add_dataset_policy_boolean_argument(
+        set_dataset_policy_parser,
+        "--name-auto-merge",
+        dest="name_auto_merge",
+        help_text="Enable or disable exact normalized-name auto-merge",
+    )
+    set_dataset_policy_parser.add_argument(
+        "--external-id-auto-merge-name",
+        dest="external_id_auto_merge_names",
+        action="append",
+        help="External identifier name eligible for exact auto-merge (repeatable; replaces the current list)",
+    )
+    set_dataset_policy_parser.add_argument(
+        "--clear-external-id-auto-merge-names",
+        action="store_true",
+        help="Clear all external-id auto-merge names",
+    )
+
     rebuild_entities_parser = subparsers.add_parser(
         "rebuild-entities",
         help="Rebuild entity recognition state from stored document metadata",
@@ -9363,6 +9981,167 @@ def build_parser() -> argparse.ArgumentParser:
     show_entity_parser.add_argument("workspace", help="Workspace root path")
     show_entity_parser.add_argument("entity_id", type=int, help="Entity id")
     show_entity_parser.add_argument("--limit", type=int, default=25, help="Maximum linked documents to return")
+
+    create_entity_parser = subparsers.add_parser("create-entity", help="Create a manual entity")
+    create_entity_parser.add_argument("workspace", help="Workspace root path")
+    create_entity_parser.add_argument(
+        "--entity-type",
+        default=ENTITY_TYPE_PERSON,
+        choices=sorted(ENTITY_TYPES),
+        help="Entity type",
+    )
+    create_entity_parser.add_argument("--display-name", help="Manual display name")
+    create_entity_parser.add_argument("--notes", help="Optional entity notes")
+    create_entity_parser.add_argument("--email", dest="emails", action="append", help="Email identifier (repeatable)")
+    create_entity_parser.add_argument("--phone", dest="phones", action="append", help="Phone identifier (repeatable)")
+    create_entity_parser.add_argument("--name", dest="names", action="append", help="Name identifier (repeatable)")
+    create_entity_parser.add_argument(
+        "--handle",
+        dest="handles",
+        action="append",
+        help="Handle identifier as provider:scope:handle (repeatable)",
+    )
+    create_entity_parser.add_argument(
+        "--external-id",
+        dest="external_ids",
+        action="append",
+        help="External identifier as name:value or name:scope:value (repeatable)",
+    )
+
+    edit_entity_parser = subparsers.add_parser("edit-entity", help="Edit a manual entity profile")
+    edit_entity_parser.add_argument("workspace", help="Workspace root path")
+    edit_entity_parser.add_argument("entity_id", type=int, help="Entity id")
+    edit_entity_parser.add_argument("--entity-type", choices=sorted(ENTITY_TYPES), help="Replacement entity type")
+    edit_entity_display_group = edit_entity_parser.add_mutually_exclusive_group()
+    edit_entity_display_group.add_argument("--display-name", help="Replacement manual display name")
+    edit_entity_display_group.add_argument("--clear-display-name", action="store_true", help="Return display name to auto")
+    edit_entity_notes_group = edit_entity_parser.add_mutually_exclusive_group()
+    edit_entity_notes_group.add_argument("--notes", help="Replacement entity notes")
+    edit_entity_notes_group.add_argument("--clear-notes", action="store_true", help="Clear entity notes")
+    edit_entity_parser.add_argument("--add-email", dest="add_emails", action="append", help="Email identifier to add (repeatable)")
+    edit_entity_parser.add_argument("--add-phone", dest="add_phones", action="append", help="Phone identifier to add (repeatable)")
+    edit_entity_parser.add_argument("--add-name", dest="add_names", action="append", help="Name identifier to add (repeatable)")
+    edit_entity_parser.add_argument(
+        "--add-handle",
+        dest="add_handles",
+        action="append",
+        help="Handle identifier as provider:scope:handle (repeatable)",
+    )
+    edit_entity_parser.add_argument(
+        "--add-external-id",
+        dest="add_external_ids",
+        action="append",
+        help="External identifier as name:value or name:scope:value (repeatable)",
+    )
+
+    entity_inventory_parser = subparsers.add_parser(
+        "list-entity-role-inventory",
+        help="List entity counts by role for a document scope",
+    )
+    entity_inventory_parser.add_argument("workspace", help="Workspace root path")
+    entity_inventory_parser.add_argument("query", nargs="?", default="", help="Optional keyword query text")
+    entity_inventory_parser.add_argument(
+        "--role",
+        dest="roles",
+        action="append",
+        help="Entity role to include, e.g. author, participant, recipient, custodian (repeatable)",
+    )
+    entity_inventory_parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        nargs="+",
+        help="Repeatable SQL-like filter expression",
+    )
+    entity_inventory_parser.add_argument(
+        "--dataset",
+        dest="dataset_names",
+        action="append",
+        help="Exact dataset name (repeatable)",
+    )
+    entity_inventory_parser.add_argument("--dataset-id", type=int, help="Dataset id")
+    entity_inventory_parser.add_argument("--conversation-id", type=int, help="Conversation id")
+    entity_inventory_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to include (repeatable)",
+    )
+    entity_inventory_parser.add_argument("--from-run-id", type=int, help="Restrict to documents from a prior run")
+    entity_inventory_parser.add_argument("--limit", type=int, default=100, help="Maximum inventory rows to return")
+    entity_inventory_parser.add_argument(
+        "--examples",
+        dest="examples_per_entity",
+        type=int,
+        default=3,
+        help="Recent document examples per entity row",
+    )
+
+    similar_entities_parser = subparsers.add_parser("similar-entities", help="Suggest active entities similar to one entity")
+    similar_entities_parser.add_argument("workspace", help="Workspace root path")
+    similar_entities_parser.add_argument("entity_id", type=int, help="Entity id")
+    similar_entities_parser.add_argument("--limit", type=int, default=25, help="Maximum suggestions to return")
+
+    merge_entities_parser = subparsers.add_parser("merge-entities", help="Merge one active entity into another")
+    merge_entities_parser.add_argument("workspace", help="Workspace root path")
+    merge_entities_parser.add_argument("source_entity_id", type=int, help="Entity id to merge away")
+    merge_entities_parser.add_argument("target_entity_id", type=int, help="Entity id to keep")
+    merge_entities_parser.add_argument("--force", action="store_true", help="Merge even when a merge block exists")
+    merge_entities_parser.add_argument("--reason", help="Optional merge reason")
+
+    block_entity_merge_parser = subparsers.add_parser("block-entity-merge", help="Prevent a suggested entity merge")
+    block_entity_merge_parser.add_argument("workspace", help="Workspace root path")
+    block_entity_merge_parser.add_argument("left_entity_id", type=int, help="First entity id")
+    block_entity_merge_parser.add_argument("right_entity_id", type=int, help="Second entity id")
+    block_entity_merge_parser.add_argument("--reason", help="Optional block reason")
+
+    ignore_entity_parser = subparsers.add_parser("ignore-entity", help="Ignore a junk or non-entity record")
+    ignore_entity_parser.add_argument("workspace", help="Workspace root path")
+    ignore_entity_parser.add_argument("entity_id", type=int, help="Entity id")
+    ignore_entity_parser.add_argument("--reason", help="Optional ignore reason")
+
+    split_entity_parser = subparsers.add_parser("split-entity", help="Move selected identifiers or document links to another entity")
+    split_entity_parser.add_argument("workspace", help="Workspace root path")
+    split_entity_parser.add_argument("source_entity_id", type=int, help="Entity id to split from")
+    split_entity_parser.add_argument("--target-entity-id", type=int, help="Existing target entity id; omitted creates a new entity")
+    split_entity_parser.add_argument(
+        "--identifier-id",
+        dest="identifier_ids",
+        action="append",
+        type=int,
+        help="Identifier id to move to the target (repeatable)",
+    )
+    split_entity_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id whose source entity links should move to the target (repeatable)",
+    )
+    split_entity_parser.add_argument(
+        "--role",
+        dest="roles",
+        action="append",
+        help="Role to move when --doc-id is used, e.g. author or recipient (repeatable)",
+    )
+    split_entity_parser.add_argument("--display-name", help="Display name for a newly created split target")
+    split_entity_parser.add_argument("--reason", help="Optional split reason")
+    split_entity_parser.add_argument("--no-block", action="store_true", help="Do not create a merge block between source and target")
+
+    assign_entity_parser = subparsers.add_parser("assign-entity", help="Manually assign an entity to a document role")
+    assign_entity_parser.add_argument("workspace", help="Workspace root path")
+    assign_entity_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
+    assign_entity_parser.add_argument("--role", required=True, help="Entity role, e.g. author, participant, recipient, custodian")
+    assign_entity_parser.add_argument("--entity-id", type=int, required=True, help="Entity id")
+    assign_entity_parser.add_argument("--reason", help="Optional assignment reason")
+
+    unassign_entity_parser = subparsers.add_parser("unassign-entity", help="Remove or suppress an entity link on a document role")
+    unassign_entity_parser.add_argument("workspace", help="Workspace root path")
+    unassign_entity_parser.add_argument("--doc-id", dest="document_id", type=int, required=True, help="Document id")
+    unassign_entity_parser.add_argument("--role", required=True, help="Entity role, e.g. author, participant, recipient, custodian")
+    unassign_entity_parser.add_argument("--entity-id", type=int, required=True, help="Entity id")
+    unassign_entity_parser.add_argument("--reason", help="Optional unassignment reason")
 
     create_dataset_parser = subparsers.add_parser("create-dataset", help="Create a manual dataset")
     create_dataset_parser.add_argument("workspace", help="Workspace root path")
@@ -10029,6 +10808,33 @@ def main() -> int:
         if args.command == "list-datasets":
             return emit_cli_payload("list-datasets", list_datasets(root))
 
+        if args.command == "show-dataset-policy":
+            return emit_cli_payload(
+                "show-dataset-policy",
+                show_dataset_policy(
+                    root,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                ),
+            )
+
+        if args.command == "set-dataset-policy":
+            return emit_cli_payload(
+                "set-dataset-policy",
+                set_dataset_policy(
+                    root,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                    allow_auto_merge=args.allow_auto_merge,
+                    email_auto_merge=args.email_auto_merge,
+                    handle_auto_merge=args.handle_auto_merge,
+                    phone_auto_merge=args.phone_auto_merge,
+                    name_auto_merge=args.name_auto_merge,
+                    external_id_auto_merge_names=args.external_id_auto_merge_names,
+                    clear_external_id_auto_merge_names=args.clear_external_id_auto_merge_names,
+                ),
+            )
+
         if args.command == "rebuild-entities":
             return emit_cli_payload(
                 "rebuild-entities",
@@ -10054,6 +10860,134 @@ def main() -> int:
             return emit_cli_payload(
                 "show-entity",
                 show_entity(root, args.entity_id, document_limit=args.limit),
+            )
+
+        if args.command == "create-entity":
+            return emit_cli_payload(
+                "create-entity",
+                create_entity(
+                    root,
+                    entity_type=args.entity_type,
+                    display_name=args.display_name,
+                    notes=args.notes,
+                    emails=args.emails,
+                    phones=args.phones,
+                    names=args.names,
+                    handles=args.handles,
+                    external_ids=args.external_ids,
+                ),
+            )
+
+        if args.command == "edit-entity":
+            return emit_cli_payload(
+                "edit-entity",
+                edit_entity(
+                    root,
+                    args.entity_id,
+                    entity_type=args.entity_type,
+                    display_name=args.display_name,
+                    clear_display_name=args.clear_display_name,
+                    notes=args.notes,
+                    clear_notes=args.clear_notes,
+                    add_emails=args.add_emails,
+                    add_phones=args.add_phones,
+                    add_names=args.add_names,
+                    add_handles=args.add_handles,
+                    add_external_ids=args.add_external_ids,
+                ),
+            )
+
+        if args.command == "list-entity-role-inventory":
+            return emit_cli_payload(
+                "list-entity-role-inventory",
+                list_entity_role_inventory(
+                    root,
+                    roles=args.roles,
+                    query=args.query,
+                    raw_filters=args.filters,
+                    document_ids=args.document_ids,
+                    dataset_id=args.dataset_id,
+                    dataset_names=args.dataset_names,
+                    conversation_id=args.conversation_id,
+                    from_run_id=args.from_run_id,
+                    limit=args.limit,
+                    examples_per_entity=args.examples_per_entity,
+                ),
+            )
+
+        if args.command == "similar-entities":
+            return emit_cli_payload(
+                "similar-entities",
+                similar_entities(root, args.entity_id, limit=args.limit),
+            )
+
+        if args.command == "merge-entities":
+            return emit_cli_payload(
+                "merge-entities",
+                merge_entities(
+                    root,
+                    args.source_entity_id,
+                    args.target_entity_id,
+                    force=args.force,
+                    reason=args.reason,
+                ),
+            )
+
+        if args.command == "block-entity-merge":
+            return emit_cli_payload(
+                "block-entity-merge",
+                block_entity_merge(
+                    root,
+                    args.left_entity_id,
+                    args.right_entity_id,
+                    reason=args.reason,
+                ),
+            )
+
+        if args.command == "ignore-entity":
+            return emit_cli_payload(
+                "ignore-entity",
+                ignore_entity(root, args.entity_id, reason=args.reason),
+            )
+
+        if args.command == "split-entity":
+            return emit_cli_payload(
+                "split-entity",
+                split_entity(
+                    root,
+                    args.source_entity_id,
+                    target_entity_id=args.target_entity_id,
+                    identifier_ids=args.identifier_ids,
+                    document_ids=args.document_ids,
+                    roles=args.roles,
+                    display_name=args.display_name,
+                    reason=args.reason,
+                    block_merge=not args.no_block,
+                ),
+            )
+
+        if args.command == "assign-entity":
+            return emit_cli_payload(
+                "assign-entity",
+                assign_entity(
+                    root,
+                    document_id=args.document_id,
+                    role=args.role,
+                    entity_id=args.entity_id,
+                    reason=args.reason,
+                ),
+            )
+
+        if args.command == "unassign-entity":
+            return emit_cli_payload(
+                "unassign-entity",
+                unassign_entity(
+                    root,
+                    document_id=args.document_id,
+                    role=args.role,
+                    entity_id=args.entity_id,
+                    reason=args.reason,
+                ),
             )
 
         if args.command == "create-dataset":
