@@ -5871,7 +5871,7 @@ def ingest_pst_source(
     )
     # Salt the scan fingerprint so unchanged PSTs get one corrective reparse when
     # container-routing rules change (for example, when Teams/system folders are reclassified
-    # or attachment naming/type inference improves for unnamed blobs).
+    # or Teams participant identity extraction improves).
     result = ingest_container_source(
         connection,
         paths,

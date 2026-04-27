@@ -2841,6 +2841,15 @@ def parse_pst_json_object(raw_value: object) -> dict[str, object] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def normalize_pst_aad_object_id(value: object) -> str | None:
+    normalized = normalize_whitespace(str(value or "")).lower()
+    if not normalized:
+        return None
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", normalized):
+        return normalized
+    return None
+
+
 def pst_chat_participant_display_name(payload: object) -> str | None:
     if not isinstance(payload, dict):
         return None
@@ -2851,6 +2860,83 @@ def pst_chat_participant_display_name(payload: object) -> str | None:
     if normalized_email:
         return normalized_email.lower()
     return None
+
+
+def pst_chat_participant_entity_hint(payload: object) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    normalized_name = normalize_entity_text(payload.get("Name") or "")
+    normalized_email = normalize_entity_email(payload.get("EmailAddress"))
+    aad_object_id = normalize_pst_aad_object_id(
+        payload.get("ExternalDirectoryObjectId")
+        or payload.get("AadObjectId")
+        or payload.get("AADObjectId")
+        or payload.get("ObjectId")
+    )
+    if normalized_name and normalized_email:
+        display_value = f"{normalized_name} <{normalized_email}>"
+    else:
+        display_value = normalized_name or normalized_email
+    if not display_value:
+        return None
+    identifiers: list[dict[str, object]] = []
+    if aad_object_id:
+        identifiers.append(
+            {
+                "identifier_type": "external_id",
+                "identifier_name": "aad_oid",
+                "display_value": aad_object_id,
+                "normalized_value": normalize_entity_lookup_text(aad_object_id),
+                "is_verified": 1,
+                "source_kind": "pst_teams",
+            }
+        )
+    hint: dict[str, object] = {
+        "display_value": display_value,
+        "source_kind": "pst_teams",
+    }
+    if identifiers:
+        hint["identifiers"] = identifiers
+    return hint
+
+
+def pst_chat_participant_entity_hint_key(hint: dict[str, object]) -> str:
+    display_key = normalize_entity_lookup_text(hint.get("display_value") or "")
+    for identifier in list(hint.get("identifiers") or []):
+        if isinstance(identifier, dict):
+            identifier_key = entity_candidate_identifier_key(identifier)
+            if identifier_key:
+                return identifier_key
+    return display_key
+
+
+def pst_chat_participant_entity_hints_from_payload(payload: object) -> list[dict[str, object]]:
+    if not isinstance(payload, dict):
+        return []
+    hints: list[dict[str, object]] = []
+    sender_hint = pst_chat_participant_entity_hint(payload.get("Sender"))
+    if sender_hint is not None:
+        hints.append(sender_hint)
+    recipients = payload.get("Recipients")
+    if isinstance(recipients, list):
+        for recipient in recipients:
+            recipient_hint = pst_chat_participant_entity_hint(recipient)
+            if recipient_hint is not None:
+                hints.append(recipient_hint)
+    return hints
+
+
+def append_pst_chat_participant_entity_hints(
+    target: list[dict[str, object]],
+    seen_keys: set[str],
+    payload: object,
+) -> None:
+    for hint in pst_chat_participant_entity_hints_from_payload(payload):
+        hint_key = pst_chat_participant_entity_hint_key(hint)
+        if not hint_key or hint_key in seen_keys:
+            continue
+        seen_keys.add(hint_key)
+        target.append(hint)
 
 
 def pst_chat_participant_names_from_payload(payload: object) -> list[str]:
@@ -2886,6 +2972,8 @@ def extract_pst_chat_threading(message: object) -> dict[str, object] | None:
     parent_message_id = None
     thread_type = None
     participant_names: list[object] = []
+    participant_entity_hints: list[dict[str, object]] = []
+    seen_participant_entity_hint_keys: set[str] = set()
 
     for record_set in pst_record_sets(message):
         for entry in pst_record_entries(record_set):
@@ -2917,17 +3005,25 @@ def extract_pst_chat_threading(message: object) -> dict[str, object] | None:
             if normalized_thread_type:
                 thread_type = normalized_thread_type
             participant_names.extend(pst_chat_participant_names_from_payload(parsed_payload))
+            append_pst_chat_participant_entity_hints(
+                participant_entity_hints,
+                seen_participant_entity_hint_keys,
+                parsed_payload,
+            )
 
     normalized_participants = sorted_unique_display_names(participant_names)
-    if not any((thread_id, message_id, parent_message_id, thread_type, normalized_participants)):
+    if not any((thread_id, message_id, parent_message_id, thread_type, normalized_participants, participant_entity_hints)):
         return None
-    return {
+    payload: dict[str, object] = {
         "thread_id": thread_id,
         "message_id": message_id,
         "parent_message_id": parent_message_id,
         "thread_type": thread_type,
         "participants": normalized_participants,
     }
+    if participant_entity_hints:
+        payload["participant_entity_hints"] = participant_entity_hints
+    return payload
 
 
 def pst_message_author(message: object) -> str | None:
@@ -3583,6 +3679,11 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
         raw_chat_threading = message_dict.get("chat_threading")
         chat_threading = dict(raw_chat_threading) if isinstance(raw_chat_threading, dict) else {}
         chat_thread_participants = sorted_unique_display_names(normalize_string_list(chat_threading.get("participants")))
+        participant_entity_hints = [
+            dict(item)
+            for item in list(chat_threading.get("participant_entity_hints") or [])
+            if isinstance(item, dict)
+        ]
         preferred_participants = render_display_name_list(chat_thread_participants)
         preferred_title = None
         if normalize_whitespace(str(chat_threading.get("thread_type") or "")).lower() == "chat":
@@ -3615,6 +3716,8 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
             chat_entries=chat_entries,
             chat_threading=chat_threading,
         )
+        if participant_entity_hints:
+            extracted["entity_hints"] = {"participants": participant_entity_hints}
     elif message_kind == "calendar":
         extracted = build_calendar_extracted_payload(
             subject=normalized_subject,
