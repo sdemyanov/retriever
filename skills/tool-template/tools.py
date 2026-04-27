@@ -32070,6 +32070,7 @@ def ingest_v2_plan_step(
     *,
     run_id: str,
     budget_seconds: int | None = None,
+    schema_applied: bool = False,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -32086,7 +32087,8 @@ def ingest_v2_plan_step(
     with workspace_ingest_session(paths, command_name="ingest-plan-step"):
         connection = connect_db(paths["db_path"])
         try:
-            apply_schema(connection, root)
+            if not schema_applied:
+                apply_schema(connection, root)
             row = require_ingest_v2_run_row(connection, run_id)
             if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
                 return {
@@ -32377,6 +32379,7 @@ def ingest_v2_prepare_step(
     *,
     run_id: str,
     budget_seconds: int | None = None,
+    schema_applied: bool = False,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -32400,7 +32403,8 @@ def ingest_v2_prepare_step(
     prepared_payload_bytes = 0
     connection = connect_db(paths["db_path"])
     try:
-        apply_schema(connection, root)
+        if not schema_applied:
+            apply_schema(connection, root)
         row = require_ingest_v2_run_row(connection, run_id)
         if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
             return {
@@ -32573,6 +32577,7 @@ def ingest_v2_commit_step(
     run_id: str,
     budget_seconds: int | None = None,
     max_items: int | None = None,
+    schema_applied: bool = False,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -32590,7 +32595,8 @@ def ingest_v2_commit_step(
     connection = connect_db(paths["db_path"])
     lease_acquired = False
     try:
-        apply_schema(connection, root)
+        if not schema_applied:
+            apply_schema(connection, root)
         row = require_ingest_v2_run_row(connection, run_id)
         if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
             return {
@@ -32816,6 +32822,7 @@ def ingest_v2_finalize_step(
     *,
     run_id: str,
     budget_seconds: int | None = None,
+    schema_applied: bool = False,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -32825,7 +32832,8 @@ def ingest_v2_finalize_step(
     stages_completed: list[str] = []
     connection = connect_db(paths["db_path"])
     try:
-        apply_schema(connection, root)
+        if not schema_applied:
+            apply_schema(connection, root)
         row = require_ingest_v2_run_row(connection, run_id)
         if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
             return {
@@ -33053,8 +33061,12 @@ def ingest_v2_run_step(
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
+    schema_started = time.perf_counter()
+    schema_ms = 0.0
+    initial_status_payload_ms = 0.0
     try:
         apply_schema(connection, root)
+        schema_ms = ingest_v2_elapsed_ms(schema_started)
         row = require_ingest_v2_run_row(connection, run_id) if run_id else latest_ingest_v2_run_row(connection)
         if row is None:
             status_payload = ingest_v2_status(root, run_id=None, budget_seconds=budget)
@@ -33072,15 +33084,26 @@ def ingest_v2_run_step(
                 "step_results": [],
                 "more_work_remaining": False,
                 "run": run_payload,
+                "timings": {
+                    "schema_ms": round(schema_ms, 3),
+                    "initial_status_payload_ms": 0.0,
+                    "inner_step_ms": ingest_v2_timing_summary([]),
+                },
                 "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
             }
         resolved_run_id = str(row["run_id"])
-        status_payload = ingest_v2_status_payload(connection, root, row, budget_seconds=budget)
+        status_payload, initial_status_payload_ms = ingest_v2_status_payload_timed(
+            connection,
+            root,
+            row,
+            budget_seconds=budget,
+        )
     finally:
         connection.close()
 
     executed_steps: list[str] = []
     step_results: list[dict[str, object]] = []
+    inner_step_ms_values: list[float] = []
     stop_reason: str | None = None
     run_payload = status_payload
     while len(executed_steps) < INGEST_V2_RUN_STEP_MAX_INNER_STEPS:
@@ -33097,16 +33120,38 @@ def ingest_v2_run_step(
             )
             break
         inner_budget = ingest_v2_runner_step_budget(remaining_seconds)
+        step_started = time.perf_counter()
         if selected_step == "plan":
-            step_result = ingest_v2_plan_step(root, run_id=resolved_run_id, budget_seconds=inner_budget)
+            step_result = ingest_v2_plan_step(
+                root,
+                run_id=resolved_run_id,
+                budget_seconds=inner_budget,
+                schema_applied=True,
+            )
         elif selected_step == "prepare":
-            step_result = ingest_v2_prepare_step(root, run_id=resolved_run_id, budget_seconds=inner_budget)
+            step_result = ingest_v2_prepare_step(
+                root,
+                run_id=resolved_run_id,
+                budget_seconds=inner_budget,
+                schema_applied=True,
+            )
         elif selected_step == "commit":
-            step_result = ingest_v2_commit_step(root, run_id=resolved_run_id, budget_seconds=inner_budget)
+            step_result = ingest_v2_commit_step(
+                root,
+                run_id=resolved_run_id,
+                budget_seconds=inner_budget,
+                schema_applied=True,
+            )
         elif selected_step == "finalize":
-            step_result = ingest_v2_finalize_step(root, run_id=resolved_run_id, budget_seconds=inner_budget)
+            step_result = ingest_v2_finalize_step(
+                root,
+                run_id=resolved_run_id,
+                budget_seconds=inner_budget,
+                schema_applied=True,
+            )
         else:
             raise RetrieverError(f"Unsupported resumable ingest step selection: {selected_step}")
+        inner_step_ms_values.append(ingest_v2_elapsed_ms(step_started))
 
         executed_steps.append(selected_step)
         step_results.append(step_result)
@@ -33136,6 +33181,11 @@ def ingest_v2_run_step(
         "step_results": step_results,
         "more_work_remaining": str(run_payload.get("status")) not in INGEST_V2_TERMINAL_STATUSES,
         "run": run_payload,
+        "timings": {
+            "schema_ms": round(schema_ms, 3),
+            "initial_status_payload_ms": round(initial_status_payload_ms, 3),
+            "inner_step_ms": ingest_v2_timing_summary(inner_step_ms_values),
+        },
         "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
     }
 
