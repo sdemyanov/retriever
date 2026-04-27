@@ -6984,6 +6984,138 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(final_payload["reason"], "run_terminal")
         self.assertEqual(final_payload["run"]["status"], "completed")
 
+    def test_ingest_v2_auto_routes_production_root(self) -> None:
+        self.write_production_fixture()
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        run_exit, run_payload, _, _ = self.run_cli(
+            "ingest-run-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(run_exit, 0)
+        self.assertIsNotNone(run_payload)
+        self.assertTrue(run_payload["executed"])
+        self.assertEqual(run_payload["run"]["status"], "completed")
+        self.assertEqual(run_payload["run"]["counts"]["by_unit_type"]["production_row"]["committed"], 4)
+
+        parent_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000001.logical"
+        )
+        child_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000003.logical"
+        )
+        native_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000004.logical"
+        )
+        self.assertEqual(parent_row["source_kind"], retriever_tools.PRODUCTION_SOURCE_KIND)
+        self.assertEqual(parent_row["content_type"], "Email")
+        self.assertEqual(child_row["parent_document_id"], parent_row["id"])
+        self.assertEqual(native_row["file_name"], "PDX000004.pdf")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            loose_artifact_rows = connection.execute(
+                """
+                SELECT rel_path
+                FROM documents
+                WHERE rel_path LIKE 'Synthetic_Production/TEXT/%'
+                   OR rel_path LIKE 'Synthetic_Production/IMAGES/%'
+                   OR rel_path LIKE 'Synthetic_Production/NATIVES/%'
+                """
+            ).fetchall()
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'finalizing'
+                  AND cursor_key = 'loose_file_finalize'
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(loose_artifact_rows, [])
+        self.assertIsNotNone(cursor_row)
+        cursor_payload = json.loads(cursor_row["cursor_json"])
+        self.assertEqual(cursor_payload["production_finalized_roots"], ["Synthetic_Production"])
+        self.assertEqual(cursor_payload["production_stats"]["families_reconstructed"], 1)
+
+    def test_ingest_v2_production_rerun_retires_missing_loadfile_rows(self) -> None:
+        production_root = self.write_production_fixture()
+
+        first_exit, first_payload, _, _ = self.run_cli("ingest-start", str(self.root), "--recursive")
+        self.assertEqual(first_exit, 0)
+        self.assertIsNotNone(first_payload)
+        first_run_id = str(first_payload["run_id"])
+        first_run_exit, first_run_payload, _, _ = self.run_cli(
+            "ingest-run-step",
+            str(self.root),
+            "--run-id",
+            first_run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(first_run_exit, 0)
+        self.assertIsNotNone(first_run_payload)
+        self.assertEqual(first_run_payload["run"]["status"], "completed")
+
+        data_path = production_root / "DATA" / "Synthetic_Production.dat"
+        lines = data_path.read_bytes().splitlines()
+        filtered = [line for line in lines if b"PDX000005" not in line]
+        data_path.write_bytes(b"\r\n".join(filtered) + b"\r\n")
+
+        second_exit, second_payload, _, _ = self.run_cli("ingest-start", str(self.root), "--recursive")
+        self.assertEqual(second_exit, 0)
+        self.assertIsNotNone(second_payload)
+        second_run_id = str(second_payload["run_id"])
+        second_run_exit, second_run_payload, _, _ = self.run_cli(
+            "ingest-run-step",
+            str(self.root),
+            "--run-id",
+            second_run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(second_run_exit, 0)
+        self.assertIsNotNone(second_run_payload)
+        self.assertEqual(second_run_payload["run"]["status"], "completed")
+        self.assertEqual(second_run_payload["run"]["counts"]["by_unit_type"]["production_row"]["committed"], 3)
+
+        retired_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+        self.assertEqual(retired_row["lifecycle_status"], "deleted")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'finalizing'
+                  AND cursor_key = 'loose_file_finalize'
+                """,
+                (second_run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(cursor_row)
+        self.assertEqual(json.loads(cursor_row["cursor_json"])["production_stats"]["retired"], 1)
+
     def test_ingest_v2_prepare_step_prepares_loose_files_without_document_writes(self) -> None:
         raw_dir = self.root / "raw"
         raw_dir.mkdir()
