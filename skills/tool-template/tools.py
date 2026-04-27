@@ -21538,6 +21538,7 @@ def commit_prepared_production_row(
     dataset_id: int,
     dataset_source_id: int,
     production_id: int,
+    before_transaction_commit=None,
 ) -> dict[str, object]:
     control_number = str(prepared_item["control_number"])
     prepare_error = prepared_item.get("prepare_error")
@@ -21617,18 +21618,23 @@ def commit_prepared_production_row(
             preview_rows,
         )
         replace_document_source_parts(connection, document_id, list(prepared_item.get("source_parts", [])))
-        connection.commit()
         if existing_row is None:
             action = "created"
         elif existing_row["lifecycle_status"] == "active" and existing_signature == desired_signature:
             action = "unchanged"
         else:
             action = "updated"
-        return {
+        result = {
             "action": action,
             "control_number": control_number,
             "page_images_linked": len(list(prepared_item.get("matching_image_paths", []))),
+            "document_id": document_id,
+            "production_id": production_id,
         }
+        if before_transaction_commit is not None:
+            before_transaction_commit(connection, result)
+        connection.commit()
+        return result
     except Exception as exc:
         connection.rollback()
         return {
@@ -29802,12 +29808,26 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
     if cursor_row is not None:
         cursor = decode_json_text(cursor_row["cursor_json"], default={}) or {}
         if isinstance(cursor, dict):
+            cursor.setdefault("pending_production_rel_roots", [])
+            cursor.setdefault("production_roots_by_rel_root", {})
+            cursor.setdefault("planned_production_roots", [])
+            cursor.setdefault("skipped_production_roots", [])
+            cursor.setdefault("planned_production_rows", 0)
+            cursor.setdefault("production_failures", [])
+            cursor.setdefault("production_docs_missing_linked_text", 0)
+            cursor.setdefault("production_docs_missing_linked_images", 0)
+            cursor.setdefault("production_docs_missing_linked_natives", 0)
             return cursor
 
     recursive = bool(row["recursive"])
     allowed_types = parse_file_types(row["raw_file_types"])
     scan_scope = ingest_v2_scan_scope_from_run(root, row)
     exclusions = ingest_v2_planning_exclusions(root, recursive, allowed_types, connection, scan_scope)
+    production_signatures = find_production_root_signatures(root, recursive, connection, scan_scope=scan_scope)
+    production_payloads = [
+        ingest_v2_production_signature_payload(root, signature)
+        for signature in production_signatures
+    ]
     next_order_row = connection.execute(
         """
         SELECT COALESCE(MAX(commit_order), 0) + 1 AS next_order
@@ -29828,6 +29848,26 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
         "skipped_excluded_paths": 0,
         "skipped_missing_paths": 0,
         "listed_directories": 0,
+        "pending_production_rel_roots": (
+            [str(payload["rel_root"]) for payload in production_payloads]
+            if allowed_types is None
+            else []
+        ),
+        "production_roots_by_rel_root": {
+            str(payload["rel_root"]): payload
+            for payload in production_payloads
+        },
+        "planned_production_roots": [],
+        "skipped_production_roots": (
+            [str(payload["rel_root"]) for payload in production_payloads]
+            if allowed_types is not None
+            else []
+        ),
+        "planned_production_rows": 0,
+        "production_failures": [],
+        "production_docs_missing_linked_text": 0,
+        "production_docs_missing_linked_images": 0,
+        "production_docs_missing_linked_natives": 0,
         "excluded_exact_rel_paths": list(exclusions["exact_rel_paths"]),
         "excluded_dir_prefixes": list(exclusions["dir_prefixes"]),
         "special_source_counts": exclusions["counts"],
@@ -29888,6 +29928,122 @@ def ingest_v2_plan_loose_file_item(
         ),
     )
     return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_production_signature_payload(root: Path, signature: dict[str, object]) -> dict[str, object]:
+    metadata_load_path = Path(signature["metadata_load_path"])
+    image_load_path = Path(signature["image_load_path"]) if signature.get("image_load_path") is not None else None
+    return {
+        "rel_root": str(signature["rel_root"]),
+        "production_name": str(signature["production_name"]),
+        "metadata_load_rel_path": relative_document_path(root, metadata_load_path),
+        "image_load_rel_path": relative_document_path(root, image_load_path) if image_load_path is not None else None,
+        "source_type": str(signature["source_type"]),
+    }
+
+
+def ingest_v2_production_signature_from_payload(root: Path, payload: dict[str, object]) -> dict[str, object]:
+    image_load_rel_path = normalize_whitespace(str(payload.get("image_load_rel_path") or "")) or None
+    return {
+        "root": (root / str(payload["rel_root"])).resolve(),
+        "rel_root": str(payload["rel_root"]),
+        "production_name": str(payload["production_name"]),
+        "metadata_load_path": root / str(payload["metadata_load_rel_path"]),
+        "image_load_path": (root / image_load_rel_path) if image_load_rel_path else None,
+        "source_type": str(payload["source_type"]),
+    }
+
+
+def ingest_v2_plan_production_row_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    plan: dict[str, object],
+    signature_payload: dict[str, object],
+    commit_order: int,
+) -> bool:
+    now = utc_now()
+    production_rel_root = str(plan["production_rel_root"])
+    control_number = str(plan["control_number"])
+    rel_path = production_logical_rel_path(production_rel_root, control_number).as_posix()
+    payload = {
+        **plan,
+        "rel_path": rel_path,
+        "metadata_load_rel_path": signature_payload["metadata_load_rel_path"],
+        "image_load_rel_path": signature_payload.get("image_load_rel_path"),
+        "source_type": signature_payload["source_type"],
+        "planned_at": now,
+    }
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO ingest_work_items (
+          run_id, unit_type, source_kind, source_key, rel_path, commit_order,
+          payload_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "production_row",
+            PRODUCTION_SOURCE_KIND,
+            f"{production_rel_root}:{control_number}",
+            rel_path,
+            int(commit_order),
+            compact_json_text(ingest_v2_json_safe_value(payload)),
+            "pending",
+            now,
+            now,
+        ),
+    )
+    return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_plan_production_root(
+    connection: sqlite3.Connection,
+    root: Path,
+    *,
+    run_id: str,
+    signature_payload: dict[str, object],
+    next_commit_order: int,
+) -> dict[str, object]:
+    signature = ingest_v2_production_signature_from_payload(root, signature_payload)
+    production_root = Path(signature["root"])
+    metadata_load_path = Path(signature["metadata_load_path"])
+    image_load_path = Path(signature["image_load_path"]) if signature.get("image_load_path") is not None else None
+    metadata = parse_production_metadata_load(metadata_load_path)
+    image_rows = parse_production_image_load(image_load_path)
+    resolved_image_rows: list[dict[str, object]] = []
+    for image_row in image_rows:
+        resolved_path = resolve_production_source_path(root, production_root, image_row["image_path"])
+        resolved_image_rows.append({**image_row, "resolved_path": resolved_path})
+    production_row_plans, seen_control_numbers = plan_production_record_work(
+        root,
+        production_root,
+        signature,
+        list(metadata["rows"]),
+        resolved_image_rows,
+    )
+    planned_rows = 0
+    current_order = int(next_commit_order)
+    for plan in production_row_plans:
+        inserted = ingest_v2_plan_production_row_item(
+            connection,
+            run_id=run_id,
+            plan=plan,
+            signature_payload=signature_payload,
+            commit_order=current_order,
+        )
+        current_order += 1
+        if inserted:
+            planned_rows += 1
+    return {
+        **signature_payload,
+        "planned_rows": planned_rows,
+        "seen_control_numbers": sorted(seen_control_numbers),
+        "docs_missing_linked_text": sum(int(plan["missing_linked_text"]) for plan in production_row_plans),
+        "docs_missing_linked_images": sum(int(plan["missing_linked_images"]) for plan in production_row_plans),
+        "docs_missing_linked_natives": sum(int(plan["missing_linked_natives"]) for plan in production_row_plans),
+        "next_commit_order": current_order,
+    }
 
 
 def ingest_v2_planning_child_paths(root: Path, directory: Path, *, recursive: bool) -> list[str]:
@@ -30038,7 +30194,7 @@ def ingest_v2_claim_prepare_items(
             SELECT *
             FROM ingest_work_items
             WHERE run_id = ?
-              AND unit_type = 'loose_file'
+              AND unit_type IN ('loose_file', 'production_row')
               AND status = 'pending'
             ORDER BY commit_order ASC, id ASC
             LIMIT ?
@@ -30219,6 +30375,49 @@ def ingest_v2_prepare_loose_file_item(
     source_fingerprint["hash"] = item["file_hash"]
     prepared_item = prepare_loose_file_item(item)
     return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_prepare_production_row_item(
+    root: Path,
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    production_rel_root = str(payload_dict.get("production_rel_root") or "")
+    control_number = str(payload_dict.get("control_number") or "")
+    source_fingerprint = {
+        "production_rel_root": production_rel_root,
+        "control_number": control_number,
+        "metadata_load_rel_path": payload_dict.get("metadata_load_rel_path"),
+        "image_load_rel_path": payload_dict.get("image_load_rel_path"),
+    }
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return None, source_fingerprint, "Not enough budget remaining to start prepare."
+    prepared_item = prepare_production_row_plan(root, payload_dict)
+    return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_hydrate_prepared_production_item(prepared_item: dict[str, object]) -> dict[str, object]:
+    hydrated = dict(prepared_item)
+    for key in (
+        "text_path",
+        "native_path",
+        "available_text_path",
+        "available_native_path",
+        "preferred_native",
+        "preferred_source_path",
+    ):
+        value = hydrated.get(key)
+        if value:
+            hydrated[key] = Path(str(value))
+    hydrated["matching_image_paths"] = [
+        Path(str(path))
+        for path in list(hydrated.get("matching_image_paths") or [])
+        if path
+    ]
+    return hydrated
 
 
 def ingest_v2_store_prepared_item(
@@ -30510,12 +30709,14 @@ def ingest_v2_load_commit_cursor(connection: sqlite3.Connection, *, run_id: str)
             cursor.setdefault("current_ingestion_batch", None)
             cursor.setdefault("actions", {})
             cursor.setdefault("freshness_fallbacks", 0)
+            cursor.setdefault("production_stats", {})
             return cursor
     return {
         "schema_version": 1,
         "current_ingestion_batch": None,
         "actions": {},
         "freshness_fallbacks": 0,
+        "production_stats": {},
     }
 
 
@@ -30794,6 +30995,111 @@ def ingest_v2_commit_work_item_hook(
     )
 
 
+def ingest_v2_ensure_production_context(
+    connection: sqlite3.Connection,
+    root: Path,
+    prepared_item: dict[str, object],
+) -> tuple[int, int, int]:
+    production_rel_root = str(prepared_item["production_rel_root"])
+    production_name = str(prepared_item["production_name"])
+    metadata_load_rel_path = str(prepared_item["metadata_load_rel_path"])
+    image_load_rel_path = normalize_whitespace(str(prepared_item.get("image_load_rel_path") or "")) or None
+    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+        connection,
+        source_kind=PRODUCTION_SOURCE_KIND,
+        source_locator=production_rel_root,
+        dataset_name=production_dataset_name(production_rel_root, production_name),
+    )
+    production_id = upsert_production_row(
+        connection,
+        dataset_id=dataset_id,
+        rel_root=production_rel_root,
+        production_name=production_name,
+        metadata_load_rel_path=metadata_load_rel_path,
+        image_load_rel_path=image_load_rel_path,
+        source_type=str(prepared_item["source_type"]),
+    )
+    connection.commit()
+    return dataset_id, dataset_source_id, production_id
+
+
+def ingest_v2_commit_production_work_item_hook(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    result: dict[str, object],
+) -> None:
+    now = utc_now()
+    action = str(result.get("action") or "")
+    affected_document_ids = [
+        int(result["document_id"])
+    ] if result.get("document_id") is not None else []
+    production_stats = cursor.setdefault("production_stats", {})
+    if isinstance(production_stats, dict):
+        production_stats[action] = int(production_stats.get(action) or 0) + 1
+        production_stats["page_images_linked"] = (
+            int(production_stats.get("page_images_linked") or 0)
+            + int(result.get("page_images_linked") or 0)
+        )
+    ingest_v2_save_phase_cursor(
+        connection,
+        run_id=run_id,
+        phase="committing",
+        cursor_key="loose_file_commit",
+        cursor=cursor,
+        status="pending",
+    )
+    update_cursor = connection.execute(
+        """
+        UPDATE ingest_work_items
+        SET status = 'committed',
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            affected_document_ids_json = ?,
+            affected_entity_ids_json = ?,
+            artifact_manifest_json = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE run_id = ?
+          AND id = ?
+          AND status = 'committing'
+          AND lease_owner = ?
+        """,
+        (
+            compact_json_text(affected_document_ids),
+            compact_json_text([]),
+            compact_json_text(
+                {
+                    "commit_action": action,
+                    "document_id": result.get("document_id"),
+                    "production_id": result.get("production_id"),
+                    "control_number": result.get("control_number"),
+                    "page_images_linked": int(result.get("page_images_linked") or 0),
+                }
+            ),
+            now,
+            run_id,
+            work_item_id,
+            writer_id,
+        ),
+    )
+    if int(update_cursor.rowcount or 0) != 1:
+        raise RetrieverError(f"Could not mark V2 ingest production work item {work_item_id} committed.")
+    connection.execute(
+        """
+        UPDATE ingest_runs
+        SET committer_heartbeat_at = ?,
+            last_heartbeat_at = ?
+        WHERE run_id = ?
+          AND committer_lease_owner = ?
+        """,
+        (now, now, run_id, writer_id),
+    )
+
+
 def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_id: str) -> bool:
     row = require_ingest_v2_run_row(connection, run_id)
     if str(row["phase"]) != "committing" or row["cancel_requested_at"] is not None:
@@ -30847,6 +31153,131 @@ def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_
         raise
 
 
+def ingest_v2_planned_production_roots_by_rel_root(connection: sqlite3.Connection, *, run_id: str) -> dict[str, dict[str, object]]:
+    cursor_row = connection.execute(
+        """
+        SELECT cursor_json
+        FROM ingest_phase_cursors
+        WHERE run_id = ?
+          AND phase = 'planning'
+          AND cursor_key = 'loose_file_scan'
+        """,
+        (run_id,),
+    ).fetchone()
+    if cursor_row is None:
+        return {}
+    cursor = decode_json_text(cursor_row["cursor_json"], default={}) or {}
+    if not isinstance(cursor, dict):
+        return {}
+    roots_by_rel_root = dict(cursor.get("production_roots_by_rel_root") or {})
+    planned_roots = [str(rel_root) for rel_root in list(cursor.get("planned_production_roots") or [])]
+    return {
+        rel_root: dict(roots_by_rel_root.get(rel_root) or {})
+        for rel_root in planned_roots
+        if roots_by_rel_root.get(rel_root)
+    }
+
+
+def ingest_v2_finalize_production_root(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    root: Path,
+    *,
+    production_payload: dict[str, object],
+) -> dict[str, int]:
+    dataset_id, _dataset_source_id, production_id = ingest_v2_ensure_production_context(
+        connection,
+        root,
+        {
+            "production_rel_root": production_payload["rel_root"],
+            "production_name": production_payload["production_name"],
+            "metadata_load_rel_path": production_payload["metadata_load_rel_path"],
+            "image_load_rel_path": production_payload.get("image_load_rel_path"),
+            "source_type": production_payload["source_type"],
+        },
+    )
+    seen_control_numbers = {str(control_number) for control_number in list(production_payload.get("seen_control_numbers") or [])}
+    retired = 0
+    existing_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE production_id = ?
+        """,
+        (production_id,),
+    ).fetchall()
+    for row in existing_rows:
+        control_number = str(row["control_number"] or "")
+        if control_number and control_number in seen_control_numbers:
+            continue
+        connection.execute("BEGIN")
+        try:
+            cleanup_document_artifacts(paths, connection, row)
+            delete_document_related_rows(connection, int(row["id"]))
+            connection.execute(
+                """
+                UPDATE documents
+                SET lifecycle_status = 'deleted',
+                    parent_document_id = NULL,
+                    dataset_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (dataset_id, utc_now(), row["id"]),
+            )
+            connection.commit()
+            retired += 1
+        except Exception:
+            connection.rollback()
+            raise
+
+    connection.execute("BEGIN")
+    try:
+        parent_link_updates = update_production_family_relationships(connection, production_id)
+        attachment_preview_updates = 0
+        preview_document_rows = connection.execute(
+            """
+            SELECT DISTINCT documents.id
+            FROM documents
+            JOIN document_previews ON document_previews.document_id = documents.id
+            WHERE documents.production_id = ?
+              AND documents.lifecycle_status != 'deleted'
+              AND document_previews.preview_type = 'html'
+            ORDER BY documents.id ASC
+            """,
+            (production_id,),
+        ).fetchall()
+        for preview_document_row in preview_document_rows:
+            attachment_preview_updates += sync_document_attachment_preview_links(
+                connection,
+                paths,
+                int(preview_document_row["id"]),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+    families_reconstructed = len(
+        connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE production_id = ?
+              AND parent_document_id IS NOT NULL
+              AND lifecycle_status != 'deleted'
+            """,
+            (production_id,),
+        ).fetchall()
+    )
+    return {
+        "retired": retired,
+        "families_reconstructed": families_reconstructed,
+        "parent_link_updates": int(parent_link_updates),
+        "attachment_preview_updates": int(attachment_preview_updates),
+    }
+
+
 def ingest_v2_load_finalize_cursor(connection: sqlite3.Connection, *, run_id: str) -> dict[str, object]:
     cursor_row = connection.execute(
         """
@@ -30862,15 +31293,24 @@ def ingest_v2_load_finalize_cursor(connection: sqlite3.Connection, *, run_id: st
         cursor = decode_json_text(cursor_row["cursor_json"], default={}) or {}
         if isinstance(cursor, dict):
             cursor.setdefault("schema_version", 1)
-            cursor.setdefault("stage", "missing")
+            cursor.setdefault("stage", "production")
+            cursor.setdefault("pending_production_rel_roots", [])
+            cursor.setdefault("production_roots_by_rel_root", {})
+            cursor.setdefault("production_finalized_roots", [])
+            cursor.setdefault("production_stats", {})
             cursor.setdefault("filesystem_missing", 0)
             cursor.setdefault("conversation_assignment", {})
             cursor.setdefault("conversation_previews_refreshed", 0)
             cursor.setdefault("pruned_unused_filesystem_dataset", False)
             return cursor
+    production_roots_by_rel_root = ingest_v2_planned_production_roots_by_rel_root(connection, run_id=run_id)
     return {
         "schema_version": 1,
-        "stage": "missing",
+        "stage": "production" if production_roots_by_rel_root else "missing",
+        "pending_production_rel_roots": sorted(production_roots_by_rel_root),
+        "production_roots_by_rel_root": production_roots_by_rel_root,
+        "production_finalized_roots": [],
+        "production_stats": {},
         "filesystem_missing": 0,
         "conversation_assignment": {},
         "conversation_previews_refreshed": 0,
@@ -31366,6 +31806,8 @@ def ingest_v2_plan_step(
     ensure_layout(paths)
     processed_paths = 0
     planned_loose_files = 0
+    planned_production_roots = 0
+    planned_production_rows = 0
     with workspace_ingest_session(paths, command_name="ingest-plan-step"):
         connection = connect_db(paths["db_path"])
         try:
@@ -31378,6 +31820,8 @@ def ingest_v2_plan_step(
                     "step": "plan",
                     "processed_paths": 0,
                     "planned_loose_files": 0,
+                    "planned_production_roots": 0,
+                    "planned_production_rows": 0,
                     "more_planning_remaining": False,
                     "more_work_remaining": False,
                     "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
@@ -31389,6 +31833,8 @@ def ingest_v2_plan_step(
                     "step": "plan",
                     "processed_paths": 0,
                     "planned_loose_files": 0,
+                    "planned_production_roots": 0,
+                    "planned_production_rows": 0,
                     "more_planning_remaining": False,
                     "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
                     "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
@@ -31400,6 +31846,108 @@ def ingest_v2_plan_step(
             scan_scope = ingest_v2_scan_scope_from_run(root, row)
 
             while time.perf_counter() < deadline:
+                pending_production_rel_roots = list(cursor.get("pending_production_rel_roots") or [])
+                if pending_production_rel_roots:
+                    production_rel_root = str(pending_production_rel_roots.pop(0))
+                    cursor["pending_production_rel_roots"] = pending_production_rel_roots
+                    signature_payload = dict(
+                        dict(cursor.get("production_roots_by_rel_root") or {}).get(production_rel_root) or {}
+                    )
+                    if signature_payload:
+                        try:
+                            production_plan = ingest_v2_plan_production_root(
+                                connection,
+                                root,
+                                run_id=run_id,
+                                signature_payload=signature_payload,
+                                next_commit_order=int(cursor.get("next_commit_order") or 1),
+                            )
+                        except Exception as exc:
+                            rollback_open_transaction(connection)
+                            failures = list(cursor.get("production_failures") or [])
+                            failures.append(
+                                {
+                                    "production_rel_root": production_rel_root,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                            )
+                            cursor["production_failures"] = failures
+                            production_plan = None
+                        if production_plan is None:
+                            if not connection.in_transaction:
+                                connection.execute("BEGIN")
+                            try:
+                                ingest_v2_save_phase_cursor(
+                                    connection,
+                                    run_id=run_id,
+                                    phase="planning",
+                                    cursor_key="loose_file_scan",
+                                    cursor=cursor,
+                                    status="pending",
+                                )
+                                connection.commit()
+                            except Exception:
+                                connection.rollback()
+                                raise
+                            continue
+                        cursor["next_commit_order"] = int(production_plan["next_commit_order"])
+                        cursor["planned_production_rows"] = (
+                            int(cursor.get("planned_production_rows") or 0)
+                            + int(production_plan["planned_rows"] or 0)
+                        )
+                        cursor["production_docs_missing_linked_text"] = (
+                            int(cursor.get("production_docs_missing_linked_text") or 0)
+                            + int(production_plan["docs_missing_linked_text"] or 0)
+                        )
+                        cursor["production_docs_missing_linked_images"] = (
+                            int(cursor.get("production_docs_missing_linked_images") or 0)
+                            + int(production_plan["docs_missing_linked_images"] or 0)
+                        )
+                        cursor["production_docs_missing_linked_natives"] = (
+                            int(cursor.get("production_docs_missing_linked_natives") or 0)
+                            + int(production_plan["docs_missing_linked_natives"] or 0)
+                        )
+                        production_root_payloads = dict(cursor.get("production_roots_by_rel_root") or {})
+                        production_root_payloads[production_rel_root] = {
+                            **signature_payload,
+                            "seen_control_numbers": list(production_plan["seen_control_numbers"]),
+                            "planned_rows": int(production_plan["planned_rows"] or 0),
+                            "docs_missing_linked_text": int(production_plan["docs_missing_linked_text"] or 0),
+                            "docs_missing_linked_images": int(production_plan["docs_missing_linked_images"] or 0),
+                            "docs_missing_linked_natives": int(production_plan["docs_missing_linked_natives"] or 0),
+                        }
+                        cursor["production_roots_by_rel_root"] = production_root_payloads
+                        planned_roots = list(cursor.get("planned_production_roots") or [])
+                        if production_rel_root not in planned_roots:
+                            planned_roots.append(production_rel_root)
+                            cursor["planned_production_roots"] = planned_roots
+                            planned_production_roots += 1
+                        planned_production_rows += int(production_plan["planned_rows"] or 0)
+                    if not connection.in_transaction:
+                        connection.execute("BEGIN")
+                    try:
+                        ingest_v2_save_phase_cursor(
+                            connection,
+                            run_id=run_id,
+                            phase="planning",
+                            cursor_key="loose_file_scan",
+                            cursor=cursor,
+                            status="pending",
+                        )
+                        connection.execute(
+                            """
+                            UPDATE ingest_runs
+                            SET last_heartbeat_at = ?
+                            WHERE run_id = ?
+                            """,
+                            (utc_now(), run_id),
+                        )
+                        connection.commit()
+                    except Exception:
+                        connection.rollback()
+                        raise
+                    continue
+
                 pending_paths = list(cursor.get("pending_paths") or [])
                 if not pending_paths:
                     break
@@ -31474,7 +32022,10 @@ def ingest_v2_plan_step(
                     connection.rollback()
                     raise
 
-            planning_complete = not list(cursor.get("pending_paths") or [])
+            planning_complete = (
+                not list(cursor.get("pending_production_rel_roots") or [])
+                and not list(cursor.get("pending_paths") or [])
+            )
             if planning_complete:
                 total_work_items = int(
                     connection.execute(
@@ -31521,10 +32072,20 @@ def ingest_v2_plan_step(
                 "step": "plan",
                 "processed_paths": processed_paths,
                 "planned_loose_files": planned_loose_files,
+                "planned_production_roots": planned_production_roots,
+                "planned_production_rows": planned_production_rows,
                 "cursor": {
                     "pending_paths": len(list(cursor.get("pending_paths") or [])),
+                    "pending_production_roots": len(list(cursor.get("pending_production_rel_roots") or [])),
                     "scanned_paths": int(cursor.get("scanned_paths") or 0),
                     "planned_loose_files": int(cursor.get("planned_loose_files") or 0),
+                    "planned_production_roots": len(list(cursor.get("planned_production_roots") or [])),
+                    "planned_production_rows": int(cursor.get("planned_production_rows") or 0),
+                    "skipped_production_roots": list(cursor.get("skipped_production_roots") or []),
+                    "production_failures": list(cursor.get("production_failures") or []),
+                    "production_docs_missing_linked_text": int(cursor.get("production_docs_missing_linked_text") or 0),
+                    "production_docs_missing_linked_images": int(cursor.get("production_docs_missing_linked_images") or 0),
+                    "production_docs_missing_linked_natives": int(cursor.get("production_docs_missing_linked_natives") or 0),
                     "skipped_container_files": int(cursor.get("skipped_container_files") or 0),
                     "skipped_filtered_files": int(cursor.get("skipped_filtered_files") or 0),
                     "skipped_excluded_paths": int(cursor.get("skipped_excluded_paths") or 0),
@@ -31615,11 +32176,21 @@ def ingest_v2_prepare_step(
                     released += 1
                 continue
 
-            prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_loose_file_item(
-                root,
-                work_item_row,
-                deadline=deadline,
-            )
+            unit_type = str(work_item_row["unit_type"] or "")
+            if unit_type == "production_row":
+                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_production_row_item(
+                    root,
+                    work_item_row,
+                    deadline=deadline,
+                )
+                payload_kind = "production_row"
+            else:
+                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_loose_file_item(
+                    root,
+                    work_item_row,
+                    deadline=deadline,
+                )
+                payload_kind = "loose_file"
             if prepared_item is None:
                 if defer_message == "Not enough budget remaining to start prepare.":
                     if ingest_v2_release_prepare_item(
@@ -31646,7 +32217,7 @@ def ingest_v2_prepare_step(
                 run_id=run_id,
                 work_item_id=work_item_id,
                 worker_id=worker_id,
-                payload_kind="loose_file",
+                payload_kind=payload_kind,
                 prepared_item=prepared_item,
                 source_fingerprint=source_fingerprint,
             ):
@@ -31804,27 +32375,64 @@ def ingest_v2_commit_step(
             work_item_id = int(claimed_row["id"])
             try:
                 prepared_item = ingest_v2_prepared_item_from_row(claimed_row)
-                commit_result = commit_prepared_loose_file(
-                    connection,
-                    paths,
-                    prepared_item,
-                    existing_by_rel,
-                    unseen_existing_by_hash,
-                    ensure_filesystem_dataset,
-                    (
-                        int(cursor["current_ingestion_batch"])
-                        if cursor.get("current_ingestion_batch") is not None
-                        else None
-                    ),
-                    before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_work_item_hook(
-                        commit_connection,
-                        run_id=run_id,
-                        work_item_id=work_item_id,
-                        writer_id=writer_id,
-                        cursor=cursor,
-                        result=result,
-                    ),
-                )
+                payload_kind = str(claimed_row["payload_kind"] or claimed_row["unit_type"] or "")
+                if payload_kind == "production_row" or str(claimed_row["unit_type"] or "") == "production_row":
+                    prepared_item = ingest_v2_hydrate_prepared_production_item(prepared_item)
+                    dataset_id, dataset_source_id, production_id = ingest_v2_ensure_production_context(
+                        connection,
+                        root,
+                        prepared_item,
+                    )
+                    existing_row = connection.execute(
+                        """
+                        SELECT *
+                        FROM documents
+                        WHERE production_id = ?
+                          AND control_number = ?
+                        ORDER BY id ASC
+                        LIMIT 1
+                        """,
+                        (production_id, str(prepared_item["control_number"])),
+                    ).fetchone()
+                    commit_result = commit_prepared_production_row(
+                        connection,
+                        paths,
+                        existing_row,
+                        prepared_item,
+                        dataset_id=dataset_id,
+                        dataset_source_id=dataset_source_id,
+                        production_id=production_id,
+                        before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_production_work_item_hook(
+                            commit_connection,
+                            run_id=run_id,
+                            work_item_id=work_item_id,
+                            writer_id=writer_id,
+                            cursor=cursor,
+                            result=result,
+                        ),
+                    )
+                else:
+                    commit_result = commit_prepared_loose_file(
+                        connection,
+                        paths,
+                        prepared_item,
+                        existing_by_rel,
+                        unseen_existing_by_hash,
+                        ensure_filesystem_dataset,
+                        (
+                            int(cursor["current_ingestion_batch"])
+                            if cursor.get("current_ingestion_batch") is not None
+                            else None
+                        ),
+                        before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_work_item_hook(
+                            commit_connection,
+                            run_id=run_id,
+                            work_item_id=work_item_id,
+                            writer_id=writer_id,
+                            cursor=cursor,
+                            result=result,
+                        ),
+                    )
                 action = str(commit_result.get("action") or "")
                 if action == "failed":
                     failed += 1
@@ -31945,6 +32553,63 @@ def ingest_v2_finalize_step(
                 "more_work_remaining": True,
                 "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
             }
+
+        if stage == "production":
+            pending_production_rel_roots = list(cursor.get("pending_production_rel_roots") or [])
+            while (
+                pending_production_rel_roots
+                and ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS
+            ):
+                production_rel_root = str(pending_production_rel_roots.pop(0))
+                cursor["pending_production_rel_roots"] = pending_production_rel_roots
+                production_payload = dict(
+                    dict(cursor.get("production_roots_by_rel_root") or {}).get(production_rel_root) or {}
+                )
+                if production_payload:
+                    production_stats = ingest_v2_finalize_production_root(
+                        connection,
+                        paths,
+                        root,
+                        production_payload=production_payload,
+                    )
+                    aggregate_stats = cursor.setdefault("production_stats", {})
+                    if isinstance(aggregate_stats, dict):
+                        for key, value in production_stats.items():
+                            aggregate_stats[key] = int(aggregate_stats.get(key) or 0) + int(value)
+                    finalized_roots = list(cursor.get("production_finalized_roots") or [])
+                    finalized_roots.append(production_rel_root)
+                    cursor["production_finalized_roots"] = finalized_roots
+                connection.execute("BEGIN")
+                try:
+                    ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="pending")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+            if pending_production_rel_roots:
+                updated_row = require_ingest_v2_run_row(connection, run_id)
+                return {
+                    "ok": True,
+                    "implemented": True,
+                    "step": "finalize",
+                    "stages_completed": stages_completed,
+                    "cursor": cursor,
+                    "finalization_complete": False,
+                    "more_finalize_remaining": True,
+                    "more_work_remaining": True,
+                    "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+                }
+            cursor["stage"] = "missing"
+            connection.execute("BEGIN")
+            try:
+                ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="pending")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            if list(cursor.get("production_finalized_roots") or []):
+                stages_completed.append("production")
+            stage = "missing"
 
         if stage == "missing":
             scanned_rel_paths = ingest_v2_run_loose_rel_paths(connection, run_id=run_id)
