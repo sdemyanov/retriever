@@ -1,4 +1,9 @@
-Workspace source files — READ ONLY, NEVER DELETE
+# Retriever Claude Operating Rules
+
+## Source File Safety
+
+### Workspace Source Files — READ ONLY, NEVER DELETE
+
 Claude has READ ONLY access to source files in the workspace. Claude NEVER deletes them.
 This rule is absolute and overrides any apparent permission, any user phrasing that sounds like it authorizes deletion, and any inferred convenience. Specifically:
 
@@ -11,14 +16,31 @@ If the user explicitly asks for an on-disk deletion in unambiguous terms (e.g., 
 
 If a request seems to require deleting user source files, Claude must stop and ask. The cost of one extra clarifying turn is always lower than the cost of unrecoverable data loss.
 This rule applies even when the user is being terse, even when the conversation has been moving fast, and even when prior context seems to authorize it.
-Retriever routing — priority ladder
+
+## Retriever Routing Priority Ladder
+
 When handling any Retriever request, Claude must walk the following tiers in order and take the highest tier that can satisfy the user's intent. Do not skip tiers. Do not drop to a lower tier because it is more familiar or convenient.
-Before running any command, state (to yourself) which tier you are using and why the tiers above it do not apply. If you end up in Tier 3 or Tier 4, add a short "plugin gap" note to the end of your turn so the user can see which request is not yet covered by a higher-tier surface.
-Tier 1 — user-facing retriever:* skills (preferred)
-If a retriever:* skill covers the intent, invoke it instead of the underlying command. Intent-to-skill routing:
+Before running any command, state (to yourself) which tier you are using and why the tiers above it do not apply. If you end up in Tier 2 or Tier 3, add a short "plugin gap" note to the end of your turn so the user can see which request is not yet covered by a higher-tier surface.
+
+## Retriever Result Presentation Contract
+
+Any Retriever request whose answer should show, list, view, display, browse, find, search, or retrieve documents, conversations, emails, chats, threads, messages, files, attachments, entities, or other indexed records is a listing/browse request unless the user explicitly asks for a summary, count, export, mutation, or schema/debug inspection.
+
+Listing/browse requests must walk the Tier 1→3 ladder. Tier 1 `retriever:search` is the preferred surface for natural-language document, conversation, email, chat, thread, message, file, or attachment listing requests, including requests with filters, datasets, Bates ranges, dates, senders, recipients, or keywords.
+
+Return Retriever's standard rendered result format. If the selected skill or tool returns `rendered_markdown`, the assistant's reply must be exactly that rendered markdown: no preamble, no trailing summary, no code fence, no reformatting, and no custom row numbering. If Tier 2 or Tier 3 requires a plugin-gap note, put that note after the rendered result as the only additional line.
+
+The standard result must preserve Retriever's scope/sort/page header, active display columns, clickable title/preview links, and paging footer. Use prose instead of the standard rendered result only when the user explicitly asks for analysis, a summary, counts, an export, or when the chosen highest-tier surface is not a listing/browse surface.
+
+## Tier 1 — User-Facing Retriever Surfaces
+
+Tier 1 combines user-facing `retriever:*` skills and the slash commands they wrap. Prefer a `retriever:*` skill when one covers the intent. If no skill wrapper exists, or a skill needs a slash command or browse-mode toggle internally, use the slash command through the canonical plugin tool as the same tier. Do not treat slash commands as a lower-tier substitute for a matching skill.
+
+### Skill Routing (Preferred Wrappers)
 
 List, switch, rename, or clear dataset scope → retriever:dataset
-Search or browse documents, filter the collection, answer "find / show me / list emails or docs matching …" → retriever:search
+Show, list, view, display, browse, find, search, or retrieve documents, conversations, emails, chats, threads, messages, files, or attachments — with or without filters or keywords — and return the standard rendered result format → retriever:search
+Narrow, restrict, constrain, exclude, or clear result filters → retriever:filter
 Change displayed columns → retriever:columns
 Change sort → retriever:sort
 Change page size → retriever:page-size
@@ -39,8 +61,44 @@ Understand file-type support and preview rules → retriever:parsing
 Understand result presentation and paging defaults → retriever:search-strategy
 Materialize or upgrade the canonical workspace tool → retriever:tool-template
 
-If the user's intent maps to one of the rows above, stop. Use that skill.
-Python runtime (applies to Tiers 2–4)
+If the user's intent maps to one of the rows above, stop. Use that skill. Continue to the slash list only when no `retriever:*` skill wrapper exists for the intent, when the user explicitly asks for a slash command, or when a skill's own instructions call for a slash command internally.
+
+### Slash Commands (Tier 1 Fallback and Implementation Surface)
+
+If no Tier 1 skill wrapper exists for the intent, use a slash command via the
+canonical plugin tool as Tier 1. Run exactly one command from the repo root:
+
+```bash
+python3 skills/tool-template/tools.py slash . /<command> [args]
+```
+
+Return Retriever state only for state-inspection commands. For listing/browse commands, return the tool-rendered standard table/result exactly as produced; prefer `rendered_markdown` when present and do not add prose or custom formatting.
+
+`/documents`, `/conversations`, and `/entities` are browse-mode toggles. Use them internally when intent is clear; do not route ordinary natural-language listing requests to those toggles before checking `retriever:search`.
+
+The authoritative current list of slash commands is regenerated at build time into the section below.
+<!-- BEGIN: slash-commands -->
+- `/bates <range>` — scope browsing to a Bates range. **Use when:** the user asks to limit or scope browsing to a Bates or production-number range — phrasings like "show ABC0001 to ABC0050", "just the ABC0100 docs", "Bates range", "production numbers X to Y", or "clear the Bates range".
+- `/columns [list|set|add|remove|default]` — inspect or change displayed columns. **Use when:** the user asks to show, hide, add, remove, reorder, or reset which columns appear in the result table — phrasings like "add the author column", "hide date_received", "show file size", "what columns are available", or "reset columns".
+- `/conversations` — switch the browse mode to conversations. **Use when:** the user asks to list, show, or browse conversations/threads — pair with `/search`, `/filter`, `/dataset`, or other scope commands to populate results; by itself it only switches the browse mode.
+- `/dataset [list|<name>[,<name>...]|clear|rename <old> <new>]` — scope to one or more datasets, list them, rename, or clear. **Use when:** the user asks to list, show, enumerate, switch, pick, select, rename, or clear datasets — phrasings like "what datasets do I have", "show me my datasets", "switch to gmail-max", "use the production dataset", or "rename X to Y".
+- `/documents` — switch the browse mode to documents. **Use when:** the user asks to list, show, or browse individual documents/messages — pair with `/search`, `/filter`, `/dataset`, or other scope commands to populate results; by itself it only switches the browse mode.
+- `/entities` — switch the browse mode to entities. **Use when:** the user asks to return to, page through, sort, resize, or re-display the active entity list — pair with `list-entities` to seed a query; by itself it switches to the saved entity browse state.
+- `/field [list|add|rename|delete|describe|type]` — list or manage custom field definitions. **Use when:** the user asks to list, add, rename, delete, re-describe, or retype a custom field — phrasings like "add a responsiveness field", "rename privilege_status", "drop the old tag", "update the field description", or "change this field to date".
+- `/fill <field> <value-or-clear> [on <doc-ref[,doc-ref,...]>] [--confirm]` — set or clear field values on documents. **Use when:** the user asks to populate, tag, mark, label, classify, annotate, flag, or clear a field value on one document or on the current filtered result set — phrasings like "mark these responsive", "fill reviewer=jdoe", "clear the review status", or "tag DOC001 as privileged".
+- `/filter [<expression>|clear]` — add or clear SQL-like filters. **Use when:** the user asks to narrow, restrict, constrain, or exclude results — phrasings like "only PDFs", "show just emails from alice", "exclude attachments", "hide chats", "only 2023", or a SQL-like predicate — or asks to drop/clear current filters.
+- `/from-run <run-id|clear>` — scope browsing to a processing run. **Use when:** the user asks to limit or scope browsing to documents produced by a specific processing run — phrasings like "only docs from run 42", "show what run 5 produced", "filter to the last OCR run", "just the image-description outputs", or "clear the run filter".
+- `/next` — go to the next page of active results. **Use when:** the user asks for more results or the next page — phrasings like "show more", "keep going", "next batch", "next page", "continue", or "what else".
+- `/page [<n>|first|last|next|previous]` — jump to a specific page. **Use when:** the user asks to jump to a specific page — phrasings like "go to page 3", "first page", "last page", "skip to the end", "back to the start", or "where am I in the results".
+- `/page-size [<n>]` — inspect or change rows per page. **Use when:** the user asks to change how many rows appear per page — phrasings like "show 50 at a time", "more per page", "smaller page size", "25 rows please", or "what's my current page size".
+- `/previous` — go to the previous page of active results. **Use when:** the user asks to go back to earlier results or the previous page — phrasings like "go back", "previous page", "back one page", "earlier results", or "the page before".
+- `/scope [list|clear|save <name>|load <name>]` — inspect or manage the active scope. **Use when:** the user asks to inspect, save, bookmark, restore, load, or clear the current combination of dataset/filter/sort/column state — phrasings like "save this view as X", "go back to my saved scope", "what's my current scope", "list saved scopes", or "clear scope".
+- `/search [<query>]` — run a keyword search. **Use when:** the user asks to show, list, view, display, browse, find, search, or retrieve documents, conversations, emails, chats, threads, messages, files, or attachments — with or without a keyword — including requests like "show me emails from alice", "list PDFs from 2023", "find docs mentioning indemnification", or "what's in gmail-max".
+- `/sort [list|<field> <asc|desc>|default]` — inspect or change sort order. **Use when:** the user asks to change or reset the order of results — phrasings like "newest first", "oldest first", "sort by date", "order by file name", "alphabetical", "by size", or "reset sort".
+<!-- END: slash-commands -->
+
+## Python Runtime (applies to command surfaces)
+
 Retriever maintains a shared plugin runtime venv under
 .retriever-plugin-runtime/<platform>/venv/.
 For Retriever commands, bare python3 is acceptable. The tool can activate the
@@ -99,7 +157,7 @@ python3 skills/tool-template/tools.py rebuild-entities-status ./data --run-id <R
 
 Repeat `rebuild-entities-run-step` until terminal status. Legacy `rebuild-entities` may exceed Cowork limits on large workspaces.
 
-For planned processing runs, prefer `retriever:run-job` at Tier 1. If using Tier 3 directly, prefer:
+For planned processing runs, prefer `retriever:run-job` at Tier 1. If using Tier 2 directly, prefer:
 
 ```bash
 python3 skills/tool-template/tools.py run-job-step . --run-id <RUN_ID> --budget-seconds 35
@@ -113,34 +171,17 @@ For any tool result with `more_work_remaining: true`, continue with the returned
 
 If an active run exists, do not start a new one. Resume it or cancel it intentionally.
 
-Tier 2 — tools.py slash commands
-If no Tier 1 skill exists for the intent, use a slash command via the canonical
-plugin tool. Run exactly one command from the repo root:
-python3 skills/tool-template/tools.py slash . /<command> [args]
-Return the resulting Retriever state or table. The authoritative current list of slash commands is regenerated at build time into the section below.
-<!-- BEGIN: slash-commands -->
-- `/bates <range>` — scope browsing to a Bates range. **Use when:** the user asks to limit or scope browsing to a Bates or production-number range — phrasings like "show ABC0001 to ABC0050", "just the ABC0100 docs", "Bates range", "production numbers X to Y", or "clear the Bates range".
-- `/columns [list|set|add|remove|default]` — inspect or change displayed columns. **Use when:** the user asks to show, hide, add, remove, reorder, or reset which columns appear in the result table — phrasings like "add the author column", "hide date_received", "show file size", "what columns are available", or "reset columns".
-- `/conversations` — switch the browse mode to conversations. **Use when:** the user asks to list, show, or browse conversations/threads — pair with `/search`, `/filter`, `/dataset`, or other scope commands to populate results; by itself it only switches the browse mode.
-- `/dataset [list|<name>[,<name>...]|clear|rename <old> <new>]` — scope to one or more datasets, list them, rename, or clear. **Use when:** the user asks to list, show, enumerate, switch, pick, select, rename, or clear datasets — phrasings like "what datasets do I have", "show me my datasets", "switch to gmail-max", "use the production dataset", or "rename X to Y".
-- `/documents` — switch the browse mode to documents. **Use when:** the user asks to list, show, or browse individual documents/messages — pair with `/search`, `/filter`, `/dataset`, or other scope commands to populate results; by itself it only switches the browse mode.
-- `/entities` — switch the browse mode to entities. **Use when:** the user asks to return to, page through, sort, resize, or re-display the active entity list — pair with `list-entities` to seed a query; by itself it switches to the saved entity browse state.
-- `/field [list|add|rename|delete|describe|type]` — list or manage custom field definitions. **Use when:** the user asks to list, add, rename, delete, re-describe, or retype a custom field — phrasings like "add a responsiveness field", "rename privilege_status", "drop the old tag", "update the field description", or "change this field to date".
-- `/fill <field> <value-or-clear> [on <doc-ref[,doc-ref,...]>] [--confirm]` — set or clear field values on documents. **Use when:** the user asks to populate, tag, mark, label, classify, annotate, flag, or clear a field value on one document or on the current filtered result set — phrasings like "mark these responsive", "fill reviewer=jdoe", "clear the review status", or "tag DOC001 as privileged".
-- `/filter [<expression>|clear]` — add or clear SQL-like filters. **Use when:** the user asks to narrow, restrict, constrain, or exclude results — phrasings like "only PDFs", "show just emails from alice", "exclude attachments", "hide chats", "only 2023", or a SQL-like predicate — or asks to drop/clear current filters.
-- `/from-run <run-id|clear>` — scope browsing to a processing run. **Use when:** the user asks to limit or scope browsing to documents produced by a specific processing run — phrasings like "only docs from run 42", "show what run 5 produced", "filter to the last OCR run", "just the image-description outputs", or "clear the run filter".
-- `/next` — go to the next page of active results. **Use when:** the user asks for more results or the next page — phrasings like "show more", "keep going", "next batch", "next page", "continue", or "what else".
-- `/page [<n>|first|last|next|previous]` — jump to a specific page. **Use when:** the user asks to jump to a specific page — phrasings like "go to page 3", "first page", "last page", "skip to the end", "back to the start", or "where am I in the results".
-- `/page-size [<n>]` — inspect or change rows per page. **Use when:** the user asks to change how many rows appear per page — phrasings like "show 50 at a time", "more per page", "smaller page size", "25 rows please", or "what's my current page size".
-- `/previous` — go to the previous page of active results. **Use when:** the user asks to go back to earlier results or the previous page — phrasings like "go back", "previous page", "back one page", "earlier results", or "the page before".
-- `/scope [list|clear|save <name>|load <name>]` — inspect or manage the active scope. **Use when:** the user asks to inspect, save, bookmark, restore, load, or clear the current combination of dataset/filter/sort/column state — phrasings like "save this view as X", "go back to my saved scope", "what's my current scope", "list saved scopes", or "clear scope".
-- `/search [<query>]` — run a keyword search. **Use when:** the user asks to show, list, view, display, browse, find, search, or retrieve documents, conversations, emails, chats, threads, messages, files, or attachments — with or without a keyword — including requests like "show me emails from alice", "list PDFs from 2023", "find docs mentioning indemnification", or "what's in gmail-max".
-- `/sort [list|<field> <asc|desc>|default]` — inspect or change sort order. **Use when:** the user asks to change or reset the order of results — phrasings like "newest first", "oldest first", "sort by date", "order by file name", "alphabetical", "by size", or "reset sort".
-<!-- END: slash-commands -->
-Tier 3 — tools.py subcommands
-If no slash form covers the intent, use a named subcommand of the canonical
-plugin tool:
+## Tier 2 — tools.py Subcommands
+
+If no Tier 1 user-facing surface covers the intent, use a named subcommand of
+the canonical plugin tool:
+
+```bash
 python3 skills/tool-template/tools.py <subcommand> . [flags]
+```
+
+Tier 2 is for gaps and explicit programmatic/stateless needs. Do not use Tier 2 search/list subcommands for ordinary document, conversation, email, chat, thread, message, file, or attachment listing requests when Tier 1 `retriever:search` or a Tier 1 slash surface can satisfy the user's intent.
+
 The authoritative current list of subcommands is regenerated at build time into the section below.
 <!-- BEGIN: tool-subcommands -->
 ### Workspace & maintenance
@@ -177,7 +218,7 @@ The authoritative current list of subcommands is regenerated at build time into 
 - you need a programmatic search with explicit filters/sort/columns → `search` — search indexed documents
 - you need citation-ready chunk hits for a query → `search-chunks` — search matching text chunks with citations
 - you need a programmatic document-level search (over parents only) → `search-docs` — search indexed documents at the document level
-- you need to invoke a Tier 2 slash programmatically → `slash` — execute a scope-aware slash command (see Tier 2)
+- you need to invoke a Tier 1 slash command programmatically → `slash` — execute a scope-aware slash command (see Tier 1)
 
 ### Documents & text
 
@@ -232,7 +273,7 @@ The authoritative current list of subcommands is regenerated at build time into 
 ### Conversations
 
 - you need to drop a document's conversation assignment → `clear-conversation-assignment` — clear a document's conversation assignment
-- the user asks to list, browse, page through, sort, or inspect conversation/thread summaries through a stateless Tier 3 command — phrasings like "show conversations 51-100", "list threads sorted by last activity", or "page conversation summaries" → `list-conversations` — list conversation summaries
+- the user asks to list, browse, page through, sort, or inspect conversation/thread summaries through a stateless Tier 2 command — phrasings like "show conversations 51-100", "list threads sorted by last activity", or "page conversation summaries" → `list-conversations` — list conversation summaries
 - the user asks to merge, join, link, or attach a document into a specific conversation/thread — phrasings like "join these emails into one thread", "merge this into thread X", "link this message to conversation Y", or "group these as one conversation" → `merge-into-conversation` — merge a document into a conversation
 - you need to re-run conversation assignment and regenerate previews after ingest or metadata changes → `rebuild-conversations` — re-run conversation assignment and regenerate conversation previews
 - you need to resolve detected duplicates → `reconcile-duplicates` — reconcile detected duplicates
@@ -276,21 +317,27 @@ The authoritative current list of subcommands is regenerated at build time into 
 - you need stored processing results for inspection → `list-results` — list stored processing results
 
 <!-- END: tool-subcommands -->
-Tier 4 — direct SQLite access (last resort only)
-Allowed only when Tiers 1–3 cannot satisfy the request. Before running any sqlite3 CLI, python3 -c "import sqlite3 …", or equivalent client against .retriever/retriever.db, Claude must:
+
+## Tier 3 — Direct SQLite Access (Last Resort Only)
+
+Allowed only when Tiers 1–2 cannot satisfy the request. Before running any sqlite3 CLI, python3 -c "import sqlite3 …", or equivalent client against .retriever/retriever.db, Claude must:
 
 State explicitly that no higher-tier surface covers the request, and name the gap (for example, "no slash or subcommand returns conversation-level participant counts").
-Read-only queries only, unless the user has explicitly asked for a mutation that cannot be expressed via Tier 3.
+Read-only queries only, unless the user has explicitly asked for a mutation that cannot be expressed via Tier 2.
 Include a "plugin gap" line at the end of the response identifying the missing command, so the gap can be closed on a later iteration.
 
-Never modify .retriever/retriever.db with direct SQL when a Tier 3 subcommand or Tier 2 slash could achieve the same change.
-Pre-flight algorithm
+Never modify .retriever/retriever.db with direct SQL when a Tier 2 subcommand or Tier 1 skill/slash surface could achieve the same change.
+
+## Pre-flight Algorithm
+
 Every time Claude is about to act on a Retriever workspace:
 
-Identify the user's intent in one sentence.
-Scan the Tier 1 table above for a matching retriever:* skill. If one matches, stop and use it.
-Otherwise, scan the Tier 2 slash list for a matching command. If one matches, run it via slash ..
-Otherwise, scan the Tier 3 subcommand list. If one matches, run it.
-Otherwise, fall to Tier 4 under the constraints above and emit the "plugin gap" note.
+1. Identify the user's intent in one sentence.
+2. Scan the Tier 1 skill table above for a matching `retriever:*` skill. If one matches, stop and use it.
+3. Otherwise, scan the Tier 1 slash list for a matching command. If one matches, run it via slash ..
+4. Otherwise, scan the Tier 2 subcommand list. If one matches, run it.
+5. Otherwise, fall to Tier 3 under the constraints above and emit the "plugin gap" note.
 
-This ladder applies to every Retriever request, including requests phrased in natural language (for example, "show me conversations in gmail-max" is a Tier 2 /conversations request under dataset scope gmail-max, not a Tier 4 SQL query).
+This ladder applies to every Retriever request, including requests phrased in natural language. For example, "show me conversations in gmail-max" is Tier 1 `retriever:search`; that skill may use dataset scope and conversation browse surfaces internally, but Claude must not bypass Tier 1 or jump to Tier 3 SQL.
+
+For any show/list/view/display/browse/find/search/retrieve request, the final answer must follow the Retriever Result Presentation Contract above.

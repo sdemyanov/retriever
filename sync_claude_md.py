@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Regenerate the Tier 2 slash list and Tier 3 subcommand list inside
+"""Regenerate the Tier 1 slash list and Tier 2 subcommand list inside
 `CLAUDE.md` so the routing ladder never goes stale.
 
-Tier 2 (slash commands) is extracted from the tool-template source by scanning
+Tier 1 slash commands are extracted from the tool-template source by scanning
 for every literal `command_name == "..."` occurrence inside the slash
-dispatcher. Tier 3 (named subcommands of `tools.py`) is extracted by shelling
+dispatcher. Tier 2 named subcommands of `tools.py` are extracted by shelling
 out to `--help` on the freshly bundled tool.
 
 For each command we keep three hand-authored pieces of metadata:
 
   - SLASH_BLURBS / SUBCOMMAND_BLURBS: the action the command performs.
   - USE_WHEN: the natural-language intent that should route to this command.
-  - SUBCOMMAND_GROUPS: the topical bucket for Tier 3 (no groups at Tier 2 —
-    the slash list is still small enough to scan flat).
+  - SUBCOMMAND_GROUPS: the topical bucket for Tier 2 subcommands (no groups
+    for slash commands because the slash list is still small enough to scan
+    flat).
 
 The renderer emits intent-first lines under topical headings so selection
-works the same way at Tier 2 and Tier 3 as it does at Tier 1. Anything new —
-a command without a blurb, without a "use when," or a Tier 3 command without
-a group — shows up as a `TODO: …` line so it is visible in a build diff and
-can be filled in before shipping.
+works the same way for slash commands and Tier 2 subcommands as it does for
+Tier 1 skill wrappers. Anything new — a command without a blurb, without a
+"use when," or a Tier 2 command without a group — shows up as a `TODO: …`
+line so it is visible in a build diff and can be filled in before shipping.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "tools.py"
 CLAUDE_PATH = REPO_ROOT / "CLAUDE.md"
 
 # ---------------------------------------------------------------------------
-# Tier 2 — slash commands. No grouping.
+# Tier 1 — slash commands. No grouping.
 # ---------------------------------------------------------------------------
 
 SLASH_BLURBS: dict[str, str] = {
@@ -97,7 +98,7 @@ SLASH_USE_WHEN: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Tier 3 — tools.py subcommands, grouped by topic.
+# Tier 2 — tools.py subcommands, grouped by topic.
 # ---------------------------------------------------------------------------
 
 SUBCOMMAND_BLURBS: dict[str, str] = {
@@ -129,7 +130,7 @@ SUBCOMMAND_BLURBS: dict[str, str] = {
     "search": "search indexed documents",
     "search-docs": "search indexed documents at the document level",
     "search-chunks": "search matching text chunks with citations",
-    "slash": "execute a scope-aware slash command (see Tier 2)",
+    "slash": "execute a scope-aware slash command (see Tier 1)",
     # Documents & text
     "get-doc": "fetch one document with optional summary text or exact chunks",
     "list-chunks": "list chunk metadata for one document",
@@ -236,7 +237,7 @@ SUBCOMMAND_USE_WHEN: dict[str, str] = {
     "search": "you need a programmatic search with explicit filters/sort/columns",
     "search-docs": "you need a programmatic document-level search (over parents only)",
     "search-chunks": "you need citation-ready chunk hits for a query",
-    "slash": "you need to invoke a Tier 2 slash programmatically",
+    "slash": "you need to invoke a Tier 1 slash command programmatically",
     # Documents & text
     "get-doc": "you need full metadata, text, or chunks for one document",
     "list-chunks": "you need the chunk layout for one document",
@@ -277,7 +278,7 @@ SUBCOMMAND_USE_WHEN: dict[str, str] = {
     "change-field-type": "you need to change a custom field's storage type",
     "fill-field": "you need to write or clear a field value on one or more documents",
     # Conversations
-    "list-conversations": "the user asks to list, browse, page through, sort, or inspect conversation/thread summaries through a stateless Tier 3 command — phrasings like \"show conversations 51-100\", \"list threads sorted by last activity\", or \"page conversation summaries\"",
+    "list-conversations": "the user asks to list, browse, page through, sort, or inspect conversation/thread summaries through a stateless Tier 2 command — phrasings like \"show conversations 51-100\", \"list threads sorted by last activity\", or \"page conversation summaries\"",
     "merge-into-conversation": "the user asks to merge, join, link, or attach a document into a specific conversation/thread — phrasings like \"join these emails into one thread\", \"merge this into thread X\", \"link this message to conversation Y\", or \"group these as one conversation\"",
     "split-from-conversation": "the user asks to split, detach, separate, or remove a document from its conversation/thread — phrasings like \"split this email off its thread\", \"detach this message\", \"separate this from the conversation\", or \"remove from thread\"",
     "clear-conversation-assignment": "you need to drop a document's conversation assignment",
@@ -482,7 +483,7 @@ def _render_subcommand_line(name: str) -> str:
     blurb = SUBCOMMAND_BLURBS.get(name, "TODO: describe")
     use_when = SUBCOMMAND_USE_WHEN.get(name, "TODO: add use-when")
     # Use-when values read as full clauses ("you need to …", "you are a run
-    # worker …"), so no leading prefix is needed — that keeps Tier 3 intent-
+    # worker …"), so no leading prefix is needed — that keeps Tier 2 intent-
     # first without the awkward "when you need to you need to …" doubling.
     return f"- {use_when} → `{name}` — {blurb}"
 
