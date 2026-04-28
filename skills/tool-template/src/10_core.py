@@ -868,6 +868,44 @@ SCHEMA_STATEMENTS = [
       updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS entity_rebuild_runs (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL UNIQUE,
+      mode TEXT NOT NULL DEFAULT 'full',
+      phase TEXT NOT NULL DEFAULT 'resetting',
+      status TEXT NOT NULL DEFAULT 'resetting',
+      document_ids_json TEXT NOT NULL DEFAULT '[]',
+      batch_size INTEGER NOT NULL DEFAULT 500,
+      reset_stage TEXT NOT NULL DEFAULT 'document_entities',
+      reset_counts_json TEXT NOT NULL DEFAULT '{}',
+      cursor_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      cancel_requested_at TEXT,
+      last_heartbeat_at TEXT,
+      error TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS entity_rebuild_items (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES entity_rebuild_runs(run_id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      document_synced INTEGER NOT NULL DEFAULT 0,
+      auto_links_created INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(run_id, document_id)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_documents_file_hash ON documents(file_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_lifecycle_status ON documents(lifecycle_status)",
@@ -887,6 +925,9 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_ingest_phase_cursors_run_phase ON ingest_phase_cursors(run_id, phase, status)",
     "CREATE INDEX IF NOT EXISTS idx_ingest_worker_events_run_created ON ingest_worker_events(run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_ingest_artifact_sweeps_run_state ON ingest_artifact_sweeps(run_id, state)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_runs_status ON entity_rebuild_runs(status, phase)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_items_run_status ON entity_rebuild_items(run_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_items_lease ON entity_rebuild_items(lease_expires_at)",
 ]
 
 

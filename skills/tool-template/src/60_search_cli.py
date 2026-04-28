@@ -10684,6 +10684,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="Documents to refresh per transaction",
     )
 
+    rebuild_entities_start_parser = subparsers.add_parser(
+        "rebuild-entities-start",
+        help="Start a resumable entity rebuild run",
+    )
+    rebuild_entities_start_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_start_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Rebuild entity links for one document id (repeatable); omit for a full graph rebuild",
+    )
+    rebuild_entities_start_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Documents to plan or refresh per bounded step",
+    )
+    rebuild_entities_start_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Recommended per-step budget; values above the bounded-worker cap are rejected",
+    )
+
+    rebuild_entities_status_parser = subparsers.add_parser(
+        "rebuild-entities-status",
+        help="Show resumable entity rebuild status",
+    )
+    rebuild_entities_status_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_status_parser.add_argument("--run-id", help="Run id; defaults to the latest entity rebuild run")
+    rebuild_entities_status_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Budget used when computing next recommended commands",
+    )
+
+    rebuild_entities_run_step_parser = subparsers.add_parser(
+        "rebuild-entities-run-step",
+        help="Advance a resumable entity rebuild until the bounded call budget is nearly exhausted",
+    )
+    rebuild_entities_run_step_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_run_step_parser.add_argument("--run-id", help="Run id to advance; defaults to the active or latest run")
+    rebuild_entities_run_step_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Per-call budget; values above the bounded-worker cap are rejected",
+    )
+
+    rebuild_entities_cancel_parser = subparsers.add_parser(
+        "rebuild-entities-cancel",
+        help="Cancel a resumable entity rebuild run",
+    )
+    rebuild_entities_cancel_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_cancel_parser.add_argument("--run-id", required=True, help="Run id to cancel")
+
     list_entities_parser = subparsers.add_parser("list-entities", help="List recognized entities")
     list_entities_parser.add_argument("workspace", help="Workspace root path")
     list_entities_parser.add_argument("--query", help="Filter entities by display name or identifier")
@@ -11685,6 +11743,46 @@ def main() -> int:
                     root,
                     document_ids=args.document_ids,
                     batch_size=args.batch_size,
+                ),
+            )
+
+        if args.command == "rebuild-entities-start":
+            return emit_cli_payload(
+                "rebuild-entities-start",
+                rebuild_entities_start(
+                    root,
+                    document_ids=args.document_ids,
+                    batch_size=args.batch_size,
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
+        if args.command == "rebuild-entities-status":
+            return emit_cli_payload(
+                "rebuild-entities-status",
+                rebuild_entities_status(
+                    root,
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
+        if args.command == "rebuild-entities-run-step":
+            return emit_cli_payload(
+                "rebuild-entities-run-step",
+                rebuild_entities_run_step(
+                    root,
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
+        if args.command == "rebuild-entities-cancel":
+            return emit_cli_payload(
+                "rebuild-entities-cancel",
+                rebuild_entities_cancel(
+                    root,
+                    run_id=args.run_id,
                 ),
             )
 
