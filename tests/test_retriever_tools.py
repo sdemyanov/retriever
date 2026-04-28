@@ -10153,7 +10153,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         search_result = retriever_tools.search(self.root, "sync", None, None, None, 1, 20)
         self.assertEqual(search_result["results"][0]["id"], day_row["id"])
 
-    def test_slack_user_external_id_hints_follow_dataset_policy_on_rebuild(self) -> None:
+    def test_slack_user_hints_store_email_handle_and_merge_by_default(self) -> None:
         export_root = self.root / "data" / "slack"
         export_root.mkdir(parents=True)
         (export_root / "users.json").write_text(
@@ -10165,6 +10165,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                         "profile": {
                             "real_name": "Sergey Demyanov",
                             "display_name": "Sergey",
+                            "email": "sergey@example.com",
                         },
                     }
                 ],
@@ -10239,8 +10240,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
         day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
-        self.assertEqual(day_one_row["participants"], "Sergey Demyanov")
-        self.assertEqual(day_two_row["participants"], "Sergey D")
+        self.assertEqual(day_one_row["participants"], "Sergey Demyanov <sergey@example.com>")
+        self.assertEqual(day_two_row["participants"], "Sergey Demyanov <sergey@example.com>")
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -10275,6 +10276,26 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 ORDER BY entity_id ASC
                 """
             ).fetchall()
+            email_identifier_rows = connection.execute(
+                """
+                SELECT entity_id, normalized_value
+                FROM entity_identifiers
+                WHERE identifier_type = 'email'
+                  AND normalized_value = 'sergey@example.com'
+                ORDER BY entity_id ASC
+                """
+            ).fetchall()
+            handle_identifier_rows = connection.execute(
+                """
+                SELECT entity_id, provider, provider_scope, normalized_value
+                FROM entity_identifiers
+                WHERE identifier_type = 'handle'
+                  AND provider = 'slack'
+                  AND provider_scope = 'data/slack'
+                  AND normalized_value = 'sergey'
+                ORDER BY entity_id ASC
+                """
+            ).fetchall()
             external_key_count = connection.execute(
                 """
                 SELECT COUNT(*) AS row_count
@@ -10289,80 +10310,170 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(len(participant_rows), 2)
-        self.assertNotEqual(participant_rows[0]["entity_id"], participant_rows[1]["entity_id"])
-        self.assertEqual({row["entity_origin"] for row in participant_rows}, {retriever_tools.ENTITY_ORIGIN_OBSERVED})
+        self.assertEqual(
+            {row["entity_id"] for row in participant_rows},
+            {participant_rows[0]["entity_id"]},
+        )
+        self.assertEqual({row["entity_origin"] for row in participant_rows}, {retriever_tools.ENTITY_ORIGIN_IDENTIFIED})
         self.assertIsNotNone(hint_row)
         hint_payload = json.loads(hint_row["entity_hints_json"])
+        hint_identifiers = hint_payload["participants"][0]["identifiers"]
         self.assertEqual(
-            hint_payload["participants"][0]["identifiers"][0]["identifier_name"],
-            "slack_user_id",
+            {
+                (
+                    identifier["identifier_type"],
+                    identifier.get("identifier_name"),
+                    identifier.get("identifier_scope"),
+                    identifier.get("provider"),
+                    identifier.get("provider_scope"),
+                    identifier["normalized_value"],
+                )
+                for identifier in hint_identifiers
+            },
+            {
+                ("external_id", "slack_user_id", "data/slack", None, None, "u04sergey1"),
+                ("email", None, None, None, None, "sergey@example.com"),
+                ("handle", None, None, "slack", "data/slack", "sergey"),
+            },
         )
+        self.assertEqual(len(external_identifier_rows), 1)
+        self.assertEqual(len(email_identifier_rows), 1)
+        self.assertEqual(len(handle_identifier_rows), 1)
         self.assertEqual(
-            hint_payload["participants"][0]["identifiers"][0]["identifier_scope"],
-            "data/slack",
+            {
+                int(external_identifier_rows[0]["entity_id"]),
+                int(email_identifier_rows[0]["entity_id"]),
+                int(handle_identifier_rows[0]["entity_id"]),
+            },
+            {int(participant_rows[0]["entity_id"])},
         )
-        self.assertEqual(len(external_identifier_rows), 2)
-        self.assertEqual(int(external_key_count["row_count"] or 0), 0)
+        self.assertEqual(int(external_key_count["row_count"] or 0), 1)
 
-        exit_code, set_payload, _, _ = self.run_cli(
-            "set-dataset-policy",
+    def test_slack_profile_email_merges_with_existing_manual_entity_on_ingest(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                            "email": "sergey@example.com",
+                        },
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Slack profile should attach to the known person.",
+                        "user": "U04SERGEY1",
+                        "ts": "1671235434.237949",
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        exit_code, create_payload, _, _ = self.run_cli(
+            "create-entity",
             str(self.root),
-            "--dataset-id",
-            str(day_one_row["dataset_id"]),
-            "--external-id-auto-merge-name",
-            "slack_user_id",
+            "--entity-type",
+            "person",
+            "--display-name",
+            "Known Sergey",
+            "--email",
+            "sergey@example.com",
         )
         self.assertEqual(exit_code, 0)
-        self.assertIsNotNone(set_payload)
-        self.assertEqual(set_payload["merge_policy"]["external_id_auto_merge_names"], ["slack_user_id"])
+        self.assertIsNotNone(create_payload)
+        manual_entity_id = int(create_payload["entity_id"])
 
-        exit_code, rebuild_payload, _, _ = self.run_cli("rebuild-entities", str(self.root))
-        self.assertEqual(exit_code, 0)
-        self.assertIsNotNone(rebuild_payload)
-        self.assertEqual(rebuild_payload["documents_synced"], 2)
-
-        rebuilt_day_one = self.fetch_document_by_id(day_one_row["id"])
-        rebuilt_day_two = self.fetch_document_by_id(day_two_row["id"])
-        self.assertEqual(rebuilt_day_one["participants"], "Sergey Demyanov")
-        self.assertEqual(rebuilt_day_two["participants"], "Sergey Demyanov")
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+        day_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        self.assertEqual(day_row["participants"], "Known Sergey <sergey@example.com>")
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
-            rebuilt_participant_rows = connection.execute(
+            participant_row = connection.execute(
                 """
-                SELECT d.rel_path, de.entity_id, e.display_name, e.entity_origin
+                SELECT de.entity_id, de.assignment_mode
                 FROM document_entities de
-                JOIN documents d ON d.id = de.document_id
-                JOIN entities e ON e.id = de.entity_id
-                WHERE de.role = 'participant'
-                  AND d.id IN (?, ?)
-                ORDER BY d.rel_path ASC
+                WHERE de.document_id = ?
+                  AND de.role = 'participant'
                 """,
-                (day_one_row["id"], day_two_row["id"]),
-            ).fetchall()
-            rebuilt_external_key_count = connection.execute(
-                """
-                SELECT COUNT(*) AS row_count
-                FROM entity_resolution_keys
-                WHERE key_type = 'external_id'
-                  AND identifier_name = 'slack_user_id'
-                  AND identifier_scope = 'data/slack'
-                  AND normalized_value = 'u04sergey1'
-                """
+                (day_row["id"],),
             ).fetchone()
+            slack_identifier_rows = connection.execute(
+                """
+                SELECT identifier_type, identifier_name, identifier_scope, provider, provider_scope, normalized_value
+                FROM entity_identifiers
+                WHERE entity_id = ?
+                  AND (
+                    identifier_type = 'email'
+                    OR identifier_type = 'handle'
+                    OR identifier_name = 'slack_user_id'
+                  )
+                ORDER BY identifier_type ASC, normalized_value ASC
+                """,
+                (manual_entity_id,),
+            ).fetchall()
         finally:
             connection.close()
 
-        self.assertEqual(len(rebuilt_participant_rows), 2)
+        self.assertIsNotNone(participant_row)
+        self.assertEqual(int(participant_row["entity_id"]), manual_entity_id)
+        self.assertEqual(participant_row["assignment_mode"], "auto")
         self.assertEqual(
-            {row["entity_id"] for row in rebuilt_participant_rows},
-            {rebuilt_participant_rows[0]["entity_id"]},
+            {
+                (
+                    row["identifier_type"],
+                    row["identifier_name"],
+                    row["identifier_scope"],
+                    row["provider"],
+                    row["provider_scope"],
+                    row["normalized_value"],
+                )
+                for row in slack_identifier_rows
+            },
+            {
+                ("email", None, None, None, None, "sergey@example.com"),
+                ("external_id", "slack_user_id", "data/slack", None, None, "u04sergey1"),
+                ("handle", None, None, "slack", "data/slack", "sergey"),
+            },
         )
-        self.assertEqual(
-            {row["entity_origin"] for row in rebuilt_participant_rows},
-            {retriever_tools.ENTITY_ORIGIN_IDENTIFIED},
-        )
-        self.assertEqual(int(rebuilt_external_key_count["row_count"] or 0), 1)
 
     def test_ingest_creates_slack_reply_thread_child_documents(self) -> None:
         export_root = self.root / "data" / "slack"

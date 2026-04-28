@@ -2272,14 +2272,28 @@ def ensure_dataset_row(
         dataset_locator=dataset_locator,
     )
     if existing_row is None:
+        external_id_auto_merge_names = (
+            ["slack_user_id"]
+            if normalize_whitespace(str(source_kind or "")).lower() == SLACK_EXPORT_SOURCE_KIND
+            else []
+        )
         try:
             connection.execute(
                 """
                 INSERT INTO datasets (
-                  source_kind, dataset_locator, dataset_name, dataset_name_normalized, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                  source_kind, dataset_locator, dataset_name, dataset_name_normalized,
+                  external_id_auto_merge_names_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (source_kind, dataset_locator, normalized_dataset_name, normalized_compare_name, now, now),
+                (
+                    source_kind,
+                    dataset_locator,
+                    normalized_dataset_name,
+                    normalized_compare_name,
+                    json.dumps(external_id_auto_merge_names, ensure_ascii=True, sort_keys=True),
+                    now,
+                    now,
+                ),
             )
         except sqlite3.IntegrityError as exc:
             conflicting_row = connection.execute(
@@ -3815,33 +3829,78 @@ def normalize_entity_hint_identifier(
     identifier_type = normalize_entity_identifier_name(
         raw_identifier.get("identifier_type") or raw_identifier.get("type") or ""
     )
-    if identifier_type != "external_id":
+    if identifier_type not in {"email", "handle", "name", "external_id"}:
         return None
-    identifier_name = normalize_entity_identifier_name(
-        raw_identifier.get("identifier_name") or raw_identifier.get("name") or ""
-    )
     display_value = normalize_entity_text(
         raw_identifier.get("display_value")
         or raw_identifier.get("value")
         or raw_identifier.get("normalized_value")
         or ""
     )
-    normalized_value = normalize_entity_lookup_text(raw_identifier.get("normalized_value") or display_value)
-    if not identifier_name or not normalized_value:
-        return None
-    identifier: dict[str, object] = {
-        "identifier_type": "external_id",
-        "display_value": display_value or normalized_value,
-        "normalized_value": normalized_value,
-        "identifier_name": identifier_name,
-        "is_verified": 1 if int(raw_identifier.get("is_verified") or 0) else 0,
-    }
-    identifier_scope = normalize_entity_lookup_text(
-        raw_identifier.get("identifier_scope") or raw_identifier.get("scope") or ""
-    )
-    if identifier_scope:
-        identifier["identifier_scope"] = identifier_scope
+    is_primary = 1 if int(raw_identifier.get("is_primary") or 0) else 0
+    is_verified = 1 if int(raw_identifier.get("is_verified") or 0) else 0
     source_kind = normalize_entity_identifier_name(raw_identifier.get("source_kind") or default_source_kind or "")
+    identifier: dict[str, object]
+    if identifier_type == "email":
+        email = normalize_entity_email(raw_identifier.get("normalized_value") or display_value)
+        if not email:
+            return None
+        identifier = {
+            "identifier_type": "email",
+            "display_value": email,
+            "normalized_value": email,
+            "is_primary": is_primary,
+            "is_verified": is_verified,
+        }
+    elif identifier_type == "handle":
+        provider = normalize_entity_identifier_name(raw_identifier.get("provider") or "")
+        provider_scope = normalize_entity_lookup_text(raw_identifier.get("provider_scope") or raw_identifier.get("scope") or "")
+        handle = normalize_entity_handle(raw_identifier.get("normalized_value") or display_value)
+        if not provider or not provider_scope or not handle:
+            return None
+        identifier = {
+            "identifier_type": "handle",
+            "display_value": display_value or f"@{handle}",
+            "normalized_value": handle,
+            "provider": provider,
+            "provider_scope": provider_scope,
+            "is_primary": is_primary,
+            "is_verified": is_verified,
+        }
+    elif identifier_type == "name":
+        parsed_name = parse_entity_name(raw_identifier.get("normalized_value") or display_value)
+        if parsed_name is None:
+            return None
+        identifier = {
+            "identifier_type": "name",
+            "display_value": parsed_name["display_value"],
+            "normalized_value": parsed_name["normalized_value"],
+            "parsed_name_json": json.dumps(parsed_name["parsed_name"], ensure_ascii=True, sort_keys=True),
+            "normalized_full_name": parsed_name["normalized_full_name"],
+            "normalized_sort_name": parsed_name["normalized_sort_name"],
+            "is_primary": is_primary or (1 if parsed_name["is_full_name"] else 0),
+            "is_verified": is_verified,
+        }
+    else:
+        identifier_name = normalize_entity_identifier_name(
+            raw_identifier.get("identifier_name") or raw_identifier.get("name") or ""
+        )
+        normalized_value = normalize_entity_lookup_text(raw_identifier.get("normalized_value") or display_value)
+        if not identifier_name or not normalized_value:
+            return None
+        identifier = {
+            "identifier_type": "external_id",
+            "display_value": display_value or normalized_value,
+            "normalized_value": normalized_value,
+            "identifier_name": identifier_name,
+            "is_primary": is_primary,
+            "is_verified": is_verified,
+        }
+        identifier_scope = normalize_entity_lookup_text(
+            raw_identifier.get("identifier_scope") or raw_identifier.get("scope") or ""
+        )
+        if identifier_scope:
+            identifier["identifier_scope"] = identifier_scope
     if source_kind:
         identifier["source_kind"] = source_kind
     return identifier
@@ -3889,15 +3948,14 @@ def parse_entity_hint_candidates(
             continue
         parsed_name_identifiers = [identifier for identifier in identifiers if identifier.get("identifier_type") == "name"]
         email_identifiers = [identifier for identifier in identifiers if identifier.get("identifier_type") == "email"]
-        entity_type = (
-            str(base_candidate.get("entity_type"))
-            if base_candidate is not None
-            else entity_type_from_candidate_parts(
-                name_value=str(parsed_name_identifiers[0]["display_value"]) if parsed_name_identifiers else display_value,
-                email_value=str(email_identifiers[0]["normalized_value"]) if email_identifiers else None,
-                name_is_full=bool(parsed_name_identifiers and parsed_name_identifiers[0].get("normalized_full_name")),
-            )
+        derived_entity_type = entity_type_from_candidate_parts(
+            name_value=str(parsed_name_identifiers[0]["display_value"]) if parsed_name_identifiers else display_value,
+            email_value=str(email_identifiers[0]["normalized_value"]) if email_identifiers else None,
+            name_is_full=bool(parsed_name_identifiers and int(parsed_name_identifiers[0].get("is_primary") or 0)),
         )
+        entity_type = str(base_candidate.get("entity_type")) if base_candidate is not None else derived_entity_type
+        if entity_type == ENTITY_TYPE_UNKNOWN and derived_entity_type != ENTITY_TYPE_UNKNOWN:
+            entity_type = derived_entity_type
         display_basis = str(base_candidate.get("display_value")) if base_candidate is not None else display_value
         candidate = {
             "role": role,
