@@ -35,7 +35,7 @@ Expected user inputs:
 
 ## Decision Rule
 
-- Start with `run-status`.
+- Start with `run-status --budget-seconds 35`.
 - Use `run.worker.recommended_execution_mode` as the default:
   - `inline` means stay in the current conversation
   - `background` means spawn a subagent unless the user explicitly wants inline execution
@@ -43,7 +43,7 @@ Expected user inputs:
   - the user explicitly asks for background execution
   - or `run.worker.recommended_execution_mode` is `background`
 
-When unsure, inspect `run-status` first.
+When unsure, inspect `run-status --budget-seconds 35` first.
 
 For long unattended runs, use the supervision hints from `run-status`:
 
@@ -84,13 +84,32 @@ When to stop it:
 
 Do not build a second supervisor inside Python. The heartbeat is the wake mechanism; the skill remains the orchestrator.
 
+## Cowork-safe execution
+
+Cowork/bash commands may be killed around 45 seconds. Prefer the bounded facade:
+
+```bash
+python3 skills/tool-template/tools.py run-job-step <workspace> --run-id <RUN_ID> --budget-seconds 35
+```
+
+`run-job-step` performs exactly one safe orchestration step:
+
+- it finalizes OCR/image-description runs when the run is ready for finalization
+- otherwise it claims one prepared batch and returns the item contexts for the agent/provider to process
+- it uses the Cowork stale-claim window by default, so abandoned inline claims can be picked up by another call after roughly 45 seconds
+- it returns `next_recommended_commands` for the next bounded action
+
+If the result contains a non-empty `batch`, process those items and call `complete-run-item` or `fail-run-item` for each one. Then call `run-job-step` again if the run still needs work.
+
+Do not use `execute-run` for normal Cowork execution. That command remains the legacy direct executor for deterministic tests and future external-provider work.
+
 ## Execution Loop
 
 Whether running inline or in a subagent, use the same small-batch loop.
 
-The main orchestration command is:
+The low-level orchestration command is:
 
-1. `prepare-run-batch --run-id ... --claimed-by ... --launch-mode ... [--worker-task-id ...] [--max-batches ...] [--limit ...]`
+1. `prepare-run-batch --run-id ... --claimed-by ... --budget-seconds 35 --launch-mode ... [--worker-task-id ...] [--max-batches ...] [--limit ...]`
 
 It returns:
 
@@ -121,7 +140,7 @@ Use these supporting commands during the loop:
 
 - `heartbeat-run-items --run-id ... --claimed-by ...` between long batches
 - `finish-run-worker --run-id ... --claimed-by ... --worker-status ...` before the worker exits
-- `run-status --run-id ...` whenever you need an external progress check
+- `run-status --run-id ... --budget-seconds 35` whenever you need an external progress check
 - `finalize-ocr-run --run-id ...` when `worker.next_action` says `finalize_ocr`
 - `finalize-image-description-run --run-id ...` when `worker.next_action` says `finalize_image_description`
 
@@ -131,8 +150,6 @@ Use small batches only. The worker hints expose:
 - `worker.recommended_max_batches_per_worker`
 - `worker.after_batch_action`
 - `worker.should_exit_after_batch`
-
-Do not use `execute-run` for the normal Cowork path. That command remains the legacy direct executor for deterministic tests and future external-provider work.
 
 ## Cancellation
 

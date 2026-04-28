@@ -2522,6 +2522,62 @@ def build_run_supervision_payload(
     }
 
 
+def run_item_claim_health(
+    connection: sqlite3.Connection,
+    run_id: int,
+    *,
+    stale_after_seconds: int = DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS,
+) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    stale_cutoff = format_utc_timestamp(now - timedelta(seconds=max(1, int(stale_after_seconds))))
+
+    def age_seconds(raw_value: object) -> int | None:
+        parsed = parse_utc_timestamp(raw_value)
+        if parsed is None:
+            return None
+        return max(0, int((now - parsed).total_seconds()))
+
+    active_row = connection.execute(
+        """
+        SELECT MIN(last_heartbeat_at) AS oldest_heartbeat_at,
+               COUNT(*) AS count
+        FROM run_items
+        WHERE run_id = ?
+          AND status = 'running'
+          AND claimed_by IS NOT NULL
+          AND last_heartbeat_at IS NOT NULL
+        """,
+        (run_id,),
+    ).fetchone()
+    stale_row = connection.execute(
+        """
+        SELECT MIN(last_heartbeat_at) AS oldest_heartbeat_at,
+               COUNT(*) AS count
+        FROM run_items
+        WHERE run_id = ?
+          AND status = 'running'
+          AND claimed_by IS NOT NULL
+          AND last_heartbeat_at IS NOT NULL
+          AND last_heartbeat_at < ?
+        """,
+        (run_id, stale_cutoff),
+    ).fetchone()
+    return {
+        "stale_after_seconds": int(stale_after_seconds),
+        "active_claim_count": int(active_row["count"] or 0) if active_row is not None else 0,
+        "stale_claim_count": int(stale_row["count"] or 0) if stale_row is not None else 0,
+        "oldest_active_claim_heartbeat_at": active_row["oldest_heartbeat_at"] if active_row is not None else None,
+        "oldest_active_claim_age_seconds": (
+            age_seconds(active_row["oldest_heartbeat_at"]) if active_row is not None else None
+        ),
+        "oldest_stale_claim_heartbeat_at": stale_row["oldest_heartbeat_at"] if stale_row is not None else None,
+        "oldest_stale_claim_age_seconds": (
+            age_seconds(stale_row["oldest_heartbeat_at"]) if stale_row is not None else None
+        ),
+        "recoverable_by_another_call": bool(int(stale_row["count"] or 0) if stale_row is not None else 0),
+    }
+
+
 def attempt_row_to_payload(row: sqlite3.Row) -> dict[str, object]:
     return {
         "id": int(row["id"]),
@@ -2935,6 +2991,15 @@ def run_status_by_id(connection: sqlite3.Connection, run_id: int) -> dict[str, o
     }
     payload["snapshot_document_count"] = len(payload.get("documents", []))
     payload["recent_failures"] = recent_run_item_failures(connection, run_id=run_id)
+    claim_health = run_item_claim_health(connection, run_id)
+    now = datetime.now(timezone.utc)
+
+    def claim_age_seconds(raw_value: object) -> int | None:
+        parsed = parse_utc_timestamp(raw_value)
+        if parsed is None:
+            return None
+        return max(0, int((now - parsed).total_seconds()))
+
     active_claim_rows = connection.execute(
         """
         SELECT claimed_by, COUNT(*) AS count, MAX(last_heartbeat_at) AS last_heartbeat_at
@@ -2952,9 +3017,15 @@ def run_status_by_id(connection: sqlite3.Connection, run_id: int) -> dict[str, o
             "claimed_by": row["claimed_by"],
             "count": int(row["count"] or 0),
             "last_heartbeat_at": row["last_heartbeat_at"],
+            "last_heartbeat_age_seconds": claim_age_seconds(row["last_heartbeat_at"]),
+            "stale": (
+                claim_age_seconds(row["last_heartbeat_at"]) is not None
+                and int(claim_age_seconds(row["last_heartbeat_at"]) or 0) > int(claim_health["stale_after_seconds"])
+            ),
         }
         for row in active_claim_rows
     ]
+    payload["claim_health"] = claim_health
     payload["workers"] = list_run_worker_payloads_for_run(connection, run_id)
     payload["worker"] = build_run_worker_payload(connection, run_id, run_payload=payload)
     payload["supervision"] = build_run_supervision_payload(

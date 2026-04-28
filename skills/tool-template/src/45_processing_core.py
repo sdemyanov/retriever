@@ -36,8 +36,10 @@ RUN_WORKER_STATUSES = {"active", "canceled", "completed", "failed", "orphaned", 
 TEXT_REVISION_ACTIVATION_POLICIES = {"always", "if_empty", "if_poor", "manual"}
 RUN_ACTIVATION_POLICIES = {"always", "manual"}
 DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS = 900
+DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS = 45
 DEFAULT_RUN_ITEM_CONTEXT_INLINE_BYTES = 50 * 1024
 DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE = 10
+RUN_JOB_MIN_SECONDS_TO_CLAIM = 5
 DEFAULT_WORKER_BATCH_SIZE = 5
 DEFAULT_WORKER_INLINE_MAX_ITEMS = 5
 DEFAULT_WORKER_INLINE_MAX_BATCHES = 12
@@ -58,6 +60,13 @@ def normalize_resumable_step_budget(raw_budget_seconds: int | None, *, label: st
             f"{label} cannot exceed {MAX_RESUMABLE_STEP_BUDGET_SECONDS} seconds in bounded worker mode."
         )
     return budget_seconds
+
+
+def default_run_item_claim_stale_seconds_for_launch_mode(launch_mode: str) -> int:
+    normalized_launch_mode = normalize_run_worker_mode(launch_mode)
+    if normalized_launch_mode == "background":
+        return DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS
+    return DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS
 
 
 def lease_expiration_after(seconds: int, *, now: datetime | None = None) -> str:

@@ -7,7 +7,7 @@
 - requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `fb98910dccf39cb6501ea11aa7dbfcec311eed2e85fa5d2bd117bdeea8f7a8c9`
+- source checksum (SHA256): `29855f44b5e237a265f430cea33c6a6fe38762572fe1191fb0f1888411e4d05d`
 
 ## Current command surface
 
@@ -60,8 +60,10 @@ The current template implements:
 - `get-run`
 - `create-run`
 - `run-status`
+- `run-job-step`
 - `cancel-run`
 - `claim-run-items`
+- `prepare-run-batch`
 - `get-run-item-context`
 - `heartbeat-run-items`
 - `complete-run-item`
@@ -74,14 +76,19 @@ The current template implements:
 
 Stats and review commands remain later-phase work.
 
-For Cowork-agent execution, prefer the queue path:
+For Cowork-agent execution, prefer the bounded run step:
+
+- `run-job-step`
+
+For low-level worker protocol work, use:
 
 - `claim-run-items`
+- `prepare-run-batch`
 - `get-run-item-context`
 - `complete-run-item`
 - `fail-run-item`
 
-`execute-run` remains the legacy direct executor for deterministic tests and future external-provider work.
+`execute-run` remains the legacy direct executor for deterministic tests and parity checks.
 
 ## Output modes
 

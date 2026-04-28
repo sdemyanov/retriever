@@ -99,6 +99,16 @@ python3 skills/tool-template/tools.py rebuild-entities-status ./data --run-id <R
 
 Repeat `rebuild-entities-run-step` until terminal status. Legacy `rebuild-entities` may exceed Cowork limits on large workspaces.
 
+For planned processing runs, prefer `retriever:run-job` at Tier 1. If using Tier 3 directly, prefer:
+
+```bash
+python3 skills/tool-template/tools.py run-job-step . --run-id <RUN_ID> --budget-seconds 35
+```
+
+If it returns a non-empty `batch`, process those items and call `complete-run-item` or `fail-run-item`, then continue with `next_recommended_commands`.
+
+Do not use `execute-run` for normal Cowork execution. It is the legacy direct executor and may exceed the command limit.
+
 For any tool result with `more_work_remaining: true`, continue with the returned `next_recommended_commands`. Stop only on terminal status: `completed`, `failed`, or `canceled`.
 
 If an active run exists, do not start a new one. Resume it or cancel it intentionally.
@@ -227,29 +237,31 @@ The authoritative current list of subcommands is regenerated at build time into 
 - you need to re-run conversation assignment and regenerate previews after ingest or metadata changes → `rebuild-conversations` — re-run conversation assignment and regenerate conversation previews
 - you need to resolve detected duplicates → `reconcile-duplicates` — reconcile detected duplicates
 - you need to rebuild conversation preview HTML → `refresh-conversation-previews` — rebuild conversation preview artifacts
+- you need to regenerate generated document and conversation preview artifacts using the current preview refresh alias → `refresh-previews` — regenerate generated document and conversation preview artifacts
 - the user asks to split, detach, separate, or remove a document from its conversation/thread — phrasings like "split this email off its thread", "detach this message", "separate this from the conversation", or "remove from thread" → `split-from-conversation` — split a document out of a conversation
 
 ### Runs — planning & lifecycle
 
 - you need to stop a run from claiming further work → `cancel-run` — stop claiming new work for a run
 - you need to plan a new processing run → `create-run` — create a frozen processing run snapshot
-- you need to execute a planned run inline via the legacy executor → `execute-run` — execute one planned processing run via the legacy direct executor
+- you explicitly need the legacy direct executor for debugging, deterministic tests, or parity checks → `execute-run` — execute one planned processing run via the legacy direct executor
 - you need to finalize an image-description run's outputs → `finalize-image-description-run` — finalize an image-description run
 - you need to finalize an OCR run's outputs → `finalize-ocr-run` — finalize an OCR run
 - you need the snapshot of one planned run → `get-run` — fetch one planned processing run
 - you need the list of planned/active processing runs → `list-runs` — list planned processing runs
 - you need to publish completed-run results → `publish-run-results` — publish results from a completed run
-- you need progress, claims, and recent failures for a run → `run-status` — summarize run progress, claims, and recent failures
+- you need progress, claim health, next recommended commands, or recent failures for a run → `run-status` — summarize run progress, claims, and recent failures
 
 ### Runs — worker execution
 
-- you are a run worker claiming pending items → `claim-run-items` — atomically claim pending run items for one worker
+- you are using the low-level worker protocol to claim pending items without contexts → `claim-run-items` — atomically claim pending run items for one worker
 - you are a run worker marking an item completed → `complete-run-item` — mark one claimed run item completed
 - you are a run worker marking an item failed → `fail-run-item` — mark one claimed run item failed
 - you are a run worker finalizing its session → `finish-run-worker` — mark one worker as finished and persist its summary
 - you are a run worker loading context for one item → `get-run-item-context` — load the execution context for one run item
 - you are a run worker refreshing its heartbeats → `heartbeat-run-items` — refresh heartbeat timestamps for one worker's claimed items
-- you are a run worker preparing one batch of work → `prepare-run-batch` — claim one worker batch and return execution contexts
+- you are using the low-level worker protocol to claim one bounded batch of work → `prepare-run-batch` — claim one worker batch and return execution contexts
+- you need to advance, resume, or execute a planned processing run under the Cowork 45-second command limit → `run-job-step` — advance one Cowork-safe processing-run step or return one prepared worker batch
 
 ### Jobs
 
