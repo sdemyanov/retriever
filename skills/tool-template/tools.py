@@ -18281,7 +18281,9 @@ def conversation_preview_writes_aggregate_artifacts(
     *,
     segment_mode: str,
 ) -> bool:
-    _ = (conversation_type, segment_mode)
+    _ = segment_mode
+    if normalize_whitespace(str(conversation_type or "")).lower() == "chat":
+        return bool(documents)
     return len(documents) > 1
 
 
@@ -19934,6 +19936,7 @@ def refresh_conversation_previews(
                     )
                 preview_rows: list[dict[str, object]] = []
                 if conversation_document_uses_entry_preview(document):
+                    preserved_preview_rows = []
                     entry_rel_path = conversation_preview_entry_rel_path(conversation_id, document_id)
                     entry_abs_path = paths["state_dir"] / entry_rel_path
                     entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -19954,34 +19957,22 @@ def refresh_conversation_previews(
                             "rel_preview_path": entry_rel_path,
                             "preview_type": "html",
                             "target_fragment": None,
-                            "label": "entry",
+                            "label": "message",
                             "ordinal": 0,
                             "created_at": created_at,
                         }
                     )
                     if writes_aggregate_artifacts:
-                        segment_ordinal = len(preview_rows)
                         preview_rows.append(
                             {
-                                "rel_preview_path": segment_rel_path,
+                                "rel_preview_path": full_rel_path,
                                 "preview_type": "html",
-                                "target_fragment": conversation_preview_anchor(int(document["id"])),
-                                "label": "segment",
-                                "ordinal": segment_ordinal,
+                                "target_fragment": None,
+                                "label": "conversation",
+                                "ordinal": len(preview_rows),
                                 "created_at": created_at,
                             }
                         )
-                        if writes_segment_artifacts:
-                            preview_rows.append(
-                                {
-                                    "rel_preview_path": toc_rel_path,
-                                    "preview_type": "html",
-                                    "target_fragment": None,
-                                    "label": "contents",
-                                    "ordinal": len(preview_rows),
-                                    "created_at": created_at,
-                                }
-                            )
                     rebased_preview_rows = rebase_preserved_preview_rows(
                         preserved_preview_rows,
                         start_ordinal=len(preview_rows),
