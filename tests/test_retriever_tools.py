@@ -15512,20 +15512,72 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         exit_code, refresh_result, _, _ = self.run_cli(
             "refresh-previews",
             str(self.root),
+            "--scope",
+            "conversations",
             "--dataset-name",
             "gmail-max.mbox",
+            "--from-source",
         )
 
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(refresh_result)
         assert refresh_result is not None
         self.assertEqual(refresh_result["status"], "ok")
+        self.assertEqual(refresh_result["scope"], "conversations")
+        self.assertTrue(refresh_result["from_source_requested"])
+        self.assertEqual(refresh_result["from_source_mode"], "not_applicable_for_conversation_previews")
         self.assertEqual(refresh_result["dataset"]["dataset_name"], "gmail-max.mbox")
         self.assertEqual(refresh_result["refreshed_conversations"], 1)
         refreshed_html = message_preview_path.read_text(encoding="utf-8")
         self.assertNotIn("stale preview html", refreshed_html)
         self.assertIn("Refresh this generated preview body", refreshed_html)
         self.assertIn('class="gmail-thread-title"', refreshed_html)
+
+    def test_refresh_previews_missing_only_regenerates_missing_mbox_message_preview(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Missing Preview Refresh",
+                    body_text="Refresh this missing preview body",
+                    message_id="<mbox-missing-preview-001@example.com>",
+                )
+            ],
+            name="gmail-missing.mbox",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        message_rel_path = retriever_tools.mbox_message_rel_path(
+            "gmail-missing.mbox",
+            "<mbox-missing-preview-001@example.com>",
+        )
+        search_result = retriever_tools.search(self.root, "Refresh this missing preview body", None, None, None, 1, 20)
+        message_result = next(item for item in search_result["results"] if item["rel_path"] == message_rel_path)
+        message_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(message_result["preview_targets"], "message")
+        )
+        message_preview_path.unlink()
+
+        exit_code, refresh_result, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--doc-id",
+            str(message_result["id"]),
+            "--missing-only",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(refresh_result)
+        assert refresh_result is not None
+        self.assertEqual(refresh_result["status"], "ok")
+        self.assertEqual(refresh_result["scope"], "conversations")
+        self.assertTrue(refresh_result["missing_only"])
+        self.assertEqual(refresh_result["candidate_conversations"], 1)
+        self.assertEqual(refresh_result["refreshed_conversations"], 1)
+        refreshed_html = message_preview_path.read_text(encoding="utf-8")
+        self.assertIn("Refresh this missing preview body", refreshed_html)
 
     def test_changed_mbox_reingest_preserves_control_numbers_and_retires_removed_messages(self) -> None:
         self.write_fake_mbox_file(

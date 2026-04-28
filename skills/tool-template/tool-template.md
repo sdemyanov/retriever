@@ -7,7 +7,7 @@
 - requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `94adf45c96624532eba87ff97de1b26edaa31061da4c93ff25407f0121beb5b2`
+- source checksum (SHA256): `fb98910dccf39cb6501ea11aa7dbfcec311eed2e85fa5d2bd117bdeea8f7a8c9`
 
 ## Current command surface
 
@@ -91,6 +91,7 @@ For Cowork-agent execution, prefer the queue path:
 - Export preview ownership is shared by the most inclusive useful unit:
   - email export units expand to the full conversation chain
   - chat export units merge contiguous selected documents inside the conversation timeline
+- `refresh-previews` defaults to `--scope conversations`, regenerating the generated per-message/document and full conversation preview artifacts for email/chat conversations. It can be narrowed with `--conversation-id`, `--doc-id`, `--dataset-id`, or `--dataset-name`; `--missing-only` limits refresh to conversations with missing preview rows/files.
 
 ## Runtime usage rules
 
