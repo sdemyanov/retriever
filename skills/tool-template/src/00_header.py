@@ -98,6 +98,7 @@ DEFAULT_PAGE_SIZE = 10
 MAX_PAGE_SIZE = 100
 BROWSE_MODE_DOCUMENTS = "documents"
 BROWSE_MODE_CONVERSATIONS = "conversations"
+BROWSE_MODE_ENTITIES = "entities"
 DEFAULT_BROWSE_MODE = BROWSE_MODE_DOCUMENTS
 DEFAULT_DOCUMENT_DISPLAY_COLUMNS = (
     "content_type",
@@ -113,6 +114,13 @@ DEFAULT_CONVERSATION_DISPLAY_COLUMNS = (
     "participants",
     "last_activity",
     "document_count",
+)
+DEFAULT_ENTITY_DISPLAY_COLUMNS = (
+    "entity_type",
+    "label",
+    "primary_email",
+    "document_count",
+    "roles",
 )
 MAX_SCOPE_DATASETS = 999
 MAX_FILTER_EXPRESSION_LENGTH = 8192
@@ -714,6 +722,45 @@ ENTITY_TYPES = {
     ENTITY_TYPE_SHARED_MAILBOX,
     ENTITY_TYPE_SYSTEM_MAILBOX,
     ENTITY_TYPE_UNKNOWN,
+}
+SYSTEM_MAILBOX_LOCAL_PARTS = {
+    "automated",
+    "daemon",
+    "donotreply",
+    "mailerdaemon",
+    "notification",
+    "notifications",
+    "noreply",
+    "postmaster",
+}
+SYSTEM_MAILBOX_LOCAL_CONTAINS = {
+    "donotreply",
+    "noreply",
+}
+SHARED_MAILBOX_LOCAL_PARTS = {
+    "admin",
+    "allcompany",
+    "billing",
+    "contact",
+    "events",
+    "help",
+    "hello",
+    "info",
+    "legal",
+    "legalevents",
+    "marketing",
+    "news",
+    "press",
+    "sales",
+    "support",
+    "team",
+}
+SHARED_MAILBOX_NAME_HINTS = {
+    "all company",
+    "help desk",
+    "legalweek",
+    "support",
+    "team",
 }
 ENTITY_ORIGIN_OBSERVED = "observed"
 ENTITY_ORIGIN_IDENTIFIED = "identified"

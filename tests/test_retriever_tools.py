@@ -1308,6 +1308,33 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(jane_identifiers["name"]["normalized_sort_name"], "doe jane")
         self.assertEqual(candidates[1]["entity_type"], retriever_tools.ENTITY_TYPE_SHARED_MAILBOX)
 
+        mailbox_candidates = retriever_tools.parse_entity_candidates(
+            (
+                "Beagle Team <hello@discoverbeagle.com>; "
+                "Everlaw Legalweek <legalevents@alm.com>; "
+                "Slack <notification@slack.com>; "
+                "Demyanov Family Team <gmail-noreply@google.com>; "
+                "All Company <allcompany@maxusivanovgmail.onmicrosoft.com>"
+            ),
+            role="recipient",
+        )
+        mailbox_types = {
+            next(
+                identifier["normalized_value"]
+                for identifier in candidate["identifiers"]
+                if identifier["identifier_type"] == "email"
+            ): candidate["entity_type"]
+            for candidate in mailbox_candidates
+        }
+        self.assertEqual(mailbox_types["hello@discoverbeagle.com"], retriever_tools.ENTITY_TYPE_SHARED_MAILBOX)
+        self.assertEqual(mailbox_types["legalevents@alm.com"], retriever_tools.ENTITY_TYPE_SHARED_MAILBOX)
+        self.assertEqual(mailbox_types["notification@slack.com"], retriever_tools.ENTITY_TYPE_SYSTEM_MAILBOX)
+        self.assertEqual(mailbox_types["gmail-noreply@google.com"], retriever_tools.ENTITY_TYPE_SYSTEM_MAILBOX)
+        self.assertEqual(
+            mailbox_types["allcompany@maxusivanovgmail.onmicrosoft.com"],
+            retriever_tools.ENTITY_TYPE_SHARED_MAILBOX,
+        )
+
     def test_source_custodian_inference_handles_archive_basename_clues(self) -> None:
         self.assertEqual(
             retriever_tools.infer_source_custodian(
@@ -1413,6 +1440,59 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         identifier_pairs = {(row["identifier_type"], row["normalized_value"]) for row in identifier_rows}
         self.assertIn(("email", "alice@example.com"), identifier_pairs)
         self.assertIn(("name", "alice example"), identifier_pairs)
+
+    def test_ingest_reuses_shared_mailbox_entity_for_author_and_participant(self) -> None:
+        self.write_email_message(
+            self.root / "all-company.eml",
+            subject="The new All Company group is ready",
+            body_text="Group ready body",
+            author="All Company <allcompany@maxusivanovgmail.onmicrosoft.com>",
+            recipients="Reviewer <reviewer@example.com>",
+            cc=None,
+            message_id="<all-company@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        document_row = self.fetch_document_row("all-company.eml")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            role_rows = connection.execute(
+                """
+                SELECT de.role, de.entity_id, e.entity_type, e.entity_origin, e.display_name, e.primary_email
+                FROM document_entities de
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.document_id = ?
+                  AND de.role IN ('author', 'participant')
+                  AND e.primary_email = 'allcompany@maxusivanovgmail.onmicrosoft.com'
+                ORDER BY de.role ASC
+                """,
+                (document_row["id"],),
+            ).fetchall()
+            key_count_row = connection.execute(
+                """
+                SELECT COUNT(*) AS key_count
+                FROM entity_resolution_keys
+                WHERE key_type = 'email'
+                  AND normalized_value = 'allcompany@maxusivanovgmail.onmicrosoft.com'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual({row["role"] for row in role_rows}, {"author", "participant"})
+        self.assertEqual({int(row["entity_id"]) for row in role_rows}, {int(role_rows[0]["entity_id"])})
+        self.assertEqual(
+            {row["entity_type"] for row in role_rows},
+            {retriever_tools.ENTITY_TYPE_SHARED_MAILBOX},
+        )
+        self.assertEqual(
+            {row["entity_origin"] for row in role_rows},
+            {retriever_tools.ENTITY_ORIGIN_IDENTIFIED},
+        )
+        self.assertEqual(key_count_row["key_count"], 1)
 
     def test_entity_rebuild_and_read_commands(self) -> None:
         self.write_email_message(
@@ -1552,6 +1632,138 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(len(author_inventory_rows), 1)
         self.assertEqual(author_inventory_rows[0]["document_count"], 2)
         self.assertEqual(len(author_inventory_rows[0]["examples"]), 1)
+
+    def test_list_entities_paginates_sorts_and_seeds_slash_entity_browse(self) -> None:
+        for name, email in [
+            ("Alice Example", "alice@people.test"),
+            ("Bob Example", "bob@people.test"),
+            ("Carol Example", "carol@people.test"),
+            ("Dave Example", "dave@people.test"),
+        ]:
+            self.write_email_message(
+                self.root / f"{email}.eml",
+                subject=f"{name} note",
+                body_text=f"{name} body",
+                author=f"{name} <{email}>",
+                recipients="Reviewer <reviewer@review.test>",
+                message_id=f"<{email}>",
+            )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 4)
+
+        exit_code, first_payload, _, _ = self.run_cli(
+            "list-entities",
+            str(self.root),
+            "--query",
+            "people.test",
+            "--limit",
+            "2",
+            "--sort",
+            "display_name",
+            "--order",
+            "asc",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(first_payload)
+        assert first_payload is not None
+        self.assertEqual(first_payload["offset"], 0)
+        self.assertEqual(first_payload["limit"], 2)
+        self.assertEqual(first_payload["total_hits"], 4)
+        self.assertEqual(
+            [entity["primary_email"] for entity in first_payload["entities"]],
+            ["alice@people.test", "bob@people.test"],
+        )
+
+        exit_code, second_payload, _, _ = self.run_cli(
+            "list-entities",
+            str(self.root),
+            "--query",
+            "people.test",
+            "--limit",
+            "2",
+            "--offset",
+            "2",
+            "--sort",
+            "display_name",
+            "--order",
+            "asc",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(second_payload)
+        assert second_payload is not None
+        self.assertEqual(second_payload["offset"], 2)
+        self.assertEqual(
+            [entity["primary_email"] for entity in second_payload["entities"]],
+            ["carol@people.test", "dave@people.test"],
+        )
+
+        state = retriever_tools.read_session_state(self.paths)
+        self.assertEqual(state["browse_mode"], retriever_tools.BROWSE_MODE_ENTITIES)
+        self.assertEqual(state["display"][retriever_tools.BROWSE_MODE_ENTITIES]["page_size"], 2)
+        self.assertEqual(
+            state["browsing"][retriever_tools.BROWSE_MODE_ENTITIES]["sort"],
+            [["display_name", "asc"]],
+        )
+
+        page_exit, page_stdout, _ = self.run_cli_raw("slash", str(self.root), "/page first")
+        self.assertEqual(page_exit, 0)
+        self.assertIn("alice@people.test", page_stdout)
+        self.assertIn("bob@people.test", page_stdout)
+        self.assertNotIn("carol@people.test", page_stdout)
+
+        page_size_exit, page_size_stdout, _ = self.run_cli_raw("slash", str(self.root), "/page-size 3")
+        self.assertEqual(page_size_exit, 0)
+        self.assertIn("alice@people.test", page_size_stdout)
+        self.assertIn("bob@people.test", page_size_stdout)
+        self.assertIn("carol@people.test", page_size_stdout)
+        self.assertNotIn("dave@people.test", page_size_stdout)
+
+        sort_exit, sort_stdout, _ = self.run_cli_raw("slash", str(self.root), "/sort primary_email desc")
+        self.assertEqual(sort_exit, 0)
+        self.assertIn("dave@people.test", sort_stdout)
+        self.assertIn("carol@people.test", sort_stdout)
+        self.assertNotIn("alice@people.test", sort_stdout)
+
+        reset_sort_exit, reset_sort_stdout, _ = self.run_cli_raw("slash", str(self.root), "/sort display_name asc")
+        self.assertEqual(reset_sort_exit, 0)
+        self.assertIn("alice@people.test", reset_sort_stdout)
+        self.assertIn("bob@people.test", reset_sort_stdout)
+
+        reset_size_exit, reset_size_stdout, _ = self.run_cli_raw("slash", str(self.root), "/page-size 2")
+        self.assertEqual(reset_size_exit, 0)
+        self.assertIn("alice@people.test", reset_size_stdout)
+        self.assertIn("bob@people.test", reset_size_stdout)
+        self.assertNotIn("carol@people.test", reset_size_stdout)
+
+        next_exit, next_stdout, _ = self.run_cli_raw("slash", str(self.root), "/next")
+        self.assertEqual(next_exit, 0)
+        self.assertIn("carol@people.test", next_stdout)
+        self.assertIn("dave@people.test", next_stdout)
+        self.assertNotIn("alice@people.test", next_stdout)
+
+        columns_exit, columns_stdout, _ = self.run_cli_raw(
+            "slash",
+            str(self.root),
+            "/columns set label,primary_email,entity_status",
+        )
+        self.assertEqual(columns_exit, 0)
+        self.assertIn("| label | primary_email | entity_status |", columns_stdout)
+
+        documents_exit, _, _ = self.run_cli_raw("slash", str(self.root), "/documents")
+        self.assertEqual(documents_exit, 0)
+        self.assertEqual(
+            retriever_tools.read_session_state(self.paths)["browse_mode"],
+            retriever_tools.BROWSE_MODE_DOCUMENTS,
+        )
+
+        entities_exit, entities_stdout, _ = self.run_cli_raw("slash", str(self.root), "/entities")
+        self.assertEqual(entities_exit, 0)
+        self.assertIn("| label | primary_email | entity_status |", entities_stdout)
+        self.assertIn("carol@people.test", entities_stdout)
+        self.assertIn("dave@people.test", entities_stdout)
+        self.assertNotIn("alice@people.test", entities_stdout)
 
     def test_entity_similar_block_and_merge_commands(self) -> None:
         self.write_email_message(
@@ -11527,6 +11739,91 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(session_payload["browsing"]["conversations"]["offset"], 0)
         self.assertEqual(session_payload["browsing"]["conversations"]["total_known"], 1)
 
+    def test_list_conversations_paginates_sorts_and_seeds_slash_browse(self) -> None:
+        for subject, email, created in [
+            ("Alpha Thread", "alpha@example.com", "Tue, 14 Apr 2026 10:00:00 +0000"),
+            ("Beta Thread", "beta@example.com", "Tue, 14 Apr 2026 11:00:00 +0000"),
+            ("Gamma Thread", "gamma@example.com", "Tue, 14 Apr 2026 12:00:00 +0000"),
+            ("Zeta Thread", "zeta@example.com", "Tue, 14 Apr 2026 13:00:00 +0000"),
+        ]:
+            self.write_email_message(
+                self.root / f"{email}.eml",
+                subject=subject,
+                body_text=f"{subject} body",
+                author=f"{subject} Author <{email}>",
+                recipients="Reviewer <reviewer@example.com>",
+                cc=None,
+                message_id=f"<{email}>",
+                date_created=created,
+            )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 4)
+
+        first_exit, first_payload, _, _ = self.run_cli(
+            "list-conversations",
+            str(self.root),
+            "--limit",
+            "2",
+            "--sort",
+            "title",
+            "--order",
+            "asc",
+        )
+        self.assertEqual(first_exit, 0)
+        self.assertIsNotNone(first_payload)
+        assert first_payload is not None
+        self.assertEqual(first_payload["browse_mode"], retriever_tools.BROWSE_MODE_CONVERSATIONS)
+        self.assertEqual(first_payload["offset"], 0)
+        self.assertEqual(first_payload["limit"], 2)
+        self.assertEqual(first_payload["total_hits"], 4)
+        self.assertEqual(
+            [conversation["title"] for conversation in first_payload["conversations"]],
+            ["Alpha Thread", "Beta Thread"],
+        )
+
+        second_exit, second_payload, _, _ = self.run_cli(
+            "list-conversations",
+            str(self.root),
+            "--limit",
+            "2",
+            "--offset",
+            "2",
+            "--sort",
+            "title",
+            "--order",
+            "asc",
+        )
+        self.assertEqual(second_exit, 0)
+        self.assertIsNotNone(second_payload)
+        assert second_payload is not None
+        self.assertEqual(second_payload["offset"], 2)
+        self.assertEqual(
+            [conversation["title"] for conversation in second_payload["conversations"]],
+            ["Gamma Thread", "Zeta Thread"],
+        )
+
+        state = retriever_tools.read_session_state(self.paths)
+        self.assertEqual(state["browse_mode"], retriever_tools.BROWSE_MODE_CONVERSATIONS)
+        self.assertEqual(state["display"][retriever_tools.BROWSE_MODE_CONVERSATIONS]["page_size"], 2)
+        self.assertEqual(
+            state["browsing"][retriever_tools.BROWSE_MODE_CONVERSATIONS]["sort"],
+            [["title", "asc"]],
+        )
+
+        page_exit, page_stdout, _ = self.run_cli_raw("slash", str(self.root), "/page first")
+        self.assertEqual(page_exit, 0)
+        self.assertIn("Alpha Thread", page_stdout)
+        self.assertIn("Beta Thread", page_stdout)
+        self.assertNotIn("Gamma Thread", page_stdout)
+
+        next_exit, next_stdout, _ = self.run_cli_raw("slash", str(self.root), "/next")
+        self.assertEqual(next_exit, 0)
+        self.assertIn("Gamma Thread", next_stdout)
+        self.assertIn("Zeta Thread", next_stdout)
+        self.assertNotIn("Alpha Thread", next_stdout)
+
     def test_slash_conversation_columns_are_separate_from_document_columns(self) -> None:
         self.write_email_message(
             self.root / "message.eml",
@@ -17735,6 +18032,113 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("sql", payload)
         self.assertIn("COUNT(DISTINCT d.id)", payload["sql"])
         self.assertIn("JOIN datasets ds", payload["sql"])
+
+    def test_aggregate_groups_entities_by_type_origin_and_role(self) -> None:
+        self.write_email_message(
+            self.root / "entity-source.eml",
+            subject="Entity aggregate",
+            body_text="Entity aggregate body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            cc=None,
+            message_id="<entity-aggregate@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        create_exit, create_payload, _, _ = self.run_cli(
+            "create-entity",
+            str(self.root),
+            "--entity-type",
+            "shared_mailbox",
+            "--display-name",
+            "Review Team",
+            "--email",
+            "review@example.com",
+        )
+        self.assertEqual(create_exit, 0)
+        self.assertIsNotNone(create_payload)
+
+        type_exit, type_payload, _, _ = self.run_cli(
+            "aggregate",
+            str(self.root),
+            "--group-by",
+            "entity_type",
+            "--order-by",
+            "entity_type",
+        )
+        self.assertEqual(type_exit, 0)
+        self.assertIsNotNone(type_payload)
+        assert type_payload is not None
+        self.assertEqual(type_payload["aggregate_scope"], "entities")
+        type_counts = {bucket["entity_type"]: bucket["count"] for bucket in type_payload["buckets"]}
+        self.assertGreaterEqual(type_counts["person"], 2)
+        self.assertEqual(type_counts["shared_mailbox"], 1)
+
+        origin_exit, origin_payload, _, _ = self.run_cli(
+            "aggregate",
+            str(self.root),
+            "--group-by",
+            "entity_origin",
+        )
+        self.assertEqual(origin_exit, 0)
+        self.assertIsNotNone(origin_payload)
+        assert origin_payload is not None
+        origin_counts = {bucket["entity_origin"]: bucket["count"] for bucket in origin_payload["buckets"]}
+        self.assertGreaterEqual(origin_counts["manual"], 1)
+
+        role_exit, role_payload, _, _ = self.run_cli(
+            "aggregate",
+            str(self.root),
+            "--group-by",
+            "entity_role",
+            "--order-by",
+            "entity_role",
+        )
+        self.assertEqual(role_exit, 0)
+        self.assertIsNotNone(role_payload)
+        assert role_payload is not None
+        role_counts = {bucket["entity_role"]: bucket["count"] for bucket in role_payload["buckets"]}
+        self.assertEqual(role_counts["author"], 1)
+        self.assertEqual(role_counts["recipient"], 1)
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "aggregate",
+            str(self.root),
+            "--group-by",
+            "entity_status",
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        assert status_payload is not None
+        status_counts = {bucket["entity_status"]: bucket["count"] for bucket in status_payload["buckets"]}
+        self.assertGreaterEqual(status_counts["active"], 3)
+
+        mixed_exit, mixed_payload, _, _ = self.run_cli(
+            "aggregate",
+            str(self.root),
+            "--group-by",
+            "entity_type",
+            "--group-by",
+            "content_type",
+        )
+        self.assertEqual(mixed_exit, 2)
+        self.assertIsNotNone(mixed_payload)
+        assert mixed_payload is not None
+        self.assertIn("cannot be mixed", mixed_payload["error"])
+
+    def test_claude_routing_ladder_lists_entity_subcommands(self) -> None:
+        routing_text = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+
+        self.assertIn("### Entities", routing_text)
+        self.assertIn("`list-entities`", routing_text)
+        self.assertIn("`show-entity`", routing_text)
+        self.assertIn("`list-entity-role-inventory`", routing_text)
+        self.assertIn("`list-conversations`", routing_text)
+        self.assertIn("`/entities`", routing_text)
+        self.assertIn("entities by type", routing_text)
 
     def test_aggregate_select_from_scope_narrows_bucket_population(self) -> None:
         (self.root / "alpha-scope.txt").write_text("alpha body\n", encoding="utf-8")

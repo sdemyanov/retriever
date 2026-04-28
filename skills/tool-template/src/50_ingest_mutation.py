@@ -8576,15 +8576,90 @@ def serialize_entity_summary(
     }
 
 
+ENTITY_LIST_SORT_EXPRESSIONS = {
+    "id": "e.id",
+    "label": "LOWER(COALESCE(e.sort_name, e.display_name, e.primary_email, e.primary_phone, ''))",
+    "display_name": "LOWER(COALESCE(e.display_name, ''))",
+    "primary_email": "LOWER(COALESCE(e.primary_email, ''))",
+    "primary_phone": "LOWER(COALESCE(e.primary_phone, ''))",
+    "sort_name": "LOWER(COALESCE(e.sort_name, ''))",
+    "entity_type": "e.entity_type",
+    "entity_origin": "e.entity_origin",
+    "canonical_status": "e.canonical_status",
+    "entity_status": "e.canonical_status",
+    "document_count": "document_count",
+}
+
+
+def normalize_entity_list_sort_field(raw_field: str | None) -> str:
+    field_name = normalize_inline_whitespace(str(raw_field or "")).lower()
+    if field_name == "status":
+        field_name = "entity_status"
+    if field_name == "type":
+        field_name = "entity_type"
+    if field_name == "origin":
+        field_name = "entity_origin"
+    if field_name == "email":
+        field_name = "primary_email"
+    if field_name not in ENTITY_LIST_SORT_EXPRESSIONS:
+        allowed = ", ".join(sorted(ENTITY_LIST_SORT_EXPRESSIONS))
+        raise RetrieverError(f"Unsupported entity sort field: {raw_field}. Sortable fields: {allowed}.")
+    return field_name
+
+
+def normalize_entity_list_sort_specs(
+    *,
+    sort: str | None = None,
+    order: str | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
+) -> list[tuple[str, str]]:
+    if sort_specs is not None:
+        normalized_specs: list[tuple[str, str]] = []
+        for raw_field, raw_direction in sort_specs:
+            field_name = normalize_entity_list_sort_field(raw_field)
+            direction = normalize_inline_whitespace(str(raw_direction or "asc")).lower()
+            if direction not in {"asc", "desc"}:
+                raise RetrieverError("Sort direction must be 'asc' or 'desc'.")
+            normalized_specs.append((field_name, direction))
+        return normalized_specs or [("document_count", "desc"), ("label", "asc"), ("id", "asc")]
+    if sort:
+        direction = normalize_inline_whitespace(str(order or "asc")).lower()
+        if direction not in {"asc", "desc"}:
+            raise RetrieverError("Sort direction must be 'asc' or 'desc'.")
+        return [(normalize_entity_list_sort_field(sort), direction)]
+    return [("document_count", "desc"), ("label", "asc"), ("id", "asc")]
+
+
+def entity_list_sort_spec_text(sort_specs: list[tuple[str, str]]) -> str:
+    return ", ".join(f"{field_name} {direction}" for field_name, direction in sort_specs)
+
+
+def entity_list_order_sql(sort_specs: list[tuple[str, str]]) -> str:
+    effective_specs = list(sort_specs)
+    if not any(field_name == "id" for field_name, _ in effective_specs):
+        effective_specs.append(("id", "asc"))
+    parts: list[str] = []
+    for field_name, direction in effective_specs:
+        expression = ENTITY_LIST_SORT_EXPRESSIONS[normalize_entity_list_sort_field(field_name)]
+        parts.append(f"{expression} {direction.upper()}")
+    return ", ".join(parts)
+
+
 def list_entities(
     root: Path,
     *,
     query: str | None = None,
     limit: int = 50,
+    offset: int = 0,
+    sort: str | None = None,
+    order: str | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
     include_ignored: bool = False,
 ) -> dict[str, object]:
     normalized_limit = max(1, min(int(limit or 50), 200))
+    normalized_offset = max(0, int(offset or 0))
     normalized_query = normalize_whitespace(str(query or "")).lower()
+    normalized_sort_specs = normalize_entity_list_sort_specs(sort=sort, order=order, sort_specs=sort_specs)
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -8614,6 +8689,15 @@ def list_entities(
             )
             params.extend([like_query, like_query, like_query, like_query, like_query])
         where_sql = " AND ".join(where_clauses)
+        total_row = connection.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM entities e
+            WHERE {where_sql}
+            """,
+            tuple(params),
+        ).fetchone()
+        total_entities = int(total_row["total"] if total_row is not None else 0)
         rows = connection.execute(
             f"""
             SELECT e.*,
@@ -8623,12 +8707,11 @@ def list_entities(
             LEFT JOIN document_entities de ON de.entity_id = e.id
             WHERE {where_sql}
             GROUP BY e.id
-            ORDER BY document_count DESC,
-                     COALESCE(e.sort_name, e.display_name, e.primary_email, e.primary_phone, '') ASC,
-                     e.id ASC
+            ORDER BY {entity_list_order_sql(normalized_sort_specs)}
             LIMIT ?
+            OFFSET ?
             """,
-            (*params, normalized_limit),
+            (*params, normalized_limit, normalized_offset),
         ).fetchall()
         entity_ids = [int(row["id"]) for row in rows]
         identifiers_by_entity = entity_identifiers_by_entity_id(connection, entity_ids)
@@ -8640,6 +8723,15 @@ def list_entities(
             "status": "ok",
             "query": normalized_query,
             "limit": normalized_limit,
+            "offset": normalized_offset,
+            "total_hits": total_entities,
+            "total": total_entities,
+            "has_more": normalized_offset + len(entities) < total_entities,
+            "next_offset": normalized_offset + normalized_limit if normalized_offset + len(entities) < total_entities else None,
+            "sort": normalized_sort_specs[0][0],
+            "order": normalized_sort_specs[0][1],
+            "sort_spec": entity_list_sort_spec_text(normalized_sort_specs),
+            "sort_override": serialize_sort_specs(normalized_sort_specs),
             "include_ignored": include_ignored,
             "entities": entities,
             **entity_graph_counts(connection),
