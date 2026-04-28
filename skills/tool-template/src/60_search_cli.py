@@ -11074,8 +11074,11 @@ def build_parser() -> argparse.ArgumentParser:
     claim_run_items_parser.add_argument(
         "--stale-seconds",
         type=int,
-        default=DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
-        help="Reclaim running items whose heartbeat is older than this many seconds",
+        help=(
+            "Reclaim running items whose heartbeat is older than this many seconds "
+            f"(default: {DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS}s for inline, "
+            f"{DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS}s for background)"
+        ),
     )
     claim_run_items_parser.add_argument(
         "--launch-mode",
@@ -11105,8 +11108,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_run_batch_parser.add_argument(
         "--stale-seconds",
         type=int,
-        default=DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
-        help="Reclaim running items whose heartbeat is older than this many seconds",
+        help=(
+            "Reclaim running items whose heartbeat is older than this many seconds "
+            f"(default: {DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS}s for inline, "
+            f"{DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS}s for background)"
+        ),
+    )
+    prepare_run_batch_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Cowork-safe time budget for this batch preparation",
     )
     prepare_run_batch_parser.add_argument(
         "--launch-mode",
@@ -11180,6 +11192,44 @@ def build_parser() -> argparse.ArgumentParser:
     run_status_parser = subparsers.add_parser("run-status", help="Summarize run progress, claims, and recent failures")
     run_status_parser.add_argument("workspace", help="Workspace root path")
     run_status_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    run_status_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Budget used when rendering next_recommended_commands",
+    )
+
+    run_job_step_parser = subparsers.add_parser(
+        "run-job-step",
+        help="Advance one Cowork-safe processing-run step or return one prepared worker batch",
+    )
+    run_job_step_parser.add_argument("workspace", help="Workspace root path")
+    run_job_step_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    run_job_step_parser.add_argument("--claimed-by", help="Worker/session identifier; defaults to a stable Cowork id for the run")
+    run_job_step_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Cowork-safe time budget for this step",
+    )
+    run_job_step_parser.add_argument("--limit", type=int, help="Optional maximum number of run items to claim")
+    run_job_step_parser.add_argument(
+        "--stale-seconds",
+        type=int,
+        help="Override stale claim recovery window for this step",
+    )
+    run_job_step_parser.add_argument(
+        "--launch-mode",
+        default="inline",
+        choices=sorted(RUN_WORKER_MODES),
+        help="Worker launch mode for supervision metadata",
+    )
+    run_job_step_parser.add_argument("--worker-task-id", help="Optional background task identifier")
+    run_job_step_parser.add_argument(
+        "--max-batches",
+        type=int,
+        help="Optional maximum number of batches this worker should prepare before handing off",
+    )
 
     cancel_run_parser = subparsers.add_parser("cancel-run", help="Stop claiming new work for a run and skip its pending items")
     cancel_run_parser.add_argument("workspace", help="Workspace root path")
@@ -12168,6 +12218,7 @@ def main() -> int:
                         launch_mode=args.launch_mode,
                         worker_task_id=args.worker_task_id,
                         max_batches=args.max_batches,
+                        budget_seconds=args.budget_seconds,
                     ),
                     indent=2,
                     sort_keys=True,
@@ -12253,7 +12304,33 @@ def main() -> int:
             return 0
 
         if args.command == "run-status":
-            print(json.dumps(run_status(root, run_id=args.run_id), indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    run_status(root, run_id=args.run_id, budget_seconds=args.budget_seconds),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "run-job-step":
+            print(
+                json.dumps(
+                    run_job_step(
+                        root,
+                        run_id=args.run_id,
+                        claimed_by=args.claimed_by,
+                        budget_seconds=args.budget_seconds,
+                        limit=args.limit,
+                        stale_after_seconds=args.stale_seconds,
+                        launch_mode=args.launch_mode,
+                        worker_task_id=args.worker_task_id,
+                        max_batches=args.max_batches,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
 
         if args.command == "cancel-run":

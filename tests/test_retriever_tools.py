@@ -4795,6 +4795,152 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             batch_entry["context"]["execution"]["completion_template"]["output_values_json"]["governing_law"],
             "<final governing_law value>",
         )
+        self.assertEqual(prepare_payload["stale_after_seconds"], 45)
+        self.assertIn("next_recommended_commands", prepare_payload["run"])
+
+    def test_run_job_step_prepares_one_cowork_safe_batch(self) -> None:
+        note_path = self.root / "step-contract.txt"
+        note_path.write_text("Governing law is Delaware.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("step-contract.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Step Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "step_contract_metadata",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "step_contract_metadata",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--filter",
+            f"id = {document_row['id']}",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "run-job-step",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--budget-seconds",
+            "35",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertTrue(step_payload["executed"])
+        self.assertEqual(step_payload["executed_step"], "prepare_run_batch")
+        self.assertEqual(step_payload["reason"], "batch_ready")
+        self.assertEqual(step_payload["claimed_by"], f"cowork-run-{run_id}")
+        self.assertEqual(len(step_payload["batch"]), 1)
+        self.assertEqual(step_payload["batch"][0]["run_item"]["status"], "running")
+        self.assertIn("run-job-step", " ".join(step_payload["next_recommended_commands"]))
+
+    def test_run_job_step_respects_tiny_budget_before_claiming(self) -> None:
+        note_path = self.root / "tiny-budget-contract.txt"
+        note_path.write_text("Governing law is California.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("tiny-budget-contract.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Tiny Budget Contract Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "tiny_budget_contract_metadata",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "tiny_budget_contract_metadata",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--filter",
+            f"id = {document_row['id']}",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "run-job-step",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--budget-seconds",
+            "1",
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertFalse(step_payload["executed"])
+        self.assertEqual(step_payload["reason"], "budget_exhausted")
+        self.assertEqual(step_payload["batch"], [])
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "run-status",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        self.assertEqual(status_payload["run"]["planned_count"], 1)
+        self.assertEqual(status_payload["run"]["run_item_counts"]["running"], 0)
+        self.assertIn("run-job-step", " ".join(status_payload["run"]["next_recommended_commands"]))
 
     def test_prepare_run_batch_registers_background_worker_and_tracks_task(self) -> None:
         note_path = self.root / "background-contract.txt"
@@ -5230,6 +5376,94 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         }
         self.assertEqual(workers_by_claimed_by["worker-a"]["status"], "orphaned")
         self.assertEqual(workers_by_claimed_by["worker-b"]["status"], "active")
+        self.assertTrue(status_payload["run"]["claim_health"]["active_claim_count"] >= 1)
+
+    def test_prepare_run_batch_inline_default_reclaims_cowork_stale_items(self) -> None:
+        note_path = self.root / "cowork-stale.txt"
+        note_path.write_text("Counterparty is ExampleCo.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("cowork-stale.txt")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Cowork Stale", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "cowork_stale",
+            "counterparty_name",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "cowork_stale",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Extract the counterparty.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--filter",
+            f"id = {document_row['id']}",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        first_claim_exit, first_claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-a",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(first_claim_exit, 0)
+        self.assertIsNotNone(first_claim_payload)
+        run_item_id = int(first_claim_payload["run_items"][0]["id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                "UPDATE run_items SET last_heartbeat_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00Z", run_item_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-b",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["stale_after_seconds"], 45)
+        self.assertEqual(len(prepare_payload["batch"]), 1)
+        self.assertEqual(int(prepare_payload["batch"][0]["run_item"]["id"]), run_item_id)
+        self.assertEqual(prepare_payload["batch"][0]["run_item"]["claimed_by"], "worker-b")
 
     def test_cancel_run_skips_pending_items_and_blocks_new_claims(self) -> None:
         (self.root / "a.txt").write_text("Alpha text.", encoding="utf-8")

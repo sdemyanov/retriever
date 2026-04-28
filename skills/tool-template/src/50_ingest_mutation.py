@@ -13960,13 +13960,18 @@ def claim_run_items(
     run_id: int,
     claimed_by: str,
     limit: int = DEFAULT_RUN_ITEM_CLAIM_BATCH_SIZE,
-    stale_after_seconds: int = DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+    stale_after_seconds: int | None = None,
     launch_mode: str = "inline",
     worker_task_id: str | None = None,
     max_batches: int | None = None,
 ) -> dict[str, object]:
     if limit < 1:
         raise RetrieverError("Claim limit must be >= 1.")
+    effective_stale_after_seconds = (
+        int(stale_after_seconds)
+        if stale_after_seconds is not None
+        else default_run_item_claim_stale_seconds_for_launch_mode(launch_mode)
+    )
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -13989,7 +13994,7 @@ def claim_run_items(
                 run_id=run_id,
                 claimed_by=claimed_by,
                 limit=limit,
-                stale_after_seconds=stale_after_seconds,
+                stale_after_seconds=effective_stale_after_seconds,
             )
             if claimed_rows:
                 update_run_worker_row(
@@ -14004,6 +14009,7 @@ def claim_run_items(
                 "status": "ok",
                 "run": run_status_by_id(connection, run_id),
                 "claimed_by": normalize_whitespace(claimed_by),
+                "stale_after_seconds": effective_stale_after_seconds,
                 "reused_count": reused_count,
                 "run_items": [run_item_row_to_payload(row) for row in claimed_rows],
             }
@@ -14022,13 +14028,20 @@ def prepare_run_batch(
     run_id: int,
     claimed_by: str,
     limit: int | None = None,
-    stale_after_seconds: int = DEFAULT_RUN_ITEM_CLAIM_STALE_SECONDS,
+    stale_after_seconds: int | None = None,
     launch_mode: str = "inline",
     worker_task_id: str | None = None,
     max_batches: int | None = None,
+    budget_seconds: int | None = None,
 ) -> dict[str, object]:
     if limit is not None and limit < 1:
         raise RetrieverError("Claim limit must be >= 1.")
+    budget = normalize_resumable_step_budget(budget_seconds) if budget_seconds is not None else None
+    effective_stale_after_seconds = (
+        int(stale_after_seconds)
+        if stale_after_seconds is not None
+        else default_run_item_claim_stale_seconds_for_launch_mode(launch_mode)
+    )
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -14054,16 +14067,18 @@ def prepare_run_batch(
                 claimed_by=claimed_by,
             )
             effective_limit = limit if limit is not None else int(initial_worker_payload["recommended_batch_size"])
+            if budget is not None and budget < RUN_JOB_MIN_SECONDS_TO_CLAIM:
+                effective_limit = 0
             claimed_rows: list[sqlite3.Row] = []
             batch_payloads: list[dict[str, object]] = []
 
-            if initial_worker_payload["next_action"] == "claim":
+            if initial_worker_payload["next_action"] == "claim" and effective_limit > 0:
                 claimed_rows = claim_run_item_rows(
                     connection,
                     run_id=run_id,
                     claimed_by=claimed_by,
                     limit=effective_limit,
-                    stale_after_seconds=stale_after_seconds,
+                    stale_after_seconds=effective_stale_after_seconds,
                 )
                 batch_payloads = [
                     {
@@ -14088,6 +14103,12 @@ def prepare_run_batch(
                 run_payload=current_run_payload,
                 claimed_by=claimed_by,
             )
+            if budget is not None:
+                worker_payload["budget_seconds"] = budget
+                worker_payload["minimum_seconds_to_claim"] = RUN_JOB_MIN_SECONDS_TO_CLAIM
+                if budget < RUN_JOB_MIN_SECONDS_TO_CLAIM and worker_payload["next_action"] == "claim":
+                    worker_payload["next_action"] = "stop"
+                    worker_payload["stop_reason"] = "budget_exhausted"
             if batch_payloads:
                 worker_payload["next_action"] = "process_batch"
                 worker_payload["stop_reason"] = None
@@ -14095,6 +14116,12 @@ def prepare_run_batch(
                 worker_payload["next_action"] = "stop"
                 worker_payload["stop_reason"] = "no_claimable_items"
             worker_payload["prepared_batch_size"] = len(batch_payloads)
+            current_run_payload["next_recommended_commands"] = run_job_next_recommended_commands(
+                root,
+                run_payload=current_run_payload,
+                budget_seconds=budget if budget is not None else DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+                claimed_by=claimed_by,
+            )
 
             payload = {
                 "status": "ok",
@@ -14102,6 +14129,7 @@ def prepare_run_batch(
                 "worker": worker_payload,
                 "claimed_by": normalize_whitespace(claimed_by),
                 "requested_limit": effective_limit,
+                "stale_after_seconds": effective_stale_after_seconds,
                 "reused_count": reused_count,
                 "batch": batch_payloads,
                 "worker_record": run_worker_row_to_payload(
@@ -14611,18 +14639,223 @@ def fail_run_item(
         connection.close()
 
 
-def run_status(root: Path, *, run_id: int) -> dict[str, object]:
+def run_job_default_claimed_by(run_id: int) -> str:
+    return f"cowork-run-{int(run_id)}"
+
+
+def run_job_next_recommended_commands(
+    root: Path,
+    *,
+    run_payload: dict[str, object],
+    budget_seconds: int,
+    claimed_by: str | None = None,
+) -> list[str]:
+    run_id = int(run_payload["id"])
+    root_arg = shlex.quote(str(root))
+    run_id_arg = str(run_id)
+    budget_arg = str(int(budget_seconds))
+    claimed_by_arg = shlex.quote(normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id)))
+    if str(run_payload.get("status") or "") in {"completed", "failed", "canceled"}:
+        return [f"run-status {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}"]
+
+    worker_payload = dict(run_payload.get("worker") or {})
+    next_action = str(worker_payload.get("next_action") or "")
+    commands: list[str] = []
+    if next_action == "finalize_ocr":
+        commands.append(f"finalize-ocr-run {root_arg} --run-id {run_id_arg}")
+    elif next_action == "finalize_image_description":
+        commands.append(f"finalize-image-description-run {root_arg} --run-id {run_id_arg}")
+    elif next_action in {"claim", "stop"}:
+        run_item_counts = dict(run_payload.get("run_item_counts") or {})
+        if (
+            int(worker_payload.get("outstanding_items", 0) or 0) > 0
+            or int(run_item_counts.get("pending", 0) or 0) > 0
+            or int(run_item_counts.get("running", 0) or 0) > 0
+        ):
+            commands.append(
+                "prepare-run-batch "
+                f"{root_arg} --run-id {run_id_arg} --claimed-by {claimed_by_arg} "
+                f"--budget-seconds {budget_arg} --stale-seconds {DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS}"
+            )
+    if commands:
+        commands.insert(
+            0,
+            "run-job-step "
+            f"{root_arg} --run-id {run_id_arg} --claimed-by {claimed_by_arg} --budget-seconds {budget_arg}",
+        )
+    commands.append(f"run-status {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
+    return commands
+
+
+def run_status(root: Path, *, run_id: int, budget_seconds: int | None = None) -> dict[str, object]:
+    budget = (
+        normalize_resumable_step_budget(budget_seconds)
+        if budget_seconds is not None
+        else DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS
+    )
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        run_payload = run_status_by_id(connection, run_id)
+        run_payload["next_recommended_commands"] = run_job_next_recommended_commands(
+            root,
+            run_payload=run_payload,
+            budget_seconds=budget,
+        )
         return {
             "status": "ok",
-            "run": run_status_by_id(connection, run_id),
+            "run": run_payload,
         }
     finally:
         connection.close()
+
+
+def run_job_step(
+    root: Path,
+    *,
+    run_id: int,
+    claimed_by: str | None = None,
+    budget_seconds: int | None = None,
+    limit: int | None = None,
+    launch_mode: str = "inline",
+    worker_task_id: str | None = None,
+    max_batches: int | None = None,
+    stale_after_seconds: int | None = None,
+) -> dict[str, object]:
+    budget = normalize_resumable_step_budget(budget_seconds)
+    normalized_claimed_by = normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id))
+    if not normalized_claimed_by:
+        raise RetrieverError("claimed_by cannot be empty.")
+    status_payload = run_status(root, run_id=run_id, budget_seconds=budget)
+    run_payload = dict(status_payload["run"])
+    worker_payload = dict(run_payload.get("worker") or {})
+    next_action = str(worker_payload.get("next_action") or "")
+    if str(run_payload.get("status") or "") in {"completed", "failed", "canceled"}:
+        return {
+            "status": "ok",
+            "step": "run-job",
+            "run_id": run_id,
+            "claimed_by": normalized_claimed_by,
+            "budget_seconds": budget,
+            "executed": False,
+            "executed_step": None,
+            "reason": "run_terminal",
+            "batch": [],
+            "step_result": None,
+            "run": run_payload,
+            "more_work_remaining": False,
+            "next_recommended_commands": run_payload.get("next_recommended_commands", []),
+        }
+    if budget < RUN_JOB_MIN_SECONDS_TO_CLAIM and next_action == "claim":
+        run_payload["next_recommended_commands"] = run_job_next_recommended_commands(
+            root,
+            run_payload=run_payload,
+            budget_seconds=budget,
+            claimed_by=normalized_claimed_by,
+        )
+        return {
+            "status": "ok",
+            "step": "run-job",
+            "run_id": run_id,
+            "claimed_by": normalized_claimed_by,
+            "budget_seconds": budget,
+            "executed": False,
+            "executed_step": None,
+            "reason": "budget_exhausted",
+            "batch": [],
+            "step_result": None,
+            "run": run_payload,
+            "more_work_remaining": True,
+            "next_recommended_commands": run_payload["next_recommended_commands"],
+        }
+
+    executed_step: str | None = None
+    step_result: dict[str, object] | None = None
+    if next_action == "finalize_ocr":
+        executed_step = "finalize_ocr"
+        step_result = finalize_ocr_run(root, run_id=run_id)
+    elif next_action == "finalize_image_description":
+        executed_step = "finalize_image_description"
+        step_result = finalize_image_description_run(root, run_id=run_id)
+    elif next_action == "claim":
+        executed_step = "prepare_run_batch"
+        step_result = prepare_run_batch(
+            root,
+            run_id=run_id,
+            claimed_by=normalized_claimed_by,
+            limit=limit,
+            stale_after_seconds=(
+                stale_after_seconds
+                if stale_after_seconds is not None
+                else DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS
+            ),
+            launch_mode=launch_mode,
+            worker_task_id=worker_task_id,
+            max_batches=max_batches,
+            budget_seconds=budget,
+        )
+    else:
+        run_payload["next_recommended_commands"] = run_job_next_recommended_commands(
+            root,
+            run_payload=run_payload,
+            budget_seconds=budget,
+            claimed_by=normalized_claimed_by,
+        )
+        return {
+            "status": "ok",
+            "step": "run-job",
+            "run_id": run_id,
+            "claimed_by": normalized_claimed_by,
+            "budget_seconds": budget,
+            "executed": False,
+            "executed_step": None,
+            "reason": next_action or "stop",
+            "batch": [],
+            "step_result": None,
+            "run": run_payload,
+            "more_work_remaining": bool(run_payload.get("status") not in {"completed", "failed", "canceled"}),
+            "next_recommended_commands": run_payload["next_recommended_commands"],
+        }
+
+    updated_run_payload = dict(
+        (step_result or {}).get("run")
+        or run_status(root, run_id=run_id, budget_seconds=budget)["run"]
+    )
+    updated_run_payload["next_recommended_commands"] = run_job_next_recommended_commands(
+        root,
+        run_payload=updated_run_payload,
+        budget_seconds=budget,
+        claimed_by=normalized_claimed_by,
+    )
+    batch_payload = list((step_result or {}).get("batch") or [])
+    return {
+        "status": "ok",
+        "step": "run-job",
+        "run_id": run_id,
+        "claimed_by": normalized_claimed_by,
+        "budget_seconds": budget,
+        "executed": True,
+        "executed_step": executed_step,
+        "reason": (
+            "batch_ready"
+            if batch_payload
+            else (
+                "run_terminal"
+                if str(updated_run_payload.get("status") or "") in {"completed", "failed", "canceled"}
+                else "step_complete"
+            )
+        ),
+        "batch": batch_payload,
+        "worker": (step_result or {}).get("worker"),
+        "step_result": step_result,
+        "run": updated_run_payload,
+        "more_work_remaining": bool(
+            str(updated_run_payload.get("status") or "") not in {"completed", "failed", "canceled"}
+        ),
+        "next_recommended_commands": updated_run_payload["next_recommended_commands"],
+    }
 
 
 def cancel_run(root: Path, *, run_id: int, force: bool = False) -> dict[str, object]:
