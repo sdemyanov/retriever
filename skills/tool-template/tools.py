@@ -14587,6 +14587,31 @@ def pst_export_normalized_text(value: object) -> str | None:
     return normalized or None
 
 
+PST_EXPORT_SMTP_ADDRESS_PATTERN = re.compile(
+    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+)
+PST_EXPORT_EXCHANGE_DN_NOISE_PATTERN = re.compile(
+    r"(?i)(?:^|\s)(?:/O=|/OU=|/CN=|=GUID-[0-9A-F-]{8,})"
+)
+
+
+def pst_export_clean_custodian_candidate(value: object) -> str | None:
+    candidate = pst_export_normalized_text(value)
+    if not candidate:
+        return None
+    direct_email = normalize_entity_email(candidate)
+    if direct_email:
+        return direct_email
+    emails: list[str] = []
+    for match in PST_EXPORT_SMTP_ADDRESS_PATTERN.finditer(candidate):
+        email = normalize_entity_email(match.group(0))
+        if email and email not in emails:
+            emails.append(email)
+    if len(emails) == 1 and PST_EXPORT_EXCHANGE_DN_NOISE_PATTERN.search(candidate):
+        return emails[0]
+    return candidate
+
+
 def pst_export_match_text_key(value: object) -> str | None:
     normalized = normalize_generated_document_title(value) or pst_export_normalized_text(value)
     return normalized.casefold() if normalized else None
@@ -14928,7 +14953,7 @@ def pst_export_sidecar_custodian_candidate(message_metadata: dict[str, object] |
     if not message_metadata:
         return None
     for key in ("custodian", "location_name"):
-        candidate = pst_export_normalized_text(message_metadata.get(key))
+        candidate = pst_export_clean_custodian_candidate(message_metadata.get(key))
         if candidate:
             return candidate
     return None

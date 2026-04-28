@@ -16361,6 +16361,98 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(sidecar_count, 0)
         self.assertGreaterEqual(chunk_count, 1)
 
+    def test_ingest_pst_export_cleans_exchange_dn_sidecar_custodian_email(self) -> None:
+        (self.root / "Exchange").mkdir(parents=True, exist_ok=True)
+        self.write_fake_pst_file(name="Exchange/general@maxusivanovgmail.onmicrosoft.com.pst")
+        noisy_custodian = (
+            "/O= =GUID-24E2A0AD-A4C3-4891-A5D0-8C74E92E556E "
+            "general@maxusivanovgmail.onmicrosoft.com"
+        )
+        self.write_csv_rows(
+            self.root / "Results.csv",
+            fieldnames=[
+                "Item Identity",
+                "Document ID",
+                "Target Path",
+                "Location",
+                "Location Name",
+                "Subject or Title",
+            ],
+            rows=[
+                {
+                    "Item Identity": "pst-general-001",
+                    "Document ID": "101",
+                    "Target Path": (
+                        r"Exchange\general@maxusivanovgmail.onmicrosoft.com.pst"
+                        r"\Top of Information Store\Inbox\General Welcome"
+                    ),
+                    "Location": noisy_custodian,
+                    "Location Name": noisy_custodian,
+                    "Subject or Title": "General Welcome",
+                }
+            ],
+        )
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-general-001",
+                subject=None,
+                body_text="General mailbox body",
+                folder_path="Top of Information Store/Inbox",
+                author=None,
+                recipients=None,
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 1)
+
+        row = self.fetch_document_row(
+            retriever_tools.pst_message_rel_path(
+                "Exchange/general@maxusivanovgmail.onmicrosoft.com.pst",
+                "pst-general-001",
+            )
+        )
+        self.assertEqual(row["custodian"], "general@maxusivanovgmail.onmicrosoft.com")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            custodian_entity_row = connection.execute(
+                """
+                SELECT e.display_name, e.primary_email, e.entity_origin, de.evidence_json
+                FROM document_entities de
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.document_id = ? AND de.role = 'custodian'
+                """,
+                (row["id"],),
+            ).fetchone()
+            hint_row = connection.execute(
+                """
+                SELECT entity_hints_json
+                FROM document_occurrences
+                WHERE document_id = ?
+                """,
+                (row["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(custodian_entity_row)
+        assert custodian_entity_row is not None
+        self.assertEqual(custodian_entity_row["primary_email"], "general@maxusivanovgmail.onmicrosoft.com")
+        self.assertEqual(custodian_entity_row["entity_origin"], retriever_tools.ENTITY_ORIGIN_IDENTIFIED)
+        evidence = json.loads(custodian_entity_row["evidence_json"])
+        self.assertEqual(evidence["raw_value"], "general@maxusivanovgmail.onmicrosoft.com")
+        self.assertIsNotNone(hint_row)
+        hint_payload = json.loads(hint_row["entity_hints_json"])
+        self.assertEqual(
+            hint_payload["custodian"][0]["display_value"],
+            "general@maxusivanovgmail.onmicrosoft.com",
+        )
+
     def test_pst_export_location_external_id_hints_follow_dataset_policy_on_rebuild(self) -> None:
         (self.root / "Exchange").mkdir(parents=True, exist_ok=True)
         self.write_fake_pst_file(name="Exchange/mailbox.pst")
