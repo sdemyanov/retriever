@@ -1683,7 +1683,7 @@ def normalize_saved_scope_name(scope_name: str) -> str:
 
 def normalize_browse_mode(raw_value: object | None) -> str:
     normalized = normalize_inline_whitespace(str(raw_value or DEFAULT_BROWSE_MODE)).lower()
-    if normalized not in {BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS}:
+    if normalized not in {BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS, BROWSE_MODE_ENTITIES}:
         return DEFAULT_BROWSE_MODE
     return normalized
 
@@ -1696,10 +1696,12 @@ def default_session_state() -> dict[str, object]:
         "browsing": {
             BROWSE_MODE_DOCUMENTS: {},
             BROWSE_MODE_CONVERSATIONS: {},
+            BROWSE_MODE_ENTITIES: {},
         },
         "display": {
             BROWSE_MODE_DOCUMENTS: {},
             BROWSE_MODE_CONVERSATIONS: {},
+            BROWSE_MODE_ENTITIES: {},
         },
     }
 
@@ -1799,6 +1801,12 @@ def coerce_browsing_payload(raw_browsing: object) -> dict[str, object]:
     total_known = raw_browsing.get("total_known")
     if isinstance(total_known, int) and total_known >= 0:
         browsing["total_known"] = total_known
+    query = raw_browsing.get("query")
+    if isinstance(query, str) and query.strip():
+        browsing["query"] = normalize_whitespace(query)
+    include_ignored = raw_browsing.get("include_ignored")
+    if isinstance(include_ignored, bool):
+        browsing["include_ignored"] = include_ignored
     run_at = raw_browsing.get("run_at")
     if isinstance(run_at, str) and run_at.strip():
         browsing["run_at"] = run_at
@@ -1824,16 +1832,17 @@ def coerce_mode_payloads(raw_value: object, payload_coercer) -> dict[str, object
     normalized_payloads = {
         BROWSE_MODE_DOCUMENTS: {},
         BROWSE_MODE_CONVERSATIONS: {},
+        BROWSE_MODE_ENTITIES: {},
     }
     if not isinstance(raw_value, dict):
         return normalized_payloads
     if any(
         key in raw_value
-        for key in ("columns", "page_size", "sort", "offset", "total_known", "run_at")
+        for key in ("columns", "page_size", "sort", "offset", "total_known", "query", "include_ignored", "run_at")
     ):
         normalized_payloads[BROWSE_MODE_DOCUMENTS] = payload_coercer(raw_value)
         return normalized_payloads
-    for browse_mode in (BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS):
+    for browse_mode in (BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS, BROWSE_MODE_ENTITIES):
         normalized_payloads[browse_mode] = payload_coercer(raw_value.get(browse_mode))
     return normalized_payloads
 
@@ -3549,11 +3558,15 @@ def entity_type_from_candidate_parts(
     if email:
         local_part = email.split("@", 1)[0]
         normalized_local = re.sub(r"[^a-z0-9]+", "", local_part.lower())
-        if normalized_local in {"noreply", "donotreply", "no-reply", "mailerdaemon", "postmaster"}:
+        if normalized_local in SYSTEM_MAILBOX_LOCAL_PARTS or any(
+            token in normalized_local for token in SYSTEM_MAILBOX_LOCAL_CONTAINS
+        ):
             return ENTITY_TYPE_SYSTEM_MAILBOX
-        if normalized_local in {"support", "sales", "legal", "info", "contact", "admin", "billing", "help"}:
+        if normalized_local in SHARED_MAILBOX_LOCAL_PARTS:
             return ENTITY_TYPE_SHARED_MAILBOX
     name = normalize_entity_lookup_text(name_value or "")
+    if email and any(re.search(rf"\b{re.escape(hint)}\b", name) for hint in SHARED_MAILBOX_NAME_HINTS):
+        return ENTITY_TYPE_SHARED_MAILBOX
     if re.search(r"\b(inc|llc|llp|ltd|corp|corporation|company|co|plc|gmbh|sarl|partners|holdings)\b", name):
         return ENTITY_TYPE_ORGANIZATION
     if email or (name and name_is_full):

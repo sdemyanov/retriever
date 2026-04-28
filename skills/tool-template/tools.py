@@ -98,6 +98,7 @@ DEFAULT_PAGE_SIZE = 10
 MAX_PAGE_SIZE = 100
 BROWSE_MODE_DOCUMENTS = "documents"
 BROWSE_MODE_CONVERSATIONS = "conversations"
+BROWSE_MODE_ENTITIES = "entities"
 DEFAULT_BROWSE_MODE = BROWSE_MODE_DOCUMENTS
 DEFAULT_DOCUMENT_DISPLAY_COLUMNS = (
     "content_type",
@@ -113,6 +114,13 @@ DEFAULT_CONVERSATION_DISPLAY_COLUMNS = (
     "participants",
     "last_activity",
     "document_count",
+)
+DEFAULT_ENTITY_DISPLAY_COLUMNS = (
+    "entity_type",
+    "label",
+    "primary_email",
+    "document_count",
+    "roles",
 )
 MAX_SCOPE_DATASETS = 999
 MAX_FILTER_EXPRESSION_LENGTH = 8192
@@ -714,6 +722,45 @@ ENTITY_TYPES = {
     ENTITY_TYPE_SHARED_MAILBOX,
     ENTITY_TYPE_SYSTEM_MAILBOX,
     ENTITY_TYPE_UNKNOWN,
+}
+SYSTEM_MAILBOX_LOCAL_PARTS = {
+    "automated",
+    "daemon",
+    "donotreply",
+    "mailerdaemon",
+    "notification",
+    "notifications",
+    "noreply",
+    "postmaster",
+}
+SYSTEM_MAILBOX_LOCAL_CONTAINS = {
+    "donotreply",
+    "noreply",
+}
+SHARED_MAILBOX_LOCAL_PARTS = {
+    "admin",
+    "allcompany",
+    "billing",
+    "contact",
+    "events",
+    "help",
+    "hello",
+    "info",
+    "legal",
+    "legalevents",
+    "marketing",
+    "news",
+    "press",
+    "sales",
+    "support",
+    "team",
+}
+SHARED_MAILBOX_NAME_HINTS = {
+    "all company",
+    "help desk",
+    "legalweek",
+    "support",
+    "team",
 }
 ENTITY_ORIGIN_OBSERVED = "observed"
 ENTITY_ORIGIN_IDENTIFIED = "identified"
@@ -2489,7 +2536,7 @@ def normalize_saved_scope_name(scope_name: str) -> str:
 
 def normalize_browse_mode(raw_value: object | None) -> str:
     normalized = normalize_inline_whitespace(str(raw_value or DEFAULT_BROWSE_MODE)).lower()
-    if normalized not in {BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS}:
+    if normalized not in {BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS, BROWSE_MODE_ENTITIES}:
         return DEFAULT_BROWSE_MODE
     return normalized
 
@@ -2502,10 +2549,12 @@ def default_session_state() -> dict[str, object]:
         "browsing": {
             BROWSE_MODE_DOCUMENTS: {},
             BROWSE_MODE_CONVERSATIONS: {},
+            BROWSE_MODE_ENTITIES: {},
         },
         "display": {
             BROWSE_MODE_DOCUMENTS: {},
             BROWSE_MODE_CONVERSATIONS: {},
+            BROWSE_MODE_ENTITIES: {},
         },
     }
 
@@ -2605,6 +2654,12 @@ def coerce_browsing_payload(raw_browsing: object) -> dict[str, object]:
     total_known = raw_browsing.get("total_known")
     if isinstance(total_known, int) and total_known >= 0:
         browsing["total_known"] = total_known
+    query = raw_browsing.get("query")
+    if isinstance(query, str) and query.strip():
+        browsing["query"] = normalize_whitespace(query)
+    include_ignored = raw_browsing.get("include_ignored")
+    if isinstance(include_ignored, bool):
+        browsing["include_ignored"] = include_ignored
     run_at = raw_browsing.get("run_at")
     if isinstance(run_at, str) and run_at.strip():
         browsing["run_at"] = run_at
@@ -2630,16 +2685,17 @@ def coerce_mode_payloads(raw_value: object, payload_coercer) -> dict[str, object
     normalized_payloads = {
         BROWSE_MODE_DOCUMENTS: {},
         BROWSE_MODE_CONVERSATIONS: {},
+        BROWSE_MODE_ENTITIES: {},
     }
     if not isinstance(raw_value, dict):
         return normalized_payloads
     if any(
         key in raw_value
-        for key in ("columns", "page_size", "sort", "offset", "total_known", "run_at")
+        for key in ("columns", "page_size", "sort", "offset", "total_known", "query", "include_ignored", "run_at")
     ):
         normalized_payloads[BROWSE_MODE_DOCUMENTS] = payload_coercer(raw_value)
         return normalized_payloads
-    for browse_mode in (BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS):
+    for browse_mode in (BROWSE_MODE_DOCUMENTS, BROWSE_MODE_CONVERSATIONS, BROWSE_MODE_ENTITIES):
         normalized_payloads[browse_mode] = payload_coercer(raw_value.get(browse_mode))
     return normalized_payloads
 
@@ -4355,11 +4411,15 @@ def entity_type_from_candidate_parts(
     if email:
         local_part = email.split("@", 1)[0]
         normalized_local = re.sub(r"[^a-z0-9]+", "", local_part.lower())
-        if normalized_local in {"noreply", "donotreply", "no-reply", "mailerdaemon", "postmaster"}:
+        if normalized_local in SYSTEM_MAILBOX_LOCAL_PARTS or any(
+            token in normalized_local for token in SYSTEM_MAILBOX_LOCAL_CONTAINS
+        ):
             return ENTITY_TYPE_SYSTEM_MAILBOX
-        if normalized_local in {"support", "sales", "legal", "info", "contact", "admin", "billing", "help"}:
+        if normalized_local in SHARED_MAILBOX_LOCAL_PARTS:
             return ENTITY_TYPE_SHARED_MAILBOX
     name = normalize_entity_lookup_text(name_value or "")
+    if email and any(re.search(rf"\b{re.escape(hint)}\b", name) for hint in SHARED_MAILBOX_NAME_HINTS):
+        return ENTITY_TYPE_SHARED_MAILBOX
     if re.search(r"\b(inc|llc|llp|ltd|corp|corporation|company|co|plc|gmbh|sarl|partners|holdings)\b", name):
         return ENTITY_TYPE_ORGANIZATION
     if email or (name and name_is_full):
@@ -38557,15 +38617,90 @@ def serialize_entity_summary(
     }
 
 
+ENTITY_LIST_SORT_EXPRESSIONS = {
+    "id": "e.id",
+    "label": "LOWER(COALESCE(e.sort_name, e.display_name, e.primary_email, e.primary_phone, ''))",
+    "display_name": "LOWER(COALESCE(e.display_name, ''))",
+    "primary_email": "LOWER(COALESCE(e.primary_email, ''))",
+    "primary_phone": "LOWER(COALESCE(e.primary_phone, ''))",
+    "sort_name": "LOWER(COALESCE(e.sort_name, ''))",
+    "entity_type": "e.entity_type",
+    "entity_origin": "e.entity_origin",
+    "canonical_status": "e.canonical_status",
+    "entity_status": "e.canonical_status",
+    "document_count": "document_count",
+}
+
+
+def normalize_entity_list_sort_field(raw_field: str | None) -> str:
+    field_name = normalize_inline_whitespace(str(raw_field or "")).lower()
+    if field_name == "status":
+        field_name = "entity_status"
+    if field_name == "type":
+        field_name = "entity_type"
+    if field_name == "origin":
+        field_name = "entity_origin"
+    if field_name == "email":
+        field_name = "primary_email"
+    if field_name not in ENTITY_LIST_SORT_EXPRESSIONS:
+        allowed = ", ".join(sorted(ENTITY_LIST_SORT_EXPRESSIONS))
+        raise RetrieverError(f"Unsupported entity sort field: {raw_field}. Sortable fields: {allowed}.")
+    return field_name
+
+
+def normalize_entity_list_sort_specs(
+    *,
+    sort: str | None = None,
+    order: str | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
+) -> list[tuple[str, str]]:
+    if sort_specs is not None:
+        normalized_specs: list[tuple[str, str]] = []
+        for raw_field, raw_direction in sort_specs:
+            field_name = normalize_entity_list_sort_field(raw_field)
+            direction = normalize_inline_whitespace(str(raw_direction or "asc")).lower()
+            if direction not in {"asc", "desc"}:
+                raise RetrieverError("Sort direction must be 'asc' or 'desc'.")
+            normalized_specs.append((field_name, direction))
+        return normalized_specs or [("document_count", "desc"), ("label", "asc"), ("id", "asc")]
+    if sort:
+        direction = normalize_inline_whitespace(str(order or "asc")).lower()
+        if direction not in {"asc", "desc"}:
+            raise RetrieverError("Sort direction must be 'asc' or 'desc'.")
+        return [(normalize_entity_list_sort_field(sort), direction)]
+    return [("document_count", "desc"), ("label", "asc"), ("id", "asc")]
+
+
+def entity_list_sort_spec_text(sort_specs: list[tuple[str, str]]) -> str:
+    return ", ".join(f"{field_name} {direction}" for field_name, direction in sort_specs)
+
+
+def entity_list_order_sql(sort_specs: list[tuple[str, str]]) -> str:
+    effective_specs = list(sort_specs)
+    if not any(field_name == "id" for field_name, _ in effective_specs):
+        effective_specs.append(("id", "asc"))
+    parts: list[str] = []
+    for field_name, direction in effective_specs:
+        expression = ENTITY_LIST_SORT_EXPRESSIONS[normalize_entity_list_sort_field(field_name)]
+        parts.append(f"{expression} {direction.upper()}")
+    return ", ".join(parts)
+
+
 def list_entities(
     root: Path,
     *,
     query: str | None = None,
     limit: int = 50,
+    offset: int = 0,
+    sort: str | None = None,
+    order: str | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
     include_ignored: bool = False,
 ) -> dict[str, object]:
     normalized_limit = max(1, min(int(limit or 50), 200))
+    normalized_offset = max(0, int(offset or 0))
     normalized_query = normalize_whitespace(str(query or "")).lower()
+    normalized_sort_specs = normalize_entity_list_sort_specs(sort=sort, order=order, sort_specs=sort_specs)
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -38595,6 +38730,15 @@ def list_entities(
             )
             params.extend([like_query, like_query, like_query, like_query, like_query])
         where_sql = " AND ".join(where_clauses)
+        total_row = connection.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM entities e
+            WHERE {where_sql}
+            """,
+            tuple(params),
+        ).fetchone()
+        total_entities = int(total_row["total"] if total_row is not None else 0)
         rows = connection.execute(
             f"""
             SELECT e.*,
@@ -38604,12 +38748,11 @@ def list_entities(
             LEFT JOIN document_entities de ON de.entity_id = e.id
             WHERE {where_sql}
             GROUP BY e.id
-            ORDER BY document_count DESC,
-                     COALESCE(e.sort_name, e.display_name, e.primary_email, e.primary_phone, '') ASC,
-                     e.id ASC
+            ORDER BY {entity_list_order_sql(normalized_sort_specs)}
             LIMIT ?
+            OFFSET ?
             """,
-            (*params, normalized_limit),
+            (*params, normalized_limit, normalized_offset),
         ).fetchall()
         entity_ids = [int(row["id"]) for row in rows]
         identifiers_by_entity = entity_identifiers_by_entity_id(connection, entity_ids)
@@ -38621,6 +38764,15 @@ def list_entities(
             "status": "ok",
             "query": normalized_query,
             "limit": normalized_limit,
+            "offset": normalized_offset,
+            "total_hits": total_entities,
+            "total": total_entities,
+            "has_more": normalized_offset + len(entities) < total_entities,
+            "next_offset": normalized_offset + normalized_limit if normalized_offset + len(entities) < total_entities else None,
+            "sort": normalized_sort_specs[0][0],
+            "order": normalized_sort_specs[0][1],
+            "sort_spec": entity_list_sort_spec_text(normalized_sort_specs),
+            "sort_override": serialize_sort_specs(normalized_sort_specs),
             "include_ignored": include_ignored,
             "entities": entities,
             **entity_graph_counts(connection),
@@ -47059,7 +47211,7 @@ def build_search_header_payload(scope: dict[str, object], payload: dict[str, obj
     end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
     sort_summary = str(payload.get("sort_spec") or f"{payload.get('sort')} {payload.get('order')}")
     browse_mode = normalize_browse_mode(payload.get("browse_mode"))
-    result_label = "conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "docs"
+    result_label = browse_mode_result_label(browse_mode)
 
     header: dict[str, str] = {}
 
@@ -47161,9 +47313,129 @@ CONVERSATION_FIELD_DEFINITIONS = {
 }
 
 
+ENTITY_FIELD_DEFINITIONS = {
+    "id": {
+        "field_name": "id",
+        "field_type": "integer",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "label": {
+        "field_name": "label",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "entity_type": {
+        "field_name": "entity_type",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "entity_origin": {
+        "field_name": "entity_origin",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "entity_status": {
+        "field_name": "entity_status",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "canonical_status": {
+        "field_name": "entity_status",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "false",
+        "sortable": "true",
+    },
+    "display_name": {
+        "field_name": "display_name",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "primary_email": {
+        "field_name": "primary_email",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "primary_phone": {
+        "field_name": "primary_phone",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "sort_name": {
+        "field_name": "sort_name",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "document_count": {
+        "field_name": "document_count",
+        "field_type": "integer",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "true",
+    },
+    "roles": {
+        "field_name": "roles",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "false",
+    },
+    "emails": {
+        "field_name": "emails",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "false",
+    },
+    "names": {
+        "field_name": "names",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "false",
+    },
+    "phones": {
+        "field_name": "phones",
+        "field_type": "text",
+        "source": "entity",
+        "displayable": "true",
+        "sortable": "false",
+    },
+}
+
+
+def entity_field_definition(field_name: str) -> dict[str, str]:
+    canonical_name = FIELD_NAME_ALIASES.get(field_name, field_name)
+    field_def = ENTITY_FIELD_DEFINITIONS.get(canonical_name)
+    if field_def is None:
+        raise RetrieverError(f"Unknown field: {field_name}")
+    return dict(field_def)
+
+
 def default_display_columns(browse_mode: str = BROWSE_MODE_DOCUMENTS) -> list[str]:
-    if normalize_browse_mode(browse_mode) == BROWSE_MODE_CONVERSATIONS:
+    effective_browse_mode = normalize_browse_mode(browse_mode)
+    if effective_browse_mode == BROWSE_MODE_CONVERSATIONS:
         return list(DEFAULT_CONVERSATION_DISPLAY_COLUMNS)
+    if effective_browse_mode == BROWSE_MODE_ENTITIES:
+        return list(DEFAULT_ENTITY_DISPLAY_COLUMNS)
     return list(DEFAULT_DOCUMENT_DISPLAY_COLUMNS)
 
 
@@ -47210,12 +47482,17 @@ def resolve_browse_field_definition(
     effective_browse_mode = normalize_browse_mode(browse_mode)
     if effective_browse_mode == BROWSE_MODE_CONVERSATIONS:
         return conversation_field_definition(field_name)
+    if effective_browse_mode == BROWSE_MODE_ENTITIES:
+        return entity_field_definition(field_name)
     return resolve_field_definition(connection, field_name)
 
 
 def known_browse_field_names(connection: sqlite3.Connection, *, browse_mode: str) -> list[str]:
-    if normalize_browse_mode(browse_mode) == BROWSE_MODE_CONVERSATIONS:
+    effective_browse_mode = normalize_browse_mode(browse_mode)
+    if effective_browse_mode == BROWSE_MODE_CONVERSATIONS:
         return sorted(CONVERSATION_FIELD_DEFINITIONS)
+    if effective_browse_mode == BROWSE_MODE_ENTITIES:
+        return sorted(ENTITY_FIELD_DEFINITIONS)
     return known_logical_field_names(connection)
 
 
@@ -47782,7 +48059,7 @@ def compute_search_overview_line(
         parts.append(f"{flagged_empty} flagged (text_status=empty)")
     if not parts:
         return None
-    label = "conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "docs"
+    label = browse_mode_result_label(browse_mode)
     parts.insert(0, f"{len(results)} {label} on this page")
     return "Overview: " + " \u00b7 ".join(parts)
 
@@ -47956,7 +48233,7 @@ def render_search_markdown(payload: dict[str, object], column_defs: list[dict[st
     total_pages = int(payload.get("total_pages") or 1)
     start_index = 0 if total_hits == 0 else ((page - 1) * per_page) + 1
     end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
-    result_label = "Conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "Documents"
+    result_label = browse_mode_result_label(browse_mode, title_case=True)
     footer_lines = [f"{result_label} {start_index}\u2013{end_index} of {total_hits}."]
     footer_lines.extend(
         build_search_footer_hints(
@@ -49055,6 +49332,14 @@ def active_sort_payload(
             "sort_source": "default",
         }
 
+    if effective_browse_mode == BROWSE_MODE_ENTITIES:
+        return {
+            "sort": "document_count",
+            "order": "desc",
+            "sort_spec": "document_count desc, label asc, id asc",
+            "sort_source": "default",
+        }
+
     return {
         "sort": "date_created",
         "order": "desc",
@@ -49183,10 +49468,19 @@ def escape_markdown_table_cell(value: object) -> str:
     return text.replace("\\", "\\\\").replace("|", "\\|")
 
 
+def browse_mode_result_label(browse_mode: str, *, title_case: bool = False) -> str:
+    effective_browse_mode = normalize_browse_mode(browse_mode)
+    if effective_browse_mode == BROWSE_MODE_CONVERSATIONS:
+        return "Conversations" if title_case else "conversations"
+    if effective_browse_mode == BROWSE_MODE_ENTITIES:
+        return "Entities" if title_case else "entities"
+    return "Documents" if title_case else "docs"
+
+
 def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) -> str | None:
     command_name, normalized_tail = parse_slash_command_text(raw_command)
     browse_mode = normalize_browse_mode(payload.get("browse_mode"))
-    result_label = "conversations" if browse_mode == BROWSE_MODE_CONVERSATIONS else "docs"
+    result_label = browse_mode_result_label(browse_mode)
 
     if command_name == "field":
         field_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
@@ -49224,7 +49518,7 @@ def render_slash_read_only_output(raw_command: str, payload: dict[str, object]) 
             summary += ". Re-run with --confirm to apply."
         return summary
 
-    if command_name in {"next", "previous", "documents", "conversations"}:
+    if command_name in {"next", "previous", "documents", "conversations", "entities"}:
         rendered_markdown = payload.get("rendered_markdown")
         if payload_has_meaningful_value(rendered_markdown):
             return str(rendered_markdown)
@@ -50120,6 +50414,284 @@ def resolve_scope_document_search_with_explicit_sort(
     return selection
 
 
+def build_entity_header_payload(payload: dict[str, object]) -> dict[str, str]:
+    total_hits = int(payload.get("total_hits") or 0)
+    page = int(payload.get("page") or 1)
+    per_page = int(payload.get("per_page") or DEFAULT_PAGE_SIZE)
+    start_index = 0 if total_hits == 0 else ((page - 1) * per_page) + 1
+    end_index = 0 if total_hits == 0 else min(total_hits, page * per_page)
+    sort_summary = str(payload.get("sort_spec") or f"{payload.get('sort')} {payload.get('order')}")
+    header: dict[str, str] = {}
+    query = normalize_inline_whitespace(str(payload.get("query") or ""))
+    if query:
+        header["keyword"] = f"Entity query: {query!r}"
+    if bool(payload.get("include_ignored")):
+        header["filters"] = "Include ignored entities"
+    header["sort"] = f"Sort: {sort_summary}"
+    header["page"] = f"Page: {page} of {payload.get('total_pages')}  (entities {start_index}-{end_index} of {total_hits})"
+    return header
+
+
+def decorate_entity_list_payload(
+    payload: dict[str, object],
+    column_defs: list[dict[str, str]],
+    *,
+    warnings: list[str] | None = None,
+) -> dict[str, object]:
+    per_page = int(payload.get("limit") or DEFAULT_PAGE_SIZE)
+    offset = int(payload.get("offset") or 0)
+    total_hits = int(payload.get("total_hits") or payload.get("total") or 0)
+    total_pages = max(1, (total_hits + per_page - 1) // per_page)
+    page = (offset // per_page) + 1
+    results = [dict(item) for item in payload.get("entities", []) if isinstance(item, dict)]
+    for item in results:
+        item["entity_status"] = item.get("canonical_status")
+        item["display_values"] = build_summary_display_values(item, column_defs)
+
+    decorated = {
+        **payload,
+        "browse_mode": BROWSE_MODE_ENTITIES,
+        "page": page,
+        "per_page": per_page,
+        "offset": offset,
+        "total_hits": total_hits,
+        "total_pages": total_pages,
+        "results": results,
+        "entities": results,
+        "filters": [],
+        "scope": {},
+        "display": build_display_payload(column_defs, per_page),
+    }
+    decorated["header"] = build_entity_header_payload(decorated)
+    if warnings:
+        decorated["warnings"] = warnings
+    decorated["rendered_markdown"] = render_search_markdown(decorated, column_defs)
+    return decorated
+
+
+def entity_browsing_options(session_state: dict[str, object]) -> tuple[str | None, bool]:
+    browsing = session_browsing_state(session_state, browse_mode=BROWSE_MODE_ENTITIES)
+    query = browsing.get("query")
+    normalized_query = normalize_whitespace(str(query or "")) if isinstance(query, str) else ""
+    return (normalized_query or None), bool(browsing.get("include_ignored"))
+
+
+def persist_entity_browsing_result(
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+    payload: dict[str, object],
+    sort_specs: list[tuple[str, str]] | None,
+) -> dict[str, object]:
+    session_state["browse_mode"] = BROWSE_MODE_ENTITIES
+    browsing_root = session_state.get("browsing")
+    if not isinstance(browsing_root, dict):
+        browsing_root = {}
+    browsing_payload: dict[str, object] = {
+        "offset": int(payload.get("offset") or 0),
+        "total_known": int(payload.get("total_hits") or 0),
+        "include_ignored": bool(payload.get("include_ignored")),
+        "run_at": utc_now(),
+    }
+    query = normalize_whitespace(str(payload.get("query") or ""))
+    if query:
+        browsing_payload["query"] = query
+    if sort_specs:
+        browsing_payload["sort"] = serialize_sort_specs(sort_specs)
+    browsing_root[BROWSE_MODE_ENTITIES] = coerce_browsing_payload(browsing_payload)
+    session_state["browsing"] = coerce_mode_payloads(browsing_root, coerce_browsing_payload)
+    persist_session_state(paths, session_state)
+    return payload
+
+
+def run_entity_browsing_from_session(
+    root: Path,
+    paths: dict[str, Path],
+    session_state: dict[str, object] | None = None,
+    *,
+    offset: int | None = None,
+    sort_specs: list[tuple[str, str]] | None = None,
+) -> dict[str, object]:
+    normalized_session_state = read_session_state(paths) if session_state is None else session_state
+    normalized_session_state["browse_mode"] = BROWSE_MODE_ENTITIES
+    effective_sort_specs = (
+        sort_specs
+        if sort_specs is not None
+        else session_sort_specs(normalized_session_state, browse_mode=BROWSE_MODE_ENTITIES)
+    )
+    current_offset = int(
+        session_browsing_state(normalized_session_state, browse_mode=BROWSE_MODE_ENTITIES).get("offset") or 0
+    )
+    query, include_ignored = entity_browsing_options(normalized_session_state)
+    connection = connect_db(paths["db_path"])
+    try:
+        display_column_defs, display_warnings, normalized_session_state = resolve_session_display_columns(
+            connection,
+            paths,
+            normalized_session_state,
+            browse_mode=BROWSE_MODE_ENTITIES,
+        )
+    finally:
+        connection.close()
+    per_page = session_page_size(normalized_session_state, browse_mode=BROWSE_MODE_ENTITIES)
+    requested_offset = current_offset if offset is None else offset
+    payload = list_entities(
+        root,
+        query=query,
+        limit=per_page,
+        offset=requested_offset,
+        sort_specs=effective_sort_specs or None,
+        include_ignored=include_ignored,
+    )
+    total_hits = int(payload.get("total_hits") or 0)
+    total_pages = max(1, (total_hits + per_page - 1) // per_page)
+    if total_hits > 0 and requested_offset >= total_hits:
+        requested_offset = (total_pages - 1) * per_page
+        payload = list_entities(
+            root,
+            query=query,
+            limit=per_page,
+            offset=requested_offset,
+            sort_specs=effective_sort_specs or None,
+            include_ignored=include_ignored,
+        )
+    decorated = decorate_entity_list_payload(payload, display_column_defs, warnings=display_warnings)
+    return persist_entity_browsing_result(
+        paths,
+        normalized_session_state,
+        decorated,
+        effective_sort_specs or None,
+    )
+
+
+def run_entity_list_command(
+    root: Path,
+    *,
+    query: str | None,
+    limit: int,
+    offset: int,
+    sort: str | None,
+    order: str | None,
+    include_ignored: bool,
+) -> dict[str, object]:
+    sort_specs = normalize_entity_list_sort_specs(
+        sort=sort or ("document_count" if order else None),
+        order=order,
+    ) if (sort or order) else None
+    payload = list_entities(
+        root,
+        query=query,
+        limit=limit,
+        offset=offset,
+        sort_specs=sort_specs,
+        include_ignored=include_ignored,
+    )
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    session_state = read_session_state(paths)
+    display_root = session_state.get("display")
+    if not isinstance(display_root, dict):
+        display_root = {}
+    display_state = session_display_state(session_state, browse_mode=BROWSE_MODE_ENTITIES)
+    page_size = min(int(payload.get("limit") or DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE)
+    if page_size == DEFAULT_PAGE_SIZE:
+        display_state.pop("page_size", None)
+    else:
+        display_state["page_size"] = page_size
+    display_root[BROWSE_MODE_ENTITIES] = coerce_display_payload(display_state)
+    session_state["display"] = coerce_mode_payloads(display_root, coerce_display_payload)
+    persist_entity_browsing_result(paths, session_state, payload, sort_specs)
+    return payload
+
+
+def normalize_conversation_list_sort_specs(
+    connection: sqlite3.Connection,
+    *,
+    sort: str | None,
+    order: str | None,
+) -> list[tuple[str, str]] | None:
+    if not sort and not order:
+        return None
+    field_name = resolve_sort_field_name(
+        connection,
+        sort or "last_activity",
+        browse_mode=BROWSE_MODE_CONVERSATIONS,
+    )
+    direction = normalize_inline_whitespace(str(order or "desc")).lower()
+    if direction not in {"asc", "desc"}:
+        raise RetrieverError("Sort direction must be 'asc' or 'desc'.")
+    return [(field_name, direction)]
+
+
+def list_conversations(
+    root: Path,
+    *,
+    query: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    dataset_names: list[str] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    sort: str | None = None,
+    order: str | None = None,
+) -> dict[str, object]:
+    normalized_limit = max(1, min(int(limit or 50), MAX_PAGE_SIZE))
+    normalized_offset = max(0, int(offset or 0))
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        selector = build_effective_scope_selector(
+            connection,
+            paths,
+            query=normalize_inline_whitespace(str(query or "")),
+            raw_bates=None,
+            raw_filters=raw_filters,
+            dataset_names=dataset_names,
+            from_run_id=from_run_id,
+            select_from_scope=select_from_scope,
+        )
+        sort_specs = normalize_conversation_list_sort_specs(connection, sort=sort, order=order)
+        session_state = read_session_state(paths)
+        display_column_defs, display_warnings, session_state = resolve_session_display_columns(
+            connection,
+            paths,
+            session_state,
+            browse_mode=BROWSE_MODE_CONVERSATIONS,
+        )
+    finally:
+        connection.close()
+
+    payload = search_with_scope(
+        root,
+        selector,
+        per_page=normalized_limit,
+        offset=normalized_offset,
+        sort_specs=sort_specs,
+        display_column_defs=display_column_defs,
+        warnings=display_warnings,
+        browse_mode=BROWSE_MODE_CONVERSATIONS,
+    )
+    payload["limit"] = normalized_limit
+    payload["conversations"] = payload["results"]
+    persisted_session_state = persist_display_preferences(
+        paths,
+        session_state,
+        display_column_defs,
+        normalized_limit,
+        browse_mode=BROWSE_MODE_CONVERSATIONS,
+    )
+    persist_browsing_search_result(
+        paths,
+        persisted_session_state,
+        payload,
+        sort_specs,
+        browse_mode=BROWSE_MODE_CONVERSATIONS,
+    )
+    return payload
+
+
 def persist_browsing_search_result(
     paths: dict[str, Path],
     session_state: dict[str, object],
@@ -50188,6 +50760,14 @@ def run_browsing_search_from_session(
 ) -> dict[str, object]:
     normalized_session_state = read_session_state(paths) if session_state is None else session_state
     effective_browse_mode = normalize_browse_mode(browse_mode or session_browse_mode(normalized_session_state))
+    if effective_browse_mode == BROWSE_MODE_ENTITIES:
+        return run_entity_browsing_from_session(
+            root,
+            paths,
+            normalized_session_state,
+            offset=offset,
+            sort_specs=sort_specs,
+        )
     normalized_session_state["browse_mode"] = effective_browse_mode
     effective_sort_specs = (
         sort_specs
@@ -50228,7 +50808,12 @@ def run_browsing_search_from_session(
 
 def run_scope_search_from_session(root: Path, paths: dict[str, Path], scope: dict[str, object]) -> dict[str, object]:
     session_state = persist_scope_to_session(paths, scope)
-    return run_browsing_search_from_session(root, paths, session_state, offset=0)
+    browse_mode = session_browse_mode(session_state)
+    if browse_mode == BROWSE_MODE_ENTITIES:
+        session_state["browse_mode"] = BROWSE_MODE_DOCUMENTS
+        session_state = persist_session_state(paths, session_state)
+        browse_mode = BROWSE_MODE_DOCUMENTS
+    return run_browsing_search_from_session(root, paths, session_state, offset=0, browse_mode=browse_mode)
 
 
 def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
@@ -50347,14 +50932,15 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
                 confirm=bool(fill_args["confirm"]),
             )
 
-        if command_name in {"documents", "conversations"}:
+        if command_name in {"documents", "conversations", "entities"}:
             if normalized_tail:
                 raise RetrieverError(f"Usage: /{command_name}")
-            target_browse_mode = (
-                BROWSE_MODE_CONVERSATIONS
-                if command_name == "conversations"
-                else BROWSE_MODE_DOCUMENTS
-            )
+            if command_name == "conversations":
+                target_browse_mode = BROWSE_MODE_CONVERSATIONS
+            elif command_name == "entities":
+                target_browse_mode = BROWSE_MODE_ENTITIES
+            else:
+                target_browse_mode = BROWSE_MODE_DOCUMENTS
             updated_session_state = read_session_state(paths)
             updated_session_state["browse_mode"] = target_browse_mode
             updated_session_state = persist_session_state(paths, updated_session_state)
@@ -53193,6 +53779,34 @@ def search_chunks(
         connection.close()
 
 
+ENTITY_AGGREGATE_GROUPS: dict[str, dict[str, object]] = {
+    "entity_type": {
+        "output_name": "entity_type",
+        "select_sql": "e.entity_type",
+        "join_documents": False,
+    },
+    "entity_origin": {
+        "output_name": "entity_origin",
+        "select_sql": "e.entity_origin",
+        "join_documents": False,
+    },
+    "canonical_status": {
+        "output_name": "entity_status",
+        "select_sql": "e.canonical_status",
+        "join_documents": False,
+    },
+    "role": {
+        "output_name": "entity_role",
+        "select_sql": "de.role",
+        "join_documents": True,
+    },
+}
+ENTITY_AGGREGATE_GROUP_ALIASES = {
+    "entity_status": "canonical_status",
+    "entity_role": "role",
+}
+
+
 def aggregate_output_name(base_name: str, used_names: set[str]) -> str:
     candidate = base_name
     if candidate not in used_names:
@@ -53208,6 +53822,146 @@ def aggregate_output_name(base_name: str, used_names: set[str]) -> str:
 
 def aggregate_date_base_expr(field_name: str) -> str:
     return f"substr(COALESCE(d.{quote_identifier(field_name)}, ''), 1, 10)"
+
+
+def normalize_entity_aggregate_group(raw_group: str) -> str | None:
+    token = normalize_whitespace(raw_group)
+    canonical = ENTITY_AGGREGATE_GROUP_ALIASES.get(token)
+    if canonical is None and token in {"entity_type", "entity_origin"}:
+        canonical = token
+    if canonical in ENTITY_AGGREGATE_GROUPS:
+        return canonical
+    return None
+
+
+def resolve_entity_aggregate_group(raw_group: str, used_names: set[str]) -> dict[str, object]:
+    token = normalize_whitespace(raw_group)
+    canonical = normalize_entity_aggregate_group(token)
+    if canonical is None:
+        raise RetrieverError(f"Unsupported entity aggregate group: {raw_group}")
+    spec = ENTITY_AGGREGATE_GROUPS[canonical]
+    output_name = aggregate_output_name(str(spec["output_name"]), used_names)
+    return {
+        "token": token,
+        "normalized_token": canonical,
+        "output_name": output_name,
+        "select_sql": str(spec["select_sql"]),
+        "group_sql": str(spec["select_sql"]),
+        "join_documents": bool(spec["join_documents"]),
+        "is_temporal": False,
+    }
+
+
+def raw_group_bys_are_entity_aggregate_groups(raw_group_bys: list[str]) -> bool:
+    return any(normalize_entity_aggregate_group(raw_group) is not None for raw_group in raw_group_bys)
+
+
+def aggregate_entities(
+    root: Path,
+    raw_filters: list[list[str]] | None,
+    raw_group_bys: list[str],
+    order_by: str | None,
+    order: str | None,
+    limit: int,
+    explain: bool,
+    *,
+    select_from_scope: bool = False,
+) -> dict[str, object]:
+    entity_group_flags = [normalize_entity_aggregate_group(raw_group) is not None for raw_group in raw_group_bys]
+    if not all(entity_group_flags):
+        raise RetrieverError(
+            "Entity aggregate groups cannot be mixed with document aggregate groups. "
+            "Use entity_type, entity_origin, entity_status, or entity_role."
+        )
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        used_names: set[str] = set()
+        group_defs = [resolve_entity_aggregate_group(raw_group, used_names) for raw_group in raw_group_bys]
+        join_documents = bool(raw_filters) or bool(select_from_scope) or any(
+            bool(group_def["join_documents"]) for group_def in group_defs
+        )
+        effective_scope: dict[str, object] | None = None
+        filter_summary: list[object] = []
+        clauses: list[str] = []
+        params: list[object] = []
+        joins: list[str] = []
+        if join_documents:
+            effective_scope, document_clauses, document_params, filter_summary = build_analysis_scope_filters(
+                connection,
+                paths,
+                raw_filters=raw_filters,
+                select_from_scope=select_from_scope,
+            )
+            joins = [
+                "JOIN document_entities de ON de.entity_id = e.id",
+                "JOIN documents d ON d.id = de.document_id",
+            ]
+            clauses.extend(document_clauses)
+            params.extend(document_params)
+        elif raw_filters:
+            raise RetrieverError("Entity aggregate filters require document-scoped entity links.")
+
+        group_tokens = {str(group_def["normalized_token"]) for group_def in group_defs}
+        if "canonical_status" not in group_tokens:
+            clauses.append("e.canonical_status = ?")
+            params.append(ENTITY_STATUS_ACTIVE)
+        where_sql = " AND ".join(clauses) if clauses else "1"
+        select_parts = [
+            f"{group_def['select_sql']} AS {quote_identifier(str(group_def['output_name']))}"
+            for group_def in group_defs
+        ]
+        select_parts.append("COUNT(DISTINCT e.id) AS count")
+        group_parts = [str(group_def["group_sql"]) for group_def in group_defs]
+        sql = (
+            f"SELECT {', '.join(select_parts)} "
+            f"FROM entities e {' '.join(joins)} "
+            f"WHERE {where_sql} "
+            f"GROUP BY {', '.join(group_parts)}"
+        )
+
+        order_name_map = {
+            "metric": "count",
+            **{str(group_def["token"]): str(group_def["output_name"]) for group_def in group_defs},
+            **{str(group_def["normalized_token"]): str(group_def["output_name"]) for group_def in group_defs},
+            **{str(group_def["output_name"]): str(group_def["output_name"]) for group_def in group_defs},
+        }
+        resolved_order_by = order_name_map.get(order_by or "", None) if order_by else "count"
+        if resolved_order_by is None:
+            raise RetrieverError(f"Unsupported aggregate order-by: {order_by}")
+        normalized_order = (order or ("desc" if resolved_order_by == "count" else "asc")).lower()
+        sql += f" ORDER BY {quote_identifier(resolved_order_by)} {normalized_order.upper()}"
+        for group_def in group_defs:
+            if str(group_def["output_name"]) == resolved_order_by:
+                continue
+            sql += f", {quote_identifier(str(group_def['output_name']))} ASC"
+        sql += " LIMIT ?"
+
+        rows = connection.execute(sql, [*params, limit]).fetchall()
+        buckets = []
+        for row in rows:
+            bucket = {str(group_def["output_name"]): row[str(group_def["output_name"])] for group_def in group_defs}
+            bucket["count"] = int(row["count"] or 0)
+            buckets.append(bucket)
+        payload = {
+            "filters": filter_summary,
+            "metric": "count",
+            "aggregate_scope": "entities",
+            "group_by": [str(group_def["token"]) for group_def in group_defs],
+            "buckets": buckets,
+            "graph": graph_metadata_for_buckets(group_defs, buckets),
+        }
+        if effective_scope is not None:
+            payload["selected_from_scope"] = True
+            payload["scope"] = effective_scope
+        if explain:
+            payload["sql"] = sql.replace(" ?", f" {limit}")
+        return payload
+    finally:
+        connection.close()
 
 
 def resolve_aggregate_group(
@@ -53321,6 +54075,18 @@ def aggregate(
     if limit < 1:
         raise RetrieverError("limit must be >= 1.")
     limit = min(limit, MAX_AGGREGATE_LIMIT)
+
+    if raw_group_bys_are_entity_aggregate_groups(raw_group_bys):
+        return aggregate_entities(
+            root,
+            raw_filters,
+            raw_group_bys,
+            order_by,
+            order,
+            limit,
+            explain,
+            select_from_scope=select_from_scope,
+        )
 
     paths = workspace_paths(root)
     ensure_layout(paths)
@@ -53832,6 +54598,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="AND-narrow the aggregation to the persisted workspace scope",
     )
 
+    list_conversations_parser = subparsers.add_parser("list-conversations", help="List conversation summaries")
+    list_conversations_parser.add_argument("workspace", help="Workspace root path")
+    list_conversations_parser.add_argument("--query", help="Keyword query text")
+    list_conversations_parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        nargs="+",
+        help="Repeatable SQL-like filter expression",
+    )
+    list_conversations_parser.add_argument(
+        "--dataset",
+        "--dataset-name",
+        dest="dataset_names",
+        action="append",
+        help="Exact dataset name (repeatable)",
+    )
+    list_conversations_parser.add_argument("--from-run-id", type=int, help="Restrict to documents already present in a prior run")
+    list_conversations_parser.add_argument(
+        "--select-from-scope",
+        action="store_true",
+        help="AND-narrow the conversation list to the persisted workspace scope",
+    )
+    list_conversations_parser.add_argument("--limit", type=int, default=50, help="Maximum conversations to return")
+    list_conversations_parser.add_argument("--offset", type=int, default=0, help="Zero-based conversation offset")
+    list_conversations_parser.add_argument(
+        "--sort",
+        "--sort-by",
+        dest="sort",
+        help="Sort field: title, last_activity, first_activity, document_count, matching_document_count, source_kind, or conversation_type",
+    )
+    list_conversations_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
+
     list_datasets_parser = subparsers.add_parser("list-datasets", help="List datasets in the workspace")
     list_datasets_parser.add_argument("workspace", help="Workspace root path")
 
@@ -53907,6 +54706,14 @@ def build_parser() -> argparse.ArgumentParser:
     list_entities_parser.add_argument("workspace", help="Workspace root path")
     list_entities_parser.add_argument("--query", help="Filter entities by display name or identifier")
     list_entities_parser.add_argument("--limit", type=int, default=50, help="Maximum entities to return")
+    list_entities_parser.add_argument("--offset", type=int, default=0, help="Zero-based entity offset")
+    list_entities_parser.add_argument(
+        "--sort",
+        "--sort-by",
+        dest="sort",
+        help="Sort field: document_count, label, display_name, primary_email, entity_type, entity_origin, entity_status, or id",
+    )
+    list_entities_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
     list_entities_parser.add_argument(
         "--include-ignored",
         action="store_true",
@@ -54813,6 +55620,23 @@ def main() -> int:
                 ),
             )
 
+        if args.command == "list-conversations":
+            return emit_cli_payload(
+                "list-conversations",
+                list_conversations(
+                    root,
+                    query=args.query,
+                    raw_filters=args.filters,
+                    dataset_names=args.dataset_names,
+                    from_run_id=args.from_run_id,
+                    select_from_scope=args.select_from_scope,
+                    limit=args.limit,
+                    offset=args.offset,
+                    sort=args.sort,
+                    order=args.order,
+                ),
+            )
+
         if args.command == "list-datasets":
             return emit_cli_payload("list-datasets", list_datasets(root))
 
@@ -54856,10 +55680,13 @@ def main() -> int:
         if args.command == "list-entities":
             return emit_cli_payload(
                 "list-entities",
-                list_entities(
+                run_entity_list_command(
                     root,
                     query=args.query,
                     limit=args.limit,
+                    offset=args.offset,
+                    sort=args.sort,
+                    order=args.order,
                     include_ignored=args.include_ignored,
                 ),
             )
