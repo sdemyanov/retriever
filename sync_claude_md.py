@@ -12,7 +12,7 @@ For each command we keep three hand-authored pieces of metadata:
   - SLASH_BLURBS / SUBCOMMAND_BLURBS: the action the command performs.
   - USE_WHEN: the natural-language intent that should route to this command.
   - SUBCOMMAND_GROUPS: the topical bucket for Tier 3 (no groups at Tier 2 —
-    14 items fit on one screen).
+    the slash list is still small enough to scan flat).
 
 The renderer emits intent-first lines under topical headings so selection
 works the same way at Tier 2 and Tier 3 as it does at Tier 1. Anything new —
@@ -114,7 +114,15 @@ SUBCOMMAND_BLURBS: dict[str, str] = {
     "show-dataset-policy": "show a source-backed dataset's entity auto-merge policy",
     "set-dataset-policy": "update a source-backed dataset's entity auto-merge policy",
     # Ingestion
-    "ingest": "index documents in the workspace",
+    "ingest": "start or resume a bounded V2 ingest for workspace documents",
+    "ingest-start": "start a resumable V2 ingest run",
+    "ingest-status": "show resumable V2 ingest status",
+    "ingest-cancel": "cancel a resumable V2 ingest run",
+    "ingest-run-step": "run recommended resumable V2 ingest steps within a bounded call budget",
+    "ingest-plan-step": "advance resumable V2 ingest planning",
+    "ingest-prepare-step": "prepare resumable V2 ingest work items",
+    "ingest-commit-step": "commit prepared resumable V2 ingest work items",
+    "ingest-finalize-step": "advance resumable V2 ingest finalization",
     "ingest-production": "ingest a processed production volume",
     "inspect-pst-properties": "inspect raw PST message fields for debugging",
     # Search & browse
@@ -144,6 +152,11 @@ SUBCOMMAND_BLURBS: dict[str, str] = {
     "split-entity": "move selected identifiers or document links to another entity",
     "assign-entity": "manually assign an entity to a document role",
     "unassign-entity": "remove or suppress an entity link on a document role",
+    "rebuild-entities-start": "start a resumable entity rebuild run",
+    "rebuild-entities-status": "show resumable entity rebuild status",
+    "rebuild-entities-run-step": "advance a resumable entity rebuild within a bounded call budget",
+    "rebuild-entities-cancel": "cancel a resumable entity rebuild run",
+    "purge-vault-filename-custodians": "dry-run or apply cleanup for synthetic Google Vault MBOX filename custodians",
     # Export
     "export-csv": "write selected documents and fields to CSV",
     "export-archive": "write selected documents, previews, and source artifacts to a zip",
@@ -163,6 +176,7 @@ SUBCOMMAND_BLURBS: dict[str, str] = {
     "clear-conversation-assignment": "clear a document's conversation assignment",
     "refresh-conversation-previews": "rebuild conversation preview artifacts",
     "reconcile-duplicates": "reconcile detected duplicates",
+    "rebuild-conversations": "re-run conversation assignment and regenerate conversation previews",
     # Runs — planning & lifecycle
     "list-runs": "list planned processing runs",
     "get-run": "fetch one planned processing run",
@@ -205,7 +219,15 @@ SUBCOMMAND_USE_WHEN: dict[str, str] = {
     "show-dataset-policy": "you need to inspect source-backed entity auto-merge settings for one dataset",
     "set-dataset-policy": "you need to enable, disable, or tune source-backed entity auto-merge settings for one dataset",
     # Ingestion
-    "ingest": "you need to index or refresh a folder",
+    "ingest": "you need the top-level folder ingest/refresh facade, which starts or resumes bounded V2 work by default",
+    "ingest-start": "you need the lower-level lifecycle command to create a resumable V2 ingest run without immediately driving all recommended steps",
+    "ingest-status": "you need to inspect status, phase, counts, or next recommended commands for a resumable V2 ingest run",
+    "ingest-cancel": "you need to cancel an active resumable V2 ingest run",
+    "ingest-run-step": "you need to advance a resumable V2 ingest run through whichever step is currently recommended within one bounded call",
+    "ingest-plan-step": "you need to advance only the planning phase of a resumable V2 ingest run",
+    "ingest-prepare-step": "you need to prepare pending work items for a resumable V2 ingest run",
+    "ingest-commit-step": "you need to commit prepared work items for a resumable V2 ingest run",
+    "ingest-finalize-step": "you need to advance finalization for a resumable V2 ingest run",
     "ingest-production": "you need to ingest a processed production (DAT/OPT/TEXT/IMAGES)",
     "inspect-pst-properties": "you are debugging PST ingestion or conversation scoping",
     # Search & browse
@@ -235,6 +257,11 @@ SUBCOMMAND_USE_WHEN: dict[str, str] = {
     "split-entity": "the user asks to split wrongly combined entity identifiers or document links into a separate entity",
     "assign-entity": "the user asks to manually add an entity as a document author, participant, recipient, or custodian",
     "unassign-entity": "the user asks to remove or suppress an entity's role on a document",
+    "rebuild-entities-start": "you need to start a bounded, resumable entity rebuild after metadata, source, or policy changes",
+    "rebuild-entities-status": "you need status, counts, or next recommended commands for a resumable entity rebuild",
+    "rebuild-entities-run-step": "you need to advance a resumable entity rebuild within one bounded call",
+    "rebuild-entities-cancel": "you need to cancel an active resumable entity rebuild",
+    "purge-vault-filename-custodians": "you need to dry-run or apply index-level cleanup for synthetic Google Vault MBOX filename custodians after custodian inference fixes",
     # Export
     "export-csv": "the user asks to export, download, or save results as a CSV or spreadsheet — phrasings like \"export these as CSV\", \"save to Excel\", \"download as spreadsheet\", or \"give me a CSV of the matches\"",
     "export-archive": "the user asks to export, download, or package results as a zip archive with previews and source files — phrasings like \"zip up the matches\", \"download everything\", \"package these docs\", or \"give me a bundle of these\"",
@@ -254,6 +281,7 @@ SUBCOMMAND_USE_WHEN: dict[str, str] = {
     "clear-conversation-assignment": "you need to drop a document's conversation assignment",
     "refresh-conversation-previews": "you need to rebuild conversation preview HTML",
     "reconcile-duplicates": "you need to resolve detected duplicates",
+    "rebuild-conversations": "you need to re-run conversation assignment and regenerate previews after ingest or metadata changes",
     # Runs — planning & lifecycle
     "list-runs": "you need the list of planned/active processing runs",
     "get-run": "you need the snapshot of one planned run",
@@ -294,6 +322,14 @@ SUBCOMMAND_GROUPS: dict[str, str] = {
     "show-dataset-policy": "Datasets",
     "set-dataset-policy": "Datasets",
     "ingest": "Ingestion",
+    "ingest-start": "Ingestion",
+    "ingest-status": "Ingestion",
+    "ingest-cancel": "Ingestion",
+    "ingest-run-step": "Ingestion",
+    "ingest-plan-step": "Ingestion",
+    "ingest-prepare-step": "Ingestion",
+    "ingest-commit-step": "Ingestion",
+    "ingest-finalize-step": "Ingestion",
     "ingest-production": "Ingestion",
     "inspect-pst-properties": "Ingestion",
     "search": "Search & browse",
@@ -319,6 +355,11 @@ SUBCOMMAND_GROUPS: dict[str, str] = {
     "split-entity": "Entities",
     "assign-entity": "Entities",
     "unassign-entity": "Entities",
+    "rebuild-entities-start": "Entities",
+    "rebuild-entities-status": "Entities",
+    "rebuild-entities-run-step": "Entities",
+    "rebuild-entities-cancel": "Entities",
+    "purge-vault-filename-custodians": "Entities",
     "export-csv": "Export",
     "export-archive": "Export",
     "export-previews": "Export",
@@ -335,6 +376,7 @@ SUBCOMMAND_GROUPS: dict[str, str] = {
     "clear-conversation-assignment": "Conversations",
     "refresh-conversation-previews": "Conversations",
     "reconcile-duplicates": "Conversations",
+    "rebuild-conversations": "Conversations",
     "list-runs": "Runs — planning & lifecycle",
     "get-run": "Runs — planning & lifecycle",
     "create-run": "Runs — planning & lifecycle",
@@ -377,7 +419,9 @@ GROUP_ORDER: list[str] = [
 ]
 
 UNCLASSIFIED_GROUP = "Unclassified — TODO"
-IGNORED_SUBCOMMANDS = {"promote-field-type", "set-field"}
+# `entities` is a namespace; current nested actions also have top-level
+# command aliases, so routing should prefer those actionable commands.
+IGNORED_SUBCOMMANDS = {"promote-field-type", "set-field", "entities"}
 
 
 # ---------------------------------------------------------------------------
