@@ -29743,6 +29743,78 @@ def ingest_v2_add_excluded_path(root: Path, path: Path, *, exact: set[str], pref
         prefixes.add(rel_path.rstrip("/") + "/")
 
 
+def ingest_v2_gmail_drive_record_payload(root: Path, record: dict[str, object]) -> dict[str, object]:
+    payload = dict(record)
+    file_path = payload.pop("file_path", None)
+    if isinstance(file_path, Path) and path_is_at_or_under(file_path, root):
+        payload["file_rel_path"] = relative_document_path(root, file_path)
+    return ingest_v2_json_safe_value(payload)
+
+
+def ingest_v2_gmail_drive_record_from_payload(root: Path, record: dict[str, object]) -> dict[str, object]:
+    restored = dict(record)
+    file_rel_path = normalize_whitespace(str(restored.pop("file_rel_path", "") or ""))
+    if file_rel_path:
+        restored["file_path"] = ingest_v2_cursor_path(root, file_rel_path)
+    return restored
+
+
+def ingest_v2_gmail_mbox_source_payloads(
+    root: Path,
+    descriptors: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    source_payloads: list[dict[str, object]] = []
+    for descriptor in descriptors:
+        root_rel_path = ingest_v2_cursor_rel_path(root, Path(descriptor["root"]))
+        linked_drive_attachment_records_by_message_id = {
+            str(message_id): [
+                ingest_v2_gmail_drive_record_payload(root, dict(record))
+                for record in list(records)
+            ]
+            for message_id, records in dict(descriptor.get("linked_drive_attachment_records_by_message_id") or {}).items()
+        }
+        linked_drive_rel_paths = sorted(
+            {
+                str(record.get("file_rel_path"))
+                for records in linked_drive_attachment_records_by_message_id.values()
+                for record in records
+                if normalize_whitespace(str(record.get("file_rel_path") or ""))
+            }
+        )
+        for mbox_path in sorted([Path(path) for path in list(descriptor.get("mbox_paths") or [])], key=lambda path: path.as_posix()):
+            source_payloads.append(
+                {
+                    "source_plan_kind": "gmail",
+                    "gmail_export_root_rel_path": root_rel_path,
+                    "source_rel_path": relative_document_path(root, mbox_path),
+                    "message_sidecar_hash": normalize_whitespace(
+                        str(descriptor.get("message_sidecar_hash") or "")
+                    ) or None,
+                    "email_metadata_by_message_id": ingest_v2_json_safe_value(
+                        dict(descriptor.get("email_metadata_by_message_id") or {})
+                    ),
+                    "linked_drive_records_by_message_id": ingest_v2_json_safe_value(
+                        dict(descriptor.get("linked_drive_records_by_message_id") or {})
+                    ),
+                    "linked_drive_attachment_records_by_message_id": linked_drive_attachment_records_by_message_id,
+                    "linked_drive_rel_paths": linked_drive_rel_paths,
+                }
+            )
+    return source_payloads
+
+
+def ingest_v2_gmail_mbox_source_scan_hash(path: Path, source_payload: dict[str, object]) -> str:
+    return sha256_json_value(
+        {
+            "mbox_hash": sha256_file(path),
+            "message_sidecar_hash": normalize_whitespace(
+                str(source_payload.get("message_sidecar_hash") or "")
+            ) or None,
+            "source_rel_path": str(source_payload["source_rel_path"]),
+        }
+    )
+
+
 def ingest_v2_planning_exclusions(
     root: Path,
     recursive: bool,
@@ -29778,6 +29850,11 @@ def ingest_v2_planning_exclusions(
         ingest_v2_add_excluded_path(root, Path(descriptor["root"]), exact=exact, prefixes=prefixes)
         for owned_path in list(descriptor.get("owned_paths") or []):
             ingest_v2_add_excluded_path(root, Path(owned_path), exact=exact, prefixes=prefixes)
+    gmail_mbox_source_payloads = (
+        ingest_v2_gmail_mbox_source_payloads(root, gmail_export_descriptors)
+        if allowed_types is None or MBOX_SOURCE_KIND in allowed_types
+        else []
+    )
 
     pst_export_descriptors = (
         find_scoped_source_roots(find_pst_export_roots, root, recursive, scan_scope)
@@ -29791,6 +29868,7 @@ def ingest_v2_planning_exclusions(
     return {
         "exact_rel_paths": sorted(exact),
         "dir_prefixes": sorted(prefixes),
+        "gmail_mbox_source_payloads": gmail_mbox_source_payloads,
         "counts": {
             "production_roots": len(production_signatures),
             "slack_export_roots": len(slack_export_descriptors),
@@ -29895,8 +29973,10 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
             cursor.setdefault("production_docs_missing_linked_images", 0)
             cursor.setdefault("production_docs_missing_linked_natives", 0)
             cursor.setdefault("current_mbox_source", None)
+            cursor.setdefault("pending_gmail_mbox_sources", [])
             cursor.setdefault("planned_mbox_sources", [])
             cursor.setdefault("planned_mbox_messages", 0)
+            cursor.setdefault("planned_gmail_mbox_sources", 0)
             cursor.setdefault("skipped_mbox_sources", 0)
             cursor.setdefault("scanned_mbox_source_rel_paths", [])
             cursor.setdefault("mbox_failures", [])
@@ -29952,8 +30032,10 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
         "production_docs_missing_linked_images": 0,
         "production_docs_missing_linked_natives": 0,
         "current_mbox_source": None,
+        "pending_gmail_mbox_sources": list(exclusions.get("gmail_mbox_source_payloads") or []),
         "planned_mbox_sources": [],
         "planned_mbox_messages": 0,
+        "planned_gmail_mbox_sources": 0,
         "skipped_mbox_sources": 0,
         "scanned_mbox_source_rel_paths": [],
         "mbox_failures": [],
@@ -30028,6 +30110,7 @@ def ingest_v2_plan_mbox_message_item(
     *,
     run_id: str,
     source_rel_path: str,
+    source_plan_kind: str,
     message_index: int,
     message_key: object,
     source_item_id: str,
@@ -30037,11 +30120,15 @@ def ingest_v2_plan_mbox_message_item(
     source_file_hash: str,
     scan_started_at: str,
     commit_order: int,
+    message_metadata: dict[str, object] | None = None,
+    linked_drive_records: list[dict[str, object]] | None = None,
+    linked_drive_attachment_records: list[dict[str, object]] | None = None,
 ) -> bool:
     now = utc_now()
     rel_path = mbox_message_rel_path(source_rel_path, source_item_id)
     payload = {
         "source_rel_path": source_rel_path,
+        "source_plan_kind": source_plan_kind,
         "message_index": int(message_index),
         "message_key": message_key,
         "source_item_id": source_item_id,
@@ -30052,6 +30139,12 @@ def ingest_v2_plan_mbox_message_item(
         "scan_started_at": scan_started_at,
         "planned_at": now,
     }
+    if message_metadata:
+        payload["message_metadata"] = dict(message_metadata)
+    if linked_drive_records:
+        payload["linked_drive_records"] = list(linked_drive_records)
+    if linked_drive_attachment_records:
+        payload["linked_drive_attachment_records"] = list(linked_drive_attachment_records)
     cursor = connection.execute(
         """
         INSERT OR IGNORE INTO ingest_work_items (
@@ -30088,16 +30181,20 @@ def ingest_v2_plan_mbox_source_finalizer_item(
     message_count: int,
     skip_source: bool,
     commit_order: int,
+    source_plan_kind: str = "mbox",
+    linked_drive_rel_paths: list[str] | None = None,
 ) -> bool:
     now = utc_now()
     payload = {
         "source_rel_path": source_rel_path,
+        "source_plan_kind": source_plan_kind,
         "source_file_size": source_file_size,
         "source_file_mtime": source_file_mtime,
         "source_file_hash": source_file_hash,
         "scan_started_at": scan_started_at,
         "message_count": int(message_count),
         "skip_source": bool(skip_source),
+        "linked_drive_rel_paths": list(linked_drive_rel_paths or []),
         "planned_at": now,
     }
     cursor = connection.execute(
@@ -30147,11 +30244,15 @@ def ingest_v2_begin_mbox_source_plan(
     run_id: str,
     rel_path: str,
     commit_order: int,
+    source_plan_kind: str = "mbox",
+    source_scan_hash: str | None = None,
+    gmail_source_payload: dict[str, object] | None = None,
 ) -> tuple[dict[str, object] | None, int, bool]:
     path = ingest_v2_cursor_path(root, rel_path)
     source_file_size = file_size_bytes(path)
     source_file_mtime = file_mtime_timestamp(path)
-    source_file_hash = ingest_v2_mbox_source_scan_hash(path)
+    source_file_hash = source_scan_hash or ingest_v2_mbox_source_scan_hash(path)
+    gmail_payload = dict(gmail_source_payload or {})
     existing_source = get_container_source_row(connection, MBOX_SOURCE_KIND, rel_path)
     scan_started_at = next_monotonic_utc_timestamp(
         [
@@ -30181,6 +30282,7 @@ def ingest_v2_begin_mbox_source_plan(
             connection,
             run_id=run_id,
             source_rel_path=rel_path,
+            source_plan_kind=source_plan_kind,
             source_file_size=source_file_size,
             source_file_mtime=source_file_mtime,
             source_file_hash=source_file_hash,
@@ -30188,11 +30290,13 @@ def ingest_v2_begin_mbox_source_plan(
             message_count=message_count,
             skip_source=True,
             commit_order=commit_order,
+            linked_drive_rel_paths=list(gmail_payload.get("linked_drive_rel_paths") or []),
         )
         return None, commit_order + 1, True
     return (
         {
             "source_rel_path": rel_path,
+            "source_plan_kind": source_plan_kind,
             "source_file_size": source_file_size,
             "source_file_mtime": source_file_mtime,
             "source_file_hash": source_file_hash,
@@ -30201,6 +30305,12 @@ def ingest_v2_begin_mbox_source_plan(
             "planned_message_count": 0,
             "duplicate_source_item_counts": {},
             "next_commit_order": int(commit_order),
+            "email_metadata_by_message_id": dict(gmail_payload.get("email_metadata_by_message_id") or {}),
+            "linked_drive_records_by_message_id": dict(gmail_payload.get("linked_drive_records_by_message_id") or {}),
+            "linked_drive_attachment_records_by_message_id": dict(
+                gmail_payload.get("linked_drive_attachment_records_by_message_id") or {}
+            ),
+            "linked_drive_rel_paths": list(gmail_payload.get("linked_drive_rel_paths") or []),
         },
         commit_order,
         False,
@@ -30216,6 +30326,7 @@ def ingest_v2_plan_current_mbox_source(
     deadline: float,
 ) -> tuple[dict[str, object] | None, int, int, bool]:
     source_rel_path = str(current_mbox_source["source_rel_path"])
+    source_plan_kind = str(current_mbox_source.get("source_plan_kind") or "mbox")
     path = ingest_v2_cursor_path(root, source_rel_path)
     next_message_index = int(current_mbox_source.get("next_message_index") or 0)
     next_commit_order = int(current_mbox_source.get("next_commit_order") or 1)
@@ -30246,10 +30357,32 @@ def ingest_v2_plan_current_mbox_source(
             duplicate_counts[base_source_item_id] = int(duplicate_counts.get(base_source_item_id) or 0) + 1
             occurrence = int(duplicate_counts[base_source_item_id])
             source_item_id = base_source_item_id if occurrence == 1 else f"{base_source_item_id}#{occurrence}"
+            message_lookup_key = gmail_normalized_message_lookup_key(source_item_id)
+            message_metadata = (
+                dict(dict(current_mbox_source.get("email_metadata_by_message_id") or {}).get(message_lookup_key) or {})
+                if message_lookup_key is not None
+                else {}
+            )
+            linked_drive_records = (
+                list(dict(current_mbox_source.get("linked_drive_records_by_message_id") or {}).get(message_lookup_key) or [])
+                if message_lookup_key is not None
+                else []
+            )
+            linked_drive_attachment_records = (
+                list(
+                    dict(current_mbox_source.get("linked_drive_attachment_records_by_message_id") or {}).get(
+                        message_lookup_key
+                    )
+                    or []
+                )
+                if message_lookup_key is not None
+                else []
+            )
             if ingest_v2_plan_mbox_message_item(
                 connection,
                 run_id=run_id,
                 source_rel_path=source_rel_path,
+                source_plan_kind=source_plan_kind,
                 message_index=message_index,
                 message_key=message_key,
                 source_item_id=source_item_id,
@@ -30267,6 +30400,9 @@ def ingest_v2_plan_current_mbox_source(
                 source_file_hash=str(current_mbox_source["source_file_hash"]),
                 scan_started_at=str(current_mbox_source["scan_started_at"]),
                 commit_order=next_commit_order,
+                message_metadata=message_metadata,
+                linked_drive_records=linked_drive_records,
+                linked_drive_attachment_records=linked_drive_attachment_records,
             ):
                 planned_this_step += 1
             next_commit_order += 1
@@ -30290,6 +30426,7 @@ def ingest_v2_plan_current_mbox_source(
         connection,
         run_id=run_id,
         source_rel_path=source_rel_path,
+        source_plan_kind=source_plan_kind,
         source_file_size=(
             int(current_mbox_source["source_file_size"])
             if current_mbox_source.get("source_file_size") is not None
@@ -30305,6 +30442,7 @@ def ingest_v2_plan_current_mbox_source(
         message_count=int(current_mbox_source.get("planned_message_count") or 0),
         skip_source=False,
         commit_order=next_commit_order,
+        linked_drive_rel_paths=list(current_mbox_source.get("linked_drive_rel_paths") or []),
     )
     return None, next_commit_order + 1, planned_this_step, True
 
@@ -30861,12 +30999,58 @@ def ingest_v2_prepare_mbox_message_item(
         )
     prepare_started = time.perf_counter()
     raw_message = ingest_v2_mbox_message_from_payload(root, payload_dict)
+    source_plan_kind = str(payload_dict.get("source_plan_kind") or "mbox")
+    if source_plan_kind == "gmail":
+        def normalize_v2_gmail_message(
+            source_rel_path_for_message: str,
+            message_dict: dict[str, object],
+        ) -> dict[str, object] | None:
+            normalized = normalize_mbox_message(source_rel_path_for_message, message_dict)
+            message_metadata = dict(payload_dict.get("message_metadata") or {})
+            linked_drive_records = [
+                dict(record)
+                for record in list(payload_dict.get("linked_drive_records") or [])
+                if isinstance(record, dict)
+            ]
+            linked_drive_attachment_records = [
+                ingest_v2_gmail_drive_record_from_payload(root, dict(record))
+                for record in list(payload_dict.get("linked_drive_attachment_records") or [])
+                if isinstance(record, dict)
+            ]
+            extracted = apply_gmail_email_export_metadata(
+                dict(normalized["extracted"]),
+                message_metadata=message_metadata,
+                linked_drive_records=linked_drive_records,
+            )
+            attachment_payloads = [
+                attachment
+                for attachment in (
+                    gmail_drive_attachment_payload(dict(record))
+                    for record in linked_drive_attachment_records
+                )
+                if attachment is not None
+            ]
+            if attachment_payloads:
+                extracted["attachments"] = [*list(extracted.get("attachments") or []), *attachment_payloads]
+            normalized["extracted"] = extracted
+            normalized["file_hash"] = gmail_enriched_message_file_hash(
+                normalized.get("file_hash"),
+                message_metadata=message_metadata,
+                linked_drive_records=linked_drive_records,
+                linked_drive_attachment_records=linked_drive_attachment_records,
+            )
+            return normalized
+
+        normalize_message = normalize_v2_gmail_message
+    else:
+        normalize_message = normalize_mbox_message
     prepared_item = prepare_container_message_item(
         source_rel_path,
         raw_message,
-        normalize_mbox_message,
+        normalize_message,
     )
     prepared_item["source_kind"] = MBOX_SOURCE_KIND
+    prepared_item["source_plan_kind"] = source_plan_kind
     prepared_item["source_rel_path"] = source_rel_path
     prepared_item["scan_started_at"] = str(payload_dict["scan_started_at"])
     prepared_item["source_file_size"] = payload_dict.get("source_file_size")
@@ -31790,6 +31974,11 @@ def ingest_v2_commit_mbox_work_item_hook(
         for key in ("mbox_sources_skipped", "mbox_sources_finalized", "mbox_messages_deleted"):
             if result.get(key) is not None:
                 mbox_stats[key] = int(mbox_stats.get(key) or 0) + int(result.get(key) or 0)
+        if result.get("gmail_linked_drive_retired") is not None:
+            mbox_stats["gmail_linked_drive_retired"] = (
+                int(mbox_stats.get("gmail_linked_drive_retired") or 0)
+                + int(result.get("gmail_linked_drive_retired") or 0)
+            )
     ingest_v2_save_phase_cursor(
         connection,
         run_id=run_id,
@@ -31822,6 +32011,7 @@ def ingest_v2_commit_mbox_work_item_hook(
                     "commit_action": action,
                     "document_id": result.get("document_id"),
                     "source_kind": MBOX_SOURCE_KIND,
+                    "source_plan_kind": result.get("source_plan_kind"),
                     "source_rel_path": source_rel_path,
                     "source_item_id": result.get("source_item_id"),
                     "mbox_messages_deleted": int(result.get("mbox_messages_deleted") or 0),
@@ -31971,8 +32161,21 @@ def ingest_v2_commit_mbox_source_finalizer(
     scan_started_at = str(prepared_item["scan_started_at"])
     message_count = int(prepared_item.get("message_count") or 0)
     skip_source = bool(prepared_item.get("skip_source"))
+    source_plan_kind = str(prepared_item.get("source_plan_kind") or "mbox")
     connection.execute("BEGIN")
     try:
+        linked_drive_retired = 0
+        linked_drive_rel_paths = {
+            normalize_whitespace(str(rel_path or "")).replace("\\", "/").strip("/")
+            for rel_path in list(prepared_item.get("linked_drive_rel_paths") or [])
+            if normalize_whitespace(str(rel_path or ""))
+        }
+        if source_plan_kind == "gmail" and linked_drive_rel_paths:
+            linked_drive_retired = retire_standalone_filesystem_documents_by_rel_paths(
+                connection,
+                paths,
+                rel_paths=linked_drive_rel_paths,
+            )
         if skip_source:
             mark_container_source_documents_active(
                 connection,
@@ -32018,9 +32221,11 @@ def ingest_v2_commit_mbox_source_finalizer(
             "action": action,
             "source_kind": MBOX_SOURCE_KIND,
             "source_rel_path": source_rel_path,
+            "source_plan_kind": source_plan_kind,
             "current_ingestion_batch": None,
             "document_id": None,
             "mbox_messages_deleted": messages_deleted,
+            "gmail_linked_drive_retired": linked_drive_retired,
             **source_stats,
         }
         ingest_v2_commit_mbox_work_item_hook(
@@ -32877,6 +33082,53 @@ def ingest_v2_plan_step(
                         break
                     continue
 
+                pending_gmail_mbox_sources = list(cursor.get("pending_gmail_mbox_sources") or [])
+                if pending_gmail_mbox_sources:
+                    gmail_source_payload = dict(pending_gmail_mbox_sources.pop(0))
+                    cursor["pending_gmail_mbox_sources"] = pending_gmail_mbox_sources
+                    source_rel_path = str(gmail_source_payload.get("source_rel_path") or "")
+                    if not source_rel_path:
+                        continue
+                    scanned_mbox_paths = list(cursor.get("scanned_mbox_source_rel_paths") or [])
+                    if source_rel_path not in scanned_mbox_paths:
+                        scanned_mbox_paths.append(source_rel_path)
+                        cursor["scanned_mbox_source_rel_paths"] = scanned_mbox_paths
+                    insert_started = time.perf_counter()
+                    source_scan_hash = ingest_v2_gmail_mbox_source_scan_hash(
+                        ingest_v2_cursor_path(root, source_rel_path),
+                        gmail_source_payload,
+                    )
+                    current_mbox_source, next_commit_order, skipped_source = ingest_v2_begin_mbox_source_plan(
+                        connection,
+                        root,
+                        run_id=run_id,
+                        rel_path=source_rel_path,
+                        commit_order=int(cursor.get("next_commit_order") or 1),
+                        source_plan_kind="gmail",
+                        source_scan_hash=source_scan_hash,
+                        gmail_source_payload=gmail_source_payload,
+                    )
+                    work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
+                    cursor["next_commit_order"] = int(next_commit_order)
+                    cursor["planned_gmail_mbox_sources"] = int(cursor.get("planned_gmail_mbox_sources") or 0) + 1
+                    if skipped_source:
+                        cursor["skipped_mbox_sources"] = int(cursor.get("skipped_mbox_sources") or 0) + 1
+                        planned_sources = list(cursor.get("planned_mbox_sources") or [])
+                        if source_rel_path not in planned_sources:
+                            planned_sources.append(source_rel_path)
+                            cursor["planned_mbox_sources"] = planned_sources
+                    else:
+                        cursor["current_mbox_source"] = current_mbox_source
+                    cursor_save_ms_values.append(
+                        ingest_v2_save_planning_cursor_heartbeat(
+                            connection,
+                            run_id=run_id,
+                            cursor=cursor,
+                            status="pending",
+                        )
+                    )
+                    continue
+
                 pending_production_rel_roots = list(cursor.get("pending_production_rel_roots") or [])
                 if pending_production_rel_roots:
                     production_rel_root = str(pending_production_rel_roots.pop(0))
@@ -33051,6 +33303,7 @@ def ingest_v2_plan_step(
 
             planning_complete = (
                 not list(cursor.get("pending_production_rel_roots") or [])
+                and not list(cursor.get("pending_gmail_mbox_sources") or [])
                 and not list(cursor.get("pending_paths") or [])
                 and not isinstance(cursor.get("current_mbox_source"), dict)
             )
@@ -33125,6 +33378,7 @@ def ingest_v2_plan_step(
                 "cursor": {
                     "pending_paths": len(list(cursor.get("pending_paths") or [])),
                     "pending_production_roots": len(list(cursor.get("pending_production_rel_roots") or [])),
+                    "pending_gmail_mbox_sources": len(list(cursor.get("pending_gmail_mbox_sources") or [])),
                     "scanned_paths": int(cursor.get("scanned_paths") or 0),
                     "planned_loose_files": int(cursor.get("planned_loose_files") or 0),
                     "planned_production_roots": len(list(cursor.get("planned_production_roots") or [])),
@@ -33136,6 +33390,7 @@ def ingest_v2_plan_step(
                     ),
                     "planned_mbox_sources": list(cursor.get("planned_mbox_sources") or []),
                     "planned_mbox_messages": int(cursor.get("planned_mbox_messages") or 0),
+                    "planned_gmail_mbox_sources": int(cursor.get("planned_gmail_mbox_sources") or 0),
                     "skipped_mbox_sources": int(cursor.get("skipped_mbox_sources") or 0),
                     "scanned_mbox_source_rel_paths": list(cursor.get("scanned_mbox_source_rel_paths") or []),
                     "mbox_failures": list(cursor.get("mbox_failures") or []),
@@ -33538,6 +33793,7 @@ def ingest_v2_commit_step(
                             commit_result = {
                                 "action": "skipped",
                                 "source_kind": MBOX_SOURCE_KIND,
+                                "source_plan_kind": str(prepared_item.get("source_plan_kind") or "mbox"),
                                 "source_rel_path": str(prepared_item.get("source_rel_path") or ""),
                                 "source_item_id": str(prepared_item.get("source_item_id") or ""),
                                 "current_ingestion_batch": None,
@@ -33600,6 +33856,7 @@ def ingest_v2_commit_step(
                                 result={
                                     **result,
                                     "source_kind": MBOX_SOURCE_KIND,
+                                    "source_plan_kind": str(prepared_item.get("source_plan_kind") or "mbox"),
                                     "source_rel_path": source_rel_path,
                                     "source_item_id": str(prepared_item["source_item_id"]),
                                 },
