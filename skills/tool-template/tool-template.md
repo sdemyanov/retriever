@@ -2,12 +2,12 @@
 
 ## Template metadata
 
-- tool version: `1.0.4`
+- tool version: `1.1.11`
 - schema version: `25`
 - requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `29855f44b5e237a265f430cea33c6a6fe38762572fe1191fb0f1888411e4d05d`
+- source checksum (SHA256): `4e728d860aaac240d4e1792b9d44184dc773948f2afccd2d2fc7b4338e74f319`
 
 ## Current command surface
 
