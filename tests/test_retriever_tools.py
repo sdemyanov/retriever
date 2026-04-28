@@ -9461,6 +9461,38 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             reopened.convert("RGB").save(rgb_buffer, format="PNG", optimize=True)
         self.assertLess(len(generated_png_bytes), len(rgb_buffer.getvalue()))
 
+    def test_build_production_extracted_payload_can_limit_preview_images(self) -> None:
+        try:
+            from PIL import Image
+        except Exception as exc:  # pragma: no cover - test helper dependency
+            self.skipTest(f"Pillow unavailable for production preview image limit test: {exc}")
+
+        image_paths: list[Path] = []
+        for index in range(3):
+            image_path = self.root / f"page-{index + 1}.tif"
+            Image.new("RGB", (32, 32), color=(index * 40, 20, 120)).save(image_path, format="TIFF")
+            image_paths.append(image_path)
+
+        payload = retriever_tools.build_production_extracted_payload(
+            self.root,
+            production_name="Synthetic",
+            control_number="PDX000001",
+            begin_bates="PDX000001",
+            end_bates="PDX000003",
+            begin_attachment=None,
+            end_attachment=None,
+            text_path=None,
+            image_paths=image_paths,
+            native_path=None,
+            preview_image_limit=1,
+            preview_image_max_dimension=16,
+        )
+
+        self.assertEqual(payload["page_count"], 3)
+        preview_content = payload["preview_artifacts"][0]["content"]
+        self.assertEqual(preview_content.count("<figure>"), 1)
+        self.assertIn("Preview shows the first 1 of 3 produced pages", preview_content)
+
     def test_ingest_supports_rtf_text_extraction(self) -> None:
         rtf_path = self.root / "memo.rtf"
         rtf_path.write_text(

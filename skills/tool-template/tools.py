@@ -8192,14 +8192,19 @@ def ooxml_image_mime_type(part_name: str) -> str | None:
     return None
 
 
-def image_path_data_url(path: Path) -> str | None:
+def image_path_data_url(path: Path, *, max_dimension: int | None = None) -> str | None:
     mime_type, _ = mimetypes.guess_type(path.name)
     normalized_suffix = path.suffix.lower()
-    if normalized_suffix in {".tif", ".tiff"}:
+    resized_dimension = max(0, int(max_dimension or 0))
+    if normalized_suffix in {".tif", ".tiff"} or resized_dimension:
         pil_image_module = load_dependency("PilImage")
         if pil_image_module is None:
+            if normalized_suffix not in {".tif", ".tiff"} and mime_type is not None and mime_type.startswith("image/"):
+                return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
             return None
         with pil_image_module.open(path) as image:
+            if resized_dimension:
+                image.thumbnail((resized_dimension, resized_dimension))
             buffer = io.BytesIO()
             try:
                 image.save(buffer, format="PNG", optimize=True)
@@ -15775,6 +15780,7 @@ def build_production_preview_html(
     end_attachment: str | None,
     text_content: str,
     page_images: list[dict[str, object]],
+    page_image_note: str | None = None,
 ) -> str:
     headers = {
         passive_field_label("production_name"): production_name,
@@ -15793,12 +15799,16 @@ def build_production_preview_html(
         )
     if page_images:
         image_sections: list[str] = ["<section><h2>Produced Pages</h2>"]
+        if page_image_note:
+            image_sections.append(f"<p>{html.escape(page_image_note)}</p>")
         for image in page_images:
             label = html.escape(str(image["label"]))
             src = html.escape(str(image["src"]))
             image_sections.append(f'<figure><figcaption>{label}</figcaption><img src="{src}" alt="{label}"/></figure>')
         image_sections.append("</section>")
         sections.append("".join(image_sections))
+    elif page_image_note:
+        sections.append(f"<section><h2>Produced Pages</h2><p>{html.escape(page_image_note)}</p></section>")
     body_html = "".join(sections) or "<p>No linked text or page images were available for this production document.</p>"
     head_html = """
 <style>
@@ -21769,6 +21779,8 @@ def build_production_extracted_payload(
     text_path: Path | None,
     image_paths: list[Path],
     native_path: Path | None,
+    preview_image_limit: int | None = None,
+    preview_image_max_dimension: int | None = None,
 ) -> dict[str, object]:
     text_content = ""
     text_status = "empty"
@@ -21800,13 +21812,23 @@ def build_production_extracted_payload(
         or fallback_content_type
     )
     page_images: list[dict[str, object]] = []
-    for index, image_path in enumerate(image_paths, start=1):
+    preview_image_paths = image_paths
+    normalized_preview_image_limit = None if preview_image_limit is None else max(0, int(preview_image_limit))
+    if normalized_preview_image_limit is not None:
+        preview_image_paths = image_paths[:normalized_preview_image_limit]
+    for index, image_path in enumerate(preview_image_paths, start=1):
         if not image_path.exists():
             continue
-        data_url = image_path_data_url(image_path)
+        data_url = image_path_data_url(image_path, max_dimension=preview_image_max_dimension)
         if data_url is None:
             continue
         page_images.append({"label": f"Page {index}", "src": data_url})
+    page_image_note = None
+    if normalized_preview_image_limit is not None and len(image_paths) > normalized_preview_image_limit:
+        page_image_note = (
+            f"Preview shows the first {len(preview_image_paths)} of {len(image_paths)} produced pages. "
+            "All produced page files are still linked as source parts."
+        )
     resolved_title = (email_headers.get("title") if email_headers else None) or infer_production_title(control_number, text_content, native_path)
     preview_artifacts: list[dict[str, object]] = []
     if preferred_native is None:
@@ -21826,6 +21848,7 @@ def build_production_extracted_payload(
                     end_attachment=end_attachment,
                     text_content=text_content,
                     page_images=page_images,
+                    page_image_note=page_image_note,
                 ),
             }
         )
@@ -21904,6 +21927,9 @@ def plan_production_record_work(
 def prepare_production_row_plan(
     workspace_root: Path,
     prepared_plan: dict[str, object],
+    *,
+    preview_image_limit: int | None = None,
+    preview_image_max_dimension: int | None = None,
 ) -> dict[str, object]:
     prepared_item = dict(prepared_plan)
     prepare_started = time.perf_counter()
@@ -21924,6 +21950,8 @@ def prepare_production_row_plan(
             text_path=available_text_path,
             image_paths=matching_image_paths,
             native_path=available_native_path,
+            preview_image_limit=preview_image_limit,
+            preview_image_max_dimension=preview_image_max_dimension,
         )
         preferred_native = extracted_payload.pop("preferred_native", None)
         source_parts = production_source_parts(
@@ -30127,6 +30155,8 @@ INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
 INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL = 25
 INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
 INGEST_V2_PREPARED_COMMIT_BATCH_TARGET = max(25, INGEST_V2_PREPARE_BATCH_SIZE * 5)
+INGEST_V2_PRODUCTION_PREVIEW_IMAGE_LIMIT = 12
+INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 1400
 
 
 def ingest_v2_elapsed_ms(started: float) -> float:
@@ -32019,7 +32049,12 @@ def ingest_v2_prepare_production_row_item(
     }
     if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
         return None, source_fingerprint, "Not enough budget remaining to start prepare."
-    prepared_item = prepare_production_row_plan(root, payload_dict)
+    prepared_item = prepare_production_row_plan(
+        root,
+        payload_dict,
+        preview_image_limit=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_LIMIT,
+        preview_image_max_dimension=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+    )
     prepared_item["prepare_hash_ms"] = 0.0
     return prepared_item, source_fingerprint, None
 

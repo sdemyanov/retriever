@@ -72,6 +72,8 @@ INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
 INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL = 25
 INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
 INGEST_V2_PREPARED_COMMIT_BATCH_TARGET = max(25, INGEST_V2_PREPARE_BATCH_SIZE * 5)
+INGEST_V2_PRODUCTION_PREVIEW_IMAGE_LIMIT = 12
+INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 1400
 
 
 def ingest_v2_elapsed_ms(started: float) -> float:
@@ -1964,7 +1966,12 @@ def ingest_v2_prepare_production_row_item(
     }
     if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
         return None, source_fingerprint, "Not enough budget remaining to start prepare."
-    prepared_item = prepare_production_row_plan(root, payload_dict)
+    prepared_item = prepare_production_row_plan(
+        root,
+        payload_dict,
+        preview_image_limit=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_LIMIT,
+        preview_image_max_dimension=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+    )
     prepared_item["prepare_hash_ms"] = 0.0
     return prepared_item, source_fingerprint, None
 
