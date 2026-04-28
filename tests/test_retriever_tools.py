@@ -14747,6 +14747,123 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             [("sergey.pst", "pst-chat-sergey-001")],
         )
 
+    def test_ingest_pst_teams_space_sender_hint_resolves_sender_by_email(self) -> None:
+        self.write_fake_pst_file()
+        aad_object_id = "45895f37-3f55-4093-9978-87581df21d97"
+        compact_aad_object_id = aad_object_id.replace("-", "")
+        thread_id = "19:channel-thread@thread.tacv2"
+
+        def text_entry(entry_type: int, value: str) -> object:
+            return types.SimpleNamespace(
+                entry_type=entry_type,
+                value_type=0x001F,
+                data=(value + "\x00").encode("utf-16-le"),
+            )
+
+        raw_message = types.SimpleNamespace(
+            sender_name="Denys",
+            sender_email_address="",
+            record_sets=[
+                types.SimpleNamespace(
+                    entries=[
+                        text_entry(0x0C1A, "Denys"),
+                        text_entry(0x0C1F, "denys@discoverbeagle.com"),
+                        text_entry(
+                            0x8043,
+                            json.dumps(
+                                {
+                                    "SenderId": compact_aad_object_id,
+                                    "ThreadId": thread_id,
+                                    "MessageId": 1713916215808,
+                                    "ParentMessageId": 1713916215808,
+                                    "ThreadType": "space",
+                                },
+                                ensure_ascii=True,
+                            ),
+                        ),
+                        text_entry(
+                            0x804F,
+                            json.dumps(
+                                {
+                                    "SchemaVersion": 1,
+                                    "ItemData": json.dumps(
+                                        {
+                                            "messageFrom": f"8:orgid:{aad_object_id}",
+                                            "from": {"internalId": f"8:orgid:{aad_object_id}"},
+                                        },
+                                        ensure_ascii=True,
+                                    ),
+                                },
+                                ensure_ascii=True,
+                            ),
+                        ),
+                    ]
+                )
+            ],
+        )
+        chat_threading = retriever_tools.extract_pst_chat_threading(raw_message)
+        self.assertIsNotNone(chat_threading)
+        assert chat_threading is not None
+        self.assertEqual(chat_threading["thread_type"], "space")
+        self.assertEqual(chat_threading["participants"], ["Denys"])
+        participant_hints = chat_threading["participant_entity_hints"]
+        self.assertEqual(len(participant_hints), 1)
+        self.assertEqual(participant_hints[0]["display_value"], "Denys <denys@discoverbeagle.com>")
+        self.assertEqual(participant_hints[0]["identifiers"][0]["identifier_name"], "aad_oid")
+        self.assertEqual(participant_hints[0]["identifiers"][0]["normalized_value"], aad_object_id)
+
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="pst-space-001",
+                subject="HI",
+                body_text="HI",
+                folder_path="Top of Personal Folders/user (Primary)/TeamsMessagesData",
+                author="Denys",
+                recipients=None,
+                date_created="2026-04-15T09:00:00Z",
+                chat_threading=chat_threading,
+            )
+        ]
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 1)
+        row = self.fetch_document_row(retriever_tools.pst_message_rel_path("mailbox.pst", "pst-space-001"))
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            participant_rows = connection.execute(
+                """
+                SELECT e.display_name, e.primary_email, e.entity_origin, de.evidence_json
+                FROM document_entities de
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.document_id = ?
+                  AND de.role = 'participant'
+                """,
+                (row["id"],),
+            ).fetchall()
+            hint_row = connection.execute(
+                """
+                SELECT entity_hints_json
+                FROM document_occurrences
+                WHERE document_id = ?
+                """,
+                (row["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(participant_rows), 1)
+        self.assertEqual(participant_rows[0]["primary_email"], "denys@discoverbeagle.com")
+        self.assertEqual(participant_rows[0]["entity_origin"], retriever_tools.ENTITY_ORIGIN_IDENTIFIED)
+        participant_evidence = json.loads(participant_rows[0]["evidence_json"])
+        self.assertEqual(participant_evidence["raw_value"], "Denys <denys@discoverbeagle.com>")
+        self.assertIsNotNone(hint_row)
+        hint_payload = json.loads(hint_row["entity_hints_json"])
+        self.assertEqual(hint_payload["participants"][0]["display_value"], "Denys <denys@discoverbeagle.com>")
+
     def test_ingest_pst_routes_teams_messages_to_chat_and_skips_system_folders(self) -> None:
         self.write_fake_pst_file()
         messages = [
@@ -14889,6 +15006,115 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("<h1>Labor Day</h1>", preview_html)
         self.assertIn("Labor Day", preview_html)
         self.assertIn("Sep 7, 2026 12:00 AM UTC", preview_html)
+
+    def test_ingest_pst_calendar_uses_mapi_smtp_identity_hints(self) -> None:
+        self.write_fake_pst_file()
+        aad_object_id = "ed697494-fafd-46b5-aaec-222f396a4264"
+
+        def text_entry(entry_type: int, value: str) -> object:
+            return types.SimpleNamespace(
+                entry_type=entry_type,
+                value_type=0x001F,
+                data=(value + "\x00").encode("utf-16-le"),
+            )
+
+        raw_message = types.SimpleNamespace(
+            sender_name="sergey",
+            sender_email_address="",
+            record_sets=[
+                types.SimpleNamespace(
+                    entries=[
+                        text_entry(0x0042, "sergey"),
+                        text_entry(0x0C1A, "sergey"),
+                        text_entry(0x5D01, "sergey@discoverbeagle.com"),
+                        text_entry(0x5D02, "sergey@discoverbeagle.com"),
+                        text_entry(0x5D0A, "sergey@discoverbeagle.com"),
+                        text_entry(0x5D0B, "sergey@discoverbeagle.com"),
+                        text_entry(
+                            0x0C1F,
+                            (
+                                "/O=EXCHANGELABS/OU=EXCHANGE ADMINISTRATIVE GROUP/"
+                                f"CN=RECIPIENTS/CN=FC6C02487FCA4662A66CD5AE66748DBD-{aad_object_id}"
+                            ),
+                        ),
+                    ]
+                )
+            ],
+        )
+        entity_hints = retriever_tools.pst_message_mapi_entity_hints(raw_message)
+        self.assertEqual(entity_hints["author"][0]["display_value"], "sergey <sergey@discoverbeagle.com>")
+        self.assertEqual(entity_hints["participants"][0]["display_value"], "sergey <sergey@discoverbeagle.com>")
+        self.assertEqual(entity_hints["author"][0]["identifiers"][0]["identifier_name"], "aad_oid")
+        self.assertEqual(entity_hints["author"][0]["identifiers"][0]["normalized_value"], aad_object_id)
+
+        message = self.build_fake_pst_message(
+            source_item_id="pst-calendar-identity-001",
+            subject="Administrative Professionals Day",
+            body_text="United States holiday",
+            folder_path="Top of Information Store/Calendar/United States holidays",
+            author="sergey",
+            recipients=None,
+            date_created="2026-04-22T00:00:00Z",
+            message_class="IPM.Appointment",
+        )
+        message["entity_hints"] = entity_hints
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter([message])):
+            ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["pst_messages_created"], 1)
+
+        row = self.fetch_document_row(
+            retriever_tools.pst_message_rel_path("mailbox.pst", "pst-calendar-identity-001")
+        )
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            entity_rows = connection.execute(
+                """
+                SELECT de.role, de.entity_id, e.display_name, e.primary_email, e.entity_origin, de.evidence_json
+                FROM document_entities de
+                JOIN entities e ON e.id = de.entity_id
+                WHERE de.document_id = ?
+                  AND de.role IN ('author', 'participant')
+                ORDER BY de.role ASC
+                """,
+                (row["id"],),
+            ).fetchall()
+            hint_row = connection.execute(
+                """
+                SELECT entity_hints_json
+                FROM document_occurrences
+                WHERE document_id = ?
+                """,
+                (row["id"],),
+            ).fetchone()
+            aad_identifier_row = connection.execute(
+                """
+                SELECT entity_id, identifier_name, normalized_value
+                FROM entity_identifiers
+                WHERE identifier_type = 'external_id'
+                  AND identifier_name = 'aad_oid'
+                  AND normalized_value = ?
+                """,
+                (aad_object_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual([item["role"] for item in entity_rows], ["author", "participant"])
+        self.assertEqual(len({int(item["entity_id"]) for item in entity_rows}), 1)
+        self.assertEqual({item["primary_email"] for item in entity_rows}, {"sergey@discoverbeagle.com"})
+        self.assertEqual({item["entity_origin"] for item in entity_rows}, {retriever_tools.ENTITY_ORIGIN_IDENTIFIED})
+        evidence_values = [json.loads(item["evidence_json"])["raw_value"] for item in entity_rows]
+        self.assertEqual(evidence_values, ["sergey <sergey@discoverbeagle.com>", "sergey <sergey@discoverbeagle.com>"])
+        self.assertIsNotNone(hint_row)
+        hint_payload = json.loads(hint_row["entity_hints_json"])
+        self.assertEqual(hint_payload["author"][0]["display_value"], "sergey <sergey@discoverbeagle.com>")
+        self.assertEqual(hint_payload["participants"][0]["display_value"], "sergey <sergey@discoverbeagle.com>")
+        self.assertIsNotNone(aad_identifier_row)
+        self.assertEqual(int(aad_identifier_row["entity_id"]), int(entity_rows[0]["entity_id"]))
 
     def test_unchanged_pst_source_skips_without_reparsing(self) -> None:
         self.write_fake_pst_file()
