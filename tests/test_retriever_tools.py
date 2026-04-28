@@ -7153,6 +7153,169 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(mbox_stats["mbox_messages_updated"], 1)
         self.assertEqual(mbox_stats["mbox_messages_deleted"], 1)
 
+    def test_ingest_v2_gmail_export_preserves_sidecar_enrichment(self) -> None:
+        export_root = self.root / "gmail-filtered"
+        export_root.mkdir()
+
+        mbox_path = export_root / "Filtered.mbox"
+        archive = mailbox.mbox(str(mbox_path), create=True)
+        try:
+            archive.add(
+                self.build_fake_mbox_message(
+                    subject="Drive sharing update",
+                    body_text="Email body that references a linked Drive document.",
+                    message_id="<gmail-v2-filter-001@example.com>",
+                    author="Sender Example <sender@example.com>",
+                    recipients="Receiver Example <receiver@example.com>",
+                )
+            )
+            archive.flush()
+        finally:
+            archive.close()
+
+        with (export_root / "Filtered-metadata.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "Rfc822MessageId",
+                    "GmailMessageId",
+                    "Account",
+                    "Labels",
+                    "Subject",
+                    "From",
+                    "To",
+                    "DateSent",
+                    "DateReceived",
+                    "ThreadedMessageCount",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "Rfc822MessageId": "gmail-v2-filter-001@example.com",
+                    "GmailMessageId": "1767000000000000042",
+                    "Account": "owner@example.com",
+                    "Labels": "^INBOX,projectalpha",
+                    "Subject": "Drive sharing update",
+                    "From": "sender@example.com Sender Example",
+                    "To": "receiver@example.com Receiver Example",
+                    "DateSent": "2026-04-14T10:00:00Z",
+                    "DateReceived": "2026-04-14T10:00:05Z",
+                    "ThreadedMessageCount": "1",
+                }
+            )
+
+        with (export_root / "Filtered-drive-links.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["Account", "Rfc822MessageId", "GmailMessageId", "DriveUrl", "DriveItemId"],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "Account": "owner@example.com",
+                    "Rfc822MessageId": "gmail-v2-filter-001@example.com",
+                    "GmailMessageId": "1767000000000000042",
+                    "DriveUrl": "https://docs.google.com/document/d/drive-doc-001/edit",
+                    "DriveItemId": "drive-doc-001",
+                }
+            )
+
+        drive_export_dir = export_root / "Filtered_Drive_Link_Export_0"
+        drive_export_dir.mkdir()
+        drive_file = drive_export_dir / "Linked notes_drive-doc-001.txt"
+        drive_file.write_text("Drive export body text.\n", encoding="utf-8")
+        (export_root / "Filtered_Drive_Link_Export-metadata.xml").write_text(
+            """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Root DataInterchangeType='Update' Description='Test'>
+  <Batch name='New Batch'>
+    <Documents>
+      <Document DocID='drive-doc-001'>
+        <Tags>
+          <Tag TagName='#Author' TagDataType='Text' TagValue='owner@example.com'/>
+          <Tag TagName='#Title' TagDataType='Text' TagValue='Linked notes from metadata'/>
+        </Tags>
+        <Files>
+          <File FileType='Native'>
+            <ExternalFile FileName='Linked notes_drive-doc-001.txt' FileSize='24' Hash='abc123'/>
+          </File>
+        </Files>
+      </Document>
+    </Documents>
+  </Batch>
+</Root>
+""",
+            encoding="utf-8",
+        )
+
+        payloads = self.run_v2_loose_ingest("gmail-filtered")
+        run_id = str(payloads["run_id"])
+        plan_payload = dict(payloads["plan"])
+        finalize_payload = dict(payloads["finalize"])
+
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+        self.assertEqual(plan_payload["cursor"]["special_source_counts"]["gmail_export_roots"], 1)
+        self.assertEqual(plan_payload["cursor"]["planned_mbox_sources"], ["gmail-filtered/Filtered.mbox"])
+        self.assertEqual(plan_payload["cursor"]["planned_mbox_messages"], 1)
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["mbox_message"]["committed"], 1)
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["mbox_source_finalizer"]["committed"], 1)
+
+        email_rel_path = retriever_tools.mbox_message_rel_path(
+            "gmail-filtered/Filtered.mbox",
+            "<gmail-v2-filter-001@example.com>",
+        )
+        email_row = self.fetch_document_row(email_rel_path)
+        child_rows = self.fetch_child_rows(int(email_row["id"]))
+        self.assertEqual(len(child_rows), 1)
+        self.assertEqual(child_rows[0]["title"], "Linked notes from metadata")
+        self.assertEqual(child_rows[0]["source_kind"], retriever_tools.EMAIL_ATTACHMENT_SOURCE_KIND)
+
+        label_search = retriever_tools.search(self.root, "projectalpha", None, None, None, 1, 20)
+        self.assertEqual(label_search["total_hits"], 1)
+        self.assertEqual(label_search["results"][0]["id"], email_row["id"])
+        self.assertEqual(label_search["results"][0]["attachment_count"], 1)
+
+        linked_title_search = retriever_tools.search(self.root, "Linked notes from metadata", None, None, None, 1, 20)
+        self.assertEqual(linked_title_search["total_hits"], 2)
+        returned_ids = {item["id"] for item in linked_title_search["results"]}
+        self.assertIn(email_row["id"], returned_ids)
+        self.assertIn(child_rows[0]["id"], returned_ids)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            parent_rel_paths = {
+                str(row["rel_path"])
+                for row in connection.execute(
+                    """
+                    SELECT rel_path
+                    FROM documents
+                    WHERE parent_document_id IS NULL
+                    ORDER BY rel_path ASC
+                    """
+                ).fetchall()
+            }
+            work_items = connection.execute(
+                """
+                SELECT artifact_manifest_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                ORDER BY commit_order ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertNotIn(
+            "gmail-filtered/Filtered_Drive_Link_Export_0/Linked notes_drive-doc-001.txt",
+            parent_rel_paths,
+        )
+        self.assertNotIn("gmail-filtered/Filtered-metadata.csv", parent_rel_paths)
+        self.assertNotIn("gmail-filtered/Filtered-drive-links.csv", parent_rel_paths)
+        self.assertNotIn("gmail-filtered/Filtered_Drive_Link_Export-metadata.xml", parent_rel_paths)
+        manifests = [json.loads(row["artifact_manifest_json"]) for row in work_items]
+        self.assertTrue(any(manifest.get("source_plan_kind") == "gmail" for manifest in manifests))
+
     def test_ingest_v2_auto_routes_production_root(self) -> None:
         self.write_production_fixture()
 
