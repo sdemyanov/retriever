@@ -61,7 +61,7 @@ INGEST_V2_WORK_ITEM_STATUSES = (
     "deferred_timeout",
     "cancelled",
 )
-INGEST_V2_WORK_ITEM_LEASE_SECONDS = 180
+INGEST_V2_WORK_ITEM_LEASE_SECONDS = 45
 INGEST_V2_PREPARE_BATCH_SIZE = DEFAULT_WORKER_BATCH_SIZE
 INGEST_V2_PREPARE_MIN_START_SECONDS = 1.0
 INGEST_V2_COMMIT_MIN_START_SECONDS = 1.0
@@ -1508,8 +1508,31 @@ def ingest_v2_deadline_remaining_seconds(deadline: float) -> float:
     return max(0.0, deadline - time.perf_counter())
 
 
+def ingest_v2_stale_lease_cutoff(now_dt: datetime | None = None) -> str:
+    return format_utc_timestamp(
+        (now_dt or datetime.now(timezone.utc)) - timedelta(seconds=INGEST_V2_WORK_ITEM_LEASE_SECONDS)
+    )
+
+
+def ingest_v2_lease_is_active(
+    expires_at: object,
+    refreshed_at: object,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    now_dt = now or datetime.now(timezone.utc)
+    parsed_refresh = parse_utc_timestamp(refreshed_at)
+    if parsed_refresh is None:
+        return False
+    if parsed_refresh <= now_dt - timedelta(seconds=INGEST_V2_WORK_ITEM_LEASE_SECONDS):
+        return False
+    return lease_is_active(expires_at, now=now_dt)
+
+
 def ingest_v2_reclaim_stale_prepare_items(connection: sqlite3.Connection, *, run_id: str) -> int:
-    now = utc_now()
+    now_dt = datetime.now(timezone.utc)
+    now = format_utc_timestamp(now_dt)
+    stale_cutoff = ingest_v2_stale_lease_cutoff(now_dt)
     connection.execute("BEGIN")
     try:
         cursor = connection.execute(
@@ -1522,9 +1545,12 @@ def ingest_v2_reclaim_stale_prepare_items(connection: sqlite3.Connection, *, run
             WHERE run_id = ?
               AND status = 'leased'
               AND lease_expires_at IS NOT NULL
-              AND lease_expires_at <= ?
+              AND (
+                lease_expires_at <= ?
+                OR updated_at <= ?
+              )
             """,
-            (now, run_id, now),
+            (now, run_id, now, stale_cutoff),
         )
         reclaimed = int(cursor.rowcount or 0)
         if reclaimed:
@@ -1559,6 +1585,7 @@ def ingest_v2_claim_prepare_items(
 ) -> tuple[list[sqlite3.Row], bool]:
     now_dt = datetime.now(timezone.utc)
     now = format_utc_timestamp(now_dt)
+    stale_cutoff = ingest_v2_stale_lease_cutoff(now_dt)
     lease_expires_at = lease_expiration_after(INGEST_V2_WORK_ITEM_LEASE_SECONDS, now=now_dt)
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -1582,8 +1609,9 @@ def ingest_v2_claim_prepare_items(
                   AND lease_owner != ?
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > ?
+                  AND updated_at > ?
                 """,
-                (run_id, worker_id, now),
+                (run_id, worker_id, now, stale_cutoff),
             ).fetchone()[0]
             or 0
         )
@@ -2425,6 +2453,7 @@ def ingest_v2_acquire_writer_lease(
 ) -> bool:
     now_dt = datetime.now(timezone.utc)
     now = format_utc_timestamp(now_dt)
+    stale_cutoff = ingest_v2_stale_lease_cutoff(now_dt)
     lease_expires_at = lease_expiration_after(INGEST_V2_WORK_ITEM_LEASE_SECONDS, now=now_dt)
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -2443,10 +2472,12 @@ def ingest_v2_acquire_writer_lease(
                 committer_lease_owner IS NULL
                 OR committer_lease_expires_at IS NULL
                 OR committer_lease_expires_at <= ?
+                OR committer_heartbeat_at IS NULL
+                OR committer_heartbeat_at <= ?
                 OR committer_lease_owner = ?
               )
             """,
-            (writer_id, lease_expires_at, now, now, run_id, now, writer_id),
+            (writer_id, lease_expires_at, now, now, run_id, now, stale_cutoff, writer_id),
         )
         acquired = int(cursor.rowcount or 0) > 0
         connection.commit()
@@ -2484,7 +2515,9 @@ def ingest_v2_release_writer_lease(
 
 
 def ingest_v2_reclaim_stale_commit_items(connection: sqlite3.Connection, *, run_id: str) -> int:
-    now = utc_now()
+    now_dt = datetime.now(timezone.utc)
+    now = format_utc_timestamp(now_dt)
+    stale_cutoff = ingest_v2_stale_lease_cutoff(now_dt)
     connection.execute("BEGIN")
     try:
         cursor = connection.execute(
@@ -2497,9 +2530,12 @@ def ingest_v2_reclaim_stale_commit_items(connection: sqlite3.Connection, *, run_
             WHERE run_id = ?
               AND status = 'committing'
               AND lease_expires_at IS NOT NULL
-              AND lease_expires_at <= ?
+              AND (
+                lease_expires_at <= ?
+                OR updated_at <= ?
+              )
             """,
-            (now, run_id, now),
+            (now, run_id, now, stale_cutoff),
         )
         reclaimed = int(cursor.rowcount or 0)
         if reclaimed:
@@ -2523,6 +2559,13 @@ def ingest_v2_reclaim_stale_commit_items(connection: sqlite3.Connection, *, run_
     except Exception:
         connection.rollback()
         raise
+
+
+def ingest_v2_reclaim_stale_work_items(connection: sqlite3.Connection, *, run_id: str) -> dict[str, int]:
+    return {
+        "prepare": ingest_v2_reclaim_stale_prepare_items(connection, run_id=run_id),
+        "commit": ingest_v2_reclaim_stale_commit_items(connection, run_id=run_id),
+    }
 
 
 def ingest_v2_load_commit_cursor(connection: sqlite3.Connection, *, run_id: str) -> dict[str, object]:
@@ -4195,6 +4238,7 @@ def ingest_v2_artifact_counts(connection: sqlite3.Connection, *, run_id: str) ->
 def ingest_v2_lease_health(connection: sqlite3.Connection, row: sqlite3.Row, *, run_id: str) -> dict[str, object]:
     now = datetime.now(timezone.utc)
     now_text = format_utc_timestamp(now)
+    stale_cutoff = ingest_v2_stale_lease_cutoff(now)
     active_prepare_workers = int(
         connection.execute(
             """
@@ -4205,8 +4249,9 @@ def ingest_v2_lease_health(connection: sqlite3.Connection, row: sqlite3.Row, *, 
               AND lease_owner IS NOT NULL
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > ?
+              AND updated_at > ?
             """,
-            (run_id, now_text),
+            (run_id, now_text, stale_cutoff),
         ).fetchone()[0]
         or 0
     )
@@ -4218,19 +4263,28 @@ def ingest_v2_lease_health(connection: sqlite3.Connection, row: sqlite3.Row, *, 
           AND status IN ('leased', 'committing')
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > ?
+          AND updated_at > ?
         """,
-        (run_id, now_text),
+        (run_id, now_text, stale_cutoff),
     ).fetchone()
     stale_lease_row = connection.execute(
         """
-        SELECT MIN(lease_expires_at) AS oldest_expired_at
+        SELECT MIN(
+          CASE
+            WHEN lease_expires_at <= ? THEN lease_expires_at
+            ELSE updated_at
+          END
+        ) AS oldest_expired_at
         FROM ingest_work_items
         WHERE run_id = ?
           AND status IN ('leased', 'committing')
           AND lease_expires_at IS NOT NULL
-          AND lease_expires_at <= ?
+          AND (
+            lease_expires_at <= ?
+            OR updated_at <= ?
+          )
         """,
-        (run_id, now_text),
+        (now_text, run_id, now_text, stale_cutoff),
     ).fetchone()
 
     def age_seconds(raw_value: object) -> int | None:
@@ -4242,7 +4296,11 @@ def ingest_v2_lease_health(connection: sqlite3.Connection, row: sqlite3.Row, *, 
     return {
         "oldest_active_lease_age_seconds": age_seconds(active_lease_row["oldest_updated_at"] if active_lease_row else None),
         "oldest_stale_lease_age_seconds": age_seconds(stale_lease_row["oldest_expired_at"] if stale_lease_row else None),
-        "writer_busy": lease_is_active(row["committer_lease_expires_at"], now=now),
+        "writer_busy": ingest_v2_lease_is_active(
+            row["committer_lease_expires_at"],
+            row["committer_heartbeat_at"],
+            now=now,
+        ),
         "active_prepare_workers": active_prepare_workers,
         "prepare_worker_soft_limit": int(row["prepare_worker_soft_limit"] or DEFAULT_WORKER_BACKGROUND_MAX_PARALLEL),
     }
@@ -6186,6 +6244,7 @@ def ingest_v2_run_step(
     schema_started = time.perf_counter()
     schema_ms = 0.0
     initial_status_payload_ms = 0.0
+    stale_reclaimed = {"prepare": 0, "commit": 0}
     try:
         apply_schema(connection, root)
         schema_ms = ingest_v2_elapsed_ms(schema_started)
@@ -6201,6 +6260,7 @@ def ingest_v2_run_step(
                 "executed": False,
                 "selected_step": None,
                 "executed_steps": [],
+                "stale_reclaimed": stale_reclaimed,
                 "reason": "no_ingest_run",
                 "step_result": None,
                 "step_results": [],
@@ -6214,6 +6274,10 @@ def ingest_v2_run_step(
                 "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
             }
         resolved_run_id = str(row["run_id"])
+        if str(row["status"]) in INGEST_V2_ACTIVE_STATUSES and row["cancel_requested_at"] is None:
+            stale_reclaimed = ingest_v2_reclaim_stale_work_items(connection, run_id=resolved_run_id)
+            if any(stale_reclaimed.values()):
+                row = require_ingest_v2_run_row(connection, resolved_run_id)
         status_payload, initial_status_payload_ms = ingest_v2_status_payload_timed(
             connection,
             root,
@@ -6298,6 +6362,7 @@ def ingest_v2_run_step(
         "executed": bool(executed_steps),
         "selected_step": executed_steps[0] if executed_steps else None,
         "executed_steps": executed_steps,
+        "stale_reclaimed": stale_reclaimed,
         "reason": stop_reason,
         "step_result": step_results[-1] if step_results else None,
         "step_results": step_results,

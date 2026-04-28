@@ -8432,6 +8432,156 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(committed_count, 3)
         self.assertEqual(document_count, 3)
 
+    def test_ingest_v2_run_step_reclaims_stale_prepare_lease(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+        self.assertEqual(plan_payload["run"]["phase"], "preparing")
+
+        old_timestamp = "2000-01-01T00:00:00Z"
+        future_timestamp = "2999-01-01T00:00:00Z"
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                """
+                UPDATE ingest_work_items
+                SET status = 'leased',
+                    lease_owner = 'dead-prepare-worker',
+                    lease_expires_at = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (future_timestamp, old_timestamp, run_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "ingest-run-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertEqual(step_payload["stale_reclaimed"], {"prepare": 1, "commit": 0})
+        self.assertEqual(step_payload["run"]["status"], "completed")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_count = int(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] or 0)
+            committed_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ingest_work_items WHERE run_id = ? AND status = 'committed'",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+        self.assertEqual(document_count, 1)
+        self.assertEqual(committed_count, 1)
+
+    def test_ingest_v2_run_step_reclaims_stale_commit_lease(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+        prepare_exit, prepare_payload, _, _ = self.run_cli("ingest-prepare-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["run"]["phase"], "committing")
+
+        old_timestamp = "2000-01-01T00:00:00Z"
+        future_timestamp = "2999-01-01T00:00:00Z"
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute(
+                """
+                UPDATE ingest_work_items
+                SET status = 'committing',
+                    lease_owner = 'dead-commit-worker',
+                    lease_expires_at = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (future_timestamp, old_timestamp, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE ingest_runs
+                SET committer_lease_owner = 'dead-commit-worker',
+                    committer_lease_expires_at = ?,
+                    committer_heartbeat_at = ?,
+                    last_heartbeat_at = ?
+                WHERE run_id = ?
+                """,
+                (future_timestamp, old_timestamp, old_timestamp, run_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "ingest-run-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertEqual(step_payload["stale_reclaimed"], {"prepare": 0, "commit": 1})
+        self.assertEqual(step_payload["run"]["status"], "completed")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_count = int(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] or 0)
+            committed_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ingest_work_items WHERE run_id = ? AND status = 'committed'",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+        self.assertEqual(document_count, 1)
+        self.assertEqual(committed_count, 1)
+
     def test_ingest_v2_finalize_step_completes_and_marks_missing_loose_files(self) -> None:
         raw_dir = self.root / "raw"
         raw_dir.mkdir()
