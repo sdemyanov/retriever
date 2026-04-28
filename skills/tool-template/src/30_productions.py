@@ -1015,6 +1015,22 @@ def cleanup_unreferenced_preview_files(
             remove_file_if_exists(paths["state_dir"] / normalized_rel_path)
 
 
+def prune_empty_conversation_preview_dirs(paths: dict[str, Path]) -> int:
+    conversations_dir = paths["state_dir"] / "previews" / "conversations"
+    if not conversations_dir.exists():
+        return 0
+    pruned = 0
+    for preview_dir in sorted(conversations_dir.glob("conversation-*"), reverse=True):
+        if not preview_dir.is_dir():
+            continue
+        try:
+            preview_dir.rmdir()
+        except OSError:
+            continue
+        pruned += 1
+    return pruned
+
+
 def refresh_documents_fts_row(connection: sqlite3.Connection, document_id: int) -> None:
     connection.execute("DELETE FROM documents_fts WHERE document_id = ?", (document_id,))
     row = connection.execute(

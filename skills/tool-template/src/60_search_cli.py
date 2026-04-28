@@ -11295,6 +11295,35 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_dataset_selector_group.add_argument("--dataset-id", type=int, help="Dataset id")
     refresh_dataset_selector_group.add_argument("--dataset-name", help="Exact dataset name")
 
+    rebuild_conversations_parser = subparsers.add_parser(
+        "rebuild-conversations",
+        help="Re-run conversation assignment and regenerate conversation previews",
+    )
+    rebuild_conversations_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_conversations_parser.add_argument(
+        "--conversation-id",
+        dest="conversation_ids",
+        action="append",
+        type=int,
+        help="Conversation id to refresh after reassignment (repeatable)",
+    )
+    rebuild_conversations_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id whose conversation should be refreshed after reassignment (repeatable)",
+    )
+    rebuild_conversations_dataset_group = rebuild_conversations_parser.add_mutually_exclusive_group()
+    rebuild_conversations_dataset_group.add_argument("--dataset-id", type=int, help="Dataset id")
+    rebuild_conversations_dataset_group.add_argument("--dataset-name", help="Exact dataset name")
+    rebuild_conversations_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Conversations to refresh per transaction",
+    )
+
     subparsers.add_parser("schema-version", help="Print the schema version")
 
     return parser
@@ -12217,6 +12246,19 @@ def main() -> int:
                     document_ids=args.document_ids,
                     dataset_id=args.dataset_id,
                     dataset_name=args.dataset_name,
+                ),
+            )
+
+        if args.command == "rebuild-conversations":
+            return emit_cli_payload(
+                "rebuild-conversations",
+                rebuild_conversations(
+                    root,
+                    conversation_ids=args.conversation_ids,
+                    document_ids=args.document_ids,
+                    dataset_id=args.dataset_id,
+                    dataset_name=args.dataset_name,
+                    batch_size=args.batch_size,
                 ),
             )
 
