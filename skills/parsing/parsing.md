@@ -57,7 +57,7 @@
 - Generated preview types:
   - `eml` -> one `.html` preview preserving headers and body
   - `msg` -> one `.html` preview preserving headers and body
-  - `pst` -> one `.html` preview per extracted PST message
+  - `pst` -> email/calendar messages get one `.html` message preview; chat messages get a chat-styled document/message preview plus a chat-styled full conversation preview
   - `rtf` -> one `.html` preview from extracted text
   - `xls` -> one `.csv` preview per sheet
   - `xlsx` -> one `.csv` preview per sheet
