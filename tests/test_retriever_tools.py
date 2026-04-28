@@ -15921,6 +15921,162 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(refresh_all_result["refreshed_conversations"], 0)
         self.assertNotIn("stale rtf preview again", preview_path.read_text(encoding="utf-8"))
 
+    def test_refresh_previews_document_scope_refreshes_production_email_in_conversation(self) -> None:
+        self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["production_documents_created"], 4)
+        row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000001.logical"
+        )
+        self.assertIsNotNone(row["conversation_id"])
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            preview_row = connection.execute(
+                """
+                SELECT rel_preview_path
+                FROM document_previews
+                WHERE document_id = ? AND preview_type = 'html'
+                ORDER BY ordinal ASC, id ASC
+                LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            self.assertIsNotNone(preview_row)
+            assert preview_row is not None
+            preview_path = self.paths["state_dir"] / str(preview_row["rel_preview_path"])
+        finally:
+            connection.close()
+        preview_path.write_text("stale production preview", encoding="utf-8")
+
+        exit_code, refresh_result, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "documents",
+            "--doc-id",
+            str(row["id"]),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(refresh_result)
+        assert refresh_result is not None
+        self.assertEqual(refresh_result["status"], "ok")
+        self.assertEqual(refresh_result["scope"], "documents")
+        self.assertEqual(refresh_result["refreshed_documents"], 1)
+        self.assertEqual(refresh_result["skipped_documents"], 0)
+        self.assertEqual(refresh_result["target_document_ids"], [row["id"]])
+        refreshed_html = preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale production preview", refreshed_html)
+        self.assertIn("Parent production memo", refreshed_html)
+
+    def test_refresh_previews_document_scope_conversation_selector_does_not_refresh_all_documents(self) -> None:
+        self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000001.logical"
+        )
+        conversation_id = row["conversation_id"]
+        self.assertIsNotNone(conversation_id)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            conversation_document_ids = [
+                int(item["id"])
+                for item in connection.execute(
+                    """
+                    SELECT id
+                    FROM documents
+                    WHERE conversation_id = ?
+                      AND lifecycle_status NOT IN ('missing', 'deleted')
+                    ORDER BY id ASC
+                    """,
+                    (conversation_id,),
+                ).fetchall()
+            ]
+            active_document_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM documents WHERE lifecycle_status NOT IN ('missing', 'deleted')"
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+        self.assertGreater(len(conversation_document_ids), 0)
+        self.assertLess(len(conversation_document_ids), active_document_count)
+
+        exit_code, refresh_result, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "documents",
+            "--conversation-id",
+            str(conversation_id),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(refresh_result)
+        assert refresh_result is not None
+        self.assertEqual(refresh_result["status"], "ok")
+        self.assertEqual(refresh_result["scope"], "documents")
+        self.assertEqual(refresh_result["target_document_ids"], conversation_document_ids)
+        self.assertLess(len(refresh_result["target_document_ids"]), active_document_count)
+
+    def test_refresh_previews_missing_only_regenerates_document_with_missing_preview_rows(self) -> None:
+        rtf_path = self.root / "rowless-preview.rtf"
+        rtf_path.write_text(
+            r"{\rtf1\ansi\deff0 {\fonttbl {\f0 Arial;}}\f0 Rowless Preview Memo\par Regenerate missing rows.\par}",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        row = self.fetch_document_row("rowless-preview.rtf")
+        search_result = retriever_tools.search(self.root, "Regenerate missing rows", None, None, None, 1, 20)
+        document_result = next(item for item in search_result["results"] if item["id"] == row["id"])
+        preview_path = self.preview_target_file_path(document_result["preview_targets"][0])
+        preview_path.write_text("stale orphan preview", encoding="utf-8")
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("DELETE FROM document_previews WHERE document_id = ?", (row["id"],))
+            connection.commit()
+        finally:
+            connection.close()
+
+        exit_code, refresh_result, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "documents",
+            "--doc-id",
+            str(row["id"]),
+            "--missing-only",
+            "--from-source",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(refresh_result)
+        assert refresh_result is not None
+        self.assertEqual(refresh_result["status"], "ok")
+        self.assertEqual(refresh_result["scope"], "documents")
+        self.assertTrue(refresh_result["missing_only"])
+        self.assertEqual(refresh_result["candidate_documents"], 1)
+        self.assertEqual(refresh_result["refreshed_documents"], 1)
+        self.assertEqual(refresh_result["skipped_documents"], 0)
+        self.assertNotIn("stale orphan preview", preview_path.read_text(encoding="utf-8"))
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            preview_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM document_previews WHERE document_id = ?",
+                (row["id"],),
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+        self.assertGreater(preview_count, 0)
+
     def test_changed_mbox_reingest_preserves_control_numbers_and_retires_removed_messages(self) -> None:
         self.write_fake_mbox_file(
             [

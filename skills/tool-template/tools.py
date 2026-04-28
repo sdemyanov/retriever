@@ -47136,12 +47136,44 @@ def filter_conversation_ids_with_missing_preview_artifacts(
 def resolve_document_preview_refresh_ids(
     connection: sqlite3.Connection,
     *,
+    conversation_ids: list[int] | None = None,
     document_ids: list[int] | None = None,
     dataset_id: int | None = None,
     dataset_name: str | None = None,
 ) -> tuple[list[int], dict[str, object] | None]:
     target_document_ids: set[int] = set()
     dataset_summary: dict[str, object] | None = None
+
+    if conversation_ids:
+        requested_conversation_ids = sorted(dict.fromkeys(int(conversation_id) for conversation_id in conversation_ids))
+        rows = connection.execute(
+            f"""
+            SELECT id
+            FROM conversations
+            WHERE id IN ({", ".join("?" for _ in requested_conversation_ids)})
+            """,
+            tuple(requested_conversation_ids),
+        ).fetchall()
+        found_conversation_ids = {int(row["id"]) for row in rows}
+        missing_conversation_ids = [
+            conversation_id
+            for conversation_id in requested_conversation_ids
+            if conversation_id not in found_conversation_ids
+        ]
+        if missing_conversation_ids:
+            missing_text = ", ".join(str(conversation_id) for conversation_id in missing_conversation_ids)
+            raise RetrieverError(f"Unknown conversation id(s): {missing_text}")
+        rows = connection.execute(
+            f"""
+            SELECT id
+            FROM documents
+            WHERE conversation_id IN ({", ".join("?" for _ in requested_conversation_ids)})
+              AND lifecycle_status NOT IN ('missing', 'deleted')
+            ORDER BY id ASC
+            """,
+            tuple(requested_conversation_ids),
+        ).fetchall()
+        target_document_ids.update(int(row["id"]) for row in rows)
 
     if document_ids:
         requested_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
@@ -47181,7 +47213,13 @@ def resolve_document_preview_refresh_ids(
         ).fetchall()
         target_document_ids.update(int(row["document_id"]) for row in rows)
 
-    if not target_document_ids and document_ids is None and dataset_id is None and dataset_name is None:
+    if (
+        not target_document_ids
+        and conversation_ids is None
+        and document_ids is None
+        and dataset_id is None
+        and dataset_name is None
+    ):
         rows = connection.execute(
             """
             SELECT id
@@ -47205,15 +47243,23 @@ def filter_document_ids_with_missing_preview_artifacts(
         return []
     rows = connection.execute(
         f"""
-        SELECT document_id, rel_preview_path, preview_type
-        FROM document_previews
-        WHERE document_id IN ({", ".join("?" for _ in normalized_document_ids)})
-        ORDER BY document_id ASC, ordinal ASC, id ASC
+        SELECT
+          d.id AS document_id,
+          dp.rel_preview_path,
+          dp.preview_type
+        FROM documents d
+        LEFT JOIN document_previews dp ON dp.document_id = d.id
+        WHERE d.id IN ({", ".join("?" for _ in normalized_document_ids)})
+          AND d.lifecycle_status NOT IN ('missing', 'deleted')
+        ORDER BY d.id ASC, dp.ordinal ASC, dp.id ASC
         """,
         tuple(normalized_document_ids),
     ).fetchall()
     missing_document_ids: set[int] = set()
     for row in rows:
+        if row["rel_preview_path"] is None:
+            missing_document_ids.add(int(row["document_id"]))
+            continue
         if normalize_whitespace(str(row["preview_type"] or "")).lower() == "native":
             continue
         rel_preview_path = normalize_whitespace(str(row["rel_preview_path"] or ""))
@@ -47324,7 +47370,7 @@ def refresh_document_previews(
     connection.execute("BEGIN")
     try:
         for row in rows:
-            if row["conversation_id"] is not None:
+            if row["conversation_id"] is not None and row["production_id"] is None:
                 result = {"status": "skipped", "reason": "conversation_scope"}
             elif from_source:
                 result = refresh_source_backed_document_preview(connection, paths, row)
@@ -47412,6 +47458,7 @@ def refresh_generated_previews(
             document_dataset_summary: dict[str, object] | None
             target_document_ids, document_dataset_summary = resolve_document_preview_refresh_ids(
                 connection,
+                conversation_ids=conversation_ids,
                 document_ids=document_ids,
                 dataset_id=dataset_id,
                 dataset_name=dataset_name,
