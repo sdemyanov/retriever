@@ -8337,6 +8337,101 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         cursor_payload = json.loads(cursor_row["cursor_json"])
         self.assertEqual(cursor_payload["actions"], {"new": 2})
 
+    def test_ingest_v2_interleaves_prepare_and_commit_batches(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        for index in range(3):
+            (raw_dir / f"doc-{index}.txt").write_text(f"body {index}\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+
+        with (
+            mock.patch.object(retriever_tools, "INGEST_V2_PREPARE_BATCH_SIZE", 2),
+            mock.patch.object(retriever_tools, "INGEST_V2_PREPARED_COMMIT_BATCH_TARGET", 2),
+        ):
+            first_prepare_exit, first_prepare_payload, _, _ = self.run_cli(
+                "ingest-prepare-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+            )
+            self.assertEqual(first_prepare_exit, 0)
+            self.assertIsNotNone(first_prepare_payload)
+            self.assertEqual(first_prepare_payload["prepared"], 2)
+            self.assertTrue(first_prepare_payload["advanced_to_commit"])
+            self.assertTrue(first_prepare_payload["more_prepare_remaining"])
+            self.assertEqual(first_prepare_payload["run"]["phase"], "committing")
+            self.assertEqual(first_prepare_payload["run"]["counts"]["work_items"]["pending"], 1)
+            self.assertEqual(first_prepare_payload["run"]["counts"]["work_items"]["prepared"], 2)
+
+            first_commit_exit, first_commit_payload, _, _ = self.run_cli(
+                "ingest-commit-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+            )
+            self.assertEqual(first_commit_exit, 0)
+            self.assertIsNotNone(first_commit_payload)
+            self.assertEqual(first_commit_payload["committed"], 2)
+            self.assertFalse(first_commit_payload["advanced_to_finalize"])
+            self.assertTrue(first_commit_payload["advanced_to_prepare"])
+            self.assertEqual(first_commit_payload["run"]["phase"], "preparing")
+            self.assertEqual(first_commit_payload["run"]["counts"]["work_items"]["pending"], 1)
+            self.assertEqual(first_commit_payload["run"]["counts"]["work_items"]["committed"], 2)
+
+            second_prepare_exit, second_prepare_payload, _, _ = self.run_cli(
+                "ingest-prepare-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+            )
+            self.assertEqual(second_prepare_exit, 0)
+            self.assertIsNotNone(second_prepare_payload)
+            self.assertEqual(second_prepare_payload["prepared"], 1)
+            self.assertTrue(second_prepare_payload["advanced_to_commit"])
+            self.assertEqual(second_prepare_payload["run"]["phase"], "committing")
+
+            second_commit_exit, second_commit_payload, _, _ = self.run_cli(
+                "ingest-commit-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+            )
+            self.assertEqual(second_commit_exit, 0)
+            self.assertIsNotNone(second_commit_payload)
+            self.assertEqual(second_commit_payload["committed"], 1)
+            self.assertTrue(second_commit_payload["advanced_to_finalize"])
+            self.assertFalse(second_commit_payload["advanced_to_prepare"])
+            self.assertEqual(second_commit_payload["run"]["phase"], "finalizing")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            committed_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ingest_work_items WHERE run_id = ? AND status = 'committed'",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            document_count = int(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] or 0)
+        finally:
+            connection.close()
+        self.assertEqual(committed_count, 3)
+        self.assertEqual(document_count, 3)
+
     def test_ingest_v2_finalize_step_completes_and_marks_missing_loose_files(self) -> None:
         raw_dir = self.root / "raw"
         raw_dir.mkdir()
