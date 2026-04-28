@@ -210,6 +210,7 @@ Retriever distinguishes between user-facing document metadata and internal helpe
 - It identifies who the source material was collected from when Retriever can determine that provenance reliably.
 - Retriever should populate it using source-kind-specific rules rather than blindly copying `source_rel_path`.
 - For PST-derived message rows, default `custodian` comes from the owning `.pst` container name without the extension.
+- For MBOX-derived message rows, Google Vault filenames of the form `<label>--<email>-<suffix>.mbox` use the embedded email as `custodian`; Google Takeout and generic MBOX filenames do not imply a custodian.
 - PST-derived child attachment rows inherit `custodian` from their parent message row.
 - Existing workspaces may require reindex or migration backfill to populate `custodian` on already ingested rows.
 

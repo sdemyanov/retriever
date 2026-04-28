@@ -10684,6 +10684,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Documents to refresh per transaction",
     )
 
+    purge_vault_custodians_parser = subparsers.add_parser(
+        "purge-vault-filename-custodians",
+        help="Dry-run or apply cleanup for synthetic Google Vault MBOX filename custodians",
+    )
+    purge_vault_custodians_parser.add_argument("workspace", help="Workspace root path")
+    purge_vault_custodians_mode = purge_vault_custodians_parser.add_mutually_exclusive_group()
+    purge_vault_custodians_mode.add_argument("--dry-run", action="store_true", help="List cleanup candidates without changing data")
+    purge_vault_custodians_mode.add_argument("--apply", action="store_true", help="Apply the cleanup")
+
+    entities_parser = subparsers.add_parser("entities", help="Entity maintenance commands")
+    entities_subparsers = entities_parser.add_subparsers(dest="entity_command", required=True)
+    entities_purge_vault_custodians_parser = entities_subparsers.add_parser(
+        "purge-vault-filename-custodians",
+        help="Dry-run or apply cleanup for synthetic Google Vault MBOX filename custodians",
+    )
+    entities_purge_vault_custodians_parser.add_argument("workspace", help="Workspace root path")
+    entities_purge_vault_custodians_mode = entities_purge_vault_custodians_parser.add_mutually_exclusive_group()
+    entities_purge_vault_custodians_mode.add_argument("--dry-run", action="store_true", help="List cleanup candidates without changing data")
+    entities_purge_vault_custodians_mode.add_argument("--apply", action="store_true", help="Apply the cleanup")
+
     rebuild_entities_start_parser = subparsers.add_parser(
         "rebuild-entities-start",
         help="Start a resumable entity rebuild run",
@@ -11745,6 +11765,19 @@ def main() -> int:
                     batch_size=args.batch_size,
                 ),
             )
+
+        if args.command == "purge-vault-filename-custodians":
+            return emit_cli_payload(
+                "purge-vault-filename-custodians",
+                purge_vault_filename_custodians(root, apply=bool(args.apply)),
+            )
+
+        if args.command == "entities":
+            if args.entity_command == "purge-vault-filename-custodians":
+                return emit_cli_payload(
+                    "entities purge-vault-filename-custodians",
+                    purge_vault_filename_custodians(root, apply=bool(args.apply)),
+                )
 
         if args.command == "rebuild-entities-start":
             return emit_cli_payload(
