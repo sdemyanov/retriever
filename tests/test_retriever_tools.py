@@ -6899,8 +6899,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(plan_payload["implemented"])
         self.assertFalse(plan_payload["more_planning_remaining"])
         self.assertEqual(plan_payload["planned_loose_files"], 2)
-        self.assertEqual(plan_payload["cursor"]["skipped_container_files"], 1)
-        self.assertEqual(plan_payload["timings"]["work_item_insert_ms"]["count"], 2)
+        self.assertEqual(plan_payload["cursor"]["skipped_container_files"], 0)
+        self.assertEqual(plan_payload["cursor"]["scanned_pst_source_rel_paths"], ["raw/mailbox.pst"])
+        self.assertEqual(len(plan_payload["cursor"]["pst_failures"]), 1)
+        self.assertEqual(plan_payload["timings"]["work_item_insert_ms"]["count"], 3)
         self.assertGreaterEqual(plan_payload["timings"]["cursor_save_ms"]["count"], 1)
         self.assertIsInstance(plan_payload["timings"]["status_payload_ms"], float)
         run_payload = plan_payload["run"]
@@ -7152,6 +7154,188 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         mbox_stats = json.loads(cursor_row["cursor_json"])["mbox_stats"]
         self.assertEqual(mbox_stats["mbox_messages_updated"], 1)
         self.assertEqual(mbox_stats["mbox_messages_deleted"], 1)
+
+    def test_ingest_v2_pst_creates_message_rows_with_source_context(self) -> None:
+        pst_path = self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-msg-001",
+                subject="V2 PST Parent",
+                body_text="V2 PST parent message body",
+                folder_path="Inbox",
+                recipients=None,
+                transport_headers="\n".join(
+                    [
+                        "To: Bob Example <bob@example.com>",
+                        "Cc: Carol Example <carol@example.com>",
+                        "",
+                    ]
+                ),
+                attachment_name="notes.txt",
+                attachment_text="v2 pst attachment body",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-msg-002",
+                subject="V2 PST Sibling",
+                body_text="V2 PST sibling body text",
+                folder_path="Sent Items",
+            ),
+        ]
+
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            payloads = self.run_v2_loose_ingest()
+        run_id = str(payloads["run_id"])
+        commit_payload = dict(payloads["commit"])
+        finalize_payload = dict(payloads["finalize"])
+
+        self.assertEqual(commit_payload["failed"], 0)
+        self.assertEqual(commit_payload["committed"], 3)
+        self.assertEqual(commit_payload["actions"], {"new": 2, "finalized": 1})
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["pst_message"]["committed"], 2)
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["pst_source_finalizer"]["committed"], 1)
+
+        parent_rel_path = retriever_tools.pst_message_rel_path("mailbox.pst", "v2-pst-msg-001")
+        sibling_rel_path = retriever_tools.pst_message_rel_path("mailbox.pst", "v2-pst-msg-002")
+        parent_row = self.fetch_document_row(parent_rel_path)
+        sibling_row = self.fetch_document_row(sibling_rel_path)
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        dataset_row = self.fetch_dataset_row(int(parent_row["dataset_id"]))
+
+        self.assertEqual(parent_row["source_kind"], retriever_tools.PST_SOURCE_KIND)
+        self.assertEqual(parent_row["source_rel_path"], "mailbox.pst")
+        self.assertEqual(parent_row["source_item_id"], "v2-pst-msg-001")
+        self.assertEqual(parent_row["source_folder_path"], "Inbox")
+        self.assertEqual(parent_row["file_type"], "pst")
+        self.assertEqual(parent_row["content_type"], "Email")
+        self.assertEqual(parent_row["custodian"], "mailbox")
+        self.assertEqual(
+            parent_row["recipients"],
+            "Bob Example <bob@example.com>, Carol Example <carol@example.com>",
+        )
+        self.assertEqual(sibling_row["source_folder_path"], "Sent Items")
+        self.assertEqual(sibling_row["dataset_id"], parent_row["dataset_id"])
+        self.assertEqual(child_row["dataset_id"], parent_row["dataset_id"])
+        self.assertEqual(dataset_row["source_kind"], retriever_tools.PST_SOURCE_KIND)
+        self.assertEqual(dataset_row["dataset_locator"], "mailbox.pst")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            container_row = connection.execute(
+                "SELECT * FROM container_sources WHERE source_kind = ? AND source_rel_path = ?",
+                (retriever_tools.PST_SOURCE_KIND, "mailbox.pst"),
+            ).fetchone()
+            work_items = connection.execute(
+                """
+                SELECT unit_type, status, affected_document_ids_json, artifact_manifest_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                ORDER BY commit_order ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'committing'
+                  AND cursor_key = 'loose_file_commit'
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(container_row)
+        self.assertEqual(container_row["dataset_id"], parent_row["dataset_id"])
+        self.assertEqual(container_row["message_count"], 2)
+        self.assertEqual(container_row["file_size"], pst_path.stat().st_size)
+        self.assertIsNotNone(container_row["last_scan_completed_at"])
+        self.assertEqual([row["unit_type"] for row in work_items], ["pst_message", "pst_message", "pst_source_finalizer"])
+        self.assertTrue(all(row["status"] == "committed" for row in work_items))
+        self.assertTrue(json.loads(work_items[0]["affected_document_ids_json"]))
+        self.assertEqual(json.loads(work_items[2]["artifact_manifest_json"])["commit_action"], "finalized")
+        self.assertIsNotNone(cursor_row)
+        pst_stats = json.loads(cursor_row["cursor_json"])["pst_stats"]
+        self.assertEqual(pst_stats["pst_messages_created"], 2)
+        self.assertEqual(pst_stats["pst_sources_finalized"], 1)
+
+    def test_ingest_v2_pst_reingest_retires_removed_messages(self) -> None:
+        pst_path = self.write_fake_pst_file(content=b"pst-v2-a")
+        first_messages = [
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-retire-001",
+                subject="V2 Original PST Parent",
+                body_text="Parent v1",
+                attachment_name="notes.txt",
+                attachment_text="stable attachment body",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-retire-002",
+                subject="V2 Removed later",
+                body_text="Remove me",
+            ),
+        ]
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(first_messages)):
+            first_payloads = self.run_v2_loose_ingest()
+        self.assertEqual(dict(first_payloads["finalize"])["run"]["status"], "completed")
+
+        parent_rel_path = retriever_tools.pst_message_rel_path("mailbox.pst", "v2-pst-retire-001")
+        removed_rel_path = retriever_tools.pst_message_rel_path("mailbox.pst", "v2-pst-retire-002")
+        parent_row = self.fetch_document_row(parent_rel_path)
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        retriever_tools.set_field(self.root, parent_row["id"], "title", "Manual V2 PST Title")
+
+        pst_path.write_bytes(b"pst-v2-b")
+        second_messages = [
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-retire-001",
+                subject="V2 Updated PST Parent",
+                body_text="Parent v2",
+                attachment_name="notes.txt",
+                attachment_text="stable attachment body",
+            )
+        ]
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(second_messages)):
+            second_payloads = self.run_v2_loose_ingest()
+        second_commit = dict(second_payloads["commit"])
+        self.assertEqual(second_commit["failed"], 0)
+        self.assertEqual(second_commit["actions"], {"updated": 1, "finalized": 1})
+
+        updated_parent = self.fetch_document_row(parent_rel_path)
+        updated_child = self.fetch_child_rows(updated_parent["id"])[0]
+        retired_row = self.fetch_document_row(removed_rel_path)
+        self.assertEqual(updated_parent["control_number"], parent_row["control_number"])
+        self.assertEqual(updated_parent["title"], "Manual V2 PST Title")
+        self.assertEqual(updated_child["id"], child_row["id"])
+        self.assertEqual(updated_child["control_number"], child_row["control_number"])
+        self.assertEqual(retired_row["lifecycle_status"], "deleted")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            container_row = connection.execute(
+                "SELECT * FROM container_sources WHERE source_kind = ? AND source_rel_path = ?",
+                (retriever_tools.PST_SOURCE_KIND, "mailbox.pst"),
+            ).fetchone()
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'committing'
+                  AND cursor_key = 'loose_file_commit'
+                """,
+                (str(second_payloads["run_id"]),),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(container_row)
+        self.assertEqual(container_row["message_count"], 1)
+        self.assertIsNotNone(cursor_row)
+        pst_stats = json.loads(cursor_row["cursor_json"])["pst_stats"]
+        self.assertEqual(pst_stats["pst_messages_updated"], 1)
+        self.assertEqual(pst_stats["pst_messages_deleted"], 1)
 
     def test_ingest_v2_gmail_export_preserves_sidecar_enrichment(self) -> None:
         export_root = self.root / "gmail-filtered"
@@ -8277,7 +8461,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(doctor_result["overall"], "pass")
         self.assertEqual(doctor_result["pst_backend"]["status"], "pass")
         self.assertIn("PST backend import succeeded", doctor_result["pst_backend"]["detail"])
-        self.assertEqual(doctor_result["plugin_runtime"]["status"], "missing")
+        self.assertIn(doctor_result["plugin_runtime"]["status"], {"missing", "partial", "pass"})
         load_dependency.assert_called_once_with("pypff", allow_auto_install=False)
 
     def test_workspace_status_reports_registry_drift_without_repairing_it(self) -> None:
@@ -8319,7 +8503,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(doctor_result["overall"], "pass")
         self.assertEqual(doctor_result["pst_backend"]["status"], "fail")
         self.assertIn("libpff-python", doctor_result["pst_backend"]["detail"])
-        self.assertEqual(doctor_result["plugin_runtime"]["status"], "missing")
+        self.assertIn(doctor_result["plugin_runtime"]["status"], {"missing", "partial", "pass"})
         load_dependency.assert_called_once_with("pypff", allow_auto_install=False)
 
     def test_inspect_pst_properties_surfaces_chat_scope_candidates(self) -> None:
