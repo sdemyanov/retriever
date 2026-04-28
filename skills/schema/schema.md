@@ -1,11 +1,13 @@
-# Schema v12
+# Schema v25
 
 ## Versioning
 
-- schema version: `12`
+- schema version: `25`
 - database file: `.retriever/retriever.db`
 - timestamps: UTC ISO 8601 with `Z`
 - booleans: `0` or `1`
+
+This file is a schema orientation guide. The authoritative current DDL and migrations live in `skills/tool-template/src/10_core.py`, `skills/tool-template/src/40_schema_runtime.py`, and the generated `skills/tool-template/tools.py`.
 
 ## SQLite pragmas
 
@@ -564,15 +566,15 @@ CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id
 
 ## JSON contracts
 
-### `doctor`
+### `workspace status`
 
 Expected JSON shape:
 
 ```json
 {
   "overall": "pass",
-  "tool_version": "0.9.4",
-  "schema_version": 12,
+  "tool_version": "1.1.11",
+  "schema_version": 25,
   "python_version": "3.10.12",
   "pip_version": "25.3",
   "sqlite_version": "3.37.2",
@@ -602,7 +604,7 @@ Expected JSON shape:
 }
 ```
 
-### `bootstrap`
+### `workspace init`
 
 Expected JSON shape:
 
@@ -610,9 +612,9 @@ Expected JSON shape:
 {
   "status": "initialized",
   "workspace_root": "/path/to/workspace",
-  "schema_version": 12,
-  "tool_version": "0.9.4",
-  "requirements_version": "2026-04-16-phase4-pst",
+  "schema_version": 25,
+  "tool_version": "1.1.11",
+  "requirements_version": "2026-04-21-phase11-document-deduplication",
   "journal_mode": "wal"
 }
 ```

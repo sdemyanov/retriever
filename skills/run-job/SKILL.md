@@ -8,7 +8,7 @@ description: >
   between inline execution and spawning a subagent, and drives the
   claim / complete / heartbeat loop against the processing DB.
 metadata:
-  version: "0.9.5"
+  version: "1.1.11"
 ---
 
 > Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
@@ -220,7 +220,7 @@ If `prepare-run-batch` returns `next_action = handoff`, stop this worker with `f
 In inline mode:
 
 - stay in the current conversation
-- process one prepared batch at a time
-- if the run remains active after one batch, continue by calling `prepare-run-batch` again
+- process one `run-job-step` batch at a time
+- if the run remains active after one batch, continue with `next_recommended_commands`
 - if the run is large enough to become noisy, switch to background mode on the next batch boundary
 - if you intentionally stop at a batch boundary, call `finish-run-worker --worker-status stopped`

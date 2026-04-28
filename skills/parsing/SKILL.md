@@ -5,7 +5,7 @@ description: >
   supported document types. It defines file-type support, encoding behavior,
   preview artifact rules, and per-file failure isolation.
 metadata:
-  version: "0.9.5"
+  version: "1.1.11"
 ---
 
 > Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.

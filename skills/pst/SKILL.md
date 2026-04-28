@@ -5,7 +5,7 @@ description: >
   It covers the first-class libpff-python / pypff-backed PST container pipeline, where one PST source expands into
   message documents plus attachment children.
 metadata:
-  version: "0.9.4"
+  version: "1.1.11"
 ---
 
 > Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
@@ -29,7 +29,8 @@ Use this skill when the user says things like:
 - Confirm or infer the workspace root.
 - Run `workspace status` and inspect `pst_backend` before attempting PST ingest.
 - If `pst_backend.status` is not `pass`, stop and explain that the required `libpff-python` / `pypff` PST backend is unavailable for PST ingest in the current runtime.
-- Use regular `ingest` for PST sources, not `ingest-production`.
+- Use regular bounded `ingest` for PST sources, not `ingest-production`.
+- For Cowork calls, run one bounded ingest command at a time with `--budget-seconds 35` and continue from `next_recommended_commands` while `more_work_remaining: true`.
 - Treat a `.pst` file as a container source that expands into one logical parent document per message, with one level of attachment child documents.
 - When a PST source is unchanged, expect Retriever to skip reparsing the source and just refresh seen timestamps.
 - When a PST source changes, expect Retriever to update matching messages in place, preserve stable control numbers, and retire removed messages.

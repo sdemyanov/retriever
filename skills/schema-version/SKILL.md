@@ -4,7 +4,7 @@ description: >
   Use this skill when the user wants to know the current Retriever tool or schema version
   for a workspace, or explicitly asks to run schema-version.
 metadata:
-  version: "0.9.4"
+  version: "1.1.11"
 ---
 
 # Retriever Schema Version

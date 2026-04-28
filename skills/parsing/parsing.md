@@ -1,6 +1,6 @@
 # Parsing Contract
 
-## Supported MVP file types
+## Supported file types
 
 - `pdf`: parse text and metadata with `pdfplumber`
 - `docx`: parse paragraphs and core properties with `python-docx`
@@ -8,6 +8,7 @@
 - `eml`: parse headers and body with stdlib `email`, generate HTML preview, and extract one level of attachment payloads as child documents
 - `msg`: parse with `extract-msg`, generate HTML preview, and extract one level of attachment payloads as child documents
 - `pst`: regular `ingest` treats PST as a container source and emits one logical message document per PST message, with HTML preview and one level of attachment child documents
+- `mbox`: regular `ingest` treats MBOX as a container source and emits one logical message document per message, with attachment handling where available
 - `png`, `jpg`, `jpeg`, `gif`, `bmp`, `webp`, `tif`, `tiff`: keep as native preview-only documents with no OCR or text extraction
 - `rtf`: extract text with `striprtf` and generate a simple HTML preview
 - `xls`: read sheets with `xlrd`, generate one CSV preview per sheet
@@ -94,12 +95,12 @@
 - Processed productions are ingested through the production pipeline.
 - Plain `ingest` without `--file-types` should detect likely production roots and auto-route them through production ingest.
 - Plain `ingest` with `--file-types` should still detect likely production roots but skip them with a warning instead of triggering full production ingest.
-- Phase 4 targets Concordance-style `DAT` + `OPT` with `TEXT/`, `IMAGES/`, and optional `NATIVES/`.
+- Current production ingest targets Concordance-style `DAT` + `OPT` with `TEXT/`, `IMAGES/`, and optional `NATIVES/`.
 - Retriever creates one logical document row per load-file row, not one row per page image or text file.
 - Produced `Begin Bates` becomes the document `control_number`.
 - `Begin Attachment` / `End Attachment` spans may create parent/child family links through `parent_document_id`.
 - Searchable text comes from linked production text when present.
-- Phase 4 does not OCR production page images; image-only production documents are valid logical docs with empty text and page-image-driven preview.
+- Production ingest does not OCR production page images by default; image-only production documents are valid logical docs with empty text and page-image-driven preview.
 - Linked `TEXT/`, `IMAGES/`, and `NATIVES/` files remain source parts, not top-level scanned workspace documents.
 
 ## PowerPoint behavior
@@ -119,7 +120,7 @@
 - Record a structured failure entry with `rel_path` and the exception summary.
 - Continue scanning the remaining files.
 
-## Deferred from MVP
+## Deferred
 
 - OCR for scanned PDFs
 - OCR / text extraction for supported image files
@@ -127,5 +128,4 @@
 - PowerPoint chart rendering or media extraction
 - archive inspection for `.zip` and similar containers
 - OCR for production page images
-- MBOX support
 - custom-field full-text indexing

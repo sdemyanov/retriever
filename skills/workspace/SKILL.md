@@ -3,9 +3,10 @@ name: workspace
 description: >
   Use this skill when initializing, checking, or refreshing a Retriever workspace.
   It defines the .retriever directory layout, bootstrap flow, runtime refresh rules,
-  the pinned dependency contract for the current runtime, and the current non-resumable MVP runtime scope.
+  the pinned dependency contract for the current runtime, and the current workspace
+  maintenance command surface.
 metadata:
-  version: "0.9.4"
+  version: "1.1.11"
 ---
 
 # Retriever Workspace
@@ -25,6 +26,7 @@ Use this skill for any task that needs to bootstrap or maintain a workspace-loca
 - All persistent Retriever state lives under `.retriever/` inside that root.
 - Database paths stored in SQLite must be relative, never absolute.
 - Treat `skills/tool-template/tools.py` as the canonical command entrypoint.
+- Use `workspace status`, `workspace init`, and `workspace update`; old direct `doctor`, `bootstrap`, and `upgrade-workspace` command names are implementation/history details, not the user-facing surface.
 - The tool's own dispatcher refreshes runtime metadata for stale workspaces before running any non-exempt command; see [workspace.md](workspace.md) for the full contract.
 - Treat `runtime.json` as the local state record for the canonical tool version, schema version, and checksum.
 - Treat canonical template checksum drift as an upgrade signal even if the plugin version string is unchanged.
@@ -33,16 +35,16 @@ Use this skill for any task that needs to bootstrap or maintain a workspace-loca
 
 ## Current outcome
 
-With the current Phase 2 tool surface, Claude should be able to:
+With the current `1.1.11` / schema `25` tool surface, Claude should be able to:
 
-- verify the runtime with `doctor`
+- verify the runtime with `workspace status`
 - create the `.retriever/` directory structure
 - use the canonical `tools.py` bundle directly
-- initialize schema v9
+- initialize or migrate schema `25`
 - write a stable `runtime.json`
-- ingest supported documents into `.retriever/retriever.db`
+- ingest supported documents through the bounded V2 `ingest` facade
 - verify the required PST backend is present before calling the runtime ready
-- populate built-in `participants` for email and chat-like documents during ingest
+- populate built-in metadata for email, chat-like, PST, MBOX, Slack, and production documents during ingest
 - ingest supported PST container sources through the same regular `ingest` surface
 - materialize one-level EML/MSG attachment families with stable `control_number` values during ingest
 - search indexed documents with structured filters

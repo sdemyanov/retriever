@@ -18,7 +18,9 @@ Create this structure under the selected workspace root:
 .retriever/
 ├── retriever.db
 ├── previews/
+├── text-revisions/
 ├── jobs/
+├── locks/
 ├── logs/
 └── runtime.json
 ```
@@ -27,7 +29,9 @@ Create this structure under the selected workspace root:
 
 - `retriever.db`: primary SQLite database
 - `previews/`: generated preview artifacts for unsupported native formats
-- `jobs/`: reserved workspace state for future bounded or background workflows
+- `text-revisions/`: derived OCR, translation, and image-description text revisions
+- `jobs/`: planned processing-run state and related artifacts
+- `locks/`: local process coordination for bounded ingest and rebuild workflows
 - `logs/`: structured logs and diagnostics
 - `runtime.json`: local installation metadata
 
@@ -36,18 +40,18 @@ Create this structure under the selected workspace root:
 Follow this order:
 
 1. Confirm the workspace root.
-2. Run the runtime check.
+2. Run `python3 skills/tool-template/tools.py workspace status --quick <workspace>`.
 3. Create the `.retriever/` directory tree.
 4. Install pinned dependencies from [requirements.lock.md](requirements.lock.md), including the required PST backend.
 5. Resolve the canonical [../tool-template/tools.py](../tool-template/tools.py) bundle that will manage the workspace.
-6. Run the tool's `bootstrap` command to create or upgrade schema v9.
+6. Run `python3 skills/tool-template/tools.py workspace init <workspace>` to create or upgrade schema `25`.
 7. Write `runtime.json`.
 
 ## Subsequent sessions
 
 On every later session:
 
-1. Run a quick runtime check.
+1. Run `workspace status --quick`.
 2. Inspect `.retriever/runtime.json` if present.
 3. Confirm the canonical tool exists at `skills/tool-template/tools.py`.
 4. Compare the current canonical tool checksum to the stored checksum in `runtime.json.template_sha256`.
@@ -60,7 +64,7 @@ Retriever now runs the canonical [../tool-template/tools.py](../tool-template/to
 
 A reinstall with a changed canonical template is still an upgrade, even if the plugin version string stayed the same.
 
-Before executing any command other than `schema-version`, `bootstrap`, `doctor`, `upgrade-workspace`, or `slash`, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper. That helper no longer replaces files inside the workspace. It only refreshes `runtime.json` / `workspace_meta` when:
+Before executing any command other than `schema-version` or the grouped `workspace` maintenance surface, the tool calls its internal `maybe_upgrade_workspace_tool(root)` helper. That helper does not replace files inside the workspace. It only refreshes `runtime.json` / `workspace_meta` when:
 
 - `.retriever/` exists
 - `runtime.json` exists
@@ -69,7 +73,7 @@ Before executing any command other than `schema-version`, `bootstrap`, `doctor`,
 
 ### Explicit runtime refresh command
 
-`tools.py upgrade-workspace <workspace> [--from <path>] [--force]`
+`tools.py workspace update <workspace> [--from <path>] [--force]`
 
 - default is to auto-discover the canonical tool
 - `--force` is accepted for backward compatibility but ignored
@@ -80,9 +84,9 @@ Write a JSON object with these fields:
 
 ```json
 {
-  "tool_version": "0.9.4",
-  "schema_version": 9,
-  "requirements_version": "2026-04-16-phase4-pst",
+  "tool_version": "1.1.11",
+  "schema_version": 25,
+  "requirements_version": "2026-04-21-phase11-document-deduplication",
   "template_source": "skills/tool-template/tools.py",
   "template_sha256": "<sha256 of canonical tools.py bundle>",
   "python_version": "3.10.12",
@@ -96,9 +100,9 @@ Notes:
 - `template_sha256` should reflect the canonical `tools.py` bundle used most recently for the workspace
 - timestamps must be UTC ISO 8601 with `Z`
 - `schema_version` tracks the actual database schema, not the plugin version
-- a successful workspace bootstrap implies the pinned PST backend imports cleanly; `doctor` should fail until `pst_backend.status` is `pass`
+- `workspace status` reports parser/runtime readiness, including `pst_backend.status`
 - for future schema changes with real migration vs. reindex tradeoffs, stop and ask the user before assuming migration is preferred
-- schema v7 renames `display_id` to `control_number`, renames the related helper columns and batch table, and keeps one-level email attachment families; existing workspaces should reindex parent emails to populate child attachment rows and preserve family numbering
+- existing workspaces should reindex parent/container sources when a new parser or metadata field needs backfill
 
 ## Failure behavior
 
@@ -124,5 +128,5 @@ If bootstrap cannot complete:
 
 ## Current scope note
 
-- Phase 1 and Phase 2 do not require resumable background review jobs.
-- If review work is present before that later phase, treat it as bounded or synchronous work rather than as a checkpointed job system.
+- Ingest and entity rebuild have bounded/resumable workflows. Prefer the facade commands (`ingest`, `rebuild-entities-run-step`) over long one-shot commands.
+- Planned processing runs should use `run-job-step` for Cowork-safe execution; `execute-run` is legacy/debug only.

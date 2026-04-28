@@ -2,9 +2,9 @@
 
 ## Lock metadata
 
-- lock version: `2026-04-16-phase4-pst`
+- lock version: `2026-04-21-phase11-document-deduplication`
 - Python target: `>=3.10`
-- scope: direct runtime dependencies for the current Phase 4 runtime
+- scope: direct parser/runtime dependencies for the current Retriever runtime
 
 ## Install command
 

@@ -5,7 +5,7 @@ description: >
   It is the source of truth for table layouts, path rules, custom field registry
   behavior, manual field locks, and schema-version behavior.
 metadata:
-  version: "0.9.4"
+  version: "1.1.11"
 ---
 
 > Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
@@ -23,9 +23,11 @@ Use this skill whenever a task touches:
 - manual-value overwrite protection rules
 - structured filter validation rules
 
-## Required reference
+## Required references
 
-Read [schema.md](schema.md) before making schema decisions.
+1. Treat [../tool-template/src/10_core.py](../tool-template/src/10_core.py), [../tool-template/src/40_schema_runtime.py](../tool-template/src/40_schema_runtime.py), and the generated [../tool-template/tools.py](../tool-template/tools.py) as the current source of truth.
+2. Use `python3 skills/tool-template/tools.py schema-version` to confirm the current `schema_version` and `tool_version`.
+3. Read [schema.md](schema.md) for background terminology only; if it conflicts with the source fragments or `schema-version`, the code wins.
 
 ## Rules
 

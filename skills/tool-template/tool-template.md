@@ -11,70 +11,17 @@
 
 ## Current command surface
 
-The current template implements:
+Use `python3 skills/tool-template/tools.py --help` as the authoritative command list. The current high-level surfaces are:
 
-- `doctor`
-- `bootstrap`
-- `schema-version`
-- `ingest`
-- `ingest-start`
-- `ingest-status`
-- `ingest-cancel`
-- `ingest-plan-step`
-- `ingest-prepare-step`
-- `ingest-commit-step`
-- `ingest-finalize-step`
-- `ingest-production`
-- `inspect-pst-properties`
-- `search`
-- `search-docs`
-- `catalog`
-- `export-csv`
-- `export-previews`
-- `export-archive`
-- `get-doc`
-- `list-chunks`
-- `search-chunks`
-- `aggregate`
-- `add-field`
-- `promote-field-type`
-- `set-field`
-- `merge-into-conversation`
-- `split-from-conversation`
-- `clear-conversation-assignment`
-- `refresh-previews`
-- `refresh-conversation-previews`
-- `rebuild-conversations`
-- `upgrade-workspace`
-- `list-datasets`
-- `create-dataset`
-- `add-to-dataset`
-- `remove-from-dataset`
-- `delete-dataset`
-- `list-jobs`
-- `create-job`
-- `add-job-output`
-- `list-job-versions`
-- `create-job-version`
-- `list-runs`
-- `get-run`
-- `create-run`
-- `run-status`
-- `run-job-step`
-- `cancel-run`
-- `claim-run-items`
-- `prepare-run-batch`
-- `get-run-item-context`
-- `heartbeat-run-items`
-- `complete-run-item`
-- `fail-run-item`
-- `list-results`
-- `execute-run`
-- `publish-run-results`
-- `list-text-revisions`
-- `activate-text-revision`
-
-Stats and review commands remain later-phase work.
+- workspace maintenance: `workspace init`, `workspace status`, `workspace update`, `schema-version`
+- bounded ingest: `ingest`, `ingest-status`, `ingest-run-step`, `ingest-cancel`, plus lower-level `ingest-*` step commands
+- production/PST diagnostics: `ingest-production`, `inspect-pst-properties`
+- browse/search/export: `slash`, `search`, `search-docs`, `search-chunks`, `get-doc`, `list-chunks`, `catalog`, `aggregate`, `export-csv`, `export-archive`, `export-previews`
+- datasets and fields: `list-datasets`, `create-dataset`, `add-to-dataset`, `remove-from-dataset`, `delete-dataset`, `list-fields`, `add-field`, `rename-field`, `delete-field`, `describe-field`, `change-field-type`, `fill-field`
+- conversations and previews: `merge-into-conversation`, `split-from-conversation`, `clear-conversation-assignment`, `refresh-previews`, `refresh-conversation-previews`, `rebuild-conversations`
+- entities: `entities`, `rebuild-entities-*`, `list-entities`, `show-entity`, `create-entity`, `edit-entity`, `similar-entities`, `merge-entities`, `block-entity-merge`, `ignore-entity`, `split-entity`, `assign-entity`, `unassign-entity`
+- jobs and runs: `list-jobs`, `create-job`, `add-job-output`, `list-job-versions`, `create-job-version`, `list-runs`, `get-run`, `create-run`, `run-status`, `run-job-step`, `cancel-run`, `publish-run-results`, `list-results`, `list-text-revisions`, `activate-text-revision`
+- low-level worker protocol: `claim-run-items`, `prepare-run-batch`, `get-run-item-context`, `heartbeat-run-items`, `finish-run-worker`, `complete-run-item`, `fail-run-item`
 
 For Cowork-agent execution, prefer the bounded run step:
 
@@ -108,7 +55,7 @@ For low-level worker protocol work, use:
 
 ## Runtime refresh dispatch
 
-The tool's `main()` calls `maybe_upgrade_workspace_tool(root)` before any command outside the exempt set `{schema-version, bootstrap, doctor, upgrade-workspace, slash}`. In the current design that helper only refreshes workspace runtime metadata when the canonical bundle checksum has changed; it does not replace files inside `.retriever/` and it does not re-exec the process.
+The tool's `main()` calls `maybe_upgrade_workspace_tool(root)` before commands outside the exempt set `{schema-version, workspace}`. In the current design that helper only refreshes workspace runtime metadata when the canonical bundle checksum has changed; it does not replace files inside `.retriever/` and it does not re-exec the process.
 
 The canonical plugin template is discovered via:
 
@@ -116,7 +63,7 @@ The canonical plugin template is discovered via:
 2. Prefer a sibling `tools.py` when running from `skills/tool-template/`
 3. Parent-walk from the currently running file looking for `skills/tool-template/tools.py`
 
-`upgrade-workspace <workspace> [--from <path>] [--force]` is the explicit equivalent of the runtime metadata refresh path. `--force` is accepted for compatibility but no longer changes behavior.
+`workspace update <workspace> [--from <path>] [--force]` is the explicit equivalent of the runtime metadata refresh path. `--force` is accepted for compatibility but no longer changes behavior.
 
 ## Implementation note
 

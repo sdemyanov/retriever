@@ -5,7 +5,7 @@ description: >
   It defines the pinned generated tools.py bundle, checksum expectations, and
   the current command surface.
 metadata:
-  version: "0.9.5"
+  version: "1.1.11"
 ---
 
 # Retriever Tool Template
@@ -25,8 +25,9 @@ Use this skill when a task needs the exact canonical tool bundle.
 - Treat `src/` as the authored source of truth and `tools.py` as the generated bundle.
 - Keep the repo-local source fragments and generated bundled `tools.py` in sync.
 - Keep `TOOL_VERSION`, schema version, and documented checksum aligned.
+- Use `python3 skills/tool-template/tools.py --help` and subcommand `--help` output as the authoritative command surface before updating routing or skill docs.
 - Treat the documented SHA256 checksum as the authoritative upgrade signal for the canonical tool source.
-- If the canonical checksum changes, refresh `runtime.json` and run `bootstrap` before any ingest, even if the version string is unchanged.
+- If the canonical checksum changes, refresh runtime metadata with `workspace update` or `workspace init` before ingest, even if the version string is unchanged.
 - Bump version metadata when releasing schema or tool changes, but do not rely on version alone to trigger workspace upgrades.
 - If the source changes, update `tool-template.md` and the workspace skill references too.
 - When multiple Retriever tool calls are already independent, emit them in one assistant turn rather than serializing them across turns.

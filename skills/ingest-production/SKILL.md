@@ -5,7 +5,7 @@ description: >
   eDiscovery production such as a DAT/OPT/TEXT/IMAGES set, a Bates-numbered volume,
   or explicitly asks to run ingest-production.
 metadata:
-  version: "0.9.4"
+  version: "1.1.11"
 ---
 
 > Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.
@@ -30,10 +30,13 @@ Use this skill when the user says things like:
 
 - Confirm or infer both the workspace root and the candidate production root.
 - Run `workspace status --quick` if runtime state is unclear.
-- Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, and user-modified tool protection without changing the intended `ingest-production` command.
+- Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, and user-modified tool protection without changing the chosen production-ingest intent.
 - Validate that the target looks like a supported processed production root, not just a loose folder of files.
-- Run `ingest-production` against the production root, not plain `ingest`.
-- Do not fall back to plain loose-file ingest unless the user explicitly wants that behavior.
+- For normal Cowork execution, prefer the bounded plain ingest facade and pass the production root as a scoped path:
+  `python3 skills/tool-template/tools.py ingest <workspace> --recursive --path <production-root-relative-path> --budget-seconds 35`
+- Continue with `next_recommended_commands` while `more_work_remaining: true`; stop only on `completed`, `failed`, or `canceled`.
+- Run `ingest-production` only when the user explicitly asks for that command, when running outside the Cowork time limit, or when debugging production-only parity.
+- Do not fall back to loose-file-only ingest. Plain `ingest` without `--file-types` should detect and route the production through the production pipeline.
 - Summarize created, updated, unchanged, and retired logical documents.
 - Call out family reconstruction, linked page images, docs missing linked text, docs missing linked images, and docs missing linked natives.
 - Note that produced Bates values become `control_number` and that linked `TEXT/`, `IMAGES/`, and `NATIVES/` files remain source parts rather than top-level documents.
