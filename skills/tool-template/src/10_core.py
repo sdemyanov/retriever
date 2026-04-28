@@ -2168,7 +2168,9 @@ def infer_source_custodian(
         return inherited
     normalized_source_kind = normalize_whitespace(str(source_kind or "")).lower()
     normalized_source_rel_path = normalize_whitespace(str(source_rel_path or ""))
-    if normalized_source_kind in {PST_SOURCE_KIND, MBOX_SOURCE_KIND} and normalized_source_rel_path:
+    if normalized_source_kind == MBOX_SOURCE_KIND and normalized_source_rel_path:
+        return mbox_custodian_email_from_source_rel_path(normalized_source_rel_path)
+    if normalized_source_kind == PST_SOURCE_KIND and normalized_source_rel_path:
         basename = normalize_whitespace(Path(normalized_source_rel_path).stem)
         if not basename:
             return None
@@ -2180,6 +2182,59 @@ def infer_source_custodian(
             return basename_email
         stripped = normalize_whitespace(strip_entity_container_words(basename))
         return stripped or None
+    return None
+
+
+GOOGLE_VAULT_MBOX_BASENAME_PATTERN = re.compile(
+    r"^(?P<label>.+?)--(?P<email>[^-]+@[^-]+\.[^-]+)-(?P<random>[A-Za-z0-9_-]{4,})$"
+)
+
+GOOGLE_TAKEOUT_MBOX_BASENAMES = {
+    "all mail",
+    "all mail including spam and trash",
+    "archive",
+    "chats",
+    "drafts",
+    "important",
+    "inbox",
+    "sent",
+    "spam",
+    "starred",
+    "trash",
+}
+
+
+def parse_google_vault_mbox_basename(basename: object) -> dict[str, str] | None:
+    normalized = normalize_whitespace(str(basename or ""))
+    if not normalized:
+        return None
+    match = GOOGLE_VAULT_MBOX_BASENAME_PATTERN.match(normalized)
+    if match is None:
+        return None
+    email = normalize_entity_email(match.group("email"))
+    if not email:
+        return None
+    return {
+        "label": normalize_whitespace(match.group("label")),
+        "email": email,
+        "random": match.group("random"),
+    }
+
+
+def is_google_takeout_mbox_basename(basename: object) -> bool:
+    normalized = normalize_entity_lookup_text(basename)
+    return normalized in GOOGLE_TAKEOUT_MBOX_BASENAMES
+
+
+def mbox_custodian_email_from_source_rel_path(source_rel_path: object) -> str | None:
+    basename = normalize_whitespace(Path(normalize_whitespace(str(source_rel_path or ""))).stem)
+    if not basename:
+        return None
+    vault_parts = parse_google_vault_mbox_basename(basename)
+    if vault_parts is not None:
+        return vault_parts["email"]
+    if is_google_takeout_mbox_basename(basename):
+        return None
     return None
 
 
@@ -3603,6 +3658,26 @@ def parse_entity_name(value: object) -> dict[str, object] | None:
     }
 
 
+def entity_name_identifier_looks_like_export_artifact(raw_value: object) -> bool:
+    display_value = normalize_entity_text(raw_value)
+    normalized = normalize_entity_lookup_text(display_value)
+    if not normalized:
+        return False
+    compact = re.sub(r"\s+", "", normalized)
+    if compact.startswith("-"):
+        return True
+    letters = re.sub(r"[^a-z]", "", compact.lower())
+    if letters and not re.search(r"[aeiou]", letters):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9_-]{4,8}", display_value):
+        has_upper = bool(re.search(r"[A-Z]", display_value))
+        has_lower = bool(re.search(r"[a-z]", display_value))
+        has_digit_or_separator = bool(re.search(r"[0-9_-]", display_value))
+        if has_upper and has_lower and has_digit_or_separator:
+            return True
+    return False
+
+
 def entity_type_from_candidate_parts(
     *,
     name_value: str | None,
@@ -3759,6 +3834,8 @@ def parse_entity_candidate_text(
             }
         )
     parsed_name = parse_entity_name(name_source)
+    if parsed_name is not None and entity_name_identifier_looks_like_export_artifact(parsed_name["display_value"]):
+        parsed_name = None
     if parsed_name is not None:
         identifiers.append(
             {

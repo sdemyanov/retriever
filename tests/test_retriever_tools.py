@@ -1363,6 +1363,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             mailbox_types["allcompany@maxusivanovgmail.onmicrosoft.com"],
             retriever_tools.ENTITY_TYPE_SHARED_MAILBOX,
         )
+        self.assertEqual(retriever_tools.parse_entity_candidates("-Dj_YIq", role="custodian"), [])
+        self.assertEqual(retriever_tools.parse_entity_candidates("Ab12Cd", role="custodian"), [])
 
     def test_source_custodian_inference_handles_archive_basename_clues(self) -> None:
         self.assertEqual(
@@ -1372,12 +1374,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ),
             "sergey@example.com",
         )
-        self.assertEqual(
+        self.assertIsNone(
             retriever_tools.infer_source_custodian(
                 source_kind=retriever_tools.MBOX_SOURCE_KIND,
                 source_rel_path="exports/Jane Doe Mailbox.mbox",
-            ),
-            "Jane Doe",
+            )
         )
         self.assertEqual(
             retriever_tools.infer_source_custodian(
@@ -1401,9 +1402,21 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(
             retriever_tools.infer_source_custodian(
                 source_kind=retriever_tools.MBOX_SOURCE_KIND,
-                source_rel_path="mailbox.mbox",
+                source_rel_path="Max_Gmail_22-23--max@discoverbeagle.com-Dj_YIq.mbox",
             ),
-            "mailbox",
+            "max@discoverbeagle.com",
+        )
+        self.assertIsNone(
+            retriever_tools.infer_source_custodian(
+                source_kind=retriever_tools.MBOX_SOURCE_KIND,
+                source_rel_path="All mail Including Spam and Trash.mbox",
+            )
+        )
+        self.assertIsNone(
+            retriever_tools.infer_source_custodian(
+                source_kind=retriever_tools.MBOX_SOURCE_KIND,
+                source_rel_path="mailbox.mbox",
+            )
         )
 
     def test_ingest_syncs_author_entities_by_email_resolution_key(self) -> None:
@@ -2069,6 +2082,199 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(source_search_payload)
         self.assertEqual(source_search_payload["total_hits"], 0)
+
+    def test_purge_vault_filename_custodians_moves_links_to_real_entity(self) -> None:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            retriever_tools.apply_schema(connection, self.root)
+            now = retriever_tools.utc_now()
+            connection.execute(
+                """
+                INSERT INTO entities (
+                  entity_type, display_name, display_name_source, entity_origin,
+                  canonical_status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    retriever_tools.ENTITY_TYPE_PERSON,
+                    "Maksim Ivanov",
+                    retriever_tools.ENTITY_DISPLAY_SOURCE_MANUAL,
+                    retriever_tools.ENTITY_ORIGIN_MANUAL,
+                    retriever_tools.ENTITY_STATUS_ACTIVE,
+                    now,
+                    now,
+                ),
+            )
+            real_entity_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+            retriever_tools.ensure_entity_identifier(
+                connection,
+                entity_id=real_entity_id,
+                identifier={
+                    "identifier_type": "email",
+                    "display_value": "max@discoverbeagle.com",
+                    "normalized_value": "max@discoverbeagle.com",
+                    "is_verified": 1,
+                },
+            )
+            retriever_tools.recompute_entity_caches(connection, real_entity_id)
+
+            connection.execute(
+                """
+                INSERT INTO entities (
+                  entity_type, display_name, display_name_source, entity_origin,
+                  canonical_status, created_at, updated_at
+                ) VALUES (?, NULL, ?, ?, ?, ?, ?)
+                """,
+                (
+                    retriever_tools.ENTITY_TYPE_PERSON,
+                    retriever_tools.ENTITY_DISPLAY_SOURCE_AUTO,
+                    retriever_tools.ENTITY_ORIGIN_OBSERVED,
+                    retriever_tools.ENTITY_STATUS_ACTIVE,
+                    now,
+                    now,
+                ),
+            )
+            fake_entity_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+            retriever_tools.ensure_entity_identifier(
+                connection,
+                entity_id=fake_entity_id,
+                identifier={
+                    "identifier_type": "email",
+                    "display_value": "max_gmail_22-23--max@discoverbeagle.com",
+                    "normalized_value": "max_gmail_22-23--max@discoverbeagle.com",
+                    "is_verified": 1,
+                },
+            )
+            retriever_tools.ensure_entity_identifier(
+                connection,
+                entity_id=fake_entity_id,
+                identifier={
+                    "identifier_type": "name",
+                    "display_value": "-Dj_YIq",
+                    "normalized_value": "-dj_yiq",
+                },
+            )
+            retriever_tools.recompute_entity_caches(connection, fake_entity_id)
+
+            connection.execute(
+                """
+                INSERT INTO documents (
+                  rel_path, file_name, canonical_kind, canonical_status,
+                  ingested_at, last_seen_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("messages/1.eml", "1.eml", "email", retriever_tools.CANONICAL_STATUS_ACTIVE, now, now, now),
+            )
+            document_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+            raw_custodian = "Max_Gmail_22-23--max@discoverbeagle.com-Dj_YIq"
+            connection.execute(
+                """
+                INSERT INTO document_occurrences (
+                  document_id, source_kind, source_rel_path, source_item_id,
+                  rel_path, file_name, custodian, text_status, lifecycle_status,
+                  has_preview, ingested_at, last_seen_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    retriever_tools.MBOX_SOURCE_KIND,
+                    "Max_Gmail_22-23--max@discoverbeagle.com-Dj_YIq.mbox",
+                    "message-1",
+                    "messages/1.eml",
+                    "1.eml",
+                    raw_custodian,
+                    "ok",
+                    retriever_tools.ACTIVE_OCCURRENCE_STATUS,
+                    0,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            occurrence_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+            connection.execute(
+                """
+                INSERT INTO document_entities (
+                  document_id, entity_id, role, ordinal, assignment_mode,
+                  evidence_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    fake_entity_id,
+                    "custodian",
+                    0,
+                    "auto",
+                    json.dumps(
+                        {
+                            "raw_value": raw_custodian,
+                            "occurrence_id": occurrence_id,
+                            "normalized_candidate_key": "custodian|email:max_gmail_22-23--max@discoverbeagle.com|name:-dj_yiq",
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        exit_code, dry_run_payload, _, _ = self.run_cli(
+            "entities",
+            "purge-vault-filename-custodians",
+            str(self.root),
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(dry_run_payload)
+        assert dry_run_payload is not None
+        self.assertGreaterEqual(dry_run_payload["candidate_count"], 1)
+        self.assertTrue(any(candidate["target_entity_id"] == real_entity_id for candidate in dry_run_payload["candidates"]))
+
+        exit_code, apply_payload, _, _ = self.run_cli(
+            "purge-vault-filename-custodians",
+            str(self.root),
+            "--apply",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(apply_payload)
+        assert apply_payload is not None
+        self.assertGreaterEqual(apply_payload["applied_count"], 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            fake_row = connection.execute(
+                "SELECT canonical_status, merged_into_entity_id FROM entities WHERE id = ?",
+                (fake_entity_id,),
+            ).fetchone()
+            self.assertEqual(fake_row["canonical_status"], retriever_tools.ENTITY_STATUS_MERGED)
+            self.assertEqual(fake_row["merged_into_entity_id"], real_entity_id)
+            custodian_link = connection.execute(
+                "SELECT entity_id FROM document_entities WHERE document_id = ? AND role = 'custodian'",
+                (document_id,),
+            ).fetchone()
+            self.assertEqual(custodian_link["entity_id"], real_entity_id)
+            occurrence_row = connection.execute(
+                "SELECT custodian FROM document_occurrences WHERE id = ?",
+                (occurrence_id,),
+            ).fetchone()
+            self.assertEqual(occurrence_row["custodian"], "max@discoverbeagle.com")
+            polluted_active_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entities
+                    WHERE canonical_status = ?
+                      AND COALESCE(primary_email, '') LIKE '%--%@%'
+                    """,
+                    (retriever_tools.ENTITY_STATUS_ACTIVE,),
+                ).fetchone()[0]
+            )
+            self.assertEqual(polluted_active_count, 0)
+        finally:
+            connection.close()
 
     def test_ignore_entity_hides_links_but_preserves_raw_metadata_after_rebuild(self) -> None:
         self.write_email_message(
@@ -7435,7 +7641,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_row["source_item_id"], "<v2-mbox-msg-001@example.com>")
         self.assertEqual(parent_row["file_type"], "mbox")
         self.assertEqual(parent_row["content_type"], "Email")
-        self.assertEqual(parent_row["custodian"], "mailbox")
+        self.assertIsNone(parent_row["custodian"])
         self.assertEqual(sibling_row["dataset_id"], parent_row["dataset_id"])
         self.assertEqual(child_row["dataset_id"], parent_row["dataset_id"])
         self.assertEqual(dataset_row["source_kind"], retriever_tools.MBOX_SOURCE_KIND)
@@ -12406,7 +12612,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(dataset_list_exit, 0)
         self.assertEqual(dataset_list_stderr, "")
         self.assertIn(
-            f"| mailbox.mbox | 2 | {retriever_tools.format_dataset_size_summary(mailbox_dataset)} | mailbox |",
+            f"| mailbox.mbox | 2 | {retriever_tools.format_dataset_size_summary(mailbox_dataset)} | — |",
             dataset_list_stdout,
         )
         self.assertNotIn("(1/2 sized)", dataset_list_stdout)
@@ -14505,9 +14711,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_row["file_type"], "mbox")
         self.assertIsNone(parent_row["file_size"])
         self.assertEqual(parent_row["content_type"], "Email")
-        self.assertEqual(parent_row["custodian"], "mailbox")
-        self.assertEqual(sibling_row["custodian"], "mailbox")
-        self.assertEqual(child_row["custodian"], "mailbox")
+        self.assertIsNone(parent_row["custodian"])
+        self.assertIsNone(sibling_row["custodian"])
+        self.assertIsNone(child_row["custodian"])
         self.assertEqual(parent_row["dataset_id"], sibling_row["dataset_id"])
         self.assertEqual(parent_row["dataset_id"], child_row["dataset_id"])
         self.assertTrue(
@@ -14584,16 +14790,26 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachment_result = next(item for item in attachment_search["results"] if item["id"] == child_row["id"])
         self.assertEqual(attachment_result["parent"]["control_number"], parent_row["control_number"])
 
-    def test_ingest_mbox_applies_archive_basename_custodian_rules(self) -> None:
+    def test_ingest_mbox_applies_vault_and_takeout_custodian_rules(self) -> None:
         self.write_fake_mbox_file(
             [
                 self.build_fake_mbox_message(
-                    subject="Email basename custodian",
-                    body_text="Email basename custodian body",
-                    message_id="<mbox-custodian-email@example.com>",
+                    subject="Vault basename custodian",
+                    body_text="Vault basename custodian body",
+                    message_id="<mbox-custodian-vault@example.com>",
                 )
             ],
-            name="jane@example.com.mbox",
+            name="Max_Gmail_22-23--max@discoverbeagle.com-Dj_YIq.mbox",
+        )
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Takeout basename custodian",
+                    body_text="Takeout basename custodian body",
+                    message_id="<mbox-custodian-takeout@example.com>",
+                )
+            ],
+            name="All mail Including Spam and Trash.mbox",
         )
         self.write_fake_mbox_file(
             [
@@ -14601,16 +14817,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                     subject="Generic basename custodian",
                     body_text="Generic basename custodian body",
                     message_id="<mbox-custodian-generic@example.com>",
-                )
-            ],
-            name="noreply@example.com.mbox",
-        )
-        self.write_fake_mbox_file(
-            [
-                self.build_fake_mbox_message(
-                    subject="Name basename custodian",
-                    body_text="Name basename custodian body",
-                    message_id="<mbox-custodian-name@example.com>",
                 )
             ],
             name="Jane Doe Mailbox.mbox",
@@ -14622,25 +14828,25 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(ingest_result["failed"], 0)
         self.assertEqual(ingest_result["mbox_messages_created"], 3)
 
-        email_rel_path = retriever_tools.mbox_message_rel_path(
-            "jane@example.com.mbox",
-            "<mbox-custodian-email@example.com>",
+        vault_rel_path = retriever_tools.mbox_message_rel_path(
+            "Max_Gmail_22-23--max@discoverbeagle.com-Dj_YIq.mbox",
+            "<mbox-custodian-vault@example.com>",
+        )
+        takeout_rel_path = retriever_tools.mbox_message_rel_path(
+            "All mail Including Spam and Trash.mbox",
+            "<mbox-custodian-takeout@example.com>",
         )
         generic_rel_path = retriever_tools.mbox_message_rel_path(
-            "noreply@example.com.mbox",
+            "Jane Doe Mailbox.mbox",
             "<mbox-custodian-generic@example.com>",
         )
-        name_rel_path = retriever_tools.mbox_message_rel_path(
-            "Jane Doe Mailbox.mbox",
-            "<mbox-custodian-name@example.com>",
-        )
-        email_row = self.fetch_document_row(email_rel_path)
+        vault_row = self.fetch_document_row(vault_rel_path)
+        takeout_row = self.fetch_document_row(takeout_rel_path)
         generic_row = self.fetch_document_row(generic_rel_path)
-        name_row = self.fetch_document_row(name_rel_path)
 
-        self.assertEqual(email_row["custodian"], "jane@example.com")
+        self.assertEqual(vault_row["custodian"], "max@discoverbeagle.com")
+        self.assertIsNone(takeout_row["custodian"])
         self.assertIsNone(generic_row["custodian"])
-        self.assertEqual(name_row["custodian"], "Jane Doe")
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -14654,35 +14860,35 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                   AND d.id IN (?, ?, ?)
                 ORDER BY d.rel_path ASC
                 """,
-                (email_row["id"], generic_row["id"], name_row["id"]),
+                (vault_row["id"], takeout_row["id"], generic_row["id"]),
             ).fetchall()
-            name_resolution_key_count = connection.execute(
+            polluted_entity_count = connection.execute(
                 """
                 SELECT COUNT(*) AS row_count
-                FROM entity_resolution_keys
-                WHERE key_type = 'name' AND normalized_value = 'jane doe'
+                FROM entities
+                WHERE COALESCE(primary_email, '') LIKE '%--%@%'
+                """
+            ).fetchone()
+            artifact_name_count = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count
+                FROM entity_identifiers
+                WHERE identifier_type = 'name'
+                  AND normalized_value = '-dj_yiq'
                 """
             ).fetchone()
         finally:
             connection.close()
 
         custodian_entities_by_path = {row["rel_path"]: row for row in custodian_rows}
-        self.assertEqual(set(custodian_entities_by_path), {email_rel_path, name_rel_path})
+        self.assertEqual(set(custodian_entities_by_path), {vault_rel_path})
         self.assertEqual(
-            custodian_entities_by_path[email_rel_path]["entity_type"],
+            custodian_entities_by_path[vault_rel_path]["entity_type"],
             retriever_tools.ENTITY_TYPE_PERSON,
         )
-        self.assertEqual(custodian_entities_by_path[email_rel_path]["primary_email"], "jane@example.com")
-        self.assertEqual(
-            custodian_entities_by_path[name_rel_path]["entity_type"],
-            retriever_tools.ENTITY_TYPE_PERSON,
-        )
-        self.assertEqual(custodian_entities_by_path[name_rel_path]["display_name"], "Jane Doe")
-        self.assertEqual(
-            custodian_entities_by_path[name_rel_path]["entity_origin"],
-            retriever_tools.ENTITY_ORIGIN_OBSERVED,
-        )
-        self.assertEqual(int(name_resolution_key_count["row_count"] or 0), 0)
+        self.assertEqual(custodian_entities_by_path[vault_rel_path]["primary_email"], "max@discoverbeagle.com")
+        self.assertEqual(int(polluted_entity_count["row_count"] or 0), 0)
+        self.assertEqual(int(artifact_name_count["row_count"] or 0), 0)
 
     def test_ingest_mbox_fixture_file_is_searchable(self) -> None:
         fixture_source = REGRESSION_CORPUS_ROOT / "sample_utf8.mbox"

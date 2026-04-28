@@ -10612,6 +10612,548 @@ def rebuild_entities(
             connection.close()
 
 
+def extract_vault_filename_custodian_email_from_artifact(raw_value: object) -> str | None:
+    text = normalize_entity_text(raw_value)
+    marker_index = text.rfind("--")
+    if marker_index < 0:
+        return None
+    suffix = text[marker_index + 2 :]
+    dash_index = suffix.find("-")
+    candidate = suffix[:dash_index] if dash_index >= 0 else suffix
+    return normalize_entity_email(candidate)
+
+
+def active_entity_id_for_email_value(
+    connection: sqlite3.Connection,
+    email: str,
+    *,
+    exclude_entity_id: int | None = None,
+) -> int | None:
+    normalized_email = normalize_entity_email(email)
+    if normalized_email is None:
+        return None
+    resolution_owner = active_entity_id_for_resolution_key(
+        connection,
+        {
+            "identifier_type": "email",
+            "normalized_value": normalized_email,
+        },
+    )
+    if resolution_owner is not None and resolution_owner != exclude_entity_id:
+        return resolution_owner
+    row = connection.execute(
+        """
+        SELECT e.id
+        FROM entities e
+        LEFT JOIN entity_identifiers ei
+          ON ei.entity_id = e.id
+         AND ei.identifier_type = 'email'
+         AND ei.normalized_value = ?
+        WHERE e.canonical_status = ?
+          AND e.id != ?
+          AND (e.primary_email = ? OR ei.id IS NOT NULL)
+        ORDER BY CASE WHEN e.primary_email = ? THEN 0 ELSE 1 END, e.id ASC
+        LIMIT 1
+        """,
+        (
+            normalized_email,
+            ENTITY_STATUS_ACTIVE,
+            int(exclude_entity_id or 0),
+            normalized_email,
+            normalized_email,
+        ),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
+def vault_filename_custodian_evidence_for_entity(
+    connection: sqlite3.Connection,
+    entity_id: int,
+) -> dict[str, object]:
+    link_rows = connection.execute(
+        """
+        SELECT id, document_id, evidence_json
+        FROM document_entities
+        WHERE entity_id = ?
+          AND role = 'custodian'
+        ORDER BY id ASC
+        """,
+        (int(entity_id),),
+    ).fetchall()
+    document_ids: set[int] = set()
+    occurrence_ids: set[int] = set()
+    raw_values: set[str] = set()
+    for row in link_rows:
+        document_ids.add(int(row["document_id"]))
+        try:
+            evidence = json.loads(str(row["evidence_json"] or "{}"))
+        except json.JSONDecodeError:
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        raw_value = normalize_whitespace(str(evidence.get("raw_value") or ""))
+        if raw_value:
+            raw_values.add(raw_value)
+        occurrence_id = evidence.get("occurrence_id")
+        if occurrence_id is not None:
+            try:
+                occurrence_ids.add(int(occurrence_id))
+            except (TypeError, ValueError):
+                pass
+    if occurrence_ids:
+        placeholders = ", ".join("?" for _ in occurrence_ids)
+        occurrence_rows = connection.execute(
+            f"""
+            SELECT id, document_id, custodian
+            FROM document_occurrences
+            WHERE id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            tuple(sorted(occurrence_ids)),
+        ).fetchall()
+        for row in occurrence_rows:
+            document_ids.add(int(row["document_id"]))
+            raw_value = normalize_whitespace(str(row["custodian"] or ""))
+            if raw_value:
+                raw_values.add(raw_value)
+    return {
+        "document_ids": sorted(document_ids),
+        "occurrence_ids": sorted(occurrence_ids),
+        "raw_values": sorted(raw_values),
+        "document_link_count": len(link_rows),
+    }
+
+
+def cleaned_email_from_vault_filename_custodian_values(values: list[object]) -> str | None:
+    for value in values:
+        text = normalize_whitespace(str(value or ""))
+        if not text:
+            continue
+        vault_parts = parse_google_vault_mbox_basename(Path(text).stem)
+        if vault_parts is not None:
+            return vault_parts["email"]
+    for value in values:
+        cleaned_email = extract_vault_filename_custodian_email_from_artifact(value)
+        if cleaned_email:
+            return cleaned_email
+    return None
+
+
+def vault_filename_custodian_candidates(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    if not all(table_exists(connection, table_name) for table_name in ("entities", "entity_identifiers", "document_entities")):
+        return []
+    rows = connection.execute(
+        """
+        SELECT e.id, e.entity_type, e.display_name, e.primary_email, e.canonical_status
+        FROM entities e
+        WHERE e.canonical_status = ?
+          AND (
+            COALESCE(e.primary_email, '') LIKE '%--%@%'
+            OR EXISTS (
+              SELECT 1
+              FROM entity_identifiers ei
+              WHERE ei.entity_id = e.id
+                AND ei.identifier_type = 'email'
+                AND ei.normalized_value LIKE '%--%@%'
+            )
+          )
+        ORDER BY e.id ASC
+        """,
+        (ENTITY_STATUS_ACTIVE,),
+    ).fetchall()
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        entity_id = int(row["id"])
+        identifier_rows = connection.execute(
+            """
+            SELECT id, identifier_type, display_value, normalized_value
+            FROM entity_identifiers
+            WHERE entity_id = ?
+            ORDER BY id ASC
+            """,
+            (entity_id,),
+        ).fetchall()
+        polluted_email_values = [
+            normalize_whitespace(str(value or ""))
+            for value in [row["primary_email"], *[item["normalized_value"] for item in identifier_rows if item["identifier_type"] == "email"]]
+            if normalize_whitespace(str(value or "")) and "--" in normalize_whitespace(str(value or "")) and "@" in normalize_whitespace(str(value or ""))
+        ]
+        evidence = vault_filename_custodian_evidence_for_entity(connection, entity_id)
+        raw_values = [str(value) for value in evidence["raw_values"]]
+        cleaned_email = cleaned_email_from_vault_filename_custodian_values([*raw_values, *polluted_email_values])
+        if cleaned_email is None:
+            continue
+        target_entity_id = active_entity_id_for_email_value(
+            connection,
+            cleaned_email,
+            exclude_entity_id=entity_id,
+        )
+        action = "merge" if target_entity_id is not None else "rewrite"
+        candidates.append(
+            {
+                "entity_id": entity_id,
+                "entity_type": row["entity_type"],
+                "display_name": row["display_name"],
+                "polluted_email": polluted_email_values[0] if polluted_email_values else None,
+                "cleaned_email": cleaned_email,
+                "target_entity_id": target_entity_id,
+                "action": action,
+                "document_ids": evidence["document_ids"],
+                "document_link_count": evidence["document_link_count"],
+                "raw_values": raw_values,
+            }
+        )
+    return candidates
+
+
+def update_vault_filename_custodian_occurrences(
+    connection: sqlite3.Connection,
+    *,
+    occurrence_ids: list[int],
+    raw_values: list[str],
+    cleaned_email: str,
+) -> dict[str, object]:
+    updated_occurrence_ids: set[int] = set()
+    for occurrence_id in sorted({int(item) for item in occurrence_ids}):
+        connection.execute(
+            """
+            UPDATE document_occurrences
+            SET custodian = ?, updated_at = ?
+            WHERE id = ?
+              AND COALESCE(custodian, '') != ?
+            """,
+            (cleaned_email, utc_now(), occurrence_id, cleaned_email),
+        )
+        if int(connection.execute("SELECT changes()").fetchone()[0] or 0):
+            updated_occurrence_ids.add(occurrence_id)
+    normalized_raw_values = [normalize_whitespace(str(value or "")) for value in raw_values if normalize_whitespace(str(value or ""))]
+    for raw_value in normalized_raw_values:
+        matching_rows = connection.execute(
+            """
+            SELECT id
+            FROM document_occurrences
+            WHERE custodian = ?
+            ORDER BY id ASC
+            """,
+            (raw_value,),
+        ).fetchall()
+        matching_occurrence_ids = {int(row["id"]) for row in matching_rows}
+        connection.execute(
+            """
+            UPDATE document_occurrences
+            SET custodian = ?, updated_at = ?
+            WHERE custodian = ?
+            """,
+            (cleaned_email, utc_now(), raw_value),
+        )
+        if int(connection.execute("SELECT changes()").fetchone()[0] or 0):
+            updated_occurrence_ids.update(matching_occurrence_ids)
+    affected_document_ids = [
+        int(row["document_id"])
+        for row in connection.execute(
+            f"""
+            SELECT DISTINCT document_id
+            FROM document_occurrences
+            WHERE id IN ({', '.join('?' for _ in updated_occurrence_ids)})
+            ORDER BY document_id ASC
+            """,
+            tuple(sorted(updated_occurrence_ids)),
+        ).fetchall()
+    ] if updated_occurrence_ids else []
+    return {
+        "updated_occurrence_ids": sorted(updated_occurrence_ids),
+        "affected_document_ids": affected_document_ids,
+    }
+
+
+def delete_artifact_name_identifiers_for_entity(connection: sqlite3.Connection, entity_id: int) -> int:
+    rows = connection.execute(
+        """
+        SELECT id, display_value, normalized_value
+        FROM entity_identifiers
+        WHERE entity_id = ?
+          AND identifier_type = 'name'
+        ORDER BY id ASC
+        """,
+        (int(entity_id),),
+    ).fetchall()
+    deleted = 0
+    for row in rows:
+        if not (
+            entity_name_identifier_looks_like_export_artifact(row["display_value"])
+            or entity_name_identifier_looks_like_export_artifact(row["normalized_value"])
+        ):
+            continue
+        connection.execute("DELETE FROM entity_resolution_keys WHERE identifier_id = ?", (int(row["id"]),))
+        connection.execute("DELETE FROM entity_identifiers WHERE id = ?", (int(row["id"]),))
+        deleted += int(connection.execute("SELECT changes()").fetchone()[0] or 0)
+    return deleted
+
+
+def rewrite_vault_filename_custodian_entity(
+    connection: sqlite3.Connection,
+    *,
+    entity_id: int,
+    cleaned_email: str,
+) -> dict[str, object]:
+    deleted_artifact_names = delete_artifact_name_identifiers_for_entity(connection, entity_id)
+    connection.execute(
+        """
+        DELETE FROM entity_resolution_keys
+        WHERE entity_id = ?
+          AND key_type = 'email'
+          AND normalized_value LIKE '%--%@%'
+        """,
+        (int(entity_id),),
+    )
+    deleted_polluted_resolution_keys = int(connection.execute("SELECT changes()").fetchone()[0] or 0)
+    connection.execute(
+        """
+        UPDATE entity_identifiers
+        SET display_value = ?,
+            normalized_value = ?,
+            is_verified = 1,
+            updated_at = ?
+        WHERE entity_id = ?
+          AND identifier_type = 'email'
+          AND normalized_value LIKE '%--%@%'
+        """,
+        (cleaned_email, cleaned_email, utc_now(), int(entity_id)),
+    )
+    updated_email_identifiers = int(connection.execute("SELECT changes()").fetchone()[0] or 0)
+    if updated_email_identifiers == 0:
+        ensure_entity_identifier(
+            connection,
+            entity_id=int(entity_id),
+            identifier={
+                "identifier_type": "email",
+                "display_value": cleaned_email,
+                "normalized_value": cleaned_email,
+                "is_verified": 1,
+            },
+        )
+        updated_email_identifiers = 1
+    email_identifier_rows = connection.execute(
+        """
+        SELECT *
+        FROM entity_identifiers
+        WHERE entity_id = ?
+          AND identifier_type = 'email'
+          AND normalized_value = ?
+        ORDER BY id ASC
+        """,
+        (int(entity_id), cleaned_email),
+    ).fetchall()
+    created_resolution_keys = 0
+    for identifier_row in email_identifier_rows:
+        resolution_key_id = ensure_entity_resolution_key(
+            connection,
+            entity_id=int(entity_id),
+            identifier_id=int(identifier_row["id"]),
+            identifier={
+                "identifier_type": "email",
+                "normalized_value": cleaned_email,
+            },
+        )
+        if resolution_key_id is not None:
+            created_resolution_keys += 1
+    connection.execute(
+        """
+        UPDATE entities
+        SET entity_type = ?,
+            display_name = NULL,
+            display_name_source = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (ENTITY_TYPE_UNKNOWN, ENTITY_DISPLAY_SOURCE_AUTO, utc_now(), int(entity_id)),
+    )
+    recompute_entity_caches(connection, int(entity_id))
+    return {
+        "updated_email_identifiers": updated_email_identifiers,
+        "deleted_artifact_name_identifiers": deleted_artifact_names,
+        "deleted_polluted_resolution_keys": deleted_polluted_resolution_keys,
+        "created_resolution_keys": created_resolution_keys,
+    }
+
+
+def merge_vault_filename_custodian_entity(
+    connection: sqlite3.Connection,
+    *,
+    loser_entity_id: int,
+    survivor_entity_id: int,
+) -> dict[str, object]:
+    if int(loser_entity_id) == int(survivor_entity_id):
+        raise RetrieverError("Cannot merge an entity into itself.")
+    affected_document_ids = [
+        int(row["document_id"])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT document_id
+            FROM document_entities
+            WHERE entity_id IN (?, ?)
+            ORDER BY document_id ASC
+            """,
+            (int(loser_entity_id), int(survivor_entity_id)),
+        ).fetchall()
+    ]
+    duplicate_link_count = counted_delete(
+        connection,
+        count_sql="""
+            SELECT COUNT(*)
+            FROM document_entities
+            WHERE entity_id = ?
+              AND EXISTS (
+                SELECT 1
+                FROM document_entities survivor_link
+                WHERE survivor_link.document_id = document_entities.document_id
+                  AND survivor_link.role = document_entities.role
+                  AND survivor_link.entity_id = ?
+              )
+        """,
+        delete_sql="""
+            DELETE FROM document_entities
+            WHERE entity_id = ?
+              AND EXISTS (
+                SELECT 1
+                FROM document_entities survivor_link
+                WHERE survivor_link.document_id = document_entities.document_id
+                  AND survivor_link.role = document_entities.role
+                  AND survivor_link.entity_id = ?
+              )
+        """,
+        params=(int(loser_entity_id), int(survivor_entity_id)),
+    )
+    connection.execute(
+        """
+        UPDATE document_entities
+        SET entity_id = ?, updated_at = ?
+        WHERE entity_id = ?
+        """,
+        (int(survivor_entity_id), utc_now(), int(loser_entity_id)),
+    )
+    moved_link_count = int(connection.execute("SELECT changes()").fetchone()[0] or 0)
+    connection.execute(
+        """
+        UPDATE entity_overrides
+        SET replacement_entity_id = ?, updated_at = ?
+        WHERE replacement_entity_id = ?
+        """,
+        (int(survivor_entity_id), utc_now(), int(loser_entity_id)),
+    )
+    connection.execute(
+        """
+        UPDATE entity_overrides
+        SET source_entity_id = ?, updated_at = ?
+        WHERE source_entity_id = ?
+        """,
+        (int(survivor_entity_id), utc_now(), int(loser_entity_id)),
+    )
+    deleted_artifact_names = delete_artifact_name_identifiers_for_entity(connection, loser_entity_id)
+    connection.execute("DELETE FROM entity_resolution_keys WHERE entity_id = ?", (int(loser_entity_id),))
+    deleted_resolution_keys = int(connection.execute("SELECT changes()").fetchone()[0] or 0)
+    connection.execute(
+        """
+        UPDATE entities
+        SET canonical_status = ?, merged_into_entity_id = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (ENTITY_STATUS_MERGED, int(survivor_entity_id), utc_now(), int(loser_entity_id)),
+    )
+    created_resolution_keys = ensure_manual_email_resolution_keys(connection, int(survivor_entity_id))
+    recompute_entity_caches(connection, int(survivor_entity_id))
+    refresh_documents_after_entity_graph_change(connection, affected_document_ids)
+    return {
+        "affected_document_ids": affected_document_ids,
+        "moved_document_links": moved_link_count,
+        "deduped_document_links": duplicate_link_count,
+        "deleted_artifact_name_identifiers": deleted_artifact_names,
+        "deleted_polluted_resolution_keys": deleted_resolution_keys,
+        "created_resolution_keys": created_resolution_keys,
+    }
+
+
+def purge_vault_filename_custodians(
+    root: Path,
+    *,
+    apply: bool = False,
+) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    command_name = "purge-vault-filename-custodians"
+    with workspace_entity_rebuild_session(paths, command_name=command_name):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name=command_name)
+            raise_if_entity_rebuild_active(connection, root, command_name=command_name)
+            candidates = vault_filename_custodian_candidates(connection)
+            if not apply:
+                return {
+                    "status": "ok",
+                    "dry_run": True,
+                    "candidate_count": len(candidates),
+                    "candidates": candidates,
+                }
+            applied: list[dict[str, object]] = []
+            connection.execute("BEGIN")
+            try:
+                for candidate in candidates:
+                    entity_id = int(candidate["entity_id"])
+                    cleaned_email = str(candidate["cleaned_email"])
+                    evidence = vault_filename_custodian_evidence_for_entity(connection, entity_id)
+                    occurrence_result = update_vault_filename_custodian_occurrences(
+                        connection,
+                        occurrence_ids=[int(item) for item in evidence["occurrence_ids"]],
+                        raw_values=[str(item) for item in evidence["raw_values"]],
+                        cleaned_email=cleaned_email,
+                    )
+                    target_entity_id = candidate.get("target_entity_id")
+                    if target_entity_id is not None:
+                        action_result = merge_vault_filename_custodian_entity(
+                            connection,
+                            loser_entity_id=entity_id,
+                            survivor_entity_id=int(target_entity_id),
+                        )
+                        action = "merged"
+                    else:
+                        action_result = rewrite_vault_filename_custodian_entity(
+                            connection,
+                            entity_id=entity_id,
+                            cleaned_email=cleaned_email,
+                        )
+                        refresh_documents_after_entity_graph_change(
+                            connection,
+                            [
+                                *[int(item) for item in evidence["document_ids"]],
+                                *[int(item) for item in occurrence_result["affected_document_ids"]],
+                            ],
+                        )
+                        action = "rewritten"
+                    applied.append(
+                        {
+                            **candidate,
+                            "action": action,
+                            **occurrence_result,
+                            **action_result,
+                        }
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            return {
+                "status": "ok",
+                "dry_run": False,
+                "candidate_count": len(candidates),
+                "applied_count": len(applied),
+                "candidates": applied,
+                **entity_graph_counts(connection),
+            }
+        finally:
+            connection.close()
+
+
 def serialize_entity_identifier(row: sqlite3.Row) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": int(row["id"]),
