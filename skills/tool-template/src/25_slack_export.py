@@ -775,17 +775,20 @@ def commit_prepared_slack_conversation(
     dataset_id: int,
     dataset_source_id: int,
     current_batch: int | None,
+    before_transaction_commit=None,
 ) -> dict[str, object]:
     prepare_error = prepared_conversation.get("prepare_error")
     if prepare_error:
         return {
             "status": "failed",
+            "action": "failed",
             "current_batch": current_batch,
             "rel_paths": list(prepared_conversation.get("rel_paths") or []),
             "error": str(prepare_error),
         }
 
     rel_paths = list(prepared_conversation.get("rel_paths") or [])
+    affected_document_ids: list[int] = []
     parent_state_by_rel: dict[str, dict[str, int]] = {}
     connection.execute("BEGIN")
     try:
@@ -837,6 +840,7 @@ def commit_prepared_slack_conversation(
                 source_item_id=plan["source_item_id"],
                 source_folder_path=str(plan["source_folder_path"]),
             )
+            affected_document_ids.append(int(document_id))
             seed_source_text_revision_for_document(
                 connection,
                 paths,
@@ -922,6 +926,7 @@ def commit_prepared_slack_conversation(
                 source_item_id=str(plan["source_item_id"]),
                 source_folder_path=str(plan["source_folder_path"]),
             )
+            affected_document_ids.append(int(document_id))
             seed_source_text_revision_for_document(
                 connection,
                 paths,
@@ -958,17 +963,26 @@ def commit_prepared_slack_conversation(
                 new_count += 1
             else:
                 updated_count += 1
-        connection.commit()
-        return {
+        result = {
             "status": "ok",
+            "action": "committed",
             "current_batch": current_batch,
             "new": new_count,
             "updated": updated_count,
+            "affected_document_ids": affected_document_ids,
+            "rel_paths": rel_paths,
+            "source_locator": str(prepared_conversation["conversation_identity"][1]),
+            "conversation_key": str(prepared_conversation["conversation_key"]),
         }
+        if before_transaction_commit is not None:
+            before_transaction_commit(connection, result)
+        connection.commit()
+        return result
     except Exception as exc:
         connection.rollback()
         return {
             "status": "failed",
+            "action": "failed",
             "current_batch": current_batch,
             "rel_paths": rel_paths,
             "error": f"{type(exc).__name__}: {exc}",

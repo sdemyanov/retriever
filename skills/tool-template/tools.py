@@ -13444,17 +13444,20 @@ def commit_prepared_slack_conversation(
     dataset_id: int,
     dataset_source_id: int,
     current_batch: int | None,
+    before_transaction_commit=None,
 ) -> dict[str, object]:
     prepare_error = prepared_conversation.get("prepare_error")
     if prepare_error:
         return {
             "status": "failed",
+            "action": "failed",
             "current_batch": current_batch,
             "rel_paths": list(prepared_conversation.get("rel_paths") or []),
             "error": str(prepare_error),
         }
 
     rel_paths = list(prepared_conversation.get("rel_paths") or [])
+    affected_document_ids: list[int] = []
     parent_state_by_rel: dict[str, dict[str, int]] = {}
     connection.execute("BEGIN")
     try:
@@ -13506,6 +13509,7 @@ def commit_prepared_slack_conversation(
                 source_item_id=plan["source_item_id"],
                 source_folder_path=str(plan["source_folder_path"]),
             )
+            affected_document_ids.append(int(document_id))
             seed_source_text_revision_for_document(
                 connection,
                 paths,
@@ -13591,6 +13595,7 @@ def commit_prepared_slack_conversation(
                 source_item_id=str(plan["source_item_id"]),
                 source_folder_path=str(plan["source_folder_path"]),
             )
+            affected_document_ids.append(int(document_id))
             seed_source_text_revision_for_document(
                 connection,
                 paths,
@@ -13627,17 +13632,26 @@ def commit_prepared_slack_conversation(
                 new_count += 1
             else:
                 updated_count += 1
-        connection.commit()
-        return {
+        result = {
             "status": "ok",
+            "action": "committed",
             "current_batch": current_batch,
             "new": new_count,
             "updated": updated_count,
+            "affected_document_ids": affected_document_ids,
+            "rel_paths": rel_paths,
+            "source_locator": str(prepared_conversation["conversation_identity"][1]),
+            "conversation_key": str(prepared_conversation["conversation_key"]),
         }
+        if before_transaction_commit is not None:
+            before_transaction_commit(connection, result)
+        connection.commit()
+        return result
     except Exception as exc:
         connection.rollback()
         return {
             "status": "failed",
+            "action": "failed",
             "current_batch": current_batch,
             "rel_paths": rel_paths,
             "error": f"{type(exc).__name__}: {exc}",
@@ -30321,6 +30335,17 @@ def ingest_v2_pst_source_scan_hash(path: Path, source_payload: dict[str, object]
     return sha256_text(f"pst-ingest-v5:{sha256_file(path) or ''}")
 
 
+def ingest_v2_slack_export_descriptor_payload(root: Path, descriptor: dict[str, object]) -> dict[str, object]:
+    export_root = Path(descriptor["root"]).resolve()
+    return {
+        "rel_root": relative_document_path(root, export_root),
+        "day_rel_paths": [
+            relative_document_path(root, Path(day_file))
+            for day_file in list(descriptor.get("day_files") or [])
+        ],
+    }
+
+
 def ingest_v2_planning_exclusions(
     root: Path,
     recursive: bool,
@@ -30344,6 +30369,10 @@ def ingest_v2_planning_exclusions(
     )
     for descriptor in slack_export_descriptors:
         ingest_v2_add_excluded_path(root, Path(descriptor["root"]), exact=exact, prefixes=prefixes)
+    slack_export_payloads = [
+        ingest_v2_slack_export_descriptor_payload(root, descriptor)
+        for descriptor in slack_export_descriptors
+    ]
 
     gmail_export_descriptors = find_scoped_source_roots(
         find_gmail_export_roots,
@@ -30375,6 +30404,7 @@ def ingest_v2_planning_exclusions(
     return {
         "exact_rel_paths": sorted(exact),
         "dir_prefixes": sorted(prefixes),
+        "slack_export_payloads": slack_export_payloads,
         "gmail_mbox_source_payloads": gmail_mbox_source_payloads,
         "pst_source_payloads_by_rel_path": pst_source_payloads_by_rel_path,
         "counts": {
@@ -30480,6 +30510,12 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
             cursor.setdefault("production_docs_missing_linked_text", 0)
             cursor.setdefault("production_docs_missing_linked_images", 0)
             cursor.setdefault("production_docs_missing_linked_natives", 0)
+            cursor.setdefault("pending_slack_export_roots", [])
+            cursor.setdefault("slack_export_roots_by_rel_root", {})
+            cursor.setdefault("planned_slack_export_roots", [])
+            cursor.setdefault("planned_slack_conversations", 0)
+            cursor.setdefault("planned_slack_day_documents", 0)
+            cursor.setdefault("slack_failures", [])
             cursor.setdefault("current_mbox_source", None)
             cursor.setdefault("pending_gmail_mbox_sources", [])
             cursor.setdefault("planned_mbox_sources", [])
@@ -30546,6 +30582,15 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
         "production_docs_missing_linked_text": 0,
         "production_docs_missing_linked_images": 0,
         "production_docs_missing_linked_natives": 0,
+        "pending_slack_export_roots": [str(payload["rel_root"]) for payload in list(exclusions.get("slack_export_payloads") or [])],
+        "slack_export_roots_by_rel_root": {
+            str(payload["rel_root"]): payload
+            for payload in list(exclusions.get("slack_export_payloads") or [])
+        },
+        "planned_slack_export_roots": [],
+        "planned_slack_conversations": 0,
+        "planned_slack_day_documents": 0,
+        "slack_failures": [],
         "current_mbox_source": None,
         "pending_gmail_mbox_sources": list(exclusions.get("gmail_mbox_source_payloads") or []),
         "planned_mbox_sources": [],
@@ -30621,6 +30666,97 @@ def ingest_v2_plan_loose_file_item(
         ),
     )
     return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_plan_slack_conversation_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    rel_root: str,
+    conversation_plan: dict[str, object],
+    commit_order: int,
+) -> bool:
+    now = utc_now()
+    conversation_key = str(conversation_plan["conversation_key"])
+    rel_paths = [str(rel_path) for rel_path in list(conversation_plan.get("rel_paths") or [])]
+    payload = {
+        **ingest_v2_json_safe_value(conversation_plan),
+        "source_locator": rel_root,
+        "planned_at": now,
+    }
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO ingest_work_items (
+          run_id, unit_type, source_kind, source_key, rel_path, commit_order,
+          payload_json, affected_conversation_keys_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "slack_conversation",
+            SLACK_EXPORT_SOURCE_KIND,
+            f"{rel_root}:{conversation_key}",
+            rel_paths[0] if rel_paths else rel_root,
+            int(commit_order),
+            compact_json_text(payload),
+            compact_json_text([f"{rel_root}:{conversation_key}"]),
+            "pending",
+            now,
+            now,
+        ),
+    )
+    return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_plan_slack_export_root(
+    connection: sqlite3.Connection,
+    root: Path,
+    *,
+    run_id: str,
+    payload: dict[str, object],
+    next_commit_order: int,
+) -> dict[str, object]:
+    rel_root = str(payload["rel_root"])
+    export_root = ingest_v2_cursor_path(root, rel_root)
+    conversation_directory = load_slack_export_conversation_directory(export_root)
+    user_directory = load_slack_user_directory(export_root)
+    day_files = [
+        ingest_v2_cursor_path(root, str(day_rel_path))
+        for day_rel_path in list(payload.get("day_rel_paths") or [])
+    ]
+    if not day_files:
+        day_files = iter_slack_export_day_files(export_root)
+    conversation_plans = plan_slack_export_conversations(
+        root,
+        export_root,
+        conversation_directory=conversation_directory,
+        user_directory=user_directory,
+        day_files=day_files,
+    )
+    commit_order = int(next_commit_order)
+    planned_conversations = 0
+    planned_day_documents = 0
+    rel_paths: list[str] = []
+    for conversation_plan in conversation_plans:
+        inserted = ingest_v2_plan_slack_conversation_item(
+            connection,
+            run_id=run_id,
+            rel_root=rel_root,
+            conversation_plan=conversation_plan,
+            commit_order=commit_order,
+        )
+        commit_order += 1
+        if inserted:
+            planned_conversations += 1
+            planned_day_documents += len(list(conversation_plan.get("day_documents") or []))
+            rel_paths.extend(str(rel_path) for rel_path in list(conversation_plan.get("rel_paths") or []))
+    return {
+        "rel_root": rel_root,
+        "next_commit_order": commit_order,
+        "planned_conversations": planned_conversations,
+        "planned_day_documents": planned_day_documents,
+        "seen_rel_paths": sorted(set(rel_paths)),
+    }
 
 
 def ingest_v2_mbox_source_scan_hash(path: Path) -> str:
@@ -31524,7 +31660,7 @@ def ingest_v2_claim_prepare_items(
             FROM ingest_work_items
             WHERE run_id = ?
               AND unit_type IN (
-                'loose_file', 'production_row',
+                'loose_file', 'production_row', 'slack_conversation',
                 'mbox_message', 'mbox_source_finalizer',
                 'pst_message', 'pst_source_finalizer'
               )
@@ -31733,6 +31869,38 @@ def ingest_v2_prepare_production_row_item(
         return None, source_fingerprint, "Not enough budget remaining to start prepare."
     prepared_item = prepare_production_row_plan(root, payload_dict)
     prepared_item["prepare_hash_ms"] = 0.0
+    return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_prepare_slack_conversation_item(
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    rel_paths = [str(rel_path) for rel_path in list(payload_dict.get("rel_paths") or [])]
+    conversation_identity = payload_dict.get("conversation_identity")
+    identity_root = ""
+    if isinstance(conversation_identity, list) and len(conversation_identity) > 1:
+        identity_root = str(conversation_identity[1])
+    source_locator = str(payload_dict.get("source_locator") or identity_root)
+    source_fingerprint = {
+        "source_locator": source_locator,
+        "conversation_key": payload_dict.get("conversation_key"),
+        "rel_paths": rel_paths,
+    }
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return None, source_fingerprint, "Not enough budget remaining to start prepare."
+    prepared_item = prepare_slack_conversation_plan(payload_dict)
+    prepared_item["payload_kind"] = "slack_conversation"
+    prepared_item["source_kind"] = SLACK_EXPORT_SOURCE_KIND
+    prepared_item["source_locator"] = source_locator
+    prepared_item["prepare_hash_ms"] = 0.0
+    prepared_item["prepare_extract_ms"] = max(
+        0.0,
+        float(prepared_item.get("prepare_ms") or 0.0) - float(prepared_item.get("prepare_chunk_ms") or 0.0),
+    )
     return prepared_item, source_fingerprint, None
 
 
@@ -32428,6 +32596,7 @@ def ingest_v2_load_commit_cursor(connection: sqlite3.Connection, *, run_id: str)
             cursor.setdefault("actions", {})
             cursor.setdefault("freshness_fallbacks", 0)
             cursor.setdefault("production_stats", {})
+            cursor.setdefault("slack_stats", {})
             cursor.setdefault("mbox_stats", {})
             cursor.setdefault("pst_stats", {})
             cursor.setdefault("container_current_ingestion_batches", {})
@@ -32438,6 +32607,7 @@ def ingest_v2_load_commit_cursor(connection: sqlite3.Connection, *, run_id: str)
         "actions": {},
         "freshness_fallbacks": 0,
         "production_stats": {},
+        "slack_stats": {},
         "mbox_stats": {},
         "pst_stats": {},
         "container_current_ingestion_batches": {},
@@ -32456,6 +32626,59 @@ def ingest_v2_run_loose_rel_paths(connection: sqlite3.Connection, *, run_id: str
         (run_id,),
     ).fetchall()
     return {str(row["rel_path"]) for row in rows}
+
+
+def ingest_v2_run_slack_seen_rel_paths_by_root(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+) -> dict[str, set[str]]:
+    rows = connection.execute(
+        """
+        SELECT payload_json
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND unit_type = 'slack_conversation'
+        """,
+        (run_id,),
+    ).fetchall()
+    seen_by_root: dict[str, set[str]] = {}
+    for row in rows:
+        payload = decode_json_text(row["payload_json"], default={}) or {}
+        if not isinstance(payload, dict):
+            continue
+        conversation_identity = payload.get("conversation_identity")
+        identity_root = ""
+        if isinstance(conversation_identity, list) and len(conversation_identity) > 1:
+            identity_root = str(conversation_identity[1])
+        rel_root = normalize_whitespace(str(payload.get("source_locator") or identity_root))
+        if not rel_root:
+            continue
+        rel_paths = {
+            normalize_whitespace(str(rel_path or "")).replace("\\", "/").strip("/")
+            for rel_path in list(payload.get("rel_paths") or [])
+            if normalize_whitespace(str(rel_path or ""))
+        }
+        seen_by_root.setdefault(rel_root, set()).update(rel_paths)
+    return seen_by_root
+
+
+def ingest_v2_mark_missing_slack_documents(connection: sqlite3.Connection, *, run_id: str) -> int:
+    missing = 0
+    for rel_root, seen_rel_paths in sorted(ingest_v2_run_slack_seen_rel_paths_by_root(connection, run_id=run_id).items()):
+        dataset_row = get_dataset_row(
+            connection,
+            source_kind=SLACK_EXPORT_SOURCE_KIND,
+            dataset_locator=rel_root,
+        )
+        if dataset_row is None:
+            continue
+        missing += mark_missing_slack_export_documents(
+            connection,
+            dataset_id=int(dataset_row["id"]),
+            seen_rel_paths=seen_rel_paths,
+        )
+    return missing
 
 
 def ingest_v2_run_mbox_source_rel_paths(connection: sqlite3.Connection, *, run_id: str) -> set[str]:
@@ -32948,6 +33171,98 @@ def ingest_v2_commit_production_work_item_hook(
     )
     if int(update_cursor.rowcount or 0) != 1:
         raise RetrieverError(f"Could not mark V2 ingest production work item {work_item_id} committed.")
+    connection.execute(
+        """
+        UPDATE ingest_runs
+        SET committer_heartbeat_at = ?,
+            last_heartbeat_at = ?
+        WHERE run_id = ?
+          AND committer_lease_owner = ?
+        """,
+        (now, now, run_id, writer_id),
+    )
+
+
+def ingest_v2_commit_slack_conversation_work_item_hook(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    result: dict[str, object],
+) -> None:
+    now = utc_now()
+    action = str(result.get("action") or "")
+    affected_document_ids = [
+        int(document_id)
+        for document_id in list(result.get("affected_document_ids") or [])
+        if document_id is not None
+    ]
+    source_locator = str(result.get("source_locator") or "")
+    conversation_key = str(result.get("conversation_key") or "")
+    current_batch = result.get("current_batch")
+    if current_batch is not None:
+        cursor["current_ingestion_batch"] = int(current_batch)
+    slack_stats = cursor.setdefault("slack_stats", {})
+    if isinstance(slack_stats, dict):
+        slack_stats["slack_conversations"] = int(slack_stats.get("slack_conversations") or 0) + 1
+        slack_stats["slack_documents_created"] = (
+            int(slack_stats.get("slack_documents_created") or 0)
+            + int(result.get("new") or 0)
+        )
+        slack_stats["slack_documents_updated"] = (
+            int(slack_stats.get("slack_documents_updated") or 0)
+            + int(result.get("updated") or 0)
+        )
+    ingest_v2_save_phase_cursor(
+        connection,
+        run_id=run_id,
+        phase="committing",
+        cursor_key="loose_file_commit",
+        cursor=cursor,
+        status="pending",
+    )
+    update_cursor = connection.execute(
+        """
+        UPDATE ingest_work_items
+        SET status = 'committed',
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            affected_document_ids_json = ?,
+            affected_conversation_keys_json = ?,
+            affected_entity_ids_json = ?,
+            artifact_manifest_json = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE run_id = ?
+          AND id = ?
+          AND status = 'committing'
+          AND lease_owner = ?
+        """,
+        (
+            compact_json_text(affected_document_ids),
+            compact_json_text([f"{source_locator}:{conversation_key}"] if source_locator and conversation_key else []),
+            compact_json_text([]),
+            compact_json_text(
+                {
+                    "commit_action": action,
+                    "source_kind": SLACK_EXPORT_SOURCE_KIND,
+                    "source_locator": source_locator,
+                    "conversation_key": conversation_key,
+                    "new": int(result.get("new") or 0),
+                    "updated": int(result.get("updated") or 0),
+                    "rel_paths": list(result.get("rel_paths") or []),
+                }
+            ),
+            now,
+            run_id,
+            work_item_id,
+            writer_id,
+        ),
+    )
+    if int(update_cursor.rowcount or 0) != 1:
+        raise RetrieverError(f"Could not mark V2 ingest Slack work item {work_item_id} committed.")
     connection.execute(
         """
         UPDATE ingest_runs
@@ -34477,6 +34792,67 @@ def ingest_v2_plan_step(
                         break
                     continue
 
+                pending_slack_export_roots = list(cursor.get("pending_slack_export_roots") or [])
+                if pending_slack_export_roots:
+                    slack_rel_root = str(pending_slack_export_roots.pop(0))
+                    cursor["pending_slack_export_roots"] = pending_slack_export_roots
+                    slack_payload = dict(
+                        dict(cursor.get("slack_export_roots_by_rel_root") or {}).get(slack_rel_root) or {}
+                    )
+                    if slack_payload:
+                        try:
+                            insert_started = time.perf_counter()
+                            slack_plan = ingest_v2_plan_slack_export_root(
+                                connection,
+                                root,
+                                run_id=run_id,
+                                payload=slack_payload,
+                                next_commit_order=int(cursor.get("next_commit_order") or 1),
+                            )
+                            work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
+                        except Exception as exc:
+                            rollback_open_transaction(connection)
+                            failures = list(cursor.get("slack_failures") or [])
+                            failures.append(
+                                {
+                                    "slack_rel_root": slack_rel_root,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                            )
+                            cursor["slack_failures"] = failures
+                            slack_plan = None
+                        if slack_plan is not None:
+                            cursor["next_commit_order"] = int(slack_plan["next_commit_order"])
+                            cursor["planned_slack_conversations"] = (
+                                int(cursor.get("planned_slack_conversations") or 0)
+                                + int(slack_plan["planned_conversations"] or 0)
+                            )
+                            cursor["planned_slack_day_documents"] = (
+                                int(cursor.get("planned_slack_day_documents") or 0)
+                                + int(slack_plan["planned_day_documents"] or 0)
+                            )
+                            slack_root_payloads = dict(cursor.get("slack_export_roots_by_rel_root") or {})
+                            slack_root_payloads[slack_rel_root] = {
+                                **slack_payload,
+                                "seen_rel_paths": list(slack_plan["seen_rel_paths"]),
+                                "planned_conversations": int(slack_plan["planned_conversations"] or 0),
+                                "planned_day_documents": int(slack_plan["planned_day_documents"] or 0),
+                            }
+                            cursor["slack_export_roots_by_rel_root"] = slack_root_payloads
+                            planned_roots = list(cursor.get("planned_slack_export_roots") or [])
+                            if slack_rel_root not in planned_roots:
+                                planned_roots.append(slack_rel_root)
+                                cursor["planned_slack_export_roots"] = planned_roots
+                    cursor_save_ms_values.append(
+                        ingest_v2_save_planning_cursor_heartbeat(
+                            connection,
+                            run_id=run_id,
+                            cursor=cursor,
+                            status="pending",
+                        )
+                    )
+                    continue
+
                 pending_gmail_mbox_sources = list(cursor.get("pending_gmail_mbox_sources") or [])
                 if pending_gmail_mbox_sources:
                     gmail_source_payload = dict(pending_gmail_mbox_sources.pop(0))
@@ -34725,6 +35101,7 @@ def ingest_v2_plan_step(
 
             planning_complete = (
                 not list(cursor.get("pending_production_rel_roots") or [])
+                and not list(cursor.get("pending_slack_export_roots") or [])
                 and not list(cursor.get("pending_gmail_mbox_sources") or [])
                 and not list(cursor.get("pending_paths") or [])
                 and not isinstance(cursor.get("current_mbox_source"), dict)
@@ -34801,11 +35178,16 @@ def ingest_v2_plan_step(
                 "cursor": {
                     "pending_paths": len(list(cursor.get("pending_paths") or [])),
                     "pending_production_roots": len(list(cursor.get("pending_production_rel_roots") or [])),
+                    "pending_slack_export_roots": len(list(cursor.get("pending_slack_export_roots") or [])),
                     "pending_gmail_mbox_sources": len(list(cursor.get("pending_gmail_mbox_sources") or [])),
                     "scanned_paths": int(cursor.get("scanned_paths") or 0),
                     "planned_loose_files": int(cursor.get("planned_loose_files") or 0),
                     "planned_production_roots": len(list(cursor.get("planned_production_roots") or [])),
                     "planned_production_rows": int(cursor.get("planned_production_rows") or 0),
+                    "planned_slack_export_roots": list(cursor.get("planned_slack_export_roots") or []),
+                    "planned_slack_conversations": int(cursor.get("planned_slack_conversations") or 0),
+                    "planned_slack_day_documents": int(cursor.get("planned_slack_day_documents") or 0),
+                    "slack_failures": list(cursor.get("slack_failures") or []),
                     "current_mbox_source": (
                         str(dict(cursor.get("current_mbox_source") or {}).get("source_rel_path") or "")
                         if isinstance(cursor.get("current_mbox_source"), dict)
@@ -34945,6 +35327,12 @@ def ingest_v2_prepare_step(
                     deadline=deadline,
                 )
                 payload_kind = "production_row"
+            elif unit_type == "slack_conversation":
+                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_slack_conversation_item(
+                    work_item_row,
+                    deadline=deadline,
+                )
+                payload_kind = "slack_conversation"
             elif unit_type == "mbox_message":
                 prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_mbox_message_item(
                     root,
@@ -35229,6 +35617,49 @@ def ingest_v2_commit_step(
                             result=result,
                         ),
                     )
+                elif payload_kind == "slack_conversation" or str(claimed_row["unit_type"] or "") == "slack_conversation":
+                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
+                    if prepare_error:
+                        raise RetrieverError(prepare_error)
+                    conversation_identity = prepared_item.get("conversation_identity")
+                    identity_root = ""
+                    if isinstance(conversation_identity, list) and len(conversation_identity) > 1:
+                        identity_root = str(conversation_identity[1])
+                    source_locator = str(prepared_item.get("source_locator") or identity_root)
+                    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+                        connection,
+                        source_kind=SLACK_EXPORT_SOURCE_KIND,
+                        source_locator=source_locator,
+                        dataset_name=slack_export_dataset_name(source_locator),
+                    )
+                    connection.commit()
+                    existing_by_rel_for_slack = existing_rows_by_rel_path(
+                        connection,
+                        [str(rel_path) for rel_path in list(prepared_item.get("rel_paths") or [])],
+                    )
+                    commit_result = commit_prepared_slack_conversation(
+                        connection,
+                        paths,
+                        prepared_item,
+                        existing_by_rel_for_slack,
+                        dataset_id=int(dataset_id),
+                        dataset_source_id=int(dataset_source_id),
+                        current_batch=(
+                            int(cursor["current_ingestion_batch"])
+                            if cursor.get("current_ingestion_batch") is not None
+                            else None
+                        ),
+                        before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_slack_conversation_work_item_hook(
+                            commit_connection,
+                            run_id=run_id,
+                            work_item_id=work_item_id,
+                            writer_id=writer_id,
+                            cursor=cursor,
+                            result=result,
+                        ),
+                    )
+                    if str(commit_result.get("status") or "") == "failed":
+                        raise RetrieverError(str(commit_result.get("error") or "Slack conversation commit failed."))
                 elif payload_kind == "mbox_message" or str(claimed_row["unit_type"] or "") == "mbox_message":
                     prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
                     if prepare_error:
@@ -35633,11 +36064,13 @@ def ingest_v2_finalize_step(
                 scanned_mbox_source_rel_paths,
                 scan_scope=scan_scope,
             )
+            slack_documents_missing = ingest_v2_mark_missing_slack_documents(connection, run_id=run_id)
             cursor["filesystem_missing"] = int(filesystem_missing)
             cursor["pst_sources_missing"] = int(pst_sources_missing)
             cursor["pst_documents_missing"] = int(pst_documents_missing)
             cursor["mbox_sources_missing"] = int(mbox_sources_missing)
             cursor["mbox_documents_missing"] = int(mbox_documents_missing)
+            cursor["slack_documents_missing"] = int(slack_documents_missing)
             cursor["stage"] = "conversations"
             connection.execute("BEGIN")
             try:
