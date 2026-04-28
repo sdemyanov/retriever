@@ -7316,6 +7316,162 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         manifests = [json.loads(row["artifact_manifest_json"]) for row in work_items]
         self.assertTrue(any(manifest.get("source_plan_kind") == "gmail" for manifest in manifests))
 
+    def test_ingest_v2_gmail_mbox_planning_saves_partial_source_cursor(self) -> None:
+        export_root = self.root / "gmail-bulk"
+        export_root.mkdir()
+
+        message_count = retriever_tools.INGEST_V2_MBOX_PLAN_BATCH_SIZE + 5
+        mbox_path = export_root / "Bulk.mbox"
+        archive = mailbox.mbox(str(mbox_path), create=True)
+        try:
+            for index in range(message_count):
+                archive.add(
+                    self.build_fake_mbox_message(
+                        subject=f"Bulk Gmail message {index:03d}",
+                        body_text=f"Bulk Gmail body {index:03d}",
+                        message_id=f"<gmail-v2-bulk-{index:03d}@example.com>",
+                        author="Sender Example <sender@example.com>",
+                        recipients="Receiver Example <receiver@example.com>",
+                    )
+                )
+            archive.flush()
+        finally:
+            archive.close()
+
+        with (export_root / "Bulk-metadata.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "Rfc822MessageId",
+                    "GmailMessageId",
+                    "Account",
+                    "Labels",
+                    "Subject",
+                    "From",
+                    "To",
+                    "DateSent",
+                    "DateReceived",
+                    "ThreadedMessageCount",
+                ],
+            )
+            writer.writeheader()
+            for index in range(message_count):
+                writer.writerow(
+                    {
+                        "Rfc822MessageId": f"gmail-v2-bulk-{index:03d}@example.com",
+                        "GmailMessageId": f"1767000000001{index:04d}",
+                        "Account": "owner@example.com",
+                        "Labels": "^INBOX,bulklabel",
+                        "Subject": f"Bulk Gmail message {index:03d}",
+                        "From": "sender@example.com Sender Example",
+                        "To": "receiver@example.com Receiver Example",
+                        "DateSent": "2026-04-14T10:00:00Z",
+                        "DateReceived": "2026-04-14T10:00:05Z",
+                        "ThreadedMessageCount": "1",
+                    }
+                )
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "gmail-bulk",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        assert start_payload is not None
+        run_id = str(start_payload["run_id"])
+
+        first_plan_exit, first_plan_payload, _, _ = self.run_cli(
+            "ingest-plan-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(first_plan_exit, 0)
+        self.assertIsNotNone(first_plan_payload)
+        assert first_plan_payload is not None
+        self.assertEqual(
+            first_plan_payload["cursor"]["planned_mbox_messages"],
+            retriever_tools.INGEST_V2_MBOX_PLAN_BATCH_SIZE,
+        )
+        self.assertEqual(first_plan_payload["cursor"]["current_mbox_source"], "gmail-bulk/Bulk.mbox")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'planning'
+                  AND cursor_key = 'loose_file_scan'
+                """,
+                (run_id,),
+            ).fetchone()
+            first_batch_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND unit_type = 'mbox_message'
+                """,
+                (run_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(cursor_row)
+        cursor_json = json.loads(cursor_row["cursor_json"])
+        current_source = cursor_json["current_mbox_source"]
+        self.assertEqual(current_source["next_message_index"], retriever_tools.INGEST_V2_MBOX_PLAN_BATCH_SIZE)
+        self.assertEqual(current_source["planned_message_count"], retriever_tools.INGEST_V2_MBOX_PLAN_BATCH_SIZE)
+        self.assertEqual(first_batch_count, retriever_tools.INGEST_V2_MBOX_PLAN_BATCH_SIZE)
+
+        second_plan_exit, second_plan_payload, _, _ = self.run_cli(
+            "ingest-plan-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(second_plan_exit, 0)
+        self.assertIsNotNone(second_plan_payload)
+        assert second_plan_payload is not None
+        self.assertEqual(second_plan_payload["run"]["phase"], "preparing")
+        self.assertEqual(second_plan_payload["cursor"]["planned_mbox_messages"], message_count)
+        self.assertEqual(second_plan_payload["cursor"]["planned_mbox_sources"], ["gmail-bulk/Bulk.mbox"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            unit_counts = {
+                str(row["unit_type"]): int(row["count"])
+                for row in connection.execute(
+                    """
+                    SELECT unit_type, COUNT(*) AS count
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                    GROUP BY unit_type
+                    """,
+                    (run_id,),
+                ).fetchall()
+            }
+            finalizer_row = connection.execute(
+                """
+                SELECT payload_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND unit_type = 'mbox_source_finalizer'
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(unit_counts, {"mbox_message": message_count, "mbox_source_finalizer": 1})
+        self.assertIsNotNone(finalizer_row)
+        self.assertEqual(json.loads(finalizer_row["payload_json"])["message_count"], message_count)
+
     def test_ingest_v2_auto_routes_production_root(self) -> None:
         self.write_production_fixture()
 

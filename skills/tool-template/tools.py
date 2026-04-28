@@ -30735,7 +30735,7 @@ def ingest_v2_plan_current_mbox_source(
     path = ingest_v2_cursor_path(root, source_rel_path)
     next_message_index = int(current_mbox_source.get("next_message_index") or 0)
     next_commit_order = int(current_mbox_source.get("next_commit_order") or 1)
-    planned_this_step = 0
+    processed_this_step = 0
     duplicate_counts = {
         str(key): int(value)
         for key, value in dict(current_mbox_source.get("duplicate_source_item_counts") or {}).items()
@@ -30747,7 +30747,7 @@ def ingest_v2_plan_current_mbox_source(
             if message_index < next_message_index:
                 continue
             if (
-                planned_this_step >= INGEST_V2_MBOX_PLAN_BATCH_SIZE
+                processed_this_step >= INGEST_V2_MBOX_PLAN_BATCH_SIZE
                 or ingest_v2_deadline_remaining_seconds(deadline) < 1.0
             ):
                 reached_end = False
@@ -30783,7 +30783,7 @@ def ingest_v2_plan_current_mbox_source(
                 if message_lookup_key is not None
                 else []
             )
-            if ingest_v2_plan_mbox_message_item(
+            ingest_v2_plan_mbox_message_item(
                 connection,
                 run_id=run_id,
                 source_rel_path=source_rel_path,
@@ -30808,8 +30808,8 @@ def ingest_v2_plan_current_mbox_source(
                 message_metadata=message_metadata,
                 linked_drive_records=linked_drive_records,
                 linked_drive_attachment_records=linked_drive_attachment_records,
-            ):
-                planned_this_step += 1
+            )
+            processed_this_step += 1
             next_commit_order += 1
             next_message_index = message_index + 1
     finally:
@@ -30821,11 +30821,11 @@ def ingest_v2_plan_current_mbox_source(
     current_mbox_source["next_message_index"] = next_message_index
     current_mbox_source["next_commit_order"] = next_commit_order
     current_mbox_source["planned_message_count"] = (
-        int(current_mbox_source.get("planned_message_count") or 0) + planned_this_step
+        int(current_mbox_source.get("planned_message_count") or 0) + processed_this_step
     )
     current_mbox_source["duplicate_source_item_counts"] = duplicate_counts
     if not reached_end:
-        return current_mbox_source, next_commit_order, planned_this_step, False
+        return current_mbox_source, next_commit_order, processed_this_step, False
 
     ingest_v2_plan_mbox_source_finalizer_item(
         connection,
@@ -30849,7 +30849,7 @@ def ingest_v2_plan_current_mbox_source(
         commit_order=next_commit_order,
         linked_drive_rel_paths=list(current_mbox_source.get("linked_drive_rel_paths") or []),
     )
-    return None, next_commit_order + 1, planned_this_step, True
+    return None, next_commit_order + 1, processed_this_step, True
 
 
 def ingest_v2_production_signature_payload(root: Path, signature: dict[str, object]) -> dict[str, object]:
@@ -33475,6 +33475,15 @@ def ingest_v2_plan_step(
                             planned_sources.append(source_rel_path)
                             cursor["planned_mbox_sources"] = planned_sources
                     if source_complete or ingest_v2_deadline_remaining_seconds(deadline) < 1.0:
+                        cursor_save_ms_values.append(
+                            ingest_v2_save_planning_cursor_heartbeat(
+                                connection,
+                                run_id=run_id,
+                                cursor=cursor,
+                                status="pending",
+                            )
+                        )
+                    elif isinstance(updated_mbox_source, dict):
                         cursor_save_ms_values.append(
                             ingest_v2_save_planning_cursor_heartbeat(
                                 connection,
