@@ -8192,25 +8192,33 @@ def ooxml_image_mime_type(part_name: str) -> str | None:
     return None
 
 
+def image_path_png_bytes(path: Path, *, max_dimension: int | None = None) -> bytes | None:
+    resized_dimension = max(0, int(max_dimension or 0))
+    pil_image_module = load_dependency("PilImage")
+    if pil_image_module is None:
+        return None
+    with pil_image_module.open(path) as image:
+        if resized_dimension:
+            image.thumbnail((resized_dimension, resized_dimension))
+        buffer = io.BytesIO()
+        try:
+            image.save(buffer, format="PNG", optimize=True)
+        except (OSError, ValueError):
+            image.convert("RGB").save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
 def image_path_data_url(path: Path, *, max_dimension: int | None = None) -> str | None:
     mime_type, _ = mimetypes.guess_type(path.name)
     normalized_suffix = path.suffix.lower()
     resized_dimension = max(0, int(max_dimension or 0))
     if normalized_suffix in {".tif", ".tiff"} or resized_dimension:
-        pil_image_module = load_dependency("PilImage")
-        if pil_image_module is None:
+        png_bytes = image_path_png_bytes(path, max_dimension=resized_dimension)
+        if png_bytes is None:
             if normalized_suffix not in {".tif", ".tiff"} and mime_type is not None and mime_type.startswith("image/"):
                 return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
             return None
-        with pil_image_module.open(path) as image:
-            if resized_dimension:
-                image.thumbnail((resized_dimension, resized_dimension))
-            buffer = io.BytesIO()
-            try:
-                image.save(buffer, format="PNG", optimize=True)
-            except (OSError, ValueError):
-                image.convert("RGB").save(buffer, format="PNG", optimize=True)
-        return f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode('ascii')}"
+        return f"data:image/png;base64,{base64.b64encode(png_bytes).decode('ascii')}"
     if mime_type is None or not mime_type.startswith("image/"):
         return None
     return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
@@ -15757,6 +15765,29 @@ def production_logical_rel_path(production_rel_root: str, control_number: str) -
     return Path(INTERNAL_REL_PATH_PREFIX) / "productions" / production_slug / "documents" / f"{control_slug}.logical"
 
 
+def production_preview_page_asset_refs(
+    rel_path: str,
+    control_number: str,
+    image_paths: list[Path],
+) -> list[dict[str, object]]:
+    preview_base = preview_base_path_for_rel_path(rel_path)
+    page_dir_name = f"{sanitize_storage_filename(control_number)}-pages"
+    refs: list[dict[str, object]] = []
+    for index, image_path in enumerate(image_paths, start=1):
+        page_file_name = f"page-{index:04d}.png"
+        rel_preview_path = preview_base / page_dir_name / page_file_name
+        refs.append(
+            {
+                "ordinal": index,
+                "label": f"Page {index}",
+                "source_path": str(image_path),
+                "rel_preview_path": rel_preview_path.as_posix(),
+                "html_src": urllib_request.pathname2url(f"{page_dir_name}/{page_file_name}"),
+            }
+        )
+    return refs
+
+
 def infer_production_title(control_number: str, text_content: str, native_path: Path | None) -> str:
     for line in text_content.splitlines():
         candidate = normalize_whitespace(line)
@@ -21781,6 +21812,7 @@ def build_production_extracted_payload(
     native_path: Path | None,
     preview_image_limit: int | None = None,
     preview_image_max_dimension: int | None = None,
+    preview_image_refs: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     text_content = ""
     text_status = "empty"
@@ -21812,23 +21844,34 @@ def build_production_extracted_payload(
         or fallback_content_type
     )
     page_images: list[dict[str, object]] = []
-    preview_image_paths = image_paths
-    normalized_preview_image_limit = None if preview_image_limit is None else max(0, int(preview_image_limit))
-    if normalized_preview_image_limit is not None:
-        preview_image_paths = image_paths[:normalized_preview_image_limit]
-    for index, image_path in enumerate(preview_image_paths, start=1):
-        if not image_path.exists():
-            continue
-        data_url = image_path_data_url(image_path, max_dimension=preview_image_max_dimension)
-        if data_url is None:
-            continue
-        page_images.append({"label": f"Page {index}", "src": data_url})
     page_image_note = None
-    if normalized_preview_image_limit is not None and len(image_paths) > normalized_preview_image_limit:
-        page_image_note = (
-            f"Preview shows the first {len(preview_image_paths)} of {len(image_paths)} produced pages. "
-            "All produced page files are still linked as source parts."
-        )
+    if preview_image_refs is not None:
+        for ref in preview_image_refs:
+            page_images.append(
+                {
+                    "label": str(ref.get("label") or f"Page {ref.get('ordinal') or len(page_images) + 1}"),
+                    "src": str(ref.get("html_src") or ""),
+                }
+            )
+        if page_images:
+            page_image_note = "Produced page previews are generated in resumable batches."
+    else:
+        preview_image_paths = image_paths
+        normalized_preview_image_limit = None if preview_image_limit is None else max(0, int(preview_image_limit))
+        if normalized_preview_image_limit is not None:
+            preview_image_paths = image_paths[:normalized_preview_image_limit]
+        for index, image_path in enumerate(preview_image_paths, start=1):
+            if not image_path.exists():
+                continue
+            data_url = image_path_data_url(image_path, max_dimension=preview_image_max_dimension)
+            if data_url is None:
+                continue
+            page_images.append({"label": f"Page {index}", "src": data_url})
+        if normalized_preview_image_limit is not None and len(image_paths) > normalized_preview_image_limit:
+            page_image_note = (
+                f"Preview shows the first {len(preview_image_paths)} of {len(image_paths)} produced pages. "
+                "All produced page files are still linked as source parts."
+            )
     resolved_title = (email_headers.get("title") if email_headers else None) or infer_production_title(control_number, text_content, native_path)
     preview_artifacts: list[dict[str, object]] = []
     if preferred_native is None:
@@ -21930,6 +21973,7 @@ def prepare_production_row_plan(
     *,
     preview_image_limit: int | None = None,
     preview_image_max_dimension: int | None = None,
+    preview_image_refs: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     prepared_item = dict(prepared_plan)
     prepare_started = time.perf_counter()
@@ -21952,6 +21996,7 @@ def prepare_production_row_plan(
             native_path=available_native_path,
             preview_image_limit=preview_image_limit,
             preview_image_max_dimension=preview_image_max_dimension,
+            preview_image_refs=preview_image_refs,
         )
         preferred_native = extracted_payload.pop("preferred_native", None)
         source_parts = production_source_parts(
@@ -30155,7 +30200,7 @@ INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
 INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL = 25
 INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
 INGEST_V2_PREPARED_COMMIT_BATCH_TARGET = max(25, INGEST_V2_PREPARE_BATCH_SIZE * 5)
-INGEST_V2_PRODUCTION_PREVIEW_IMAGE_LIMIT = 12
+INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE = 12
 INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 1400
 
 
@@ -31493,6 +31538,59 @@ def ingest_v2_plan_production_row_item(
     return int(cursor.rowcount or 0) > 0
 
 
+def ingest_v2_plan_production_preview_batch_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    plan: dict[str, object],
+    signature_payload: dict[str, object],
+    rel_path: str,
+    page_refs: list[dict[str, object]],
+    batch_index: int,
+    parent_order: int,
+    commit_order: int,
+) -> bool:
+    if not page_refs:
+        return False
+    now = utc_now()
+    production_rel_root = str(plan["production_rel_root"])
+    control_number = str(plan["control_number"])
+    payload = {
+        "production_rel_root": production_rel_root,
+        "production_name": plan["production_name"],
+        "control_number": control_number,
+        "rel_path": rel_path,
+        "metadata_load_rel_path": signature_payload["metadata_load_rel_path"],
+        "image_load_rel_path": signature_payload.get("image_load_rel_path"),
+        "source_type": signature_payload["source_type"],
+        "batch_index": int(batch_index),
+        "page_refs": page_refs,
+        "planned_at": now,
+    }
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO ingest_work_items (
+          run_id, unit_type, source_kind, source_key, rel_path, commit_order, parent_order,
+          payload_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "production_preview_batch",
+            PRODUCTION_SOURCE_KIND,
+            f"{production_rel_root}:{control_number}:preview:{batch_index}",
+            rel_path,
+            int(commit_order),
+            int(parent_order),
+            compact_json_text(ingest_v2_json_safe_value(payload)),
+            "pending",
+            now,
+            now,
+        ),
+    )
+    return int(cursor.rowcount or 0) > 0
+
+
 def ingest_v2_plan_production_root(
     connection: sqlite3.Connection,
     root: Path,
@@ -31519,21 +31617,57 @@ def ingest_v2_plan_production_root(
         resolved_image_rows,
     )
     planned_rows = 0
+    planned_preview_batches = 0
     current_order = int(next_commit_order)
     for plan in production_row_plans:
+        row_order = current_order
+        production_rel_root = str(plan["production_rel_root"])
+        control_number = str(plan["control_number"])
+        rel_path = production_logical_rel_path(production_rel_root, control_number).as_posix()
         inserted = ingest_v2_plan_production_row_item(
             connection,
             run_id=run_id,
             plan=plan,
             signature_payload=signature_payload,
-            commit_order=current_order,
+            commit_order=row_order,
         )
         current_order += 1
         if inserted:
             planned_rows += 1
+        native_path = Path(str(plan["native_path"])) if plan.get("native_path") is not None else None
+        page_refs = (
+            production_preview_page_asset_refs(
+                rel_path,
+                control_number,
+                [
+                    Path(str(path))
+                    for path in list(plan.get("matching_image_paths") or [])
+                    if path
+                ],
+            )
+            if production_previewable_native(native_path) is None
+            else []
+        )
+        for batch_index, start in enumerate(range(0, len(page_refs), INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE), start=1):
+            batch_refs = page_refs[start : start + INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE]
+            batch_inserted = ingest_v2_plan_production_preview_batch_item(
+                connection,
+                run_id=run_id,
+                plan=plan,
+                signature_payload=signature_payload,
+                rel_path=rel_path,
+                page_refs=batch_refs,
+                batch_index=batch_index,
+                parent_order=row_order,
+                commit_order=current_order,
+            )
+            current_order += 1
+            if batch_inserted:
+                planned_preview_batches += 1
     return {
         **signature_payload,
         "planned_rows": planned_rows,
+        "planned_preview_batches": planned_preview_batches,
         "seen_control_numbers": sorted(seen_control_numbers),
         "docs_missing_linked_text": sum(int(plan["missing_linked_text"]) for plan in production_row_plans),
         "docs_missing_linked_images": sum(int(plan["missing_linked_images"]) for plan in production_row_plans),
@@ -31719,7 +31853,7 @@ def ingest_v2_claim_prepare_items(
             FROM ingest_work_items
             WHERE run_id = ?
               AND unit_type IN (
-                'loose_file', 'production_row', 'slack_conversation',
+                'loose_file', 'production_row', 'production_preview_batch', 'slack_conversation',
                 'mbox_message', 'mbox_source_finalizer',
                 'pst_message', 'pst_source_finalizer'
               )
@@ -31911,6 +32045,13 @@ def ingest_v2_prepare_claimed_work_item(
             deadline=deadline,
         )
         payload_kind = "production_row"
+    elif unit_type == "production_preview_batch":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_production_preview_batch_item(
+            root,
+            work_item_row,
+            deadline=deadline,
+        )
+        payload_kind = "production_preview_batch"
     elif unit_type == "slack_conversation":
         prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_slack_conversation_item(
             work_item_row,
@@ -32049,13 +32190,75 @@ def ingest_v2_prepare_production_row_item(
     }
     if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
         return None, source_fingerprint, "Not enough budget remaining to start prepare."
+    rel_path = str(payload_dict.get("rel_path") or production_logical_rel_path(production_rel_root, control_number))
+    matching_image_paths = [
+        Path(str(path))
+        for path in list(payload_dict.get("matching_image_paths") or [])
+        if path
+    ]
     prepared_item = prepare_production_row_plan(
         root,
         payload_dict,
-        preview_image_limit=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_LIMIT,
-        preview_image_max_dimension=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+        preview_image_refs=production_preview_page_asset_refs(rel_path, control_number, matching_image_paths),
     )
     prepared_item["prepare_hash_ms"] = 0.0
+    return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_prepare_production_preview_batch_item(
+    root: Path,
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    page_refs = [
+        dict(ref)
+        for ref in list(payload_dict.get("page_refs") or [])
+        if isinstance(ref, dict)
+    ]
+    source_fingerprint = {
+        "production_rel_root": payload_dict.get("production_rel_root"),
+        "control_number": payload_dict.get("control_number"),
+        "batch_index": payload_dict.get("batch_index"),
+        "page_count": len(page_refs),
+    }
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return None, source_fingerprint, "Not enough budget remaining to start prepare."
+    prepare_started = time.perf_counter()
+    page_assets: list[dict[str, object]] = []
+    for ref in page_refs:
+        if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+            return None, source_fingerprint, "Not enough budget remaining to start prepare."
+        source_path = Path(str(ref.get("source_path") or ""))
+        if not source_path.exists():
+            continue
+        png_bytes = image_path_png_bytes(
+            source_path,
+            max_dimension=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+        )
+        if png_bytes is None:
+            continue
+        page_assets.append(
+            {
+                "ordinal": int(ref.get("ordinal") or 0),
+                "label": str(ref.get("label") or ""),
+                "rel_preview_path": str(ref.get("rel_preview_path") or ""),
+                "payload": png_bytes,
+            }
+        )
+    prepared_item = {
+        **payload_dict,
+        "payload_kind": "production_preview_batch",
+        "source_kind": PRODUCTION_SOURCE_KIND,
+        "page_assets": page_assets,
+        "prepare_ms": ingest_v2_elapsed_ms(prepare_started),
+        "prepare_hash_ms": 0.0,
+        "prepare_extract_ms": ingest_v2_elapsed_ms(prepare_started),
+        "prepare_chunk_ms": 0.0,
+        "prepare_error": None,
+    }
     return prepared_item, source_fingerprint, None
 
 
@@ -33385,6 +33588,98 @@ def ingest_v2_commit_production_work_item_hook(
         """,
         (now, now, run_id, writer_id),
     )
+
+
+def ingest_v2_commit_production_preview_batch(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    production_id: int,
+    prepared_item: dict[str, object],
+) -> dict[str, object]:
+    control_number = str(prepared_item["control_number"])
+    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
+    if prepare_error:
+        raise RetrieverError(prepare_error)
+    page_assets = [
+        dict(asset)
+        for asset in list(prepared_item.get("page_assets") or [])
+        if isinstance(asset, dict)
+    ]
+    connection.execute("BEGIN")
+    try:
+        document_row = connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE production_id = ?
+              AND control_number = ?
+              AND lifecycle_status != 'deleted'
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (production_id, control_number),
+        ).fetchone()
+        if document_row is None:
+            raise RetrieverError(f"Production document {control_number} is not committed yet.")
+        document_id = int(document_row["id"])
+        preview_rows: list[dict[str, object]] = []
+        rel_preview_paths: list[str] = []
+        for asset in page_assets:
+            rel_preview_path = normalize_whitespace(str(asset.get("rel_preview_path") or ""))
+            payload = asset.get("payload")
+            if not rel_preview_path or not isinstance(payload, (bytes, bytearray)):
+                continue
+            abs_path = paths["state_dir"] / rel_preview_path
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_bytes(bytes(payload))
+            rel_preview_paths.append(rel_preview_path)
+            preview_rows.append(
+                {
+                    "rel_preview_path": rel_preview_path,
+                    "preview_type": "image",
+                    "target_fragment": None,
+                    "label": asset.get("label"),
+                    "ordinal": int(asset.get("ordinal") or 0),
+                    "created_at": utc_now(),
+                }
+            )
+        if rel_preview_paths:
+            placeholders = ",".join("?" for _ in rel_preview_paths)
+            connection.execute(
+                f"""
+                DELETE FROM document_previews
+                WHERE document_id = ?
+                  AND rel_preview_path IN ({placeholders})
+                """,
+                (document_id, *rel_preview_paths),
+            )
+            insert_document_preview_rows(connection, document_id, preview_rows)
+        result = {
+            "action": "preview_batch",
+            "control_number": control_number,
+            "document_id": document_id,
+            "production_id": production_id,
+            "page_images_linked": 0,
+            "preview_pages_generated": len(preview_rows),
+        }
+        ingest_v2_commit_production_work_item_hook(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            writer_id=writer_id,
+            cursor=cursor,
+            result=result,
+        )
+        connection.commit()
+        return result
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def ingest_v2_commit_slack_conversation_work_item_hook(
@@ -35180,6 +35475,10 @@ def ingest_v2_plan_step(
                             int(cursor.get("planned_production_rows") or 0)
                             + int(production_plan["planned_rows"] or 0)
                         )
+                        cursor["planned_production_preview_batches"] = (
+                            int(cursor.get("planned_production_preview_batches") or 0)
+                            + int(production_plan.get("planned_preview_batches") or 0)
+                        )
                         cursor["production_docs_missing_linked_text"] = (
                             int(cursor.get("production_docs_missing_linked_text") or 0)
                             + int(production_plan["docs_missing_linked_text"] or 0)
@@ -35197,6 +35496,7 @@ def ingest_v2_plan_step(
                             **signature_payload,
                             "seen_control_numbers": list(production_plan["seen_control_numbers"]),
                             "planned_rows": int(production_plan["planned_rows"] or 0),
+                            "planned_preview_batches": int(production_plan.get("planned_preview_batches") or 0),
                             "docs_missing_linked_text": int(production_plan["docs_missing_linked_text"] or 0),
                             "docs_missing_linked_images": int(production_plan["docs_missing_linked_images"] or 0),
                             "docs_missing_linked_natives": int(production_plan["docs_missing_linked_natives"] or 0),
@@ -35420,6 +35720,7 @@ def ingest_v2_plan_step(
                     "planned_loose_files": int(cursor.get("planned_loose_files") or 0),
                     "planned_production_roots": len(list(cursor.get("planned_production_roots") or [])),
                     "planned_production_rows": int(cursor.get("planned_production_rows") or 0),
+                    "planned_production_preview_batches": int(cursor.get("planned_production_preview_batches") or 0),
                     "planned_slack_export_roots": list(cursor.get("planned_slack_export_roots") or []),
                     "planned_slack_conversations": int(cursor.get("planned_slack_conversations") or 0),
                     "planned_slack_day_documents": int(cursor.get("planned_slack_day_documents") or 0),
@@ -35816,6 +36117,25 @@ def ingest_v2_commit_step(
                             cursor=cursor,
                             result=result,
                         ),
+                    )
+                elif (
+                    payload_kind == "production_preview_batch"
+                    or str(claimed_row["unit_type"] or "") == "production_preview_batch"
+                ):
+                    _dataset_id, _dataset_source_id, production_id = ingest_v2_ensure_production_context(
+                        connection,
+                        root,
+                        prepared_item,
+                    )
+                    commit_result = ingest_v2_commit_production_preview_batch(
+                        connection,
+                        paths,
+                        run_id=run_id,
+                        work_item_id=work_item_id,
+                        writer_id=writer_id,
+                        cursor=cursor,
+                        production_id=production_id,
+                        prepared_item=prepared_item,
                     )
                 elif payload_kind == "slack_conversation" or str(claimed_row["unit_type"] or "") == "slack_conversation":
                     prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None

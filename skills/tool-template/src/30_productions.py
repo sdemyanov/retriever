@@ -445,6 +445,29 @@ def production_logical_rel_path(production_rel_root: str, control_number: str) -
     return Path(INTERNAL_REL_PATH_PREFIX) / "productions" / production_slug / "documents" / f"{control_slug}.logical"
 
 
+def production_preview_page_asset_refs(
+    rel_path: str,
+    control_number: str,
+    image_paths: list[Path],
+) -> list[dict[str, object]]:
+    preview_base = preview_base_path_for_rel_path(rel_path)
+    page_dir_name = f"{sanitize_storage_filename(control_number)}-pages"
+    refs: list[dict[str, object]] = []
+    for index, image_path in enumerate(image_paths, start=1):
+        page_file_name = f"page-{index:04d}.png"
+        rel_preview_path = preview_base / page_dir_name / page_file_name
+        refs.append(
+            {
+                "ordinal": index,
+                "label": f"Page {index}",
+                "source_path": str(image_path),
+                "rel_preview_path": rel_preview_path.as_posix(),
+                "html_src": urllib_request.pathname2url(f"{page_dir_name}/{page_file_name}"),
+            }
+        )
+    return refs
+
+
 def infer_production_title(control_number: str, text_content: str, native_path: Path | None) -> str:
     for line in text_content.splitlines():
         candidate = normalize_whitespace(line)
@@ -6469,6 +6492,7 @@ def build_production_extracted_payload(
     native_path: Path | None,
     preview_image_limit: int | None = None,
     preview_image_max_dimension: int | None = None,
+    preview_image_refs: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     text_content = ""
     text_status = "empty"
@@ -6500,23 +6524,34 @@ def build_production_extracted_payload(
         or fallback_content_type
     )
     page_images: list[dict[str, object]] = []
-    preview_image_paths = image_paths
-    normalized_preview_image_limit = None if preview_image_limit is None else max(0, int(preview_image_limit))
-    if normalized_preview_image_limit is not None:
-        preview_image_paths = image_paths[:normalized_preview_image_limit]
-    for index, image_path in enumerate(preview_image_paths, start=1):
-        if not image_path.exists():
-            continue
-        data_url = image_path_data_url(image_path, max_dimension=preview_image_max_dimension)
-        if data_url is None:
-            continue
-        page_images.append({"label": f"Page {index}", "src": data_url})
     page_image_note = None
-    if normalized_preview_image_limit is not None and len(image_paths) > normalized_preview_image_limit:
-        page_image_note = (
-            f"Preview shows the first {len(preview_image_paths)} of {len(image_paths)} produced pages. "
-            "All produced page files are still linked as source parts."
-        )
+    if preview_image_refs is not None:
+        for ref in preview_image_refs:
+            page_images.append(
+                {
+                    "label": str(ref.get("label") or f"Page {ref.get('ordinal') or len(page_images) + 1}"),
+                    "src": str(ref.get("html_src") or ""),
+                }
+            )
+        if page_images:
+            page_image_note = "Produced page previews are generated in resumable batches."
+    else:
+        preview_image_paths = image_paths
+        normalized_preview_image_limit = None if preview_image_limit is None else max(0, int(preview_image_limit))
+        if normalized_preview_image_limit is not None:
+            preview_image_paths = image_paths[:normalized_preview_image_limit]
+        for index, image_path in enumerate(preview_image_paths, start=1):
+            if not image_path.exists():
+                continue
+            data_url = image_path_data_url(image_path, max_dimension=preview_image_max_dimension)
+            if data_url is None:
+                continue
+            page_images.append({"label": f"Page {index}", "src": data_url})
+        if normalized_preview_image_limit is not None and len(image_paths) > normalized_preview_image_limit:
+            page_image_note = (
+                f"Preview shows the first {len(preview_image_paths)} of {len(image_paths)} produced pages. "
+                "All produced page files are still linked as source parts."
+            )
     resolved_title = (email_headers.get("title") if email_headers else None) or infer_production_title(control_number, text_content, native_path)
     preview_artifacts: list[dict[str, object]] = []
     if preferred_native is None:
@@ -6618,6 +6653,7 @@ def prepare_production_row_plan(
     *,
     preview_image_limit: int | None = None,
     preview_image_max_dimension: int | None = None,
+    preview_image_refs: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     prepared_item = dict(prepared_plan)
     prepare_started = time.perf_counter()
@@ -6640,6 +6676,7 @@ def prepare_production_row_plan(
             native_path=available_native_path,
             preview_image_limit=preview_image_limit,
             preview_image_max_dimension=preview_image_max_dimension,
+            preview_image_refs=preview_image_refs,
         )
         preferred_native = extracted_payload.pop("preferred_native", None)
         source_parts = production_source_parts(
