@@ -674,3 +674,7 @@ If you are trying Retriever for the first time, this sequence is a good starting
 ```
 
 That path exercises the setup, browse, narrowing, display, persistence, and export surfaces that most users rely on first.
+
+## License
+
+Retriever is licensed under the Elastic License 2.0 (ELv2). The SPDX identifier is `Elastic-2.0`. See the [Elastic License 2.0](https://www.elastic.co/licensing/elastic-license) for the license terms.
