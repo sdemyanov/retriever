@@ -11374,6 +11374,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh_previews_parser = subparsers.add_parser(
         "refresh-conversation-previews",
+        aliases=["refresh-previews"],
         help="Regenerate thread and per-message HTML previews for existing conversations",
     )
     refresh_previews_parser.add_argument("workspace", help="Workspace root path")
@@ -12402,9 +12403,9 @@ def main() -> int:
                 clear_conversation_assignment(root, args.doc_id),
             )
 
-        if args.command == "refresh-conversation-previews":
+        if args.command in {"refresh-conversation-previews", "refresh-previews"}:
             return emit_cli_payload(
-                "refresh-conversation-previews",
+                args.command,
                 refresh_generated_previews(
                     root,
                     conversation_ids=args.conversation_ids,

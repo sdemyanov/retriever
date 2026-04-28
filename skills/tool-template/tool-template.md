@@ -7,7 +7,7 @@
 - requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `d0617df92c7b1ed14914f799a86f571bce326902bcca79603c1525d97effe47f`
+- source checksum (SHA256): `94adf45c96624532eba87ff97de1b26edaa31061da4c93ff25407f0121beb5b2`
 
 ## Current command surface
 
@@ -42,6 +42,9 @@ The current template implements:
 - `merge-into-conversation`
 - `split-from-conversation`
 - `clear-conversation-assignment`
+- `refresh-previews`
+- `refresh-conversation-previews`
+- `rebuild-conversations`
 - `upgrade-workspace`
 - `list-datasets`
 - `create-dataset`

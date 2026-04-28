@@ -15509,8 +15509,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         message_preview_path.write_text("stale preview html", encoding="utf-8")
 
-        refresh_result = retriever_tools.refresh_generated_previews(self.root, dataset_name="gmail-max.mbox")
+        exit_code, refresh_result, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--dataset-name",
+            "gmail-max.mbox",
+        )
 
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(refresh_result)
+        assert refresh_result is not None
         self.assertEqual(refresh_result["status"], "ok")
         self.assertEqual(refresh_result["dataset"]["dataset_name"], "gmail-max.mbox")
         self.assertEqual(refresh_result["refreshed_conversations"], 1)
