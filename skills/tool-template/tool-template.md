@@ -7,7 +7,7 @@
 - requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `c3e18059167ad05a7c15d80d02d62a1367bf29cd1a24b30c238fac3600e200b9`
+- source checksum (SHA256): `f3b95a71a71d8cd4935574c26ee992cce581ba5dceee090e0f5e604419251b21`
 
 ## Current command surface
 
@@ -45,7 +45,7 @@ For low-level worker protocol work, use:
 - Export preview ownership is shared by the most inclusive useful unit:
   - email export units expand to the full conversation chain
   - chat export units merge contiguous selected documents inside the conversation timeline
-- `refresh-previews` defaults to `--scope conversations`, regenerating the generated per-message/document and full conversation preview artifacts for email/chat conversations. It can be narrowed with `--conversation-id`, `--doc-id`, `--dataset-id`, or `--dataset-name`; `--missing-only` limits refresh to conversations with missing preview rows/files.
+- `refresh-previews` defaults to `--scope conversations`, regenerating the generated per-message/document and full conversation preview artifacts for email/chat conversations. `--scope documents` refreshes standalone generated document previews from stored production state or, with `--from-source`, by re-running source-backed preview extraction without updating document metadata/text. `--scope all` runs both scopes. The command can be narrowed with `--conversation-id`, `--doc-id`, `--dataset-id`, or `--dataset-name`; `--missing-only` limits refresh to previews with missing rows/files.
 
 ## Runtime usage rules
 

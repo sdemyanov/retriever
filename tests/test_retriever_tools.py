@@ -15860,6 +15860,67 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         refreshed_html = message_preview_path.read_text(encoding="utf-8")
         self.assertIn("Refresh this missing preview body", refreshed_html)
 
+    def test_refresh_previews_document_and_all_scope_regenerate_rtf_preview_from_source(self) -> None:
+        rtf_path = self.root / "memo.rtf"
+        rtf_path.write_text(
+            r"{\rtf1\ansi\deff0 {\fonttbl {\f0 Arial;}}\f0 Source Refresh Memo\par Updated from source preview body.\par}",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        row = self.fetch_document_row("memo.rtf")
+        search_result = retriever_tools.search(self.root, "Updated from source preview body", None, None, None, 1, 20)
+        document_result = next(item for item in search_result["results"] if item["id"] == row["id"])
+        preview_path = self.preview_target_file_path(document_result["preview_targets"][0])
+        preview_path.write_text("stale rtf preview", encoding="utf-8")
+
+        exit_code, refresh_result, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "documents",
+            "--doc-id",
+            str(row["id"]),
+            "--from-source",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(refresh_result)
+        assert refresh_result is not None
+        self.assertEqual(refresh_result["status"], "ok")
+        self.assertEqual(refresh_result["scope"], "documents")
+        self.assertEqual(refresh_result["from_source_mode"], "enabled_for_document_previews")
+        self.assertEqual(refresh_result["refreshed_documents"], 1)
+        self.assertEqual(refresh_result["skipped_documents"], 0)
+        self.assertEqual(refresh_result["refreshed_conversations"], 0)
+        self.assertEqual(refresh_result["target_document_ids"], [row["id"]])
+        refreshed_html = preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale rtf preview", refreshed_html)
+        self.assertIn("Updated from source preview body", refreshed_html)
+
+        preview_path.write_text("stale rtf preview again", encoding="utf-8")
+        exit_code, refresh_all_result, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "all",
+            "--doc-id",
+            str(row["id"]),
+            "--from-source",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(refresh_all_result)
+        assert refresh_all_result is not None
+        self.assertEqual(refresh_all_result["status"], "ok")
+        self.assertEqual(refresh_all_result["scope"], "all")
+        self.assertEqual(refresh_all_result["refreshed_documents"], 1)
+        self.assertEqual(refresh_all_result["refreshed_conversations"], 0)
+        self.assertNotIn("stale rtf preview again", preview_path.read_text(encoding="utf-8"))
+
     def test_changed_mbox_reingest_preserves_control_numbers_and_retires_removed_messages(self) -> None:
         self.write_fake_mbox_file(
             [

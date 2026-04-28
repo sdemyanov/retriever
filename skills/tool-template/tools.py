@@ -47026,6 +47026,7 @@ def resolve_conversation_preview_refresh_ids(
     document_ids: list[int] | None = None,
     dataset_id: int | None = None,
     dataset_name: str | None = None,
+    ignore_documents_without_conversation: bool = False,
 ) -> tuple[list[int], dict[str, object] | None]:
     target_conversation_ids: set[int] = set()
     dataset_summary: dict[str, object] | None = None
@@ -47056,6 +47057,8 @@ def resolve_conversation_preview_refresh_ids(
             root_row = get_document_family_root_row_for_assignment(connection, document_id)
             conversation_id = root_row["conversation_id"]
             if conversation_id is None:
+                if ignore_documents_without_conversation:
+                    continue
                 raise RetrieverError(
                     f"Document {document_id} does not belong to a conversation, so there are no conversation previews to refresh."
                 )
@@ -47130,6 +47133,220 @@ def filter_conversation_ids_with_missing_preview_artifacts(
     ]
 
 
+def resolve_document_preview_refresh_ids(
+    connection: sqlite3.Connection,
+    *,
+    document_ids: list[int] | None = None,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+) -> tuple[list[int], dict[str, object] | None]:
+    target_document_ids: set[int] = set()
+    dataset_summary: dict[str, object] | None = None
+
+    if document_ids:
+        requested_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+        rows = connection.execute(
+            f"""
+            SELECT id
+            FROM documents
+            WHERE id IN ({", ".join("?" for _ in requested_document_ids)})
+              AND lifecycle_status NOT IN ('missing', 'deleted')
+            """,
+            tuple(requested_document_ids),
+        ).fetchall()
+        found_document_ids = {int(row["id"]) for row in rows}
+        missing_document_ids = [
+            document_id
+            for document_id in requested_document_ids
+            if document_id not in found_document_ids
+        ]
+        if missing_document_ids:
+            missing_text = ", ".join(str(document_id) for document_id in missing_document_ids)
+            raise RetrieverError(f"Unknown active document id(s): {missing_text}")
+        target_document_ids.update(requested_document_ids)
+
+    if dataset_id is not None or dataset_name is not None:
+        dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
+        dataset_summary = dataset_summary_by_id(connection, int(dataset_row["id"]))
+        rows = connection.execute(
+            """
+            SELECT DISTINCT documents.id AS document_id
+            FROM dataset_documents
+            JOIN documents ON documents.id = dataset_documents.document_id
+            WHERE dataset_documents.dataset_id = ?
+              AND documents.lifecycle_status NOT IN ('missing', 'deleted')
+            ORDER BY documents.id ASC
+            """,
+            (int(dataset_row["id"]),),
+        ).fetchall()
+        target_document_ids.update(int(row["document_id"]) for row in rows)
+
+    if not target_document_ids and document_ids is None and dataset_id is None and dataset_name is None:
+        rows = connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE lifecycle_status NOT IN ('missing', 'deleted')
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        target_document_ids.update(int(row["id"]) for row in rows)
+
+    return sorted(target_document_ids), dataset_summary
+
+
+def filter_document_ids_with_missing_preview_artifacts(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_ids: list[int],
+) -> list[int]:
+    normalized_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+    if not normalized_document_ids:
+        return []
+    rows = connection.execute(
+        f"""
+        SELECT document_id, rel_preview_path, preview_type
+        FROM document_previews
+        WHERE document_id IN ({", ".join("?" for _ in normalized_document_ids)})
+        ORDER BY document_id ASC, ordinal ASC, id ASC
+        """,
+        tuple(normalized_document_ids),
+    ).fetchall()
+    missing_document_ids: set[int] = set()
+    for row in rows:
+        if normalize_whitespace(str(row["preview_type"] or "")).lower() == "native":
+            continue
+        rel_preview_path = normalize_whitespace(str(row["rel_preview_path"] or ""))
+        if rel_preview_path and not (paths["state_dir"] / rel_preview_path).exists():
+            missing_document_ids.add(int(row["document_id"]))
+    return [
+        document_id
+        for document_id in normalized_document_ids
+        if document_id in missing_document_ids
+    ]
+
+
+def load_preview_refresh_document_rows(
+    connection: sqlite3.Connection,
+    document_ids: list[int],
+) -> list[sqlite3.Row]:
+    normalized_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+    if not normalized_document_ids:
+        return []
+    return connection.execute(
+        f"""
+        SELECT
+          d.id,
+          d.rel_path,
+          d.source_kind,
+          d.conversation_id,
+          d.production_id,
+          tr.storage_rel_path AS source_text_storage_rel_path
+        FROM documents d
+        LEFT JOIN text_revisions tr ON tr.id = d.source_text_revision_id
+        WHERE d.id IN ({", ".join("?" for _ in normalized_document_ids)})
+          AND d.lifecycle_status NOT IN ('missing', 'deleted')
+        ORDER BY d.id ASC
+        """,
+        tuple(normalized_document_ids),
+    ).fetchall()
+
+
+def refresh_source_backed_document_preview(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+) -> dict[str, object]:
+    document_id = int(row["id"])
+    rel_path = str(row["rel_path"] or "")
+    if is_internal_rel_path(rel_path):
+        return {"status": "skipped", "reason": "internal_document"}
+    source_kind = normalize_whitespace(str(row["source_kind"] or FILESYSTEM_SOURCE_KIND)).lower()
+    if source_kind != FILESYSTEM_SOURCE_KIND:
+        return {"status": "skipped", "reason": "source_kind_requires_ingest"}
+    source_path = document_absolute_path(paths, rel_path)
+    if not source_path.exists():
+        return {"status": "skipped", "reason": "source_file_missing"}
+    try:
+        extracted = extract_document(source_path, include_attachments=False)
+    except RetrieverError as exc:
+        return {"status": "skipped", "reason": "extractor_error", "error": str(exc)}
+    preview_artifacts = list(extracted.get("preview_artifacts", []))
+    if not preview_artifacts:
+        return {"status": "skipped", "reason": "no_generated_preview_artifacts"}
+    previous_preview_paths = [
+        str(preview_row["rel_preview_path"])
+        for preview_row in connection.execute(
+            "SELECT rel_preview_path FROM document_previews WHERE document_id = ?",
+            (document_id,),
+        ).fetchall()
+    ]
+    preview_rows = write_preview_artifacts(paths, rel_path, preview_artifacts)
+    replace_document_preview_rows(connection, document_id, preview_rows)
+    cleanup_unreferenced_preview_files(paths, connection, previous_preview_paths)
+    sync_document_attachment_preview_links(connection, paths, document_id)
+    return {"status": "ok", "preview_rows": len(preview_rows)}
+
+
+def refresh_stored_state_document_preview(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+) -> dict[str, object]:
+    document_id = int(row["id"])
+    if row["production_id"] is not None:
+        text_content = load_document_preview_text(
+            connection,
+            paths,
+            document_id=document_id,
+            storage_rel_path=row["source_text_storage_rel_path"],
+        )
+        return regenerate_production_preview_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+            text_content=text_content,
+        )
+    return {"status": "skipped", "reason": "requires_from_source"}
+
+
+def refresh_document_previews(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_ids: list[int],
+    *,
+    from_source: bool,
+) -> dict[str, object]:
+    refreshed = 0
+    skipped = 0
+    skip_reasons: dict[str, int] = defaultdict(int)
+    rows = load_preview_refresh_document_rows(connection, document_ids)
+    connection.execute("BEGIN")
+    try:
+        for row in rows:
+            if row["conversation_id"] is not None:
+                result = {"status": "skipped", "reason": "conversation_scope"}
+            elif from_source:
+                result = refresh_source_backed_document_preview(connection, paths, row)
+            else:
+                result = refresh_stored_state_document_preview(connection, paths, row)
+            if result.get("status") == "ok":
+                refreshed += 1
+            else:
+                skipped += 1
+                reason = normalize_whitespace(str(result.get("reason") or "unknown"))
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return {
+        "refreshed_documents": refreshed,
+        "skipped_documents": skipped,
+        "document_skip_reasons": dict(sorted(skip_reasons.items())),
+    }
+
+
 def refresh_generated_previews(
     root: Path,
     *,
@@ -47142,59 +47359,114 @@ def refresh_generated_previews(
     from_source: bool = False,
 ) -> dict[str, object]:
     normalized_scope = normalize_whitespace(str(scope or "conversations")).lower()
-    if normalized_scope not in {"conversations"}:
-        raise RetrieverError(
-            "refresh-previews currently supports --scope conversations. "
-            "Document/all preview refresh will be added as a separate safe repair path."
-        )
+    if normalized_scope not in {"conversations", "documents", "all"}:
+        raise RetrieverError("refresh-previews --scope must be one of: conversations, documents, all.")
+    refresh_conversation_scope = normalized_scope in {"conversations", "all"}
+    refresh_document_scope = normalized_scope in {"documents", "all"}
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        target_conversation_ids, dataset_summary = resolve_conversation_preview_refresh_ids(
-            connection,
-            conversation_ids=conversation_ids,
-            document_ids=document_ids,
-            dataset_id=dataset_id,
-            dataset_name=dataset_name,
-        )
-        candidate_conversation_ids = list(target_conversation_ids)
-        if missing_only:
-            target_conversation_ids = filter_conversation_ids_with_missing_preview_artifacts(
+        dataset_summary: dict[str, object] | None = None
+        target_conversation_ids: list[int] = []
+        candidate_conversation_ids: list[int] = []
+        refreshed_conversations = 0
+        empty_dirs_pruned = 0
+        if refresh_conversation_scope:
+            conversation_dataset_summary: dict[str, object] | None
+            target_conversation_ids, conversation_dataset_summary = resolve_conversation_preview_refresh_ids(
+                connection,
+                conversation_ids=conversation_ids,
+                document_ids=document_ids,
+                dataset_id=dataset_id,
+                dataset_name=dataset_name,
+                ignore_documents_without_conversation=normalized_scope == "all",
+            )
+            if conversation_dataset_summary is not None:
+                dataset_summary = conversation_dataset_summary
+            candidate_conversation_ids = list(target_conversation_ids)
+            if missing_only:
+                target_conversation_ids = filter_conversation_ids_with_missing_preview_artifacts(
+                    connection,
+                    paths,
+                    target_conversation_ids,
+                )
+            connection.execute("BEGIN")
+            try:
+                refreshed_conversations = refresh_conversation_previews(connection, paths, target_conversation_ids)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            empty_dirs_pruned = prune_empty_conversation_preview_dirs(paths)
+
+        target_document_ids: list[int] = []
+        candidate_document_ids: list[int] = []
+        document_result: dict[str, object] = {
+            "refreshed_documents": 0,
+            "skipped_documents": 0,
+            "document_skip_reasons": {},
+        }
+        if refresh_document_scope:
+            document_dataset_summary: dict[str, object] | None
+            target_document_ids, document_dataset_summary = resolve_document_preview_refresh_ids(
+                connection,
+                document_ids=document_ids,
+                dataset_id=dataset_id,
+                dataset_name=dataset_name,
+            )
+            if dataset_summary is None and document_dataset_summary is not None:
+                dataset_summary = document_dataset_summary
+            candidate_document_ids = list(target_document_ids)
+            if missing_only:
+                target_document_ids = filter_document_ids_with_missing_preview_artifacts(
+                    connection,
+                    paths,
+                    target_document_ids,
+                )
+            document_result = refresh_document_previews(
                 connection,
                 paths,
-                target_conversation_ids,
+                target_document_ids,
+                from_source=from_source,
             )
-        connection.execute("BEGIN")
-        try:
-            refreshed = refresh_conversation_previews(connection, paths, target_conversation_ids)
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        empty_dirs_pruned = prune_empty_conversation_preview_dirs(paths)
 
         result: dict[str, object] = {
             "status": "ok",
             "scope": normalized_scope,
             "missing_only": bool(missing_only),
             "from_source_requested": bool(from_source),
-            "refreshed_conversations": int(refreshed),
+            "refreshed_conversations": int(refreshed_conversations),
+            **document_result,
             "empty_conversation_preview_dirs_pruned": int(empty_dirs_pruned),
         }
         if from_source:
-            result["from_source_mode"] = "not_applicable_for_conversation_previews"
-            result["from_source_note"] = (
-                "Conversation previews are regenerated from stored document text and metadata; "
-                "use ingest to reparse original source files."
+            result["from_source_mode"] = (
+                "enabled_for_document_previews"
+                if refresh_document_scope
+                else "not_applicable_for_conversation_previews"
             )
+            if refresh_conversation_scope:
+                result["from_source_note"] = (
+                    "Conversation previews are regenerated from stored document text and metadata; "
+                    "source reparse only applies to document preview scope."
+                )
         if missing_only:
             result["candidate_conversations"] = len(candidate_conversation_ids)
+            result["candidate_documents"] = len(candidate_document_ids)
         if conversation_ids is None and document_ids is None and dataset_id is None and dataset_name is None:
-            result["target_scope"] = "all_active_conversations"
+            if normalized_scope == "conversations":
+                result["target_scope"] = "all_active_conversations"
+            elif normalized_scope == "documents":
+                result["target_scope"] = "all_active_documents"
+            else:
+                result["target_scope"] = "all_active_documents_and_conversations"
         else:
-            result["target_conversation_ids"] = target_conversation_ids
+            if refresh_conversation_scope:
+                result["target_conversation_ids"] = target_conversation_ids
+            if refresh_document_scope:
+                result["target_document_ids"] = target_document_ids
         if document_ids:
             result["requested_document_ids"] = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
         if conversation_ids:
@@ -59293,21 +59565,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         choices=["conversations", "documents", "all"],
         default="conversations",
-        help="Preview family to refresh (currently conversations)",
+        help="Preview family to refresh",
     )
     refresh_previews_parser.add_argument(
         "--conversation-id",
         dest="conversation_ids",
         action="append",
         type=int,
-        help="Conversation id to refresh (repeatable)",
+        help="Conversation id to refresh (repeatable; conversation scope)",
     )
     refresh_previews_parser.add_argument(
         "--doc-id",
         dest="document_ids",
         action="append",
         type=int,
-        help="Document id whose conversation should be refreshed (repeatable)",
+        help="Document id to refresh or use as a conversation selector (repeatable)",
     )
     refresh_dataset_selector_group = refresh_previews_parser.add_mutually_exclusive_group()
     refresh_dataset_selector_group.add_argument("--dataset-id", type=int, help="Dataset id")
@@ -59315,7 +59587,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_previews_parser.add_argument(
         "--missing-only",
         action="store_true",
-        help="Only refresh conversations with missing preview rows or files",
+        help="Only refresh preview packages with missing rows or files",
     )
     refresh_previews_parser.add_argument(
         "--from-source",

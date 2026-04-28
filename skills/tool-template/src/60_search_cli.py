@@ -11432,21 +11432,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         choices=["conversations", "documents", "all"],
         default="conversations",
-        help="Preview family to refresh (currently conversations)",
+        help="Preview family to refresh",
     )
     refresh_previews_parser.add_argument(
         "--conversation-id",
         dest="conversation_ids",
         action="append",
         type=int,
-        help="Conversation id to refresh (repeatable)",
+        help="Conversation id to refresh (repeatable; conversation scope)",
     )
     refresh_previews_parser.add_argument(
         "--doc-id",
         dest="document_ids",
         action="append",
         type=int,
-        help="Document id whose conversation should be refreshed (repeatable)",
+        help="Document id to refresh or use as a conversation selector (repeatable)",
     )
     refresh_dataset_selector_group = refresh_previews_parser.add_mutually_exclusive_group()
     refresh_dataset_selector_group.add_argument("--dataset-id", type=int, help="Dataset id")
@@ -11454,7 +11454,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_previews_parser.add_argument(
         "--missing-only",
         action="store_true",
-        help="Only refresh conversations with missing preview rows or files",
+        help="Only refresh preview packages with missing rows or files",
     )
     refresh_previews_parser.add_argument(
         "--from-source",
