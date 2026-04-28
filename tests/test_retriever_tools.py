@@ -11706,6 +11706,53 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Root message body", refreshed_message_preview_html)
         self.assertIn('class="gmail-thread-title-link"', refreshed_message_preview_html)
 
+    def test_email_preview_renderer_rebases_preview_relative_assets(self) -> None:
+        source_preview_rel_path = "previews/productions/Synthetic_Production/documents/PDX000001.html"
+        conversation_preview_rel_path = "previews/conversations/conversation-00000012/conversation.html"
+        production_body_html = (
+            '<section><img src="PDX000001-pages/page-0001.png" alt="Page 1"/>'
+            '<img src="data:image/png;base64,abc" alt="Inline"/>'
+            '<img src="https://example.com/external.png" alt="External"/>'
+            '<video poster="clips/frame 1.png"></video></section>'
+        )
+        document = {
+            "id": 12,
+            "control_number": "PDX000001",
+            "content_type": "Email",
+            "author": "Elena Steven <elena@example.com>",
+            "recipients": "Harry Montoro <harry@example.com>",
+            "date_created": "2026-04-14T10:32:00Z",
+            "subject": "Attachment Handling",
+            "title": "Attachment Handling",
+            "text_content": "Parent production memo",
+            "standalone_preview_body_html": production_body_html,
+            "standalone_preview_rel_path": source_preview_rel_path,
+        }
+
+        conversation_html = retriever_tools.build_email_thread_preview_html(
+            thread_title="Attachment Handling",
+            documents=[document],
+            page_title="Attachment Handling",
+            target_preview_rel_path=conversation_preview_rel_path,
+        )
+        direct_html = retriever_tools.build_email_message_preview_html(
+            document,
+            body_html=production_body_html,
+            target_preview_rel_path=source_preview_rel_path,
+        )
+
+        self.assertIn(
+            'src="../../productions/Synthetic_Production/documents/PDX000001-pages/page-0001.png"',
+            conversation_html,
+        )
+        self.assertIn(
+            'poster="../../productions/Synthetic_Production/documents/clips/frame%201.png"',
+            conversation_html,
+        )
+        self.assertIn('src="data:image/png;base64,abc"', conversation_html)
+        self.assertIn('src="https://example.com/external.png"', conversation_html)
+        self.assertIn('src="PDX000001-pages/page-0001.png"', direct_html)
+
     def test_rebuild_conversations_reassigns_refreshes_and_prunes_empty_preview_dirs(self) -> None:
         root_path = self.root / "root.eml"
         reply_path = self.root / "reply.eml"

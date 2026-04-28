@@ -18704,10 +18704,97 @@ def strip_email_reply_history_html(html_content: str | None) -> str | None:
     return candidate if email_html_has_visible_content(candidate) else None
 
 
+HTML_PREVIEW_RELATIVE_ASSET_ATTR_PATTERN = re.compile(
+    r"(?is)(\s(?:src|poster)\s*=\s*)([\"'])(.*?)\2"
+)
+ABSOLUTE_OR_SPECIAL_URL_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+
+def preview_asset_url_is_relative(value: str) -> bool:
+    normalized = normalize_whitespace(str(value or ""))
+    if not normalized:
+        return False
+    return not (
+        normalized.startswith(("#", "/", "//"))
+        or ABSOLUTE_OR_SPECIAL_URL_PATTERN.match(normalized) is not None
+    )
+
+
+def rebase_preview_relative_asset_url(
+    value: str,
+    *,
+    source_preview_rel_path: object,
+    target_preview_rel_path: object,
+) -> str:
+    normalized_value = str(value or "")
+    if not preview_asset_url_is_relative(normalized_value):
+        return normalized_value
+    source_rel_path = normalize_internal_rel_path(Path(str(source_preview_rel_path or "")))
+    target_rel_path = normalize_internal_rel_path(Path(str(target_preview_rel_path or "")))
+    if not source_rel_path or not target_rel_path:
+        return normalized_value
+    source_dir = posixpath.dirname(source_rel_path)
+    target_dir = posixpath.dirname(target_rel_path)
+    split_at = len(normalized_value)
+    for separator in ("?", "#"):
+        index = normalized_value.find(separator)
+        if index >= 0:
+            split_at = min(split_at, index)
+    url_path = normalized_value[:split_at]
+    suffix = normalized_value[split_at:]
+    if not url_path:
+        return normalized_value
+    asset_rel_path = posixpath.normpath(
+        posixpath.join(source_dir, urllib_request.url2pathname(url_path))
+    )
+    if asset_rel_path == ".." or asset_rel_path.startswith("../"):
+        return normalized_value
+    rebased_path = posixpath.relpath(asset_rel_path, start=target_dir or ".")
+    return urllib_request.pathname2url(rebased_path) + suffix
+
+
+def rebase_preview_relative_asset_paths(
+    html_body: str,
+    *,
+    source_preview_rel_path: object,
+    target_preview_rel_path: object,
+) -> str:
+    if not html_body or not source_preview_rel_path or not target_preview_rel_path:
+        return html_body
+
+    def replace_attr(match: re.Match[str]) -> str:
+        rebased_url = rebase_preview_relative_asset_url(
+            match.group(3),
+            source_preview_rel_path=source_preview_rel_path,
+            target_preview_rel_path=target_preview_rel_path,
+        )
+        return f"{match.group(1)}{match.group(2)}{html.escape(rebased_url, quote=True)}{match.group(2)}"
+
+    return HTML_PREVIEW_RELATIVE_ASSET_ATTR_PATTERN.sub(replace_attr, html_body)
+
+
+def preview_body_html_for_output(
+    document: dict[str, object],
+    body_html: str | None,
+    *,
+    target_preview_rel_path: object = None,
+) -> str | None:
+    if not isinstance(body_html, str) or not body_html.strip():
+        return None
+    if target_preview_rel_path is None:
+        return body_html
+    return rebase_preview_relative_asset_paths(
+        body_html,
+        source_preview_rel_path=document.get("standalone_preview_rel_path"),
+        target_preview_rel_path=target_preview_rel_path,
+    )
+
+
 def build_email_message_body_content_html(
     document: dict[str, object],
     *,
     body_html: str | None = None,
+    target_preview_rel_path: object = None,
     strip_quoted_history: bool = False,
 ) -> str:
     text_content, calendar_invites = extract_calendar_invites_from_text_content(
@@ -18723,6 +18810,11 @@ def build_email_message_body_content_html(
             if isinstance(stored_body_html, str) and stored_body_html.strip()
             else None
         )
+    preferred_body_html = preview_body_html_for_output(
+        document,
+        preferred_body_html,
+        target_preview_rel_path=target_preview_rel_path,
+    )
     if preferred_body_html:
         normalized_html = preferred_body_html.strip()
         if strip_quoted_history:
@@ -18769,6 +18861,7 @@ def build_email_message_card_html(
     body_html: str | None = None,
     selected: bool = False,
     attachment_links: list[dict[str, str]] | None = None,
+    target_preview_rel_path: object = None,
     strip_quoted_history: bool = False,
 ) -> str:
     author_name, author_email = normalize_email_preview_address(document.get("author"))
@@ -18790,6 +18883,7 @@ def build_email_message_card_html(
     message_body_html = build_email_message_body_content_html(
         document,
         body_html=body_html,
+        target_preview_rel_path=target_preview_rel_path,
         strip_quoted_history=strip_quoted_history,
     )
     attachment_links_html = render_html_preview_attachment_links(attachment_links or [])
@@ -18897,6 +18991,7 @@ def build_email_thread_preview_html(
     body_source_html: str | None = None,
     thread_link_href: str | None = None,
     thread_position_label: str | None = None,
+    target_preview_rel_path: object = None,
     strip_quoted_history: bool = False,
     newest_first: bool = False,
 ) -> str:
@@ -18936,6 +19031,7 @@ def build_email_thread_preview_html(
                     if document_id is not None
                     else None
                 ),
+                target_preview_rel_path=target_preview_rel_path,
                 strip_quoted_history=strip_quoted_history,
             )
         )
@@ -18973,6 +19069,7 @@ def build_email_message_preview_html(
     position_index: int | None = None,
     thread_link_href: str | None = None,
     attachment_links: list[dict[str, str]] | None = None,
+    target_preview_rel_path: object = None,
 ) -> str:
     document_title = conversation_preview_document_heading(document) or "Retriever Email Preview"
     document_id = email_preview_document_id(document)
@@ -19031,6 +19128,7 @@ def build_email_message_preview_html(
             thread_link_href=thread_link_href,
             thread_position_label=thread_position_label,
             attachment_links_by_document_id=attachment_links_by_document_id,
+            target_preview_rel_path=target_preview_rel_path,
             strip_quoted_history=True,
             newest_first=True,
         )
@@ -19043,6 +19141,7 @@ def build_email_message_preview_html(
         body_source_document=document,
         body_source_html=body_html,
         attachment_links_by_document_id=attachment_links_by_document_id,
+        target_preview_rel_path=target_preview_rel_path,
     )
 
 
@@ -19110,6 +19209,7 @@ def rewrite_preserved_email_message_preview(
         if thread_path.exists():
             thread_link_href = relative_preview_href(thread_path, preview_path)
     body_html = document.get("standalone_preview_body_html")
+    target_preview_rel_path = str(target_row["rel_preview_path"])
     preview_path.write_text(
         build_email_message_preview_html(
             document,
@@ -19119,6 +19219,7 @@ def rewrite_preserved_email_message_preview(
             position_index=position_index,
             thread_link_href=thread_link_href,
             attachment_links=attachment_links,
+            target_preview_rel_path=target_preview_rel_path,
         ),
         encoding="utf-8",
     )
@@ -19194,10 +19295,10 @@ def load_preserved_preview_rows_by_document_id(
     return dict(preview_rows_by_document_id)
 
 
-def load_document_preview_body_html(
+def load_document_preview_body_payload(
     paths: dict[str, Path],
     preview_rows: list[dict[str, object]],
-) -> str | None:
+) -> dict[str, str] | None:
     preferred_rows = sorted(
         preview_rows,
         key=lambda row: (
@@ -19215,8 +19316,19 @@ def load_document_preview_body_html(
             preview_path.read_text(encoding="utf-8")
         )
         if body_html:
-            return body_html
+            return {
+                "body_html": body_html,
+                "rel_preview_path": str(preview_row["rel_preview_path"]),
+            }
     return None
+
+
+def load_document_preview_body_html(
+    paths: dict[str, Path],
+    preview_rows: list[dict[str, object]],
+) -> str | None:
+    payload = load_document_preview_body_payload(paths, preview_rows)
+    return payload["body_html"] if payload else None
 
 
 def rebase_preserved_preview_rows(
@@ -19408,6 +19520,7 @@ def render_conversation_document_section(
     current_segment_href: str,
     doc_target_hrefs: dict[int, str],
     attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
+    target_preview_rel_path: object = None,
 ) -> str:
     document_id = int(document["id"])
     anchor = conversation_preview_anchor(document_id)
@@ -19459,7 +19572,11 @@ def render_conversation_document_section(
     body_html = (
         render_conversation_chat_body_html(text_content)
         if normalize_whitespace(str(document.get("content_type") or "")) == "Chat"
-        else str(standalone_preview_body_html)
+        else preview_body_html_for_output(
+            document,
+            str(standalone_preview_body_html),
+            target_preview_rel_path=target_preview_rel_path,
+        )
         if isinstance(standalone_preview_body_html, str) and standalone_preview_body_html.strip()
         else f"<pre>{html.escape(text_content or 'No extracted text available.')}</pre>"
     )
@@ -19655,6 +19772,7 @@ def build_conversation_segment_html(
             ),
             segment_count=segment_count,
             attachment_links_by_document_id=attachment_links_by_document_id,
+            target_preview_rel_path=current_segment_rel_path,
             strip_quoted_history=True,
         )
     headers = {
@@ -19669,6 +19787,7 @@ def build_conversation_segment_html(
             current_segment_href=current_file_name,
             doc_target_hrefs=doc_target_hrefs,
             attachment_links_by_document_id=attachment_links_by_document_id,
+            target_preview_rel_path=current_segment_rel_path,
         )
         for document in segment_documents
     )
@@ -19696,6 +19815,7 @@ def build_conversation_entry_html(
     attachment_links: list[dict[str, str]] | None = None,
     position_index: int | None = None,
     total_count: int | None = None,
+    target_preview_rel_path: object = None,
 ) -> str:
     conversation_name = (
         normalize_whitespace(str(conversation_row["display_name"] or ""))
@@ -19711,6 +19831,7 @@ def build_conversation_entry_html(
             if attachment_links
             else None
         ),
+        target_preview_rel_path=target_preview_rel_path,
     )
     headers: dict[str, str] = {
         "Conversation": conversation_name,
@@ -19735,6 +19856,7 @@ def build_email_conversation_full_html(
     documents: list[dict[str, object]],
     segment_items: list[dict[str, object]],
     attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
+    target_preview_rel_path: object = None,
 ) -> str:
     thread_title = (
         normalize_whitespace(str(conversation_row["display_name"] or ""))
@@ -19746,6 +19868,7 @@ def build_email_conversation_full_html(
             documents=documents,
             page_title=thread_title,
             attachment_links_by_document_id=attachment_links_by_document_id,
+            target_preview_rel_path=target_preview_rel_path,
             strip_quoted_history=True,
         )
     segment_sections: list[str] = []
@@ -19755,6 +19878,7 @@ def build_email_conversation_full_html(
             build_email_message_card_html(
                 document,
                 attachment_links=(attachment_links_by_document_id or {}).get(int(document["id"]), []),
+                target_preview_rel_path=target_preview_rel_path,
                 strip_quoted_history=True,
             )
             for document in segment_documents
@@ -19801,12 +19925,14 @@ def build_conversation_full_html(
     segment_items: list[dict[str, object]],
     attachment_links_by_document_id: dict[int, list[dict[str, str]]] | None = None,
 ) -> str:
+    full_rel_path = conversation_preview_full_rel_path(int(conversation_row["id"]))
     if normalize_whitespace(str(conversation_row["conversation_type"] or "")).lower() == "email":
         return build_email_conversation_full_html(
             conversation_row,
             documents=documents,
             segment_items=segment_items,
             attachment_links_by_document_id=attachment_links_by_document_id,
+            target_preview_rel_path=full_rel_path,
         )
     if conversation_documents_are_chat(documents):
         return build_chat_conversation_preview_html(
@@ -19837,6 +19963,7 @@ def build_conversation_full_html(
                     current_segment_href="conversation",
                     doc_target_hrefs=doc_target_hrefs,
                     attachment_links_by_document_id=attachment_links_by_document_id,
+                    target_preview_rel_path=full_rel_path,
                 )
                 for document in segment["documents"]
             )
@@ -19972,10 +20099,13 @@ def load_preview_documents(
     for document in documents:
         if normalize_whitespace(str(document.get("content_type") or "")).lower() == "chat":
             continue
-        document["standalone_preview_body_html"] = load_document_preview_body_html(
+        body_payload = load_document_preview_body_payload(
             paths,
             preserved_preview_rows_by_document_id.get(int(document["id"]), []),
         )
+        if body_payload:
+            document["standalone_preview_body_html"] = body_payload["body_html"]
+            document["standalone_preview_rel_path"] = body_payload["rel_preview_path"]
     documents.sort(key=conversation_preview_sort_key)
     return documents
 
