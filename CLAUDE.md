@@ -54,6 +54,55 @@ If a Retriever command fails with ModuleNotFoundError, ImportError, or
 Missing dependency for .<ext> parsing: install <package>, do not install into
 system Python. Prefer workspace init; if manual installation is truly needed,
 use the shared plugin runtime venv.
+
+## Bounded Retriever Workflows
+Cowork/bash commands may be killed around 45 seconds. Do not run long, one-shot mutation commands when a bounded/resumable workflow exists.
+
+Use plain `ingest` as the preferred entrypoint. It is a bounded V2 facade by default.
+
+Recommended:
+
+```bash
+python3 skills/tool-template/tools.py ingest ./data --recursive --budget-seconds 35
+```
+
+If the result has `more_work_remaining: true`, repeat the command from `next_recommended_commands` until `status` is `completed`, `failed`, or `canceled`.
+
+Do not use background jobs. Do not manually loop inside one bash command. Run one bounded command per Cowork call.
+
+Use legacy ingest only when explicitly requested, or when debugging parity with the old pipeline:
+
+```bash
+python3 skills/tool-template/tools.py ingest ./data --recursive --legacy
+```
+
+Do not use legacy ingest for normal Cowork reingest tasks. It is a one-shot command and may exceed the 45-second command limit on large workspaces.
+
+Advanced/manual ingest control is available through:
+
+```bash
+python3 skills/tool-template/tools.py ingest-status ./data
+python3 skills/tool-template/tools.py ingest-start ./data --recursive --budget-seconds 35
+python3 skills/tool-template/tools.py ingest-run-step ./data --run-id <RUN_ID> --budget-seconds 35
+python3 skills/tool-template/tools.py ingest-cancel ./data --run-id <RUN_ID>
+```
+
+Prefer the plain `ingest` facade unless you need to inspect or recover a specific run.
+
+For large workspaces, use the resumable entity rebuild flow:
+
+```bash
+python3 skills/tool-template/tools.py rebuild-entities-start ./data --budget-seconds 35
+python3 skills/tool-template/tools.py rebuild-entities-run-step ./data --run-id <RUN_ID> --budget-seconds 35
+python3 skills/tool-template/tools.py rebuild-entities-status ./data --run-id <RUN_ID>
+```
+
+Repeat `rebuild-entities-run-step` until terminal status. Legacy `rebuild-entities` may exceed Cowork limits on large workspaces.
+
+For any tool result with `more_work_remaining: true`, continue with the returned `next_recommended_commands`. Stop only on terminal status: `completed`, `failed`, or `canceled`.
+
+If an active run exists, do not start a new one. Resume it or cancel it intentionally.
+
 Tier 2 — tools.py slash commands
 If no Tier 1 skill exists for the intent, use a slash command via the canonical
 plugin tool. Run exactly one command from the repo root:
@@ -101,8 +150,16 @@ The authoritative current list of subcommands is regenerated at build time into 
 
 ### Ingestion
 
-- you need to index or refresh a folder → `ingest` — index documents in the workspace
+- you need the top-level folder ingest/refresh facade, which starts or resumes bounded V2 work by default → `ingest` — start or resume a bounded V2 ingest for workspace documents
+- you need to cancel an active resumable V2 ingest run → `ingest-cancel` — cancel a resumable V2 ingest run
+- you need to commit prepared work items for a resumable V2 ingest run → `ingest-commit-step` — commit prepared resumable V2 ingest work items
+- you need to advance finalization for a resumable V2 ingest run → `ingest-finalize-step` — advance resumable V2 ingest finalization
+- you need to advance only the planning phase of a resumable V2 ingest run → `ingest-plan-step` — advance resumable V2 ingest planning
+- you need to prepare pending work items for a resumable V2 ingest run → `ingest-prepare-step` — prepare resumable V2 ingest work items
 - you need to ingest a processed production (DAT/OPT/TEXT/IMAGES) → `ingest-production` — ingest a processed production volume
+- you need to advance a resumable V2 ingest run through whichever step is currently recommended within one bounded call → `ingest-run-step` — run recommended resumable V2 ingest steps within a bounded call budget
+- you need the lower-level lifecycle command to create a resumable V2 ingest run without immediately driving all recommended steps → `ingest-start` — start a resumable V2 ingest run
+- you need to inspect status, phase, counts, or next recommended commands for a resumable V2 ingest run → `ingest-status` — show resumable V2 ingest status
 - you are debugging PST ingestion or conversation scoping → `inspect-pst-properties` — inspect raw PST message fields for debugging
 
 ### Search & browse
@@ -135,7 +192,12 @@ The authoritative current list of subcommands is regenerated at build time into 
 - the user asks to list, browse, show, enumerate, or search recognized people, mailboxes, organizations, or entities — phrasings like "show me the first 20 entities", "list person entities", "find entity alice@example.com", or "show ignored entities" → `list-entities` — list recognized entities
 - the user asks which entities appear as authors, participants, recipients, or custodians in a document scope → `list-entity-role-inventory` — list entity counts by role for a document scope
 - the user asks to merge, combine, or deduplicate two entities → `merge-entities` — merge one active entity into another
+- you need to dry-run or apply index-level cleanup for synthetic Google Vault MBOX filename custodians after custodian inference fixes → `purge-vault-filename-custodians` — dry-run or apply cleanup for synthetic Google Vault MBOX filename custodians
 - you need to refresh or repair entity links after metadata, source, or policy changes → `rebuild-entities` — rebuild entity recognition state from stored document metadata
+- you need to cancel an active resumable entity rebuild → `rebuild-entities-cancel` — cancel a resumable entity rebuild run
+- you need to advance a resumable entity rebuild within one bounded call → `rebuild-entities-run-step` — advance a resumable entity rebuild within a bounded call budget
+- you need to start a bounded, resumable entity rebuild after metadata, source, or policy changes → `rebuild-entities-start` — start a resumable entity rebuild run
+- you need status, counts, or next recommended commands for a resumable entity rebuild → `rebuild-entities-status` — show resumable entity rebuild status
 - the user asks to inspect one entity by id, including identifiers, roles, and linked documents → `show-entity` — show one recognized entity
 - the user asks for possible duplicates or merge candidates for an entity → `similar-entities` — suggest active entities similar to one entity
 - the user asks to split wrongly combined entity identifiers or document links into a separate entity → `split-entity` — move selected identifiers or document links to another entity
@@ -162,6 +224,7 @@ The authoritative current list of subcommands is regenerated at build time into 
 - you need to drop a document's conversation assignment → `clear-conversation-assignment` — clear a document's conversation assignment
 - the user asks to list, browse, page through, sort, or inspect conversation/thread summaries through a stateless Tier 3 command — phrasings like "show conversations 51-100", "list threads sorted by last activity", or "page conversation summaries" → `list-conversations` — list conversation summaries
 - the user asks to merge, join, link, or attach a document into a specific conversation/thread — phrasings like "join these emails into one thread", "merge this into thread X", "link this message to conversation Y", or "group these as one conversation" → `merge-into-conversation` — merge a document into a conversation
+- you need to re-run conversation assignment and regenerate previews after ingest or metadata changes → `rebuild-conversations` — re-run conversation assignment and regenerate conversation previews
 - you need to resolve detected duplicates → `reconcile-duplicates` — reconcile detected duplicates
 - you need to rebuild conversation preview HTML → `refresh-conversation-previews` — rebuild conversation preview artifacts
 - the user asks to split, detach, separate, or remove a document from its conversation/thread — phrasings like "split this email off its thread", "detach this message", "separate this from the conversation", or "remove from thread" → `split-from-conversation` — split a document out of a conversation
@@ -199,17 +262,6 @@ The authoritative current list of subcommands is regenerated at build time into 
 ### Results
 
 - you need stored processing results for inspection → `list-results` — list stored processing results
-
-### Unclassified — TODO
-
-- TODO: add use-when → `ingest-cancel` — TODO: describe
-- TODO: add use-when → `ingest-commit-step` — TODO: describe
-- TODO: add use-when → `ingest-finalize-step` — TODO: describe
-- TODO: add use-when → `ingest-plan-step` — TODO: describe
-- TODO: add use-when → `ingest-prepare-step` — TODO: describe
-- TODO: add use-when → `ingest-run-step` — TODO: describe
-- TODO: add use-when → `ingest-start` — TODO: describe
-- TODO: add use-when → `ingest-status` — TODO: describe
 
 <!-- END: tool-subcommands -->
 Tier 4 — direct SQLite access (last resort only)
