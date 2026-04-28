@@ -1463,6 +1463,47 @@ def ingest_v2_plan_production_preview_batch_item(
     return int(cursor.rowcount or 0) > 0
 
 
+def ingest_v2_plan_conversation_preview_items(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    conversation_ids: list[int],
+    next_commit_order: int,
+) -> dict[str, int]:
+    now = utc_now()
+    planned = 0
+    current_order = int(next_commit_order)
+    for conversation_id in sorted(dict.fromkeys(int(value) for value in conversation_ids)):
+        payload = {
+            "conversation_id": conversation_id,
+            "planned_at": now,
+        }
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO ingest_work_items (
+              run_id, unit_type, source_kind, source_key, rel_path, commit_order,
+              payload_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                "conversation_preview",
+                "conversation",
+                f"conversation:{conversation_id}",
+                None,
+                current_order,
+                compact_json_text(ingest_v2_json_safe_value(payload)),
+                "pending",
+                now,
+                now,
+            ),
+        )
+        current_order += 1
+        if int(cursor.rowcount or 0) > 0:
+            planned += 1
+    return {"planned": planned, "next_commit_order": current_order}
+
+
 def ingest_v2_plan_production_root(
     connection: sqlite3.Connection,
     root: Path,
@@ -1726,6 +1767,7 @@ def ingest_v2_claim_prepare_items(
             WHERE run_id = ?
               AND unit_type IN (
                 'loose_file', 'production_row', 'production_preview_batch', 'slack_conversation',
+                'conversation_preview',
                 'mbox_message', 'mbox_source_finalizer',
                 'pst_message', 'pst_source_finalizer'
               )
@@ -1930,6 +1972,12 @@ def ingest_v2_prepare_claimed_work_item(
             deadline=deadline,
         )
         payload_kind = "slack_conversation"
+    elif unit_type == "conversation_preview":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_conversation_preview_item(
+            work_item_row,
+            deadline=deadline,
+        )
+        payload_kind = "conversation_preview"
     elif unit_type == "mbox_message":
         prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_mbox_message_item(
             root,
@@ -2132,6 +2180,32 @@ def ingest_v2_prepare_production_preview_batch_item(
         "prepare_error": None,
     }
     return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_prepare_conversation_preview_item(
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    conversation_id = int(payload_dict.get("conversation_id") or 0)
+    source_fingerprint = {"conversation_id": conversation_id}
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return None, source_fingerprint, "Not enough budget remaining to start prepare."
+    return (
+        {
+            "payload_kind": "conversation_preview",
+            "conversation_id": conversation_id,
+            "prepare_ms": 0.0,
+            "prepare_hash_ms": 0.0,
+            "prepare_extract_ms": 0.0,
+            "prepare_chunk_ms": 0.0,
+            "prepare_error": None,
+        },
+        source_fingerprint,
+        None,
+    )
 
 
 def ingest_v2_prepare_slack_conversation_item(
@@ -3011,7 +3085,7 @@ def ingest_v2_redelete_retired_mbox_documents(
         WHERE parent_occurrence_id IS NULL
           AND source_kind = ?
           AND source_rel_path IN ({placeholders})
-          AND lifecycle_status = 'deleted'
+          AND lifecycle_status IN ('deleted', 'missing')
         ORDER BY id ASC
         """,
         [MBOX_SOURCE_KIND, *source_rel_paths],
@@ -3019,13 +3093,62 @@ def ingest_v2_redelete_retired_mbox_documents(
     root_occurrence_ids = [int(row["id"]) for row in root_occurrence_rows]
     if not root_occurrence_ids:
         return 0
+    now = utc_now()
+    occurrence_placeholders = ", ".join("?" for _ in root_occurrence_ids)
+    connection.execute(
+        f"""
+        UPDATE document_occurrences
+        SET lifecycle_status = 'deleted', updated_at = ?
+        WHERE lifecycle_status != 'deleted'
+          AND (id IN ({occurrence_placeholders}) OR parent_occurrence_id IN ({occurrence_placeholders}))
+        """,
+        [now, *root_occurrence_ids, *root_occurrence_ids],
+    )
     document_ids = container_document_ids_for_root_occurrence_ids(connection, root_occurrence_ids)
-    return delete_documents_with_only_deleted_occurrences(
+    deleted = delete_documents_with_only_deleted_occurrences(
         connection,
         paths,
         document_ids,
-        deleted_at=utc_now(),
+        deleted_at=now,
     )
+    return deleted + force_delete_documents_with_no_active_occurrences(
+        connection,
+        document_ids,
+        deleted_at=now,
+    )
+
+
+def force_delete_documents_with_no_active_occurrences(
+    connection: sqlite3.Connection,
+    document_ids: set[int],
+    *,
+    deleted_at: str,
+) -> int:
+    forced = 0
+    for document_id in sorted(int(value) for value in document_ids):
+        active_row = connection.execute(
+            """
+            SELECT 1
+            FROM document_occurrences
+            WHERE document_id = ?
+              AND lifecycle_status != 'deleted'
+            LIMIT 1
+            """,
+            (document_id,),
+        ).fetchone()
+        if active_row is not None:
+            continue
+        cursor = connection.execute(
+            """
+            UPDATE documents
+            SET lifecycle_status = 'deleted', updated_at = ?
+            WHERE id = ?
+              AND lifecycle_status != 'deleted'
+            """,
+            (deleted_at, document_id),
+        )
+        forced += int(cursor.rowcount or 0)
+    return forced
 
 
 def ingest_v2_run_pst_source_rel_paths(connection: sqlite3.Connection, *, run_id: str) -> set[str]:
@@ -3079,7 +3202,7 @@ def ingest_v2_redelete_retired_pst_documents(
         WHERE parent_occurrence_id IS NULL
           AND source_kind = ?
           AND source_rel_path IN ({placeholders})
-          AND lifecycle_status = 'deleted'
+          AND lifecycle_status IN ('deleted', 'missing')
         ORDER BY id ASC
         """,
         [PST_SOURCE_KIND, *source_rel_paths],
@@ -3087,12 +3210,28 @@ def ingest_v2_redelete_retired_pst_documents(
     root_occurrence_ids = [int(row["id"]) for row in root_occurrence_rows]
     if not root_occurrence_ids:
         return 0
+    now = utc_now()
+    occurrence_placeholders = ", ".join("?" for _ in root_occurrence_ids)
+    connection.execute(
+        f"""
+        UPDATE document_occurrences
+        SET lifecycle_status = 'deleted', updated_at = ?
+        WHERE lifecycle_status != 'deleted'
+          AND (id IN ({occurrence_placeholders}) OR parent_occurrence_id IN ({occurrence_placeholders}))
+        """,
+        [now, *root_occurrence_ids, *root_occurrence_ids],
+    )
     document_ids = container_document_ids_for_root_occurrence_ids(connection, root_occurrence_ids)
-    return delete_documents_with_only_deleted_occurrences(
+    deleted = delete_documents_with_only_deleted_occurrences(
         connection,
         paths,
         document_ids,
-        deleted_at=utc_now(),
+        deleted_at=now,
+    )
+    return deleted + force_delete_documents_with_no_active_occurrences(
+        connection,
+        document_ids,
+        deleted_at=now,
     )
 
 
@@ -3355,6 +3494,97 @@ def ingest_v2_commit_work_item_hook(
         """,
         (now, now, run_id, writer_id),
     )
+
+
+def ingest_v2_commit_conversation_preview_work_item(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    prepared_item: dict[str, object],
+) -> dict[str, object]:
+    conversation_id = int(prepared_item.get("conversation_id") or 0)
+    if conversation_id <= 0:
+        raise RetrieverError("Conversation preview work item is missing conversation_id.")
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        connection.execute("SAVEPOINT ingest_v2_conversation_preview_item")
+        try:
+            refreshed = refresh_conversation_previews(connection, paths, [conversation_id])
+            connection.execute("RELEASE SAVEPOINT ingest_v2_conversation_preview_item")
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT ingest_v2_conversation_preview_item")
+            connection.execute("RELEASE SAVEPOINT ingest_v2_conversation_preview_item")
+            raise
+        actions = cursor.setdefault("actions", {})
+        if isinstance(actions, dict):
+            actions["conversation_preview"] = int(actions.get("conversation_preview") or 0) + 1
+        stats = cursor.setdefault("conversation_preview_stats", {})
+        if isinstance(stats, dict):
+            stats["refreshed"] = int(stats.get("refreshed") or 0) + int(refreshed)
+        ingest_v2_save_phase_cursor(
+            connection,
+            run_id=run_id,
+            phase="committing",
+            cursor_key="loose_file_commit",
+            cursor=cursor,
+            status="pending",
+        )
+        update_cursor = connection.execute(
+            """
+            UPDATE ingest_work_items
+            SET status = 'committed',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                affected_conversation_keys_json = ?,
+                artifact_manifest_json = ?,
+                updated_at = ?,
+                last_error = NULL
+            WHERE run_id = ?
+              AND id = ?
+              AND status = 'committing'
+              AND lease_owner = ?
+            """,
+            (
+                compact_json_text([str(conversation_id)]),
+                compact_json_text(
+                    {
+                        "commit_action": "conversation_preview",
+                        "conversation_id": conversation_id,
+                        "refreshed": int(refreshed),
+                    }
+                ),
+                now,
+                run_id,
+                work_item_id,
+                writer_id,
+            ),
+        )
+        if int(update_cursor.rowcount or 0) != 1:
+            raise RetrieverError(f"Could not mark V2 ingest conversation preview work item {work_item_id} committed.")
+        connection.execute(
+            """
+            UPDATE ingest_runs
+            SET committer_heartbeat_at = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND committer_lease_owner = ?
+            """,
+            (now, now, run_id, writer_id),
+        )
+        connection.commit()
+        return {
+            "action": "conversation_preview",
+            "conversation_id": conversation_id,
+            "refreshed": int(refreshed),
+        }
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def ingest_v2_ensure_production_context(
@@ -4815,6 +5045,39 @@ def ingest_v2_refresh_conversation_previews_best_effort(
         return 0, f"{type(exc).__name__}: {exc}"
 
 
+def ingest_v2_conversation_preview_work_summary(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+) -> dict[str, int]:
+    rows = connection.execute(
+        """
+        SELECT status, artifact_manifest_json
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND unit_type = 'conversation_preview'
+        """,
+        (run_id,),
+    ).fetchall()
+    summary = {
+        "total": 0,
+        "committed": 0,
+        "failed": 0,
+        "refreshed": 0,
+    }
+    for row in rows:
+        summary["total"] += 1
+        status = str(row["status"] or "")
+        if status == "committed":
+            summary["committed"] += 1
+            manifest = decode_json_text(row["artifact_manifest_json"], default={}) or {}
+            if isinstance(manifest, dict):
+                summary["refreshed"] += int(manifest.get("refreshed") or 0)
+        elif status == "failed":
+            summary["failed"] += 1
+    return summary
+
+
 def ingest_v2_start(
     root: Path,
     *,
@@ -6052,6 +6315,19 @@ def ingest_v2_commit_step(
                     )
                     if str(commit_result.get("status") or "") == "failed":
                         raise RetrieverError(str(commit_result.get("error") or "Slack conversation commit failed."))
+                elif payload_kind == "conversation_preview" or str(claimed_row["unit_type"] or "") == "conversation_preview":
+                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
+                    if prepare_error:
+                        raise RetrieverError(prepare_error)
+                    commit_result = ingest_v2_commit_conversation_preview_work_item(
+                        connection,
+                        paths,
+                        run_id=run_id,
+                        work_item_id=work_item_id,
+                        writer_id=writer_id,
+                        cursor=cursor,
+                        prepared_item=prepared_item,
+                    )
                 elif payload_kind == "mbox_message" or str(claimed_row["unit_type"] or "") == "mbox_message":
                     prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
                     if prepare_error:
@@ -6481,10 +6757,6 @@ def ingest_v2_finalize_step(
             connection.execute("BEGIN")
             try:
                 conversation_assignment = assign_supported_conversations(connection)
-                previews_refreshed, preview_refresh_error = ingest_v2_refresh_conversation_previews_best_effort(
-                    connection,
-                    paths,
-                )
                 mbox_documents_redeleted = ingest_v2_redelete_retired_mbox_documents(
                     connection,
                     paths,
@@ -6499,18 +6771,88 @@ def ingest_v2_finalize_step(
                     key: int(value)
                     for key, value in dict(conversation_assignment).items()
                 }
-                cursor["conversation_previews_refreshed"] = int(previews_refreshed)
                 cursor["mbox_documents_redeleted"] = int(mbox_documents_redeleted)
                 cursor["pst_documents_redeleted"] = int(pst_documents_redeleted)
-                if preview_refresh_error:
-                    cursor["conversation_preview_refresh_error"] = preview_refresh_error
+                target_conversation_ids = list_active_conversation_ids(connection)
+                next_commit_order = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(commit_order), 0) + 1
+                        FROM ingest_work_items
+                        WHERE run_id = ?
+                        """,
+                        (run_id,),
+                    ).fetchone()[0]
+                    or 1
+                )
+                planned_preview_items = ingest_v2_plan_conversation_preview_items(
+                    connection,
+                    run_id=run_id,
+                    conversation_ids=target_conversation_ids,
+                    next_commit_order=next_commit_order,
+                )
+                cursor["conversation_preview_target_count"] = len(target_conversation_ids)
+                cursor["conversation_preview_work_items_planned"] = int(planned_preview_items["planned"])
+                if int(planned_preview_items["planned"]):
+                    cursor["stage"] = "conversation_previews"
+                    next_phase = "preparing"
+                else:
+                    cursor["conversation_previews_refreshed"] = 0
+                    cursor["conversation_preview_failures"] = 0
+                    cursor["empty_conversation_preview_dirs_pruned"] = prune_empty_conversation_preview_dirs(paths)
+                    cursor["stage"] = "prune"
+                    next_phase = "finalizing"
+                ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="pending")
+                connection.execute(
+                    """
+                    UPDATE ingest_runs
+                    SET phase = ?,
+                        status = ?,
+                        last_heartbeat_at = ?
+                    WHERE run_id = ?
+                      AND phase = 'finalizing'
+                      AND cancel_requested_at IS NULL
+                    """,
+                    (next_phase, next_phase, utc_now(), run_id),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            stages_completed.append("conversations")
+            stage = str(cursor.get("stage") or "prune")
+
+        if (
+            stage == "conversation_previews"
+            and str(require_ingest_v2_run_row(connection, run_id)["phase"]) == "finalizing"
+        ):
+            preview_summary = ingest_v2_conversation_preview_work_summary(connection, run_id=run_id)
+            connection.execute("BEGIN")
+            try:
+                cursor["conversation_previews_refreshed"] = int(preview_summary["refreshed"])
+                cursor["conversation_preview_failures"] = int(preview_summary["failed"])
+                cursor["mbox_documents_redeleted"] = int(cursor.get("mbox_documents_redeleted") or 0) + int(
+                    ingest_v2_redelete_retired_mbox_documents(
+                        connection,
+                        paths,
+                        run_id=run_id,
+                    )
+                )
+                cursor["pst_documents_redeleted"] = int(cursor.get("pst_documents_redeleted") or 0) + int(
+                    ingest_v2_redelete_retired_pst_documents(
+                        connection,
+                        paths,
+                        run_id=run_id,
+                    )
+                )
+                cursor["empty_conversation_preview_dirs_pruned"] = prune_empty_conversation_preview_dirs(paths)
                 cursor["stage"] = "prune"
                 ingest_v2_save_finalize_cursor(connection, run_id=run_id, cursor=cursor, status="pending")
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
-            stages_completed.append("conversations")
+            stages_completed.append("conversation_previews")
             stage = "prune"
 
         if stage == "prune" and ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS:
@@ -14245,10 +14587,79 @@ def refresh_generated_previews(
         except Exception:
             connection.rollback()
             raise
+        empty_dirs_pruned = prune_empty_conversation_preview_dirs(paths)
 
         result: dict[str, object] = {
             "status": "ok",
             "refreshed_conversations": int(refreshed),
+            "empty_conversation_preview_dirs_pruned": int(empty_dirs_pruned),
+        }
+        if conversation_ids is None and document_ids is None and dataset_id is None and dataset_name is None:
+            result["target_scope"] = "all_active_conversations"
+        else:
+            result["target_conversation_ids"] = target_conversation_ids
+        if document_ids:
+            result["requested_document_ids"] = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+        if conversation_ids:
+            result["requested_conversation_ids"] = sorted(
+                dict.fromkeys(int(conversation_id) for conversation_id in conversation_ids)
+            )
+        if dataset_summary is not None:
+            result["dataset"] = dataset_summary
+        return result
+    finally:
+        connection.close()
+
+
+def rebuild_conversations(
+    root: Path,
+    *,
+    conversation_ids: list[int] | None = None,
+    document_ids: list[int] | None = None,
+    dataset_id: int | None = None,
+    dataset_name: str | None = None,
+    batch_size: int = 50,
+) -> dict[str, object]:
+    normalized_batch_size = max(1, min(int(batch_size or 50), 1000))
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        raise_if_ingest_v2_active(connection, root, command_name="rebuild-conversations")
+        connection.execute("BEGIN")
+        try:
+            assignment = assign_supported_conversations(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        target_conversation_ids, dataset_summary = resolve_conversation_preview_refresh_ids(
+            connection,
+            conversation_ids=conversation_ids,
+            document_ids=document_ids,
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+        )
+        refreshed = 0
+        for offset in range(0, len(target_conversation_ids), normalized_batch_size):
+            batch_conversation_ids = target_conversation_ids[offset : offset + normalized_batch_size]
+            connection.execute("BEGIN")
+            try:
+                refreshed += refresh_conversation_previews(connection, paths, batch_conversation_ids)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        empty_dirs_pruned = prune_empty_conversation_preview_dirs(paths)
+        result: dict[str, object] = {
+            "status": "ok",
+            "assignment": {key: int(value) for key, value in dict(assignment).items()},
+            "target_conversations": len(target_conversation_ids),
+            "refreshed_conversations": int(refreshed),
+            "batch_size": normalized_batch_size,
+            "empty_conversation_preview_dirs_pruned": int(empty_dirs_pruned),
         }
         if conversation_ids is None and document_ids is None and dataset_id is None and dataset_name is None:
             result["target_scope"] = "all_active_conversations"

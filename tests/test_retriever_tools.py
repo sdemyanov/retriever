@@ -221,6 +221,34 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.assertIsNotNone(payload)
             assert payload is not None
             payloads[payload_key] = payload
+        post_finalize_steps: list[dict[str, object]] = []
+        while dict(payloads["finalize"])["run"]["status"] != "completed":
+            exit_code, payload, _, _ = self.run_cli(
+                "ingest-run-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            post_finalize_steps.append(payload)
+            step_result = payload.get("step_result")
+            if isinstance(step_result, dict) and step_result.get("step") == "finalize":
+                payloads["finalize"] = step_result
+            elif payload["run"]["status"] == "completed":
+                payloads["finalize"] = {
+                    "ok": True,
+                    "implemented": True,
+                    "step": "finalize",
+                    "finalization_complete": True,
+                    "run": payload["run"],
+                }
+            self.assertLessEqual(len(post_finalize_steps), 10)
+        if post_finalize_steps:
+            payloads["post_finalize_run_steps"] = post_finalize_steps
         return payloads
 
     def preview_target_file_path(self, target: dict[str, object]) -> Path:
@@ -7288,7 +7316,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(container_row["message_count"], 2)
         self.assertEqual(container_row["file_size"], mbox_path.stat().st_size)
         self.assertIsNotNone(container_row["last_scan_completed_at"])
-        self.assertEqual([row["unit_type"] for row in work_items], ["mbox_message", "mbox_message", "mbox_source_finalizer"])
+        self.assertEqual(
+            [row["unit_type"] for row in work_items],
+            ["mbox_message", "mbox_message", "mbox_source_finalizer", "conversation_preview", "conversation_preview"],
+        )
         self.assertTrue(all(row["status"] == "committed" for row in work_items))
         self.assertTrue(json.loads(work_items[0]["affected_document_ids_json"]))
         self.assertEqual(json.loads(work_items[2]["artifact_manifest_json"])["commit_action"], "finalized")
@@ -7465,7 +7496,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(container_row["message_count"], 2)
         self.assertEqual(container_row["file_size"], pst_path.stat().st_size)
         self.assertIsNotNone(container_row["last_scan_completed_at"])
-        self.assertEqual([row["unit_type"] for row in work_items], ["pst_message", "pst_message", "pst_source_finalizer"])
+        self.assertEqual(
+            [row["unit_type"] for row in work_items],
+            ["pst_message", "pst_message", "pst_source_finalizer", "conversation_preview", "conversation_preview"],
+        )
         self.assertTrue(all(row["status"] == "committed" for row in work_items))
         self.assertTrue(json.loads(work_items[0]["affected_document_ids_json"]))
         self.assertEqual(json.loads(work_items[2]["artifact_manifest_json"])["commit_action"], "finalized")
@@ -8824,7 +8858,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
     def test_ingest_v2_finalize_records_conversation_preview_permission_error(self) -> None:
         raw_dir = self.root / "raw"
         raw_dir.mkdir()
-        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        self.write_email_message(
+            raw_dir / "alpha.eml",
+            subject="Preview blocked",
+            body_text="preview body\n",
+            message_id="<preview-blocked@example.com>",
+        )
 
         start_exit, start_payload, _, _ = self.run_cli(
             "ingest-start",
@@ -8842,13 +8881,27 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertIsNotNone(payload)
 
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "ingest-finalize-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertFalse(finalize_payload["finalization_complete"])
+        self.assertEqual(finalize_payload["run"]["phase"], "preparing")
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["conversation_preview"]["pending"], 1)
+
         with mock.patch.object(
             retriever_tools,
             "refresh_conversation_previews",
             side_effect=PermissionError("blocked preview write"),
         ):
-            finalize_exit, finalize_payload, _, _ = self.run_cli(
-                "ingest-finalize-step",
+            run_exit, run_payload, _, _ = self.run_cli(
+                "ingest-run-step",
                 str(self.root),
                 "--run-id",
                 run_id,
@@ -8856,12 +8909,37 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 "35",
             )
 
-        self.assertEqual(finalize_exit, 0)
-        self.assertIsNotNone(finalize_payload)
-        self.assertTrue(finalize_payload["finalization_complete"])
-        self.assertEqual(finalize_payload["run"]["status"], "completed")
-        self.assertEqual(finalize_payload["cursor"]["conversation_previews_refreshed"], 0)
-        self.assertIn("PermissionError", finalize_payload["cursor"]["conversation_preview_refresh_error"])
+        self.assertEqual(run_exit, 0)
+        self.assertIsNotNone(run_payload)
+        self.assertEqual(run_payload["run"]["status"], "completed")
+        self.assertEqual(run_payload["run"]["counts"]["by_unit_type"]["conversation_preview"]["failed"], 1)
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            failed_row = connection.execute(
+                """
+                SELECT last_error
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND unit_type = 'conversation_preview'
+                """,
+                (run_id,),
+            ).fetchone()
+            cursor_row = connection.execute(
+                """
+                SELECT cursor_json
+                FROM ingest_phase_cursors
+                WHERE run_id = ?
+                  AND phase = 'finalizing'
+                  AND cursor_key = 'loose_file_finalize'
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(failed_row)
+        self.assertIn("PermissionError", failed_row["last_error"])
+        self.assertIsNotNone(cursor_row)
+        self.assertEqual(json.loads(cursor_row["cursor_json"])["conversation_preview_failures"], 1)
 
     def test_ingest_v2_reingest_skips_unchanged_loose_file(self) -> None:
         raw_dir = self.root / "raw"
@@ -10804,6 +10882,43 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         refreshed_message_preview_html = refreshed_message_preview_path.read_text(encoding="utf-8")
         self.assertIn("Root message body", refreshed_message_preview_html)
         self.assertIn('class="gmail-thread-title-link"', refreshed_message_preview_html)
+
+    def test_rebuild_conversations_reassigns_refreshes_and_prunes_empty_preview_dirs(self) -> None:
+        root_path = self.root / "root.eml"
+        reply_path = self.root / "reply.eml"
+        self.write_email_message(
+            root_path,
+            subject="Rebuild Conversation",
+            body_text="Root rebuild body",
+            message_id="<rebuild-root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            reply_path,
+            subject="Re: Rebuild Conversation",
+            body_text="Reply rebuild body",
+            message_id="<rebuild-reply@example.com>",
+            in_reply_to="<rebuild-root@example.com>",
+            references="<rebuild-root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        stale_dir = self.paths["state_dir"] / "previews" / "conversations" / "conversation-99999999"
+        stale_dir.mkdir(parents=True)
+        exit_code, payload, _, _ = self.run_cli("rebuild-conversations", str(self.root), "--batch-size", "1")
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["target_conversations"], 1)
+        self.assertEqual(payload["refreshed_conversations"], 1)
+        self.assertGreaterEqual(payload["empty_conversation_preview_dirs_pruned"], 1)
+        self.assertFalse(stale_dir.exists())
 
     def test_single_large_email_conversation_skips_redundant_conversation_artifacts(self) -> None:
         single_path = self.root / "single.eml"
