@@ -11373,11 +11373,17 @@ def build_parser() -> argparse.ArgumentParser:
     clear_conversation_parser.add_argument("--doc-id", type=int, required=True, help="Document id to clear")
 
     refresh_previews_parser = subparsers.add_parser(
-        "refresh-conversation-previews",
-        aliases=["refresh-previews"],
-        help="Regenerate thread and per-message HTML previews for existing conversations",
+        "refresh-previews",
+        aliases=["refresh-conversation-previews"],
+        help="Regenerate generated document and conversation preview artifacts",
     )
     refresh_previews_parser.add_argument("workspace", help="Workspace root path")
+    refresh_previews_parser.add_argument(
+        "--scope",
+        choices=["conversations", "documents", "all"],
+        default="conversations",
+        help="Preview family to refresh (currently conversations)",
+    )
     refresh_previews_parser.add_argument(
         "--conversation-id",
         dest="conversation_ids",
@@ -11395,6 +11401,16 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_dataset_selector_group = refresh_previews_parser.add_mutually_exclusive_group()
     refresh_dataset_selector_group.add_argument("--dataset-id", type=int, help="Dataset id")
     refresh_dataset_selector_group.add_argument("--dataset-name", help="Exact dataset name")
+    refresh_previews_parser.add_argument(
+        "--missing-only",
+        action="store_true",
+        help="Only refresh conversations with missing preview rows or files",
+    )
+    refresh_previews_parser.add_argument(
+        "--from-source",
+        action="store_true",
+        help="Request source-backed preview regeneration where the selected scope supports it",
+    )
 
     rebuild_conversations_parser = subparsers.add_parser(
         "rebuild-conversations",
@@ -12408,10 +12424,13 @@ def main() -> int:
                 args.command,
                 refresh_generated_previews(
                     root,
+                    scope=args.scope,
                     conversation_ids=args.conversation_ids,
                     document_ids=args.document_ids,
                     dataset_id=args.dataset_id,
                     dataset_name=args.dataset_name,
+                    missing_only=args.missing_only,
+                    from_source=args.from_source,
                 ),
             )
 

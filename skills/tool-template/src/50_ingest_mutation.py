@@ -16193,14 +16193,65 @@ def resolve_conversation_preview_refresh_ids(
     return sorted(target_conversation_ids), dataset_summary
 
 
+def filter_conversation_ids_with_missing_preview_artifacts(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    conversation_ids: list[int],
+) -> list[int]:
+    normalized_conversation_ids = sorted(dict.fromkeys(int(conversation_id) for conversation_id in conversation_ids))
+    if not normalized_conversation_ids:
+        return []
+    rows = connection.execute(
+        f"""
+        SELECT
+          d.conversation_id,
+          d.id AS document_id,
+          dp.rel_preview_path,
+          dp.preview_type
+        FROM documents d
+        LEFT JOIN document_previews dp ON dp.document_id = d.id
+        WHERE d.conversation_id IN ({", ".join("?" for _ in normalized_conversation_ids)})
+          AND d.lifecycle_status NOT IN ('missing', 'deleted')
+          AND COALESCE(d.child_document_kind, '') != ?
+        ORDER BY d.conversation_id ASC, d.id ASC, dp.ordinal ASC, dp.id ASC
+        """,
+        (*normalized_conversation_ids, CHILD_DOCUMENT_KIND_ATTACHMENT),
+    ).fetchall()
+    missing_conversation_ids: set[int] = set()
+    for row in rows:
+        conversation_id = int(row["conversation_id"])
+        rel_preview_path = row["rel_preview_path"]
+        if rel_preview_path is None:
+            missing_conversation_ids.add(conversation_id)
+            continue
+        if normalize_whitespace(str(row["preview_type"] or "")).lower() == "native":
+            continue
+        if not (paths["state_dir"] / str(rel_preview_path)).exists():
+            missing_conversation_ids.add(conversation_id)
+    return [
+        conversation_id
+        for conversation_id in normalized_conversation_ids
+        if conversation_id in missing_conversation_ids
+    ]
+
+
 def refresh_generated_previews(
     root: Path,
     *,
+    scope: str = "conversations",
     conversation_ids: list[int] | None = None,
     document_ids: list[int] | None = None,
     dataset_id: int | None = None,
     dataset_name: str | None = None,
+    missing_only: bool = False,
+    from_source: bool = False,
 ) -> dict[str, object]:
+    normalized_scope = normalize_whitespace(str(scope or "conversations")).lower()
+    if normalized_scope not in {"conversations"}:
+        raise RetrieverError(
+            "refresh-previews currently supports --scope conversations. "
+            "Document/all preview refresh will be added as a separate safe repair path."
+        )
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -16213,6 +16264,13 @@ def refresh_generated_previews(
             dataset_id=dataset_id,
             dataset_name=dataset_name,
         )
+        candidate_conversation_ids = list(target_conversation_ids)
+        if missing_only:
+            target_conversation_ids = filter_conversation_ids_with_missing_preview_artifacts(
+                connection,
+                paths,
+                target_conversation_ids,
+            )
         connection.execute("BEGIN")
         try:
             refreshed = refresh_conversation_previews(connection, paths, target_conversation_ids)
@@ -16224,9 +16282,20 @@ def refresh_generated_previews(
 
         result: dict[str, object] = {
             "status": "ok",
+            "scope": normalized_scope,
+            "missing_only": bool(missing_only),
+            "from_source_requested": bool(from_source),
             "refreshed_conversations": int(refreshed),
             "empty_conversation_preview_dirs_pruned": int(empty_dirs_pruned),
         }
+        if from_source:
+            result["from_source_mode"] = "not_applicable_for_conversation_previews"
+            result["from_source_note"] = (
+                "Conversation previews are regenerated from stored document text and metadata; "
+                "use ingest to reparse original source files."
+            )
+        if missing_only:
+            result["candidate_conversations"] = len(candidate_conversation_ids)
         if conversation_ids is None and document_ids is None and dataset_id is None and dataset_name is None:
             result["target_scope"] = "all_active_conversations"
         else:
