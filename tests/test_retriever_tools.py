@@ -13,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -8247,6 +8248,61 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             hashlib.sha256(alpha_text.encode("utf-8")).hexdigest(),
         )
 
+    def test_ingest_v2_prepare_step_uses_parallel_workers(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        for index in range(4):
+            (raw_dir / f"doc-{index}.txt").write_text(f"parallel body {index}\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+
+        original_prepare = retriever_tools.ingest_v2_prepare_loose_file_item
+        barrier = threading.Barrier(4)
+        thread_ids: set[int] = set()
+        thread_ids_lock = threading.Lock()
+
+        def wrapped_prepare(root: Path, work_item_row, *, deadline: float):
+            with thread_ids_lock:
+                thread_ids.add(threading.get_ident())
+            barrier.wait(timeout=5)
+            return original_prepare(root, work_item_row, deadline=deadline)
+
+        with (
+            mock.patch.object(retriever_tools, "INGEST_V2_PREPARE_BATCH_SIZE", 4),
+            mock.patch.object(retriever_tools, "ingest_prepare_worker_count", return_value=4),
+            mock.patch.object(retriever_tools, "ingest_container_prepare_worker_count", return_value=1),
+            mock.patch.object(retriever_tools, "ingest_v2_prepare_loose_file_item", side_effect=wrapped_prepare),
+        ):
+            prepare_exit, prepare_payload, _, _ = self.run_cli(
+                "ingest-prepare-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
+
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        self.assertEqual(prepare_payload["claimed"], 4)
+        self.assertEqual(prepare_payload["prepared"], 4)
+        self.assertEqual(prepare_payload["claim_limit"], 4)
+        self.assertEqual(prepare_payload["prepare_workers"], 4)
+        self.assertEqual(len(thread_ids), 4)
+
     def test_ingest_v2_commit_step_commits_prepared_loose_files(self) -> None:
         raw_dir = self.root / "raw"
         raw_dir.mkdir()
@@ -8361,6 +8417,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         with (
             mock.patch.object(retriever_tools, "INGEST_V2_PREPARE_BATCH_SIZE", 2),
             mock.patch.object(retriever_tools, "INGEST_V2_PREPARED_COMMIT_BATCH_TARGET", 2),
+            mock.patch.object(retriever_tools, "ingest_prepare_worker_count", return_value=1),
+            mock.patch.object(retriever_tools, "ingest_container_prepare_worker_count", return_value=1),
         ):
             first_prepare_exit, first_prepare_payload, _, _ = self.run_cli(
                 "ingest-prepare-step",
