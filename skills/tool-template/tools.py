@@ -1721,6 +1721,44 @@ SCHEMA_STATEMENTS = [
       updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS entity_rebuild_runs (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL UNIQUE,
+      mode TEXT NOT NULL DEFAULT 'full',
+      phase TEXT NOT NULL DEFAULT 'resetting',
+      status TEXT NOT NULL DEFAULT 'resetting',
+      document_ids_json TEXT NOT NULL DEFAULT '[]',
+      batch_size INTEGER NOT NULL DEFAULT 500,
+      reset_stage TEXT NOT NULL DEFAULT 'document_entities',
+      reset_counts_json TEXT NOT NULL DEFAULT '{}',
+      cursor_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      cancel_requested_at TEXT,
+      last_heartbeat_at TEXT,
+      error TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS entity_rebuild_items (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES entity_rebuild_runs(run_id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      document_synced INTEGER NOT NULL DEFAULT 0,
+      auto_links_created INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(run_id, document_id)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_documents_file_hash ON documents(file_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_lifecycle_status ON documents(lifecycle_status)",
@@ -1740,6 +1778,9 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_ingest_phase_cursors_run_phase ON ingest_phase_cursors(run_id, phase, status)",
     "CREATE INDEX IF NOT EXISTS idx_ingest_worker_events_run_created ON ingest_worker_events(run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_ingest_artifact_sweeps_run_state ON ingest_artifact_sweeps(run_id, state)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_runs_status ON entity_rebuild_runs(status, phase)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_items_run_status ON entity_rebuild_items(run_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_items_lease ON entity_rebuild_items(lease_expires_at)",
 ]
 
 
@@ -39784,6 +39825,906 @@ def entity_graph_counts(connection: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+ENTITY_REBUILD_ACTIVE_STATUSES = {"resetting", "planning", "rebuilding"}
+ENTITY_REBUILD_TERMINAL_STATUSES = {"completed", "canceled", "failed"}
+ENTITY_REBUILD_ITEM_STATUSES = ("pending", "leased", "committed", "failed", "cancelled")
+ENTITY_REBUILD_RESET_STAGES = (
+    "document_entities",
+    "resolution_keys",
+    "identifiers",
+    "entities",
+    "complete",
+)
+ENTITY_REBUILD_LEASE_SECONDS = 45
+
+
+def new_entity_rebuild_run_id(now: datetime | None = None) -> str:
+    return new_ingest_v2_run_id(now)
+
+
+def entity_rebuild_run_row_by_id(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM entity_rebuild_runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+
+
+def latest_entity_rebuild_run_row(connection: sqlite3.Connection) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM entity_rebuild_runs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def active_entity_rebuild_run_row(connection: sqlite3.Connection) -> sqlite3.Row | None:
+    return connection.execute(
+        f"""
+        SELECT *
+        FROM entity_rebuild_runs
+        WHERE status IN ({", ".join("?" for _ in ENTITY_REBUILD_ACTIVE_STATUSES)})
+          AND cancel_requested_at IS NULL
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        tuple(sorted(ENTITY_REBUILD_ACTIVE_STATUSES)),
+    ).fetchone()
+
+
+def require_entity_rebuild_run_row(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
+    row = entity_rebuild_run_row_by_id(connection, run_id)
+    if row is None:
+        raise RetrieverError(f"Unknown entity rebuild run id: {run_id}")
+    return row
+
+
+def entity_rebuild_conflict_payload(root: Path, active_row: sqlite3.Row, *, message: str) -> dict[str, object]:
+    run_id = str(active_row["run_id"])
+    quoted_root = shlex.quote(str(root))
+    quoted_run_id = shlex.quote(run_id)
+    return {
+        "ok": False,
+        "error": "active_entity_rebuild_run",
+        "active_run_id": run_id,
+        "message": message,
+        "status_command": f"rebuild-entities-status {quoted_root} --run-id {quoted_run_id}",
+        "cancel_command": f"rebuild-entities-cancel {quoted_root} --run-id {quoted_run_id}",
+    }
+
+
+def raise_if_entity_rebuild_active(connection: sqlite3.Connection, root: Path, *, command_name: str) -> None:
+    active_row = active_entity_rebuild_run_row(connection)
+    if active_row is None:
+        return
+    raise RetrieverStructuredError(
+        f"{command_name} cannot run while entity rebuild run {active_row['run_id']} is active.",
+        entity_rebuild_conflict_payload(
+            root,
+            active_row,
+            message=f"{command_name} cannot run while a resumable entity rebuild is active.",
+        ),
+    )
+
+
+def entity_rebuild_status_counts(connection: sqlite3.Connection, *, run_id: str) -> dict[str, int]:
+    counts = {status: 0 for status in ENTITY_REBUILD_ITEM_STATUSES}
+    rows = connection.execute(
+        """
+        SELECT status, COUNT(*) AS count
+        FROM entity_rebuild_items
+        WHERE run_id = ?
+        GROUP BY status
+        """,
+        (run_id,),
+    ).fetchall()
+    for row in rows:
+        counts[str(row["status"])] = int(row["count"] or 0)
+    return counts
+
+
+def entity_rebuild_status_payload(
+    connection: sqlite3.Connection,
+    root: Path,
+    row: sqlite3.Row,
+    *,
+    budget_seconds: int = DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    counts = entity_rebuild_status_counts(connection, run_id=run_id)
+    reset_counts = decode_json_text(row["reset_counts_json"], default={}) or {}
+    cursor = decode_json_text(row["cursor_json"], default={}) or {}
+    totals_row = connection.execute(
+        """
+        SELECT
+          COALESCE(SUM(document_synced), 0) AS documents_synced,
+          COALESCE(SUM(auto_links_created), 0) AS auto_links_created
+        FROM entity_rebuild_items
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    root_arg = shlex.quote(str(root))
+    run_id_arg = shlex.quote(run_id)
+    budget_arg = str(int(budget_seconds))
+    next_commands: list[str]
+    if row["cancel_requested_at"] is not None or str(row["status"]) in ENTITY_REBUILD_TERMINAL_STATUSES:
+        next_commands = [f"rebuild-entities-status {root_arg} --run-id {run_id_arg}"]
+    else:
+        next_commands = [
+            f"rebuild-entities-run-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}",
+        ]
+    return {
+        "run_id": run_id,
+        "mode": str(row["mode"]),
+        "phase": str(row["phase"]),
+        "status": str(row["status"]),
+        "batch_size": int(row["batch_size"] or 0),
+        "counts": {"work_items": counts},
+        "progress": {
+            "reset_stage": str(row["reset_stage"] or ""),
+            "reset_counts": reset_counts,
+            "cursor": cursor,
+            "documents_scanned": sum(counts.values()),
+            "documents_synced": int(totals_row["documents_synced"] or 0) if totals_row is not None else 0,
+            "auto_links_created": int(totals_row["auto_links_created"] or 0) if totals_row is not None else 0,
+        },
+        "graph": entity_graph_counts(connection),
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "cancel_requested_at": row["cancel_requested_at"],
+        "last_error": row["error"],
+        "next_recommended_commands": next_commands,
+    }
+
+
+def rebuild_entities_start(
+    root: Path,
+    *,
+    document_ids: list[int] | None = None,
+    batch_size: int = 500,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    budget = normalize_resumable_step_budget(budget_seconds)
+    normalized_batch_size = max(1, min(int(batch_size or 500), 5000))
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="rebuild-entities-start"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            raise_if_ingest_v2_active(connection, root, command_name="rebuild-entities-start")
+            active_row = active_entity_rebuild_run_row(connection)
+            if active_row is not None:
+                raise RetrieverStructuredError(
+                    f"Entity rebuild run {active_row['run_id']} is already active.",
+                    entity_rebuild_conflict_payload(
+                        root,
+                        active_row,
+                        message="A resumable entity rebuild is active in this workspace.",
+                    ),
+                )
+            selected_document_ids = entity_rebuild_document_ids(connection, document_ids) if document_ids else []
+            full_rebuild = not document_ids
+            run_id = new_entity_rebuild_run_id()
+            now = utc_now()
+            phase = "resetting" if full_rebuild else "planning"
+            connection.execute("BEGIN")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO entity_rebuild_runs (
+                      run_id, mode, phase, status, document_ids_json, batch_size,
+                      reset_stage, reset_counts_json, cursor_json,
+                      created_at, started_at, last_heartbeat_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        "full" if full_rebuild else "selected",
+                        phase,
+                        phase,
+                        compact_json_text(selected_document_ids),
+                        normalized_batch_size,
+                        "document_entities",
+                        compact_json_text(
+                            {
+                                "auto_document_links_deleted": 0,
+                                "auto_resolution_keys_deleted": 0,
+                                "auto_identifiers_deleted": 0,
+                                "auto_entities_deleted": 0,
+                            }
+                        ),
+                        compact_json_text({"selected_offset": 0, "last_document_id": 0, "planned": 0}),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            row = require_entity_rebuild_run_row(connection, run_id)
+            return {"ok": True, "created": True, **entity_rebuild_status_payload(connection, root, row, budget_seconds=budget)}
+        finally:
+            connection.close()
+
+
+def rebuild_entities_status(root: Path, *, run_id: str | None = None, budget_seconds: int | None = None) -> dict[str, object]:
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = require_entity_rebuild_run_row(connection, run_id) if run_id else latest_entity_rebuild_run_row(connection)
+        if row is None:
+            return {
+                "ok": True,
+                "status": "none",
+                "phase": None,
+                "run_id": None,
+                "counts": {"work_items": {status: 0 for status in ENTITY_REBUILD_ITEM_STATUSES}},
+                "progress": {
+                    "reset_stage": None,
+                    "reset_counts": {},
+                    "cursor": {},
+                    "documents_scanned": 0,
+                    "documents_synced": 0,
+                    "auto_links_created": 0,
+                },
+                "graph": entity_graph_counts(connection),
+                "next_recommended_commands": [],
+            }
+        return {"ok": True, **entity_rebuild_status_payload(connection, root, row, budget_seconds=budget)}
+    finally:
+        connection.close()
+
+
+def rebuild_entities_cancel(root: Path, *, run_id: str) -> dict[str, object]:
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    with workspace_entity_rebuild_session(paths, command_name="rebuild-entities-cancel"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            row = require_entity_rebuild_run_row(connection, run_id)
+            now = utc_now()
+            connection.execute("BEGIN")
+            try:
+                if str(row["status"]) not in ENTITY_REBUILD_TERMINAL_STATUSES:
+                    connection.execute(
+                        """
+                        UPDATE entity_rebuild_items
+                        SET status = 'cancelled',
+                            lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            updated_at = ?
+                        WHERE run_id = ?
+                          AND status IN ('pending', 'leased')
+                        """,
+                        (now, run_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE entity_rebuild_runs
+                        SET phase = 'canceled',
+                            status = 'canceled',
+                            cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                            completed_at = COALESCE(completed_at, ?),
+                            last_heartbeat_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (now, now, now, run_id),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            updated_row = require_entity_rebuild_run_row(connection, run_id)
+            return {"ok": True, "cancelled": str(updated_row["status"]) == "canceled", **entity_rebuild_status_payload(connection, root, updated_row)}
+        finally:
+            connection.close()
+
+
+def entity_rebuild_reset_stage_delete_sql(stage: str) -> tuple[str, str]:
+    if stage == "document_entities":
+        return (
+            "auto_document_links_deleted",
+            """
+            DELETE FROM document_entities
+            WHERE id IN (
+              SELECT id
+              FROM document_entities
+              WHERE assignment_mode = 'auto'
+              ORDER BY id ASC
+              LIMIT ?
+            )
+            """,
+        )
+    if stage == "resolution_keys":
+        return (
+            "auto_resolution_keys_deleted",
+            """
+            DELETE FROM entity_resolution_keys
+            WHERE id IN (
+              SELECT id
+              FROM entity_resolution_keys
+              WHERE identifier_id IS NULL
+                 OR identifier_id IN (
+                   SELECT id
+                   FROM entity_identifiers
+                   WHERE COALESCE(source_kind, 'auto') = 'auto'
+                 )
+              ORDER BY id ASC
+              LIMIT ?
+            )
+            """,
+        )
+    if stage == "identifiers":
+        return (
+            "auto_identifiers_deleted",
+            """
+            DELETE FROM entity_identifiers
+            WHERE id IN (
+              SELECT id
+              FROM entity_identifiers
+              WHERE COALESCE(source_kind, 'auto') = 'auto'
+              ORDER BY id ASC
+              LIMIT ?
+            )
+            """,
+        )
+    if stage == "entities":
+        return (
+            "auto_entities_deleted",
+            """
+            DELETE FROM entities
+            WHERE id IN (
+              SELECT id
+              FROM entities
+              WHERE entity_origin IN ('observed', 'identified')
+                AND display_name_source = 'auto'
+                AND canonical_status = 'active'
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM entity_identifiers ei
+                  WHERE ei.entity_id = entities.id
+                    AND COALESCE(ei.source_kind, 'auto') != 'auto'
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM document_entities de
+                  WHERE de.entity_id = entities.id
+                    AND de.assignment_mode != 'auto'
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM entity_resolution_keys erk
+                  WHERE erk.entity_id = entities.id
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM entity_overrides eo
+                  WHERE eo.source_entity_id = entities.id
+                     OR eo.replacement_entity_id = entities.id
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM entity_merge_blocks emb
+                  WHERE emb.left_entity_id = entities.id
+                     OR emb.right_entity_id = entities.id
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM entities merged_child
+                  WHERE merged_child.merged_into_entity_id = entities.id
+                )
+              ORDER BY id ASC
+              LIMIT ?
+            )
+            """,
+        )
+    raise RetrieverError(f"Unsupported entity rebuild reset stage: {stage}")
+
+
+def entity_rebuild_next_reset_stage(stage: str) -> str:
+    try:
+        index = ENTITY_REBUILD_RESET_STAGES.index(stage)
+    except ValueError:
+        return "complete"
+    return ENTITY_REBUILD_RESET_STAGES[min(index + 1, len(ENTITY_REBUILD_RESET_STAGES) - 1)]
+
+
+def entity_rebuild_reset_step(connection: sqlite3.Connection, *, run_id: str, batch_size: int) -> dict[str, object]:
+    row = require_entity_rebuild_run_row(connection, run_id)
+    stage = str(row["reset_stage"] or "document_entities")
+    counts = decode_json_text(row["reset_counts_json"], default={}) or {}
+    if stage == "complete":
+        return {"stage": stage, "deleted": 0, "reset_complete": True}
+    count_key, delete_sql = entity_rebuild_reset_stage_delete_sql(stage)
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(delete_sql, (max(1, int(batch_size)),))
+        deleted = int(cursor.rowcount or 0)
+        if deleted:
+            counts[count_key] = int(counts.get(count_key) or 0) + deleted
+            next_stage = stage
+            next_phase = "resetting"
+        else:
+            next_stage = entity_rebuild_next_reset_stage(stage)
+            next_phase = "planning" if next_stage == "complete" else "resetting"
+        connection.execute(
+            """
+            UPDATE entity_rebuild_runs
+            SET reset_stage = ?,
+                reset_counts_json = ?,
+                phase = ?,
+                status = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND status = 'resetting'
+              AND cancel_requested_at IS NULL
+            """,
+            (next_stage, compact_json_text(counts), next_phase, next_phase, now, run_id),
+        )
+        connection.commit()
+        return {
+            "stage": stage,
+            "deleted": deleted,
+            "reset_complete": next_stage == "complete",
+            "next_stage": next_stage,
+        }
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def entity_rebuild_plan_step(connection: sqlite3.Connection, *, run_id: str, batch_size: int) -> dict[str, object]:
+    row = require_entity_rebuild_run_row(connection, run_id)
+    cursor = decode_json_text(row["cursor_json"], default={}) or {}
+    now = utc_now()
+    planned_ids: list[int] = []
+    if str(row["mode"]) == "selected":
+        selected_ids = [int(value) for value in list(decode_json_text(row["document_ids_json"], default=[]) or [])]
+        offset = int(cursor.get("selected_offset") or 0)
+        planned_ids = selected_ids[offset : offset + max(1, int(batch_size))]
+        cursor["selected_offset"] = offset + len(planned_ids)
+        planning_complete = int(cursor["selected_offset"]) >= len(selected_ids)
+    else:
+        last_document_id = int(cursor.get("last_document_id") or 0)
+        rows = connection.execute(
+            """
+            SELECT id
+            FROM documents
+            WHERE canonical_status != ?
+              AND id > ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (CANONICAL_STATUS_MERGED, last_document_id, max(1, int(batch_size))),
+        ).fetchall()
+        planned_ids = [int(item["id"]) for item in rows]
+        if planned_ids:
+            cursor["last_document_id"] = planned_ids[-1]
+        planning_complete = len(planned_ids) < max(1, int(batch_size))
+
+    connection.execute("BEGIN")
+    try:
+        planned = 0
+        for ordinal, document_id in enumerate(planned_ids, start=int(cursor.get("planned") or 0) + 1):
+            insert_cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO entity_rebuild_items (
+                  run_id, document_id, ordinal, status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?)
+                """,
+                (run_id, document_id, ordinal, now, now),
+            )
+            planned += int(insert_cursor.rowcount or 0)
+        cursor["planned"] = int(cursor.get("planned") or 0) + planned
+        if planning_complete:
+            item_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM entity_rebuild_items WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            next_phase = "rebuilding" if item_count else "completed"
+            completed_at = now if not item_count else None
+        else:
+            next_phase = "planning"
+            completed_at = None
+        connection.execute(
+            """
+            UPDATE entity_rebuild_runs
+            SET cursor_json = ?,
+                phase = ?,
+                status = ?,
+                completed_at = COALESCE(completed_at, ?),
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND phase = 'planning'
+              AND cancel_requested_at IS NULL
+            """,
+            (compact_json_text(cursor), next_phase, next_phase, completed_at, now, run_id),
+        )
+        connection.commit()
+        return {"planned": planned, "planning_complete": planning_complete, "next_phase": next_phase}
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def entity_rebuild_reclaim_stale_items(connection: sqlite3.Connection, *, run_id: str) -> int:
+    now_dt = datetime.now(timezone.utc)
+    now = format_utc_timestamp(now_dt)
+    stale_cutoff = format_utc_timestamp(now_dt - timedelta(seconds=ENTITY_REBUILD_LEASE_SECONDS))
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE entity_rebuild_items
+            SET status = 'pending',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?
+            WHERE run_id = ?
+              AND status = 'leased'
+              AND lease_expires_at IS NOT NULL
+              AND (
+                lease_expires_at <= ?
+                OR updated_at <= ?
+              )
+            """,
+            (now, run_id, now, stale_cutoff),
+        )
+        reclaimed = int(cursor.rowcount or 0)
+        connection.commit()
+        return reclaimed
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def entity_rebuild_claim_items(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    worker_id: str,
+    limit: int,
+) -> list[sqlite3.Row]:
+    now_dt = datetime.now(timezone.utc)
+    now = format_utc_timestamp(now_dt)
+    lease_expires_at = lease_expiration_after(ENTITY_REBUILD_LEASE_SECONDS, now=now_dt)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = require_entity_rebuild_run_row(connection, run_id)
+        if str(row["phase"]) != "rebuilding" or row["cancel_requested_at"] is not None:
+            connection.rollback()
+            return []
+        claim_rows = connection.execute(
+            """
+            SELECT id
+            FROM entity_rebuild_items
+            WHERE run_id = ?
+              AND status = 'pending'
+            ORDER BY ordinal ASC, id ASC
+            LIMIT ?
+            """,
+            (run_id, max(1, int(limit))),
+        ).fetchall()
+        claim_ids = [int(item["id"]) for item in claim_rows]
+        if claim_ids:
+            placeholders = ",".join("?" for _ in claim_ids)
+            connection.execute(
+                f"""
+                UPDATE entity_rebuild_items
+                SET status = 'leased',
+                    lease_owner = ?,
+                    lease_expires_at = ?,
+                    attempts = attempts + 1,
+                    updated_at = ?
+                WHERE run_id = ?
+                  AND status = 'pending'
+                  AND id IN ({placeholders})
+                """,
+                (worker_id, lease_expires_at, now, run_id, *claim_ids),
+            )
+        connection.execute(
+            "UPDATE entity_rebuild_runs SET last_heartbeat_at = ? WHERE run_id = ?",
+            (now, run_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    if not claim_ids:
+        return []
+    placeholders = ",".join("?" for _ in claim_ids)
+    return connection.execute(
+        f"""
+        SELECT *
+        FROM entity_rebuild_items
+        WHERE run_id = ?
+          AND lease_owner = ?
+          AND status = 'leased'
+          AND id IN ({placeholders})
+        ORDER BY ordinal ASC, id ASC
+        """,
+        (run_id, worker_id, *claim_ids),
+    ).fetchall()
+
+
+def entity_rebuild_release_items(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    worker_id: str,
+    item_ids: list[int],
+    reason: str,
+) -> int:
+    if not item_ids:
+        return 0
+    now = utc_now()
+    placeholders = ",".join("?" for _ in item_ids)
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            f"""
+            UPDATE entity_rebuild_items
+            SET status = 'pending',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                last_error = ?,
+                updated_at = ?
+            WHERE run_id = ?
+              AND lease_owner = ?
+              AND status = 'leased'
+              AND id IN ({placeholders})
+            """,
+            (reason, now, run_id, worker_id, *item_ids),
+        )
+        released = int(cursor.rowcount or 0)
+        connection.commit()
+        return released
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def entity_rebuild_mark_item_failed(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    item_id: int,
+    worker_id: str,
+    message: str,
+) -> None:
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        connection.execute(
+            """
+            UPDATE entity_rebuild_items
+            SET status = 'failed',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                last_error = ?,
+                updated_at = ?
+            WHERE run_id = ?
+              AND id = ?
+              AND status = 'leased'
+              AND lease_owner = ?
+            """,
+            (message, now, run_id, item_id, worker_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def entity_rebuild_maybe_complete(connection: sqlite3.Connection, *, run_id: str) -> bool:
+    row = require_entity_rebuild_run_row(connection, run_id)
+    if str(row["phase"]) != "rebuilding" or row["cancel_requested_at"] is not None:
+        return False
+    remaining = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM entity_rebuild_items
+            WHERE run_id = ?
+              AND status IN ('pending', 'leased')
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        or 0
+    )
+    if remaining:
+        return False
+    now = utc_now()
+    connection.execute("BEGIN")
+    try:
+        connection.execute(
+            """
+            UPDATE entity_rebuild_runs
+            SET phase = 'completed',
+                status = 'completed',
+                completed_at = COALESCE(completed_at, ?),
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+              AND phase = 'rebuilding'
+              AND cancel_requested_at IS NULL
+            """,
+            (now, now, run_id),
+        )
+        connection.commit()
+        return True
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def rebuild_entities_run_step(
+    root: Path,
+    *,
+    run_id: str | None = None,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    budget = normalize_resumable_step_budget(budget_seconds)
+    deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    worker_id = ingest_v2_worker_id("entity-rebuild")
+    executed_steps: list[str] = []
+    step_results: list[dict[str, object]] = []
+    with workspace_entity_rebuild_session(paths, command_name="rebuild-entities-run-step"):
+        connection = connect_db(paths["db_path"])
+        try:
+            apply_schema(connection, root)
+            row = require_entity_rebuild_run_row(connection, run_id) if run_id else active_entity_rebuild_run_row(connection)
+            if row is None and run_id is None:
+                row = latest_entity_rebuild_run_row(connection)
+            if row is None:
+                raise RetrieverError("No entity rebuild run exists in this workspace.")
+            run_id = str(row["run_id"])
+            if str(row["status"]) in ENTITY_REBUILD_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
+                return {
+                    "ok": True,
+                    "executed_steps": [],
+                    "reason": "run_terminal",
+                    "more_work_remaining": False,
+                    "run": entity_rebuild_status_payload(connection, root, row, budget_seconds=budget),
+                }
+            raise_if_ingest_v2_active(connection, root, command_name="rebuild-entities-run-step")
+            while ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_RUN_STEP_MIN_REMAINING_SECONDS:
+                row = require_entity_rebuild_run_row(connection, run_id)
+                phase = str(row["phase"])
+                if phase == "resetting":
+                    result = entity_rebuild_reset_step(connection, run_id=run_id, batch_size=int(row["batch_size"] or 500))
+                    executed_steps.append("reset")
+                    step_results.append(result)
+                    continue
+                if phase == "planning":
+                    result = entity_rebuild_plan_step(connection, run_id=run_id, batch_size=int(row["batch_size"] or 500))
+                    executed_steps.append("plan")
+                    step_results.append(result)
+                    continue
+                if phase != "rebuilding":
+                    break
+                reclaimed = entity_rebuild_reclaim_stale_items(connection, run_id=run_id)
+                claim_limit = max(1, min(int(row["batch_size"] or 500), 100))
+                claimed_rows = entity_rebuild_claim_items(
+                    connection,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    limit=claim_limit,
+                )
+                if not claimed_rows:
+                    completed = entity_rebuild_maybe_complete(connection, run_id=run_id)
+                    executed_steps.append("complete" if completed else "rebuild")
+                    step_results.append({"claimed": 0, "committed": 0, "failed": 0, "stale_reclaimed": reclaimed})
+                    break
+                committed = 0
+                failed = 0
+                processed_ids: set[int] = set()
+                for item_row in claimed_rows:
+                    item_id = int(item_row["id"])
+                    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_RUN_STEP_MIN_REMAINING_SECONDS:
+                        break
+                    processed_ids.add(item_id)
+                    document_id = int(item_row["document_id"])
+                    connection.execute("BEGIN")
+                    try:
+                        result = refresh_document_from_occurrences(connection, document_id)
+                        document_synced = 1 if result.get("canonical_status") == CANONICAL_STATUS_ACTIVE else 0
+                        auto_links_created = 0
+                        if document_synced:
+                            link_row = connection.execute(
+                                """
+                                SELECT COUNT(*)
+                                FROM document_entities
+                                WHERE document_id = ?
+                                  AND assignment_mode = 'auto'
+                                """,
+                                (document_id,),
+                            ).fetchone()
+                            auto_links_created = int(link_row[0] or 0) if link_row is not None else 0
+                        now = utc_now()
+                        connection.execute(
+                            """
+                            UPDATE entity_rebuild_items
+                            SET status = 'committed',
+                                lease_owner = NULL,
+                                lease_expires_at = NULL,
+                                document_synced = ?,
+                                auto_links_created = ?,
+                                last_error = NULL,
+                                updated_at = ?
+                            WHERE run_id = ?
+                              AND id = ?
+                              AND status = 'leased'
+                              AND lease_owner = ?
+                            """,
+                            (document_synced, auto_links_created, now, run_id, item_id, worker_id),
+                        )
+                        connection.execute(
+                            "UPDATE entity_rebuild_runs SET last_heartbeat_at = ? WHERE run_id = ?",
+                            (now, run_id),
+                        )
+                        connection.commit()
+                        committed += 1
+                    except Exception as exc:
+                        rollback_open_transaction(connection)
+                        entity_rebuild_mark_item_failed(
+                            connection,
+                            run_id=run_id,
+                            item_id=item_id,
+                            worker_id=worker_id,
+                            message=f"{type(exc).__name__}: {exc}",
+                        )
+                        failed += 1
+                unprocessed_ids = [int(item["id"]) for item in claimed_rows if int(item["id"]) not in processed_ids]
+                released = entity_rebuild_release_items(
+                    connection,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    item_ids=unprocessed_ids,
+                    reason="Released because run-step budget was nearly exhausted.",
+                )
+                entity_rebuild_maybe_complete(connection, run_id=run_id)
+                executed_steps.append("rebuild")
+                step_results.append(
+                    {
+                        "claimed": len(claimed_rows),
+                        "committed": committed,
+                        "failed": failed,
+                        "released": released,
+                        "stale_reclaimed": reclaimed,
+                    }
+                )
+            updated_row = require_entity_rebuild_run_row(connection, run_id)
+            reason = "run_terminal" if str(updated_row["status"]) in ENTITY_REBUILD_TERMINAL_STATUSES else "budget_exhausted"
+            return {
+                "ok": True,
+                "executed_steps": executed_steps,
+                "step_results": step_results,
+                "reason": reason,
+                "more_work_remaining": str(updated_row["status"]) not in ENTITY_REBUILD_TERMINAL_STATUSES,
+                "run": entity_rebuild_status_payload(connection, root, updated_row, budget_seconds=budget),
+                "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
+            }
+        finally:
+            connection.close()
+
+
 def rebuild_entities(
     root: Path,
     *,
@@ -39798,6 +40739,7 @@ def rebuild_entities(
         try:
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="rebuild-entities")
+            raise_if_entity_rebuild_active(connection, root, command_name="rebuild-entities")
             ids_to_rebuild = entity_rebuild_document_ids(connection, document_ids)
             full_rebuild = not document_ids
             reset_counts = {
@@ -40423,6 +41365,7 @@ def create_entity(
         try:
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="create-entity")
+            raise_if_entity_rebuild_active(connection, root, command_name="create-entity")
             connection.execute("BEGIN")
             try:
                 assert_manual_resolution_identifiers_available(connection, identifiers)
@@ -40515,6 +41458,7 @@ def edit_entity(
         try:
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="edit-entity")
+            raise_if_entity_rebuild_active(connection, root, command_name="edit-entity")
             active_entity_row(connection, entity_id)
             affected_document_ids = [
                 int(row["document_id"])
@@ -41109,6 +42053,7 @@ def merge_entities(
         try:
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="merge-entities")
+            raise_if_entity_rebuild_active(connection, root, command_name="merge-entities")
             loser_row = active_entity_row(connection, loser_entity_id)
             survivor_row = active_entity_row(connection, survivor_entity_id)
             if entity_merge_block_exists(connection, loser_entity_id, survivor_entity_id) and not force:
@@ -41272,6 +42217,7 @@ def ignore_entity(root: Path, entity_id: int, *, reason: str | None = None) -> d
         try:
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="ignore-entity")
+            raise_if_entity_rebuild_active(connection, root, command_name="ignore-entity")
             entity_row = active_entity_row(connection, entity_id)
             affected_document_ids = [
                 int(row["document_id"])
@@ -41405,6 +42351,7 @@ def assign_entity(
         try:
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="assign-entity")
+            raise_if_entity_rebuild_active(connection, root, command_name="assign-entity")
             ensure_document_row(connection, document_id)
             entity_row = active_entity_row(connection, entity_id)
             connection.execute("BEGIN")
@@ -41537,6 +42484,7 @@ def unassign_entity(
         try:
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="unassign-entity")
+            raise_if_entity_rebuild_active(connection, root, command_name="unassign-entity")
             ensure_document_row(connection, document_id)
             active_entity_row(connection, entity_id)
             link_rows = connection.execute(
@@ -41786,6 +42734,7 @@ def split_entity(
         try:
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="split-entity")
+            raise_if_entity_rebuild_active(connection, root, command_name="split-entity")
             source_row = active_entity_row(connection, source_entity_id)
             identifier_rows = selected_identifier_rows_for_split(
                 connection,
@@ -42007,6 +42956,8 @@ def set_dataset_policy(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        raise_if_ingest_v2_active(connection, root, command_name="set-dataset-policy")
+        raise_if_entity_rebuild_active(connection, root, command_name="set-dataset-policy")
         dataset_row = resolve_dataset_row(connection, dataset_id=dataset_id, dataset_name=dataset_name)
         if normalize_whitespace(str(dataset_row["source_kind"] or "")).lower() == MANUAL_DATASET_SOURCE_KIND:
             raise RetrieverError("Dataset merge policy controls apply only to source-backed datasets.")
@@ -56092,6 +57043,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="Documents to refresh per transaction",
     )
 
+    rebuild_entities_start_parser = subparsers.add_parser(
+        "rebuild-entities-start",
+        help="Start a resumable entity rebuild run",
+    )
+    rebuild_entities_start_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_start_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Rebuild entity links for one document id (repeatable); omit for a full graph rebuild",
+    )
+    rebuild_entities_start_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Documents to plan or refresh per bounded step",
+    )
+    rebuild_entities_start_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Recommended per-step budget; values above the bounded-worker cap are rejected",
+    )
+
+    rebuild_entities_status_parser = subparsers.add_parser(
+        "rebuild-entities-status",
+        help="Show resumable entity rebuild status",
+    )
+    rebuild_entities_status_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_status_parser.add_argument("--run-id", help="Run id; defaults to the latest entity rebuild run")
+    rebuild_entities_status_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Budget used when computing next recommended commands",
+    )
+
+    rebuild_entities_run_step_parser = subparsers.add_parser(
+        "rebuild-entities-run-step",
+        help="Advance a resumable entity rebuild until the bounded call budget is nearly exhausted",
+    )
+    rebuild_entities_run_step_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_run_step_parser.add_argument("--run-id", help="Run id to advance; defaults to the active or latest run")
+    rebuild_entities_run_step_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="Per-call budget; values above the bounded-worker cap are rejected",
+    )
+
+    rebuild_entities_cancel_parser = subparsers.add_parser(
+        "rebuild-entities-cancel",
+        help="Cancel a resumable entity rebuild run",
+    )
+    rebuild_entities_cancel_parser.add_argument("workspace", help="Workspace root path")
+    rebuild_entities_cancel_parser.add_argument("--run-id", required=True, help="Run id to cancel")
+
     list_entities_parser = subparsers.add_parser("list-entities", help="List recognized entities")
     list_entities_parser.add_argument("workspace", help="Workspace root path")
     list_entities_parser.add_argument("--query", help="Filter entities by display name or identifier")
@@ -57093,6 +58102,46 @@ def main() -> int:
                     root,
                     document_ids=args.document_ids,
                     batch_size=args.batch_size,
+                ),
+            )
+
+        if args.command == "rebuild-entities-start":
+            return emit_cli_payload(
+                "rebuild-entities-start",
+                rebuild_entities_start(
+                    root,
+                    document_ids=args.document_ids,
+                    batch_size=args.batch_size,
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
+        if args.command == "rebuild-entities-status":
+            return emit_cli_payload(
+                "rebuild-entities-status",
+                rebuild_entities_status(
+                    root,
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
+        if args.command == "rebuild-entities-run-step":
+            return emit_cli_payload(
+                "rebuild-entities-run-step",
+                rebuild_entities_run_step(
+                    root,
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                ),
+            )
+
+        if args.command == "rebuild-entities-cancel":
+            return emit_cli_payload(
+                "rebuild-entities-cancel",
+                rebuild_entities_cancel(
+                    root,
+                    run_id=args.run_id,
                 ),
             )
 

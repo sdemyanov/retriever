@@ -1662,6 +1662,164 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(author_inventory_rows[0]["document_count"], 2)
         self.assertEqual(len(author_inventory_rows[0]["examples"]), 1)
 
+    def test_resumable_entity_rebuild_full_run_completes(self) -> None:
+        self.write_email_message(
+            self.root / "first.eml",
+            subject="First resumable entity rebuild",
+            body_text="First body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<first-resumable-entity@example.com>",
+        )
+        self.write_email_message(
+            self.root / "second.eml",
+            subject="Second resumable entity rebuild",
+            body_text="Second body",
+            author="Alice A. <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<second-resumable-entity@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "rebuild-entities-start",
+            str(self.root),
+            "--batch-size",
+            "1",
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        assert start_payload is not None
+        self.assertTrue(start_payload["created"])
+        self.assertEqual(start_payload["mode"], "full")
+        self.assertEqual(start_payload["phase"], "resetting")
+        run_id = str(start_payload["run_id"])
+        self.assertIn("rebuild-entities-run-step", start_payload["next_recommended_commands"][0])
+
+        legacy_exit, legacy_payload, _, _ = self.run_cli("rebuild-entities", str(self.root))
+        self.assertEqual(legacy_exit, 2)
+        self.assertIsNotNone(legacy_payload)
+        assert legacy_payload is not None
+        self.assertEqual(legacy_payload["error"], "active_entity_rebuild_run")
+
+        final_payload: dict[str, object] | None = None
+        executed_steps: list[str] = []
+        for _ in range(10):
+            step_exit, step_payload, _, _ = self.run_cli(
+                "rebuild-entities-run-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
+            self.assertEqual(step_exit, 0)
+            self.assertIsNotNone(step_payload)
+            assert step_payload is not None
+            executed_steps.extend(str(step) for step in step_payload["executed_steps"])
+            final_payload = step_payload
+            if step_payload["run"]["status"] == "completed":
+                break
+        self.assertIsNotNone(final_payload)
+        assert final_payload is not None
+        self.assertEqual(final_payload["run"]["status"], "completed")
+        self.assertIn("reset", executed_steps)
+        self.assertIn("plan", executed_steps)
+        self.assertIn("rebuild", executed_steps)
+        self.assertEqual(final_payload["run"]["counts"]["work_items"]["committed"], 2)
+        self.assertEqual(final_payload["run"]["counts"]["work_items"]["failed"], 0)
+        self.assertEqual(final_payload["run"]["progress"]["documents_synced"], 2)
+        self.assertGreaterEqual(final_payload["run"]["progress"]["auto_links_created"], 4)
+        self.assertGreaterEqual(final_payload["run"]["progress"]["reset_counts"]["auto_document_links_deleted"], 4)
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "rebuild-entities-status",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        assert status_payload is not None
+        self.assertEqual(status_payload["status"], "completed")
+
+        list_exit, list_payload, _, _ = self.run_cli(
+            "list-entities",
+            str(self.root),
+            "--query",
+            "alice@example.com",
+        )
+        self.assertEqual(list_exit, 0)
+        self.assertIsNotNone(list_payload)
+        assert list_payload is not None
+        alice_entities = [
+            entity
+            for entity in list_payload["entities"]
+            if entity["primary_email"] == "alice@example.com"
+        ]
+        self.assertEqual(len(alice_entities), 1)
+        self.assertEqual(alice_entities[0]["document_count"], 2)
+
+    def test_resumable_entity_rebuild_selected_documents(self) -> None:
+        self.write_email_message(
+            self.root / "first.eml",
+            subject="Selected entity rebuild one",
+            body_text="First body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<selected-entity-one@example.com>",
+        )
+        self.write_email_message(
+            self.root / "second.eml",
+            subject="Selected entity rebuild two",
+            body_text="Second body",
+            author="Carol Example <carol@example.com>",
+            recipients="Dan Example <dan@example.com>",
+            message_id="<selected-entity-two@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        document_row = self.fetch_document_row("first.eml")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "rebuild-entities-start",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+            "--batch-size",
+            "1",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        assert start_payload is not None
+        self.assertEqual(start_payload["mode"], "selected")
+        self.assertEqual(start_payload["phase"], "planning")
+        run_id = str(start_payload["run_id"])
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "rebuild-entities-run-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        assert step_payload is not None
+        self.assertEqual(step_payload["run"]["status"], "completed")
+        self.assertNotIn("reset", step_payload["executed_steps"])
+        self.assertIn("plan", step_payload["executed_steps"])
+        self.assertIn("rebuild", step_payload["executed_steps"])
+        self.assertEqual(step_payload["run"]["counts"]["work_items"]["committed"], 1)
+        self.assertEqual(step_payload["run"]["progress"]["documents_synced"], 1)
+        self.assertEqual(step_payload["run"]["progress"]["reset_counts"]["auto_document_links_deleted"], 0)
+
     def test_list_entities_paginates_sorts_and_seeds_slash_entity_browse(self) -> None:
         for name, email in [
             ("Alice Example", "alice@people.test"),
