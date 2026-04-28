@@ -1726,6 +1726,14 @@ def ingest_v2_release_prepare_item(
         raise
 
 
+def ingest_v2_prepare_claim_limit() -> int:
+    return max(
+        INGEST_V2_PREPARE_BATCH_SIZE,
+        ingest_prepare_worker_count(),
+        ingest_container_prepare_worker_count(),
+    )
+
+
 def ingest_v2_mark_prepare_deferred_timeout(
     connection: sqlite3.Connection,
     *,
@@ -1775,6 +1783,121 @@ def ingest_v2_mark_prepare_deferred_timeout(
     except Exception:
         connection.rollback()
         raise
+
+
+def ingest_v2_prepare_worker_count_for_rows(rows: list[sqlite3.Row]) -> int:
+    if not rows:
+        return 1
+    unit_types = {str(row["unit_type"] or "") for row in rows}
+    container_unit_types = {
+        "mbox_message",
+        "mbox_source_finalizer",
+        "pst_message",
+        "pst_source_finalizer",
+    }
+    if unit_types and unit_types <= container_unit_types:
+        return ingest_container_prepare_worker_count()
+    if unit_types.isdisjoint(container_unit_types):
+        return ingest_prepare_worker_count()
+    return max(ingest_prepare_worker_count(), ingest_container_prepare_worker_count())
+
+
+def ingest_v2_prepare_claimed_work_item(
+    root: Path,
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> dict[str, object]:
+    work_item_id = int(work_item_row["id"])
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return {
+            "work_item_id": work_item_id,
+            "payload_kind": str(work_item_row["unit_type"] or "loose_file"),
+            "prepared_item": None,
+            "source_fingerprint": {},
+            "defer_message": "Not enough budget remaining to start prepare.",
+        }
+
+    unit_type = str(work_item_row["unit_type"] or "")
+    if unit_type == "production_row":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_production_row_item(
+            root,
+            work_item_row,
+            deadline=deadline,
+        )
+        payload_kind = "production_row"
+    elif unit_type == "slack_conversation":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_slack_conversation_item(
+            work_item_row,
+            deadline=deadline,
+        )
+        payload_kind = "slack_conversation"
+    elif unit_type == "mbox_message":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_mbox_message_item(
+            root,
+            work_item_row,
+            deadline=deadline,
+        )
+        payload_kind = "mbox_message"
+    elif unit_type == "mbox_source_finalizer":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_mbox_source_finalizer_item(
+            work_item_row,
+        )
+        payload_kind = "mbox_source_finalizer"
+    elif unit_type == "pst_message":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_pst_message_item(
+            root,
+            work_item_row,
+            deadline=deadline,
+        )
+        payload_kind = "pst_message"
+    elif unit_type == "pst_source_finalizer":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_pst_source_finalizer_item(
+            work_item_row,
+        )
+        payload_kind = "pst_source_finalizer"
+    else:
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_loose_file_item(
+            root,
+            work_item_row,
+            deadline=deadline,
+        )
+        payload_kind = "loose_file"
+    return {
+        "work_item_id": work_item_id,
+        "payload_kind": payload_kind,
+        "prepared_item": prepared_item,
+        "source_fingerprint": source_fingerprint,
+        "defer_message": defer_message,
+    }
+
+
+def ingest_v2_prepare_claimed_work_items_parallel(
+    root: Path,
+    rows: list[sqlite3.Row],
+    *,
+    deadline: float,
+    prepare_workers: int,
+) -> list[dict[str, object]]:
+    if not rows:
+        return []
+    effective_workers = max(1, min(int(prepare_workers), len(rows)))
+    if effective_workers == 1:
+        return [
+            ingest_v2_prepare_claimed_work_item(root, row, deadline=deadline)
+            for row in rows
+        ]
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        futures = [
+            executor.submit(
+                ingest_v2_prepare_claimed_work_item,
+                root,
+                row,
+                deadline=deadline,
+            )
+            for row in rows
+        ]
+        return [future.result() for future in futures]
 
 
 def ingest_v2_prepare_loose_file_item(
@@ -5274,6 +5397,8 @@ def ingest_v2_prepare_step(
     released = 0
     stale_reclaimed = 0
     throttled = False
+    claim_limit = ingest_v2_prepare_claim_limit()
+    prepare_workers = 1
     prepared_entries: list[dict[str, object]] = []
     prepare_ms_values: list[float] = []
     prepare_hash_ms_values: list[float] = []
@@ -5298,6 +5423,8 @@ def ingest_v2_prepare_step(
                 "deferred_timeout": 0,
                 "released": 0,
                 "stale_reclaimed": 0,
+                "claim_limit": claim_limit,
+                "prepare_workers": 0,
                 "throttled": False,
                 "more_prepare_remaining": False,
                 "more_work_remaining": False,
@@ -5314,6 +5441,8 @@ def ingest_v2_prepare_step(
                 "deferred_timeout": 0,
                 "released": 0,
                 "stale_reclaimed": 0,
+                "claim_limit": claim_limit,
+                "prepare_workers": 0,
                 "throttled": False,
                 "more_prepare_remaining": str(row["phase"]) == "planning",
                 "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
@@ -5325,68 +5454,23 @@ def ingest_v2_prepare_step(
             connection,
             run_id=run_id,
             worker_id=worker_id,
-            limit=INGEST_V2_PREPARE_BATCH_SIZE,
+            limit=claim_limit,
         )
         claimed = len(claimed_rows)
+        prepare_workers = max(1, min(ingest_v2_prepare_worker_count_for_rows(claimed_rows), claimed or 1))
+        prepared_results = ingest_v2_prepare_claimed_work_items_parallel(
+            root,
+            claimed_rows,
+            deadline=deadline,
+            prepare_workers=prepare_workers,
+        )
 
-        for work_item_row in claimed_rows:
-            work_item_id = int(work_item_row["id"])
-            if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
-                if ingest_v2_release_prepare_item(
-                    connection,
-                    run_id=run_id,
-                    work_item_id=work_item_id,
-                    worker_id=worker_id,
-                    reason="Released because prepare-step budget was nearly exhausted.",
-                ):
-                    released += 1
-                continue
-
-            unit_type = str(work_item_row["unit_type"] or "")
-            if unit_type == "production_row":
-                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_production_row_item(
-                    root,
-                    work_item_row,
-                    deadline=deadline,
-                )
-                payload_kind = "production_row"
-            elif unit_type == "slack_conversation":
-                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_slack_conversation_item(
-                    work_item_row,
-                    deadline=deadline,
-                )
-                payload_kind = "slack_conversation"
-            elif unit_type == "mbox_message":
-                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_mbox_message_item(
-                    root,
-                    work_item_row,
-                    deadline=deadline,
-                )
-                payload_kind = "mbox_message"
-            elif unit_type == "mbox_source_finalizer":
-                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_mbox_source_finalizer_item(
-                    work_item_row,
-                )
-                payload_kind = "mbox_source_finalizer"
-            elif unit_type == "pst_message":
-                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_pst_message_item(
-                    root,
-                    work_item_row,
-                    deadline=deadline,
-                )
-                payload_kind = "pst_message"
-            elif unit_type == "pst_source_finalizer":
-                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_pst_source_finalizer_item(
-                    work_item_row,
-                )
-                payload_kind = "pst_source_finalizer"
-            else:
-                prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_loose_file_item(
-                    root,
-                    work_item_row,
-                    deadline=deadline,
-                )
-                payload_kind = "loose_file"
+        for prepared_result in prepared_results:
+            work_item_id = int(prepared_result["work_item_id"])
+            prepared_item = prepared_result.get("prepared_item")
+            source_fingerprint = dict(prepared_result.get("source_fingerprint") or {})
+            defer_message = prepared_result.get("defer_message")
+            payload_kind = str(prepared_result.get("payload_kind") or "loose_file")
             if prepared_item is None:
                 if defer_message == "Not enough budget remaining to start prepare.":
                     if ingest_v2_release_prepare_item(
@@ -5407,16 +5491,17 @@ def ingest_v2_prepare_step(
                     ):
                         deferred_timeout += 1
                 continue
+            prepared_item_dict = dict(prepared_item)
 
-            prepare_ms_values.append(float(prepared_item.get("prepare_ms") or 0.0))
-            prepare_hash_ms_values.append(float(prepared_item.get("prepare_hash_ms") or 0.0))
-            prepare_extract_ms_values.append(float(prepared_item.get("prepare_extract_ms") or 0.0))
-            prepare_chunk_ms_values.append(float(prepared_item.get("prepare_chunk_ms") or 0.0))
+            prepare_ms_values.append(float(prepared_item_dict.get("prepare_ms") or 0.0))
+            prepare_hash_ms_values.append(float(prepared_item_dict.get("prepare_hash_ms") or 0.0))
+            prepare_extract_ms_values.append(float(prepared_item_dict.get("prepare_extract_ms") or 0.0))
+            prepare_chunk_ms_values.append(float(prepared_item_dict.get("prepare_chunk_ms") or 0.0))
             prepared_entries.append(
                 {
                     "work_item_id": work_item_id,
                     "payload_kind": payload_kind,
-                    "prepared_item": prepared_item,
+                    "prepared_item": prepared_item_dict,
                     "source_fingerprint": source_fingerprint,
                 }
             )
@@ -5462,6 +5547,8 @@ def ingest_v2_prepare_step(
             "deferred_timeout": deferred_timeout,
             "released": released,
             "stale_reclaimed": stale_reclaimed,
+            "claim_limit": claim_limit,
+            "prepare_workers": prepare_workers if claimed else 0,
             "throttled": throttled,
             "advanced_to_commit": advanced_to_commit,
             "more_prepare_remaining": remaining_prepare_items > 0,
