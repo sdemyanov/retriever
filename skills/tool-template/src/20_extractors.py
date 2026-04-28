@@ -2752,6 +2752,19 @@ PST_PROP_ATTACH_FILENAME = 0x3704
 PST_PROP_ATTACH_LONG_FILENAME = 0x3707
 PST_PROP_ATTACH_MIME_TAG = 0x370E
 PST_PROP_ATTACH_CONTENT_ID = 0x3712
+PST_SENDER_DISPLAY_NAME_ENTRY_TYPES = {0x0042, 0x0C1A}
+PST_SENDER_EMAIL_ADDRESS_ENTRY_TYPES = {0x0065, 0x0C1F}
+PST_MAPI_AUTHOR_DISPLAY_NAME_ENTRY_TYPES = {0x0042, 0x0C1A}
+PST_MAPI_AUTHOR_SMTP_ADDRESS_ENTRY_TYPES = {0x5D01, 0x5D02}
+PST_MAPI_AUTHOR_LEGACY_DN_ENTRY_TYPES = {0x0065, 0x0C1F}
+PST_MAPI_RECIPIENT_DISPLAY_NAME_ENTRY_TYPES = {0x3FF8, 0x3FFA, 0x4038, 0x4039}
+PST_MAPI_RECIPIENT_SMTP_ADDRESS_ENTRY_TYPES = {0x5D0A, 0x5D0B}
+PST_MAPI_RECIPIENT_LEGACY_DN_ENTRY_TYPES = {0x4023, 0x4025}
+PST_TEAMS_ORGID_PREFIX = "8:orgid:"
+PST_DASHED_GUID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
 PST_DEBUG_SCOPE_NAME_PATTERN = re.compile(
     r"(team|teams|skype|conversation|thread|chat|channel|space|group|participant|member|roster)",
     re.IGNORECASE,
@@ -2845,8 +2858,15 @@ def normalize_pst_aad_object_id(value: object) -> str | None:
     normalized = normalize_whitespace(str(value or "")).lower()
     if not normalized:
         return None
+    if normalized.startswith(PST_TEAMS_ORGID_PREFIX):
+        normalized = normalized[len(PST_TEAMS_ORGID_PREFIX) :]
     if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", normalized):
         return normalized
+    if re.fullmatch(r"[0-9a-f]{32}", normalized):
+        return (
+            f"{normalized[0:8]}-{normalized[8:12]}-{normalized[12:16]}-"
+            f"{normalized[16:20]}-{normalized[20:32]}"
+        )
     return None
 
 
@@ -2862,7 +2882,11 @@ def pst_chat_participant_display_name(payload: object) -> str | None:
     return None
 
 
-def pst_chat_participant_entity_hint(payload: object) -> dict[str, object] | None:
+def pst_chat_participant_entity_hint(
+    payload: object,
+    *,
+    source_kind: str = "pst_teams",
+) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     normalized_name = normalize_entity_text(payload.get("Name") or "")
@@ -2876,7 +2900,7 @@ def pst_chat_participant_entity_hint(payload: object) -> dict[str, object] | Non
     if normalized_name and normalized_email:
         display_value = f"{normalized_name} <{normalized_email}>"
     else:
-        display_value = normalized_name or normalized_email
+        display_value = normalized_name or normalized_email or aad_object_id
     if not display_value:
         return None
     identifiers: list[dict[str, object]] = []
@@ -2888,12 +2912,12 @@ def pst_chat_participant_entity_hint(payload: object) -> dict[str, object] | Non
                 "display_value": aad_object_id,
                 "normalized_value": normalize_entity_lookup_text(aad_object_id),
                 "is_verified": 1,
-                "source_kind": "pst_teams",
+                "source_kind": source_kind,
             }
         )
     hint: dict[str, object] = {
         "display_value": display_value,
-        "source_kind": "pst_teams",
+        "source_kind": source_kind,
     }
     if identifiers:
         hint["identifiers"] = identifiers
@@ -2908,6 +2932,101 @@ def pst_chat_participant_entity_hint_key(hint: dict[str, object]) -> str:
             if identifier_key:
                 return identifier_key
     return display_key
+
+
+def append_unique_pst_aad_object_id(target: list[str], value: object) -> None:
+    aad_object_id = normalize_pst_aad_object_id(value)
+    if aad_object_id and aad_object_id not in target:
+        target.append(aad_object_id)
+
+
+def append_unique_normalized_email(target: list[str], value: object) -> None:
+    normalized_email = normalize_entity_email(value)
+    if normalized_email and normalized_email not in target:
+        target.append(normalized_email)
+
+
+def append_unique_entity_text(target: list[str], value: object) -> None:
+    normalized_text = normalize_entity_text(value or "")
+    if normalized_text and normalized_text not in target:
+        target.append(normalized_text)
+
+
+def pst_legacy_exchange_dn_aad_object_ids(value: object) -> list[str]:
+    text = normalize_whitespace(str(value or ""))
+    if not text:
+        return []
+    normalized_text = text.lower()
+    marker = "/cn=recipients/cn="
+    marker_index = normalized_text.rfind(marker)
+    if marker_index < 0:
+        return []
+    tail = text[marker_index + len(marker) :]
+    aad_object_ids: list[str] = []
+    for match in PST_DASHED_GUID_PATTERN.finditer(tail):
+        append_unique_pst_aad_object_id(aad_object_ids, match.group(0))
+    return aad_object_ids
+
+
+def pst_json_payload_child(payload: dict[str, object], key: str) -> dict[str, object] | None:
+    value = payload.get(key)
+    if isinstance(value, dict):
+        return value
+    return parse_pst_json_object(value)
+
+
+def pst_chat_sender_aad_object_ids_from_payload(
+    payload: object,
+    *,
+    depth: int = 0,
+) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    aad_object_ids: list[str] = []
+    for key in ("SenderId", "senderId", "messageFrom", "MessageFrom"):
+        append_unique_pst_aad_object_id(aad_object_ids, payload.get(key))
+
+    from_payload = payload.get("from") or payload.get("From")
+    if isinstance(from_payload, dict):
+        for key in ("internalId", "InternalId", "id", "Id", "userId", "UserId"):
+            append_unique_pst_aad_object_id(aad_object_ids, from_payload.get(key))
+
+    if depth < 2:
+        for key in ("Context", "ItemData"):
+            child_payload = pst_json_payload_child(payload, key)
+            for aad_object_id in pst_chat_sender_aad_object_ids_from_payload(child_payload, depth=depth + 1):
+                append_unique_pst_aad_object_id(aad_object_ids, aad_object_id)
+    return aad_object_ids
+
+
+def append_pst_chat_sender_entity_hint(
+    target: list[dict[str, object]],
+    seen_keys: set[str],
+    *,
+    sender_display_name: object,
+    sender_email_address: object,
+    sender_aad_object_ids: list[str],
+) -> None:
+    normalized_name = normalize_entity_text(sender_display_name or "")
+    normalized_email = normalize_entity_email(sender_email_address)
+    aad_object_id = sender_aad_object_ids[0] if sender_aad_object_ids else None
+    if not any((normalized_name, normalized_email, aad_object_id)):
+        return
+    hint = pst_chat_participant_entity_hint(
+        {
+            "Name": normalized_name,
+            "EmailAddress": normalized_email,
+            "ExternalDirectoryObjectId": aad_object_id,
+        },
+        source_kind="pst_teams",
+    )
+    if hint is None:
+        return
+    hint_key = pst_chat_participant_entity_hint_key(hint)
+    if not hint_key or hint_key in seen_keys:
+        return
+    seen_keys.add(hint_key)
+    target.append(hint)
 
 
 def pst_chat_participant_entity_hints_from_payload(payload: object) -> list[dict[str, object]]:
@@ -2955,6 +3074,131 @@ def pst_chat_participant_names_from_payload(payload: object) -> list[str]:
     return sorted_unique_display_names(participant_names)
 
 
+def pst_message_mapi_entity_hint(
+    *,
+    names: list[str],
+    emails: list[str],
+    aad_object_ids: list[str],
+) -> dict[str, object] | None:
+    normalized_name = normalize_entity_text(names[0] if names else "")
+    normalized_email = normalize_entity_email(emails[0] if emails else None)
+    aad_object_id = aad_object_ids[0] if aad_object_ids else None
+    return pst_chat_participant_entity_hint(
+        {
+            "Name": normalized_name,
+            "EmailAddress": normalized_email,
+            "ExternalDirectoryObjectId": aad_object_id,
+        },
+        source_kind="pst_mapi",
+    )
+
+
+def merge_pst_entity_hint(
+    existing_hints: object,
+    *,
+    role: str,
+    hint: dict[str, object] | None,
+) -> dict[str, object]:
+    hints = dict(existing_hints) if isinstance(existing_hints, dict) else {}
+    if hint is None:
+        return hints
+    role_hints = [
+        item
+        for item in list(hints.get(role) or [])
+        if isinstance(item, dict)
+    ]
+    hint_key = pst_chat_participant_entity_hint_key(hint)
+    if hint_key:
+        for item in role_hints:
+            if pst_chat_participant_entity_hint_key(item) == hint_key:
+                return hints
+    role_hints.append(hint)
+    hints[role] = role_hints
+    return hints
+
+
+def merge_pst_entity_hint_payloads(
+    existing_hints: object,
+    incoming_hints: object,
+    *,
+    roles: set[str] | None = None,
+) -> dict[str, object]:
+    hints = dict(existing_hints) if isinstance(existing_hints, dict) else {}
+    if not isinstance(incoming_hints, dict):
+        return hints
+    enabled_roles = set(roles) if roles is not None else set(str(role) for role in incoming_hints.keys())
+    for role in enabled_roles:
+        for hint in list(incoming_hints.get(role) or []):
+            if isinstance(hint, dict):
+                hints = merge_pst_entity_hint(hints, role=role, hint=hint)
+    return hints
+
+
+def pst_message_mapi_entity_hints(message: object) -> dict[str, object]:
+    identity_parts = {
+        "author": {
+            "names": [],
+            "emails": [],
+            "aad_object_ids": [],
+        },
+        "recipient": {
+            "names": [],
+            "emails": [],
+            "aad_object_ids": [],
+        },
+    }
+    append_unique_entity_text(
+        identity_parts["author"]["names"],
+        getattr(message, "sender_name", "") or getattr(message, "sender", "") or "",
+    )
+    append_unique_normalized_email(
+        identity_parts["author"]["emails"],
+        getattr(message, "sender_email_address", "") or "",
+    )
+    for record_set in pst_record_sets(message):
+        for entry in pst_record_entries(record_set):
+            try:
+                entry_type = int(getattr(entry, "entry_type", 0) or 0)
+            except Exception:
+                entry_type = 0
+            decoded_value = decode_pst_record_entry_value(entry)
+            if not decoded_value:
+                continue
+            if entry_type in PST_MAPI_AUTHOR_DISPLAY_NAME_ENTRY_TYPES:
+                append_unique_entity_text(identity_parts["author"]["names"], decoded_value)
+            elif entry_type in PST_MAPI_RECIPIENT_DISPLAY_NAME_ENTRY_TYPES:
+                append_unique_entity_text(identity_parts["recipient"]["names"], decoded_value)
+            if entry_type in PST_MAPI_AUTHOR_SMTP_ADDRESS_ENTRY_TYPES:
+                append_unique_normalized_email(identity_parts["author"]["emails"], decoded_value)
+            elif entry_type in PST_MAPI_RECIPIENT_SMTP_ADDRESS_ENTRY_TYPES:
+                append_unique_normalized_email(identity_parts["recipient"]["emails"], decoded_value)
+            if entry_type in PST_MAPI_AUTHOR_LEGACY_DN_ENTRY_TYPES:
+                for aad_object_id in pst_legacy_exchange_dn_aad_object_ids(decoded_value):
+                    append_unique_pst_aad_object_id(identity_parts["author"]["aad_object_ids"], aad_object_id)
+            elif entry_type in PST_MAPI_RECIPIENT_LEGACY_DN_ENTRY_TYPES:
+                for aad_object_id in pst_legacy_exchange_dn_aad_object_ids(decoded_value):
+                    append_unique_pst_aad_object_id(identity_parts["recipient"]["aad_object_ids"], aad_object_id)
+
+    author_hint = pst_message_mapi_entity_hint(
+        names=identity_parts["author"]["names"],
+        emails=identity_parts["author"]["emails"],
+        aad_object_ids=identity_parts["author"]["aad_object_ids"],
+    )
+    recipient_hint = pst_message_mapi_entity_hint(
+        names=identity_parts["recipient"]["names"],
+        emails=identity_parts["recipient"]["emails"],
+        aad_object_ids=identity_parts["recipient"]["aad_object_ids"],
+    )
+    hints: dict[str, object] = {}
+    if author_hint is not None:
+        hints = merge_pst_entity_hint(hints, role="author", hint=author_hint)
+        hints = merge_pst_entity_hint(hints, role="participants", hint=author_hint)
+    if recipient_hint is not None:
+        hints = merge_pst_entity_hint(hints, role="recipients", hint=recipient_hint)
+        hints = merge_pst_entity_hint(hints, role="participants", hint=recipient_hint)
+    return hints
+
+
 def pst_message_may_have_chat_threading(folder_path: object, message_class: object) -> bool:
     if pst_folder_path_contains(folder_path, "/skypespacesdata/teamsmeetings/"):
         return False
@@ -2974,6 +3218,11 @@ def extract_pst_chat_threading(message: object) -> dict[str, object] | None:
     participant_names: list[object] = []
     participant_entity_hints: list[dict[str, object]] = []
     seen_participant_entity_hint_keys: set[str] = set()
+    sender_display_name = normalize_entity_text(
+        getattr(message, "sender_name", "") or getattr(message, "sender", "") or ""
+    )
+    sender_email_address = normalize_entity_email(getattr(message, "sender_email_address", "") or "")
+    sender_aad_object_ids: list[str] = []
 
     for record_set in pst_record_sets(message):
         for entry in pst_record_entries(record_set):
@@ -2981,6 +3230,16 @@ def extract_pst_chat_threading(message: object) -> dict[str, object] | None:
             normalized_value = normalize_whitespace(str(decoded_value or ""))
             if not normalized_value:
                 continue
+            try:
+                entry_type = int(getattr(entry, "entry_type", 0) or 0)
+            except Exception:
+                entry_type = 0
+            if entry_type in PST_SENDER_DISPLAY_NAME_ENTRY_TYPES and not sender_display_name:
+                sender_display_name = normalize_entity_text(normalized_value)
+            elif entry_type in PST_SENDER_EMAIL_ADDRESS_ENTRY_TYPES and not sender_email_address:
+                sender_email_address = normalize_entity_email(normalized_value)
+            if normalized_value.lower().startswith(PST_TEAMS_ORGID_PREFIX):
+                append_unique_pst_aad_object_id(sender_aad_object_ids, normalized_value)
 
             candidate_thread_id = normalize_pst_chat_thread_id(normalized_value)
             if candidate_thread_id and thread_id is None:
@@ -3010,7 +3269,32 @@ def extract_pst_chat_threading(message: object) -> dict[str, object] | None:
                 seen_participant_entity_hint_keys,
                 parsed_payload,
             )
+            for aad_object_id in pst_chat_sender_aad_object_ids_from_payload(parsed_payload):
+                append_unique_pst_aad_object_id(sender_aad_object_ids, aad_object_id)
 
+    has_threading_signal = any(
+        (
+            thread_id,
+            message_id,
+            parent_message_id,
+            thread_type,
+            participant_names,
+            participant_entity_hints,
+            sender_aad_object_ids,
+        )
+    )
+    if has_threading_signal:
+        if not participant_names:
+            sender_participant_name = normalize_participant_token(sender_display_name) or sender_email_address
+            if sender_participant_name:
+                participant_names.append(sender_participant_name)
+        append_pst_chat_sender_entity_hint(
+            participant_entity_hints,
+            seen_participant_entity_hint_keys,
+            sender_display_name=sender_display_name,
+            sender_email_address=sender_email_address,
+            sender_aad_object_ids=sender_aad_object_ids,
+        )
     normalized_participants = sorted_unique_display_names(participant_names)
     if not any((thread_id, message_id, parent_message_id, thread_type, normalized_participants, participant_entity_hints)):
         return None
@@ -3408,6 +3692,7 @@ def iter_pst_raw_messages(
                 )
 
             message_class = normalize_whitespace(str(getattr(message, "message_class", "") or "")) or None
+            entity_hints = pst_message_mapi_entity_hints(message)
             chat_threading = (
                 extract_pst_chat_threading(message)
                 if pst_message_may_have_chat_threading(folder_path, message_class)
@@ -3438,6 +3723,7 @@ def iter_pst_raw_messages(
                 "transport_headers": transport_headers,
                 "author": pst_message_author(message),
                 "recipients": pst_message_recipients(message, transport_headers),
+                "entity_hints": entity_hints,
                 "date_created": normalize_datetime(
                     getattr(message, "delivery_time", None)
                     or getattr(message, "client_submit_time", None)
@@ -3605,6 +3891,7 @@ def iter_pst_messages(path: Path):
             "transport_headers": payload.get("transport_headers"),
             "author": payload.get("author"),
             "recipients": payload.get("recipients"),
+            "entity_hints": payload.get("entity_hints"),
             "date_created": payload.get("date_created"),
             "text_body": payload.get("text_body"),
             "html_body": payload.get("html_body"),
@@ -3746,6 +4033,21 @@ def normalize_pst_message(source_rel_path: str, message_dict: dict[str, object])
             preview_file_name=pst_preview_file_name(source_item_id),
             email_threading=email_threading,
         )
+    mapi_hint_roles: set[str] = set()
+    if normalize_whitespace(str(extracted.get("author") or "")):
+        mapi_hint_roles.add("author")
+    if normalize_whitespace(str(extracted.get("participants") or "")):
+        mapi_hint_roles.add("participants")
+    if normalize_whitespace(str(extracted.get("recipients") or "")):
+        mapi_hint_roles.add("recipients")
+    if mapi_hint_roles:
+        merged_entity_hints = merge_pst_entity_hint_payloads(
+            extracted.get("entity_hints"),
+            message_dict.get("entity_hints"),
+            roles=mapi_hint_roles,
+        )
+        if merged_entity_hints:
+            extracted["entity_hints"] = merged_entity_hints
     return {
         "rel_path": pst_message_rel_path(source_rel_path, source_item_id),
         "file_name": pst_message_file_name(source_item_id),
