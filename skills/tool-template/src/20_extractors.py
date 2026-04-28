@@ -400,23 +400,28 @@ def normalize_slack_user_info(
     first_name = choose_slack_text(profile.get("first_name"), record.get("first_name"))
     last_name = choose_slack_text(profile.get("last_name"), record.get("last_name"))
     combined_name = " ".join(part for part in [first_name, last_name] if part)
+    real_name = choose_slack_text(profile.get("real_name"), record.get("real_name"))
+    display_name = choose_slack_text(profile.get("display_name"))
+    handle = choose_slack_text(profile.get("name"), record.get("name"))
+    email = normalize_entity_email(choose_slack_text(profile.get("email"), record.get("email")) or "")
     speaker_name = choose_slack_text(
-        profile.get("real_name"),
-        record.get("real_name"),
-        profile.get("display_name"),
+        real_name,
+        display_name,
         combined_name,
-        profile.get("name"),
-        record.get("name"),
+        handle,
     )
     mention_name = choose_slack_text(
-        profile.get("display_name"),
+        display_name,
         first_name,
-        profile.get("name"),
-        record.get("name"),
+        handle,
         speaker_name,
     )
     return {
         "avatar_color": choose_slack_text(profile.get("color"), record.get("color")),
+        "email": email,
+        "handle": handle,
+        "real_name": real_name,
+        "display_name": display_name,
         "speaker_name": speaker_name,
         "mention_name": mention_name,
     }

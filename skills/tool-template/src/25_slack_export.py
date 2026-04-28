@@ -229,7 +229,8 @@ def slack_actor_entity_hint(
     speaker_name = normalize_entity_text(actor_info.get("speaker_name") or "")
     if not slack_user_id or not speaker_name:
         return None
-    identifier: dict[str, object] = {
+    identifiers: list[dict[str, object]] = []
+    external_identifier: dict[str, object] = {
         "identifier_type": "external_id",
         "identifier_name": "slack_user_id",
         "display_value": slack_user_id,
@@ -238,10 +239,33 @@ def slack_actor_entity_hint(
     }
     normalized_scope = normalize_entity_lookup_text(identifier_scope or "")
     if normalized_scope:
-        identifier["identifier_scope"] = normalized_scope
+        external_identifier["identifier_scope"] = normalized_scope
+    identifiers.append(external_identifier)
+    email = normalize_entity_email(actor_info.get("email") or "")
+    if email:
+        identifiers.append(
+            {
+                "identifier_type": "email",
+                "display_value": email,
+                "normalized_value": email,
+                "is_verified": 1,
+            }
+        )
+    handle = normalize_entity_handle(actor_info.get("handle") or "")
+    if handle and normalized_scope:
+        identifiers.append(
+            {
+                "identifier_type": "handle",
+                "display_value": f"@{handle}",
+                "normalized_value": handle,
+                "provider": "slack",
+                "provider_scope": normalized_scope,
+                "is_verified": 1,
+            }
+        )
     return {
         "display_value": speaker_name,
-        "identifiers": [identifier],
+        "identifiers": identifiers,
     }
 
 
