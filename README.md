@@ -361,13 +361,15 @@ python3 skills/tool-template/tools.py add-job-output . issue_tags primary_issue 
 python3 skills/tool-template/tools.py create-job-version . issue_tags --provider <provider> --model <model> --input-basis active_search_text --instruction "Extract the primary issue."
 python3 skills/tool-template/tools.py create-run . --job-name issue_tags --job-version 1 --select-from-scope
 python3 skills/tool-template/tools.py run-status . --run-id 7
-python3 skills/tool-template/tools.py execute-run . --run-id 7
+python3 skills/tool-template/tools.py run-job-step . --run-id 7 --budget-seconds 35
 ```
 
 Notes:
 
 - job display names are normalized to handles such as `issue_tags`
-- `execute-run` is the direct executor; advanced unattended/background orchestration uses the queue-oriented run commands instead
+<!-- Use run-job-step as the documented path because Cowork/bash calls may be killed around 45 seconds; the bounded step returns next_recommended_commands so agents can resume safely. -->
+- `run-job-step` is the normal Cowork-safe executor. If it returns `more_work_remaining: true`, continue with `next_recommended_commands`.
+- `execute-run` is the legacy direct executor for debugging, deterministic tests, or parity checks.
 
 ## Slash command reference
 
