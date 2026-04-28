@@ -71,6 +71,7 @@ INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES = 2 * 1024 * 1024 * 1024
 INGEST_V2_BYTES_B64_KEY = "__retriever_bytes_b64__"
 INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL = 25
 INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
+INGEST_V2_PREPARED_COMMIT_BATCH_TARGET = max(25, INGEST_V2_PREPARE_BATCH_SIZE * 5)
 
 
 def ingest_v2_elapsed_ms(started: float) -> float:
@@ -2376,8 +2377,6 @@ def ingest_v2_maybe_advance_after_prepare(connection: sqlite3.Connection, *, run
         ).fetchone()[0]
         or 0
     )
-    if remaining_prepare_items:
-        return False
     prepared_items = int(
         connection.execute(
             """
@@ -2390,6 +2389,10 @@ def ingest_v2_maybe_advance_after_prepare(connection: sqlite3.Connection, *, run
         ).fetchone()[0]
         or 0
     )
+    if not prepared_items and remaining_prepare_items:
+        return False
+    if prepared_items and remaining_prepare_items and prepared_items < INGEST_V2_PREPARED_COMMIT_BATCH_TARGET:
+        return False
     next_phase = "committing" if prepared_items else "finalizing"
     now = utc_now()
     connection.execute("BEGIN")
@@ -3823,6 +3826,19 @@ def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_
     )
     if remaining_commit_items:
         return False
+    remaining_prepare_items = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND status IN ('pending', 'leased')
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        or 0
+    )
+    next_phase = "preparing" if remaining_prepare_items else "finalizing"
     cursor = ingest_v2_load_commit_cursor(connection, run_id=run_id)
     now = utc_now()
     connection.execute("BEGIN")
@@ -3833,13 +3849,13 @@ def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_
             phase="committing",
             cursor_key="loose_file_commit",
             cursor=cursor,
-            status="complete",
+            status="pending" if remaining_prepare_items else "complete",
         )
         update_cursor = connection.execute(
             """
             UPDATE ingest_runs
-            SET phase = 'finalizing',
-                status = 'finalizing',
+            SET phase = ?,
+                status = ?,
                 committer_lease_owner = NULL,
                 committer_lease_expires_at = NULL,
                 committer_heartbeat_at = ?,
@@ -3848,7 +3864,7 @@ def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_
               AND phase = 'committing'
               AND cancel_requested_at IS NULL
             """,
-            (now, now, run_id),
+            (next_phase, next_phase, now, now, run_id),
         )
         advanced = int(update_cursor.rowcount or 0) > 0
         connection.commit()
@@ -4250,9 +4266,13 @@ def ingest_v2_next_commands(
     phase = str(row["phase"] or "")
     if phase == "planning":
         runnable_commands.append(f"ingest-plan-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
-    if counts.get("pending", 0) > 0 and int(leases.get("active_prepare_workers") or 0) < int(leases.get("prepare_worker_soft_limit") or 0):
+    if (
+        phase == "preparing"
+        and (counts.get("pending", 0) > 0 or counts.get("leased", 0) > 0)
+        and int(leases.get("active_prepare_workers") or 0) < int(leases.get("prepare_worker_soft_limit") or 0)
+    ):
         runnable_commands.append(f"ingest-prepare-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
-    if counts.get("prepared", 0) > 0 and not bool(leases.get("writer_busy")):
+    if phase == "committing" and counts.get("prepared", 0) > 0 and not bool(leases.get("writer_busy")):
         runnable_commands.append(f"ingest-commit-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
     if phase == "finalizing" or int(artifacts.get("orphan_pending_sweep") or 0) > 0:
         runnable_commands.append(f"ingest-finalize-step {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
@@ -5839,11 +5859,13 @@ def ingest_v2_commit_step(
                     message=f"{type(exc).__name__}: {exc}",
                 )
 
-        advanced_to_finalize = ingest_v2_maybe_advance_after_commit(connection, run_id=run_id)
+        advanced_after_commit = ingest_v2_maybe_advance_after_commit(connection, run_id=run_id)
         if lease_acquired:
             ingest_v2_release_writer_lease(connection, run_id=run_id, writer_id=writer_id)
             lease_acquired = False
         updated_row = require_ingest_v2_run_row(connection, run_id)
+        advanced_to_finalize = bool(advanced_after_commit and str(updated_row["phase"]) == "finalizing")
+        advanced_to_prepare = bool(advanced_after_commit and str(updated_row["phase"]) == "preparing")
         remaining_commit_items = int(
             connection.execute(
                 """
@@ -5868,6 +5890,7 @@ def ingest_v2_commit_step(
             "actions": actions,
             "freshness_fallbacks": freshness_fallbacks,
             "advanced_to_finalize": advanced_to_finalize,
+            "advanced_to_prepare": advanced_to_prepare,
             "more_commit_remaining": remaining_commit_items > 0,
             "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
             "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
