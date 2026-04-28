@@ -7339,25 +7339,33 @@ def ooxml_image_mime_type(part_name: str) -> str | None:
     return None
 
 
+def image_path_png_bytes(path: Path, *, max_dimension: int | None = None) -> bytes | None:
+    resized_dimension = max(0, int(max_dimension or 0))
+    pil_image_module = load_dependency("PilImage")
+    if pil_image_module is None:
+        return None
+    with pil_image_module.open(path) as image:
+        if resized_dimension:
+            image.thumbnail((resized_dimension, resized_dimension))
+        buffer = io.BytesIO()
+        try:
+            image.save(buffer, format="PNG", optimize=True)
+        except (OSError, ValueError):
+            image.convert("RGB").save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
 def image_path_data_url(path: Path, *, max_dimension: int | None = None) -> str | None:
     mime_type, _ = mimetypes.guess_type(path.name)
     normalized_suffix = path.suffix.lower()
     resized_dimension = max(0, int(max_dimension or 0))
     if normalized_suffix in {".tif", ".tiff"} or resized_dimension:
-        pil_image_module = load_dependency("PilImage")
-        if pil_image_module is None:
+        png_bytes = image_path_png_bytes(path, max_dimension=resized_dimension)
+        if png_bytes is None:
             if normalized_suffix not in {".tif", ".tiff"} and mime_type is not None and mime_type.startswith("image/"):
                 return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
             return None
-        with pil_image_module.open(path) as image:
-            if resized_dimension:
-                image.thumbnail((resized_dimension, resized_dimension))
-            buffer = io.BytesIO()
-            try:
-                image.save(buffer, format="PNG", optimize=True)
-            except (OSError, ValueError):
-                image.convert("RGB").save(buffer, format="PNG", optimize=True)
-        return f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode('ascii')}"
+        return f"data:image/png;base64,{base64.b64encode(png_bytes).decode('ascii')}"
     if mime_type is None or not mime_type.startswith("image/"):
         return None
     return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"

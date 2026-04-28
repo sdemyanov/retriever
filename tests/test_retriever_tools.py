@@ -8096,6 +8096,101 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(cursor_payload["production_finalized_roots"], ["Synthetic_Production"])
         self.assertEqual(cursor_payload["production_stats"]["families_reconstructed"], 1)
 
+    def test_ingest_v2_generates_all_production_preview_pages_in_batches(self) -> None:
+        production_name = "Batched_Production"
+        production_root = self.root / production_name
+        data_dir = production_root / "DATA"
+        text_dir = production_root / "TEXT" / "TEXT001"
+        image_dir = production_root / "IMAGES" / "IMG001"
+        for directory in (data_dir, text_dir, image_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        def bates(number: int) -> str:
+            return f"BP{number:06d}"
+
+        def loadfile_path(*parts: str) -> str:
+            return ".\\" + "\\".join([production_name, *parts])
+
+        page_count = retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE + 3
+        (text_dir / f"{bates(1)}.txt").write_text("Large image-backed production row\n", encoding="utf-8")
+        for index in range(1, page_count + 1):
+            self.write_tiff_fixture(
+                image_dir / f"{bates(index)}.tif",
+                ((index * 11) % 255, (index * 17) % 255, (index * 23) % 255),
+            )
+
+        delimiter = b"\x14"
+        quote = b"\xfe"
+
+        def dat_line(fields: list[str]) -> bytes:
+            return delimiter.join(quote + field.encode("latin-1") + quote for field in fields) + b"\r\n"
+
+        headers = ["Begin Bates", "End Bates", "Begin Attachment", "End Attachment", "Text Precedence", "FILE_PATH"]
+        row = [
+            bates(1),
+            bates(page_count),
+            "",
+            "",
+            loadfile_path("TEXT", "TEXT001", f"{bates(1)}.txt"),
+            "",
+        ]
+        (data_dir / f"{production_name}.dat").write_bytes(dat_line(headers) + dat_line(row))
+        opt_lines = [
+            f"{bates(1)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(1)}.tif')},Y,,,{page_count}",
+            *[
+                f"{bates(index)},{production_name},{loadfile_path('IMAGES', 'IMG001', f'{bates(index)}.tif')},,,,"
+                for index in range(2, page_count + 1)
+            ],
+        ]
+        (data_dir / f"{production_name}.opt").write_text("\n".join(opt_lines) + "\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli("ingest-start", str(self.root), "--recursive")
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+        run_exit, run_payload, _, _ = self.run_cli(
+            "ingest-run-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(run_exit, 0)
+        self.assertIsNotNone(run_payload)
+        self.assertEqual(run_payload["run"]["status"], "completed")
+        by_unit_type = run_payload["run"]["counts"]["by_unit_type"]
+        self.assertEqual(by_unit_type["production_row"]["committed"], 1)
+        self.assertEqual(by_unit_type["production_preview_batch"]["committed"], 2)
+
+        document_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/{production_name}/documents/{bates(1)}.logical"
+        )
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            preview_rows = connection.execute(
+                """
+                SELECT rel_preview_path, preview_type, ordinal
+                FROM document_previews
+                WHERE document_id = ?
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (document_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        html_rows = [row for row in preview_rows if row["preview_type"] == "html"]
+        image_rows = [row for row in preview_rows if row["preview_type"] == "image"]
+        self.assertEqual(len(html_rows), 1)
+        self.assertEqual(len(image_rows), page_count)
+        preview_html = (self.paths["state_dir"] / html_rows[0]["rel_preview_path"]).read_text(encoding="utf-8")
+        self.assertEqual(preview_html.count("<figure>"), page_count)
+        self.assertNotIn("Preview shows the first", preview_html)
+        self.assertNotIn("data:image/png;base64,", preview_html)
+        for row in image_rows:
+            self.assertTrue((self.paths["state_dir"] / row["rel_preview_path"]).exists())
+
     def test_ingest_v2_production_rerun_retires_missing_loadfile_rows(self) -> None:
         production_root = self.write_production_fixture()
 
