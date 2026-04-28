@@ -10143,12 +10143,17 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         day_result = next(item for item in browse_result["results"] if item["id"] == day_row["id"])
         self.assertEqual(day_result["dataset_name"], slack_dataset["dataset_name"])
         self.assertEqual(day_result["conversation_id"], day_row["conversation_id"])
-        self.assertTrue(
-            day_result["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
+        self.assertEqual(
+            [target.get("label") for target in day_result["preview_targets"]],
+            ["message", "conversation"],
         )
-        self.assertTrue(day_result["preview_rel_path"].endswith(f"doc-{day_row['id']}.html"))
+        self.assertEqual(
+            day_result["preview_rel_path"],
+            self.preview_target_by_label(day_result["preview_targets"], "message")["rel_path"],
+        )
+        day_preview_html = Path(str(day_result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
+        self.assertIn('class="chat-message"', day_preview_html)
+        self.assertIn("sync", day_preview_html)
 
         search_result = retriever_tools.search(self.root, "sync", None, None, None, 1, 20)
         self.assertEqual(search_result["results"][0]["id"], day_row["id"])
@@ -10590,12 +10595,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         reply_search = retriever_tools.search(self.root, "Following up on kickoff", None, None, None, 1, 20)
         self.assertEqual(reply_search["total_hits"], 1)
         self.assertEqual(reply_search["results"][0]["id"], child_row["id"])
-        self.assertTrue(
-            reply_search["results"][0]["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
-        )
-        self.assertTrue(reply_search["results"][0]["preview_rel_path"].endswith(f"doc-{child_row['id']}.html"))
 
         browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
         day_one_result = next(item for item in browse_result["results"] if item["id"] == day_one_row["id"])
@@ -10605,12 +10604,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(day_one_result["child_documents"][0]["id"], child_row["id"])
         self.assertEqual(day_one_result["child_documents"][0]["child_document_kind"], retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD)
         self.assertEqual(day_two_result["child_document_count"], 0)
-        self.assertTrue(
-            day_one_result["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
-        )
-        self.assertTrue(day_one_result["preview_rel_path"].endswith(f"doc-{day_one_row['id']}.html"))
         self.assertEqual(
             [target.get("label") for target in day_one_result["preview_targets"]],
             ["message", "conversation"],
@@ -10618,6 +10611,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(
             [target.get("label") for target in reply_search["results"][0]["preview_targets"]],
             ["message", "conversation"],
+        )
+        self.assertEqual(
+            day_one_result["preview_rel_path"],
+            self.preview_target_by_label(day_one_result["preview_targets"], "message")["rel_path"],
+        )
+        self.assertEqual(
+            reply_search["results"][0]["preview_rel_path"],
+            self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "message")["rel_path"],
         )
         self.assertEqual(
             self.preview_target_file_path(
@@ -10635,6 +10636,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         slack_entry_path = self.preview_target_file_path(day_one_result["preview_targets"][0])
         slack_entry_html = slack_entry_path.read_text(encoding="utf-8")
+        self.assertIn('class="chat-message"', slack_entry_html)
         self.assertIn("Kickoff thread", slack_entry_html)
         self.assertNotIn("Contents", slack_entry_html)
         self.assertNotIn('class="conversation-nav-segment"', slack_entry_html)
@@ -10642,6 +10644,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         slack_preview_html = self.preview_target_file_path(
             self.preview_target_by_label(day_one_result["preview_targets"], "conversation")
         ).read_text(encoding="utf-8")
+        self.assertIn('class="chat-message"', slack_preview_html)
         self.assertIn("Kickoff thread", slack_preview_html)
         self.assertIn("Following up on kickoff", slack_preview_html)
         self.assertTrue(slack_conversation_preview.exists())
@@ -16038,18 +16041,24 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         search_result = retriever_tools.search(self.root, "draft the update", None, None, None, 1, 20)
         result = search_result["results"][0]
-        self.assertTrue(
-            result["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
+        self.assertEqual(
+            [target.get("label") for target in result["preview_targets"]],
+            ["message", "conversation"],
         )
-        self.assertTrue(result["preview_rel_path"].endswith(f"doc-{row['id']}.html"))
-        self.assertEqual(result["preview_targets"][0]["preview_type"], "html")
+        self.assertEqual(
+            result["preview_rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
+        )
         preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
+        self.assertIn('class="chat-message"', preview_html)
         self.assertIn("Alice Example", preview_html)
         self.assertIn("Bob Example", preview_html)
         self.assertIn("Kickoff thread for launch planning.", preview_html)
-        self.assertIn(f'id="doc-{row["id"]}"', preview_html)
+        conversation_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(result["preview_targets"], "conversation")
+        ).read_text(encoding="utf-8")
+        self.assertIn('class="chat-message"', conversation_preview_html)
+        self.assertIn("draft the update.", conversation_preview_html)
 
     def test_ingest_groups_pst_chat_messages_by_thread_id_over_shared_folder_path(self) -> None:
         self.write_fake_pst_file()
@@ -16146,15 +16155,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         search_result = retriever_tools.search(self.root, "Follow-up from the same Teams space", None, None, None, 1, 20)
         result = search_result["results"][0]
-        self.assertTrue(
-            result["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
-        )
-        self.assertTrue(result["preview_rel_path"].endswith(f"doc-{second_row['id']}.html"))
         self.assertEqual(
             [target.get("label") for target in result["preview_targets"]],
             ["message", "conversation"],
+        )
+        self.assertEqual(
+            result["preview_rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
         )
         self.assertEqual(
             self.preview_target_file_path(
@@ -16162,12 +16169,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ).name,
             "conversation.html",
         )
+        message_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(result["preview_targets"], "message")
+        ).read_text(encoding="utf-8")
+        self.assertIn('class="chat-message"', message_preview_html)
+        self.assertIn("Bob Example", message_preview_html)
+        self.assertIn("Follow-up from the same Teams space.", message_preview_html)
         preview_html = self.preview_target_file_path(
             self.preview_target_by_label(result["preview_targets"], "conversation")
         ).read_text(encoding="utf-8")
-        self.assertIn(f'id="doc-{first_row["id"]}"', preview_html)
-        self.assertIn(f'id="doc-{second_row["id"]}"', preview_html)
-        self.assertNotIn(f'id="doc-{third_row["id"]}"', preview_html)
+        self.assertIn('class="chat-message"', preview_html)
+        self.assertIn("Alice Example", preview_html)
+        self.assertIn("Bob Example", preview_html)
         self.assertIn("Kickoff thread for launch planning.", preview_html)
         self.assertIn("Follow-up from the same Teams space.", preview_html)
 
@@ -16581,20 +16594,24 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         search_result = retriever_tools.search(self.root, "hey there", None, None, None, 1, 20)
         result = next(item for item in search_result["results"] if item["id"] == chat_row["id"])
-        self.assertTrue(
-            result["preview_rel_path"].startswith(
-                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/previews/conversations/"
-            )
-        )
-        self.assertTrue(result["preview_rel_path"].endswith(f"doc-{chat_row['id']}.html"))
         self.assertEqual(
             [target.get("label") for target in result["preview_targets"]],
             ["message", "conversation"],
         )
+        self.assertEqual(
+            result["preview_rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
+        )
         preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
-        self.assertIn("Conversation document", preview_html)
+        self.assertIn('class="chat-message"', preview_html)
         self.assertIn("Sergey Demyanov", preview_html)
         self.assertIn("hey there", preview_html)
+        conversation_preview_html = self.preview_target_file_path(
+            self.preview_target_by_label(result["preview_targets"], "conversation")
+        ).read_text(encoding="utf-8")
+        self.assertIn('class="chat-message"', conversation_preview_html)
+        self.assertIn("Sergey Demyanov", conversation_preview_html)
+        self.assertIn("hey there", conversation_preview_html)
 
     def test_ingest_pst_calendar_folder_uses_calendar_content_type(self) -> None:
         self.write_fake_pst_file()
