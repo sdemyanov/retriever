@@ -2827,6 +2827,13 @@ def conversation_preview_segment_label(segment_key: str, *, segment_mode: str) -
         return segment_key
 
 
+def conversation_documents_are_chat(documents: list[dict[str, object]]) -> bool:
+    return bool(documents) and all(
+        normalize_whitespace(str(document.get("content_type") or "")).lower() == "chat"
+        for document in documents
+    )
+
+
 def conversation_preview_writes_aggregate_artifacts(
     conversation_type: object,
     documents: list[dict[str, object]],
@@ -2834,7 +2841,10 @@ def conversation_preview_writes_aggregate_artifacts(
     segment_mode: str,
 ) -> bool:
     _ = segment_mode
-    if normalize_whitespace(str(conversation_type or "")).lower() == "chat":
+    if (
+        normalize_whitespace(str(conversation_type or "")).lower() == "chat"
+        or conversation_documents_are_chat(documents)
+    ):
         return bool(documents)
     return len(documents) > 1
 
@@ -3705,6 +3715,128 @@ def rebase_preserved_preview_rows(
     return rebased_rows
 
 
+def chat_preview_entries_for_document(document: dict[str, object]) -> list[dict[str, object]]:
+    text_content = str(document.get("text_content") or "")
+    parsed_entries = list(iter_chat_transcript_entries(text_content, max_lines=4000))
+    if parsed_entries:
+        return parsed_entries
+    body = normalize_whitespace(text_content)
+    if not body:
+        return []
+    speaker = normalize_whitespace(str(document.get("author") or "")) or "Message"
+    timestamp = conversation_preview_primary_timestamp(document)
+    return [
+        {
+            "speaker": speaker,
+            "body": body,
+            "timestamp": timestamp,
+            "timestamp_label": format_chat_preview_timestamp(timestamp),
+            "avatar_label": chat_avatar_initials(speaker),
+        }
+    ]
+
+
+def chat_preview_headers_for_document(document: dict[str, object]) -> dict[str, str]:
+    date_created = conversation_preview_primary_timestamp(document)
+    date_modified = normalize_datetime(document.get("date_modified"))
+    return {
+        "Author": normalize_whitespace(str(document.get("author") or "")),
+        "Participants": normalize_whitespace(str(document.get("participants") or "")),
+        "Started": format_chat_preview_timestamp(date_created) or date_created or "",
+        "Updated": format_chat_preview_timestamp(date_modified) or date_modified or "",
+        "Title": conversation_preview_document_heading(document),
+        "Messages": str(len(chat_preview_entries_for_document(document)) or 1),
+    }
+
+
+def build_chat_document_preview_html(document: dict[str, object]) -> str:
+    text_content = str(document.get("text_content") or "")
+    return build_chat_preview_html(
+        chat_preview_headers_for_document(document),
+        text_content,
+        document_title=conversation_preview_document_heading(document) or "Chat message",
+        entries=chat_preview_entries_for_document(document),
+    )
+
+
+def build_chat_conversation_preview_html(
+    conversation_row: sqlite3.Row,
+    documents: list[dict[str, object]],
+) -> str:
+    conversation_name = (
+        normalize_whitespace(str(conversation_row["display_name"] or ""))
+        or f"Conversation {int(conversation_row['id'])}"
+    )
+    first_activity, last_activity = conversation_preview_bounds(documents)
+    entries = [
+        entry
+        for document in documents
+        for entry in chat_preview_entries_for_document(document)
+    ]
+    body_text = normalize_whitespace(
+        "\n\n".join(
+            str(document.get("text_content") or "")
+            for document in documents
+            if normalize_whitespace(str(document.get("text_content") or ""))
+        )
+    )
+    headers = {
+        "Author": "",
+        "Participants": conversation_preview_participants(documents) or "",
+        "Started": format_chat_preview_timestamp(first_activity) or first_activity or "",
+        "Updated": format_chat_preview_timestamp(last_activity) or last_activity or "",
+        "Title": conversation_name,
+        "Messages": str(len(entries) or len(documents)),
+    }
+    return build_chat_preview_html(
+        headers,
+        body_text,
+        document_title=conversation_name,
+        entries=entries,
+    )
+
+
+def chat_message_preview_rows(
+    paths: dict[str, Path],
+    *,
+    document: dict[str, object],
+    preserved_preview_rows: list[dict[str, object]],
+    entry_rel_path: str,
+    created_at: str,
+) -> list[dict[str, object]]:
+    preferred_rows = sorted(
+        preserved_preview_rows,
+        key=lambda row: (
+            0 if normalize_whitespace(str(row.get("preview_type") or "")).lower() == "html" else 1,
+            int(row.get("ordinal", 0)),
+        ),
+    )
+    if preferred_rows and normalize_whitespace(str(preferred_rows[0].get("preview_type") or "")).lower() == "html":
+        target_row = dict(preferred_rows[0])
+        target_row["target_fragment"] = None
+        target_row["label"] = "message"
+        target_row["ordinal"] = 0
+        target_row["created_at"] = created_at
+        return [target_row]
+
+    entry_abs_path = paths["state_dir"] / entry_rel_path
+    entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
+    entry_abs_path.write_text(
+        build_chat_document_preview_html(document),
+        encoding="utf-8",
+    )
+    return [
+        {
+            "rel_preview_path": entry_rel_path,
+            "preview_type": "html",
+            "target_fragment": None,
+            "label": "message",
+            "ordinal": 0,
+            "created_at": created_at,
+        }
+    ]
+
+
 def render_conversation_chat_body_html(text_content: str) -> str:
     chat_entries = iter_chat_transcript_entries(text_content, max_lines=4000)
     if not chat_entries:
@@ -4151,6 +4283,11 @@ def build_conversation_full_html(
             segment_items=segment_items,
             attachment_links_by_document_id=attachment_links_by_document_id,
         )
+    if conversation_documents_are_chat(documents):
+        return build_chat_conversation_preview_html(
+            conversation_row,
+            documents=documents,
+        )
     conversation_name = (
         normalize_whitespace(str(conversation_row["display_name"] or ""))
         or f"Conversation {int(conversation_row['id'])}"
@@ -4363,16 +4500,11 @@ def refresh_conversation_previews(
             paths,
             document_ids,
         )
-        writes_segment_artifacts = writes_aggregate_artifacts and len(segment_items) > 1
-        entry_document_ids = [
-            int(document["id"])
-            for document in documents
-            if conversation_document_uses_entry_preview(document)
-        ]
-        entry_position_by_document_id = {
-            document_id: index + 1
-            for index, document_id in enumerate(entry_document_ids)
-        }
+        writes_segment_artifacts = (
+            writes_aggregate_artifacts
+            and len(segment_items) > 1
+            and not conversation_documents_are_chat(documents)
+        )
         toc_rel_path = conversation_preview_toc_rel_path(conversation_id)
         full_rel_path = conversation_preview_full_rel_path(conversation_id)
         full_preview_existed_before = (paths["state_dir"] / full_rel_path).exists()
@@ -4485,34 +4617,18 @@ def refresh_conversation_previews(
                             else None
                         ),
                         attachment_links=entry_attachment_links.get(document_id) or [],
-                    )
+                )
                 preview_rows: list[dict[str, object]] = []
                 if conversation_document_uses_entry_preview(document):
-                    preserved_preview_rows = []
                     entry_rel_path = conversation_preview_entry_rel_path(conversation_id, document_id)
-                    entry_abs_path = paths["state_dir"] / entry_rel_path
-                    entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
-                    entry_abs_path.write_text(
-                        build_conversation_entry_html(
-                            conversation_row,
+                    preview_rows.extend(
+                        chat_message_preview_rows(
+                            paths,
                             document=document,
-                            document_heading=conversation_preview_document_heading(document),
-                            segment_label=str(segment["label"]),
-                            attachment_links=entry_attachment_links.get(document_id) or [],
-                            position_index=entry_position_by_document_id.get(document_id),
-                            total_count=len(entry_document_ids),
-                        ),
-                        encoding="utf-8",
-                    )
-                    preview_rows.append(
-                        {
-                            "rel_preview_path": entry_rel_path,
-                            "preview_type": "html",
-                            "target_fragment": None,
-                            "label": "message",
-                            "ordinal": 0,
-                            "created_at": created_at,
-                        }
+                            preserved_preview_rows=preserved_preview_rows,
+                            entry_rel_path=entry_rel_path,
+                            created_at=created_at,
+                        )
                     )
                     if writes_aggregate_artifacts:
                         preview_rows.append(
@@ -4525,11 +4641,7 @@ def refresh_conversation_previews(
                                 "created_at": created_at,
                             }
                         )
-                    rebased_preview_rows = rebase_preserved_preview_rows(
-                        preserved_preview_rows,
-                        start_ordinal=len(preview_rows),
-                        created_at=created_at,
-                    )
+                    rebased_preview_rows = []
                 else:
                     rebased_preview_rows = rebase_preserved_preview_rows(
                         preserved_preview_rows,
