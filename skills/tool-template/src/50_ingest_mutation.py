@@ -74,6 +74,9 @@ INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
 INGEST_V2_PREPARED_COMMIT_BATCH_TARGET = max(25, INGEST_V2_PREPARE_BATCH_SIZE * 5)
 INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE = 12
 INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 1400
+INGEST_PIPELINE_LEGACY = "legacy"
+INGEST_PIPELINE_V2 = "v2"
+INGEST_PIPELINE_MODE = INGEST_PIPELINE_V2
 
 
 def ingest_v2_elapsed_ms(started: float) -> float:
@@ -7086,6 +7089,184 @@ def ingest_v2_run_step(
         },
         "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
     }
+
+
+def ingest_v2_scopes_match(active_scope: object, requested_scope: dict[str, object]) -> bool:
+    if not isinstance(active_scope, dict):
+        return False
+    return compact_json_text(active_scope) == compact_json_text(requested_scope)
+
+
+def ingest_v2_facade_command(
+    root: Path,
+    *,
+    recursive: bool,
+    raw_file_types: str | None,
+    raw_paths: list[str] | None,
+    budget_seconds: int,
+) -> str:
+    parts = ["ingest", shlex.quote(str(root))]
+    if recursive:
+        parts.append("--recursive")
+    for raw_path in raw_paths or []:
+        parts.extend(["--path", shlex.quote(str(raw_path))])
+    if raw_file_types:
+        parts.extend(["--file-types", shlex.quote(str(raw_file_types))])
+    parts.extend(["--budget-seconds", str(int(budget_seconds))])
+    return " ".join(parts)
+
+
+def ingest_v2_facade_payload(
+    *,
+    root: Path,
+    recursive: bool,
+    raw_file_types: str | None,
+    raw_paths: list[str] | None,
+    budget_seconds: int,
+    created: bool,
+    resumed: bool,
+    run_payload: dict[str, object],
+    step_payloads: list[dict[str, object]],
+    reason: str,
+    mode: str,
+) -> dict[str, object]:
+    run_id = str(run_payload.get("run_id") or "")
+    more_work_remaining = str(run_payload.get("status")) not in INGEST_V2_TERMINAL_STATUSES
+    executed_steps: list[str] = []
+    for step_payload in step_payloads:
+        executed_steps.extend(str(step) for step in list(step_payload.get("executed_steps") or []))
+    next_commands: list[str] = []
+    if more_work_remaining:
+        next_commands.append(
+            ingest_v2_facade_command(
+                root,
+                recursive=recursive,
+                raw_file_types=raw_file_types,
+                raw_paths=raw_paths,
+                budget_seconds=budget_seconds,
+            )
+        )
+    next_commands.extend(str(command) for command in list(run_payload.get("next_recommended_commands") or []))
+    return {
+        "ok": True,
+        "pipeline": INGEST_PIPELINE_V2,
+        "mode": mode,
+        "created": created,
+        "resumed": resumed,
+        "run_id": run_id or None,
+        "status": run_payload.get("status"),
+        "phase": run_payload.get("phase"),
+        "reason": reason,
+        "executed": bool(executed_steps),
+        "executed_steps": executed_steps,
+        "step_calls": len(step_payloads),
+        "step_results": step_payloads,
+        "more_work_remaining": more_work_remaining,
+        "run": run_payload,
+        "counts": run_payload.get("counts"),
+        "next_recommended_commands": next_commands,
+    }
+
+
+def ingest_v2_facade_remaining_budget(deadline: float) -> int | None:
+    remaining_seconds = ingest_v2_deadline_remaining_seconds(deadline)
+    if remaining_seconds < INGEST_V2_RUN_STEP_MIN_REMAINING_SECONDS:
+        return None
+    return max(1, min(MAX_RESUMABLE_STEP_BUDGET_SECONDS, int(remaining_seconds)))
+
+
+def ingest_v2_facade(
+    root: Path,
+    *,
+    recursive: bool,
+    raw_file_types: str | None,
+    raw_paths: list[str] | None = None,
+    budget_seconds: int | None = None,
+    run_to_completion: bool = False,
+) -> dict[str, object]:
+    set_active_workspace_root(root)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    requested_scope = ingest_v2_scope_payload(
+        root,
+        recursive=recursive,
+        raw_file_types=raw_file_types,
+        raw_paths=raw_paths,
+    )
+    created = False
+    resumed = False
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        active_row = active_ingest_v2_run_row(connection)
+        if active_row is not None:
+            active_scope = decode_json_text(active_row["scope_json"], default={}) or {}
+            if not ingest_v2_scopes_match(active_scope, requested_scope):
+                payload = ingest_v2_conflict_payload(
+                    root,
+                    active_row,
+                    message="A resumable ingest run is active with a different scope.",
+                )
+                payload["active_scope"] = active_scope
+                payload["requested_scope"] = requested_scope
+                raise RetrieverStructuredError(
+                    f"Resumable ingest run {active_row['run_id']} is already active with a different scope.",
+                    payload,
+                )
+            run_id = str(active_row["run_id"])
+            resumed = True
+            run_payload = ingest_v2_status_payload(connection, root, active_row, budget_seconds=budget)
+        else:
+            run_id = ""
+            run_payload = {}
+    finally:
+        connection.close()
+
+    if not resumed:
+        start_payload = ingest_v2_start(
+            root,
+            recursive=recursive,
+            raw_file_types=raw_file_types,
+            raw_paths=raw_paths,
+            budget_seconds=budget,
+        )
+        run_id = str(start_payload["run_id"])
+        created = True
+        run_payload = {
+            key: value
+            for key, value in start_payload.items()
+            if key not in {"ok", "created"}
+        }
+
+    step_payloads: list[dict[str, object]] = []
+    reason = "run_terminal" if str(run_payload.get("status")) in INGEST_V2_TERMINAL_STATUSES else "budget_exhausted"
+    while str(run_payload.get("status")) not in INGEST_V2_TERMINAL_STATUSES:
+        step_budget = budget if run_to_completion else ingest_v2_facade_remaining_budget(deadline)
+        if step_budget is None:
+            reason = "budget_exhausted"
+            break
+        step_payload = ingest_v2_run_step(root, run_id=run_id, budget_seconds=step_budget)
+        step_payloads.append(step_payload)
+        run_payload = dict(step_payload["run"])
+        reason = str(step_payload.get("reason") or reason)
+        if not run_to_completion:
+            break
+
+    return ingest_v2_facade_payload(
+        root=root,
+        recursive=recursive,
+        raw_file_types=raw_file_types,
+        raw_paths=raw_paths,
+        budget_seconds=budget,
+        created=created,
+        resumed=resumed,
+        run_payload=run_payload,
+        step_payloads=step_payloads,
+        reason=reason,
+        mode="run_to_completion" if run_to_completion else "bounded",
+    )
 
 
 def ingest_v2_step_not_implemented(

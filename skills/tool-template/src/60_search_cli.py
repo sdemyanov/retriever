@@ -10277,6 +10277,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--file-types",
         help="Comma-separated file types to include, e.g. pdf,docx,eml",
     )
+    ingest_parser.add_argument(
+        "--pipeline",
+        choices=(INGEST_PIPELINE_V2, INGEST_PIPELINE_LEGACY),
+        default=INGEST_PIPELINE_MODE,
+        help="Ingest implementation to use; v2 is bounded and resumable",
+    )
+    ingest_parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Compatibility alias for --pipeline legacy",
+    )
+    ingest_parser.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+        help="V2 per-call budget; values above the bounded-worker cap are rejected",
+    )
+    ingest_parser.add_argument(
+        "--run-to-completion",
+        action="store_true",
+        help="For local terminals only: keep invoking V2 steps until the run reaches a terminal state",
+    )
 
     ingest_start_parser = subparsers.add_parser("ingest-start", help="Start a resumable V2 ingest run")
     ingest_start_parser.add_argument("workspace", help="Workspace root path")
@@ -11474,7 +11496,19 @@ def main() -> int:
         _auto_upgrade_and_maybe_reexec(root, args.command)
 
         if args.command == "ingest":
-            return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types, raw_paths=args.paths))
+            if args.legacy or args.pipeline == INGEST_PIPELINE_LEGACY:
+                return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types, raw_paths=args.paths))
+            return emit_cli_payload(
+                "ingest",
+                ingest_v2_facade(
+                    root,
+                    recursive=args.recursive,
+                    raw_file_types=args.file_types,
+                    raw_paths=args.paths,
+                    budget_seconds=args.budget_seconds,
+                    run_to_completion=args.run_to_completion,
+                ),
+            )
 
         if args.command == "ingest-start":
             return emit_cli_payload(

@@ -7397,6 +7397,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         exit_code, payload, _, _ = self.run_cli(
             "ingest",
             str(self.root),
+            "--legacy",
             "--recursive",
             "--path",
             "raw",
@@ -7406,6 +7407,95 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(payload["new"], 1)
         self.assertEqual(payload["scan_paths"], ["raw"])
+
+    def test_ingest_cli_uses_bounded_v2_facade_and_resumes(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "sample.txt").write_text("facade body\n", encoding="utf-8")
+
+        first_exit, first_payload, _, _ = self.run_cli(
+            "ingest",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+            "--budget-seconds",
+            "1",
+        )
+
+        self.assertEqual(first_exit, 0)
+        self.assertIsNotNone(first_payload)
+        assert first_payload is not None
+        self.assertEqual(first_payload["pipeline"], "v2")
+        self.assertEqual(first_payload["mode"], "bounded")
+        self.assertTrue(first_payload["created"])
+        self.assertFalse(first_payload["resumed"])
+        self.assertEqual(first_payload["status"], "planning")
+        self.assertTrue(first_payload["more_work_remaining"])
+        self.assertEqual(first_payload["executed_steps"], [])
+        self.assertIn("ingest", first_payload["next_recommended_commands"][0])
+        run_id = str(first_payload["run_id"])
+
+        second_exit, second_payload, _, _ = self.run_cli(
+            "ingest",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+            "--budget-seconds",
+            "35",
+        )
+
+        self.assertEqual(second_exit, 0)
+        self.assertIsNotNone(second_payload)
+        assert second_payload is not None
+        self.assertEqual(second_payload["pipeline"], "v2")
+        self.assertFalse(second_payload["created"])
+        self.assertTrue(second_payload["resumed"])
+        self.assertEqual(second_payload["run_id"], run_id)
+        self.assertEqual(second_payload["status"], "completed")
+        self.assertFalse(second_payload["more_work_remaining"])
+        self.assertIn("plan", second_payload["executed_steps"])
+        self.assertIn("prepare", second_payload["executed_steps"])
+        self.assertIn("commit", second_payload["executed_steps"])
+        self.assertEqual(second_payload["counts"]["work_items"]["committed"], 1)
+
+        document_row = self.fetch_document_row("raw/sample.txt")
+        self.assertEqual(document_row["file_name"], "sample.txt")
+
+    def test_ingest_cli_v2_facade_rejects_different_active_scope(self) -> None:
+        (self.root / "raw-a").mkdir()
+        (self.root / "raw-b").mkdir()
+
+        first_exit, first_payload, _, _ = self.run_cli(
+            "ingest",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw-a",
+            "--budget-seconds",
+            "1",
+        )
+        self.assertEqual(first_exit, 0)
+        self.assertIsNotNone(first_payload)
+        assert first_payload is not None
+
+        second_exit, second_payload, _, _ = self.run_cli(
+            "ingest",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw-b",
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(second_exit, 2)
+        self.assertIsNotNone(second_payload)
+        assert second_payload is not None
+        self.assertEqual(second_payload["error"], "active_ingest_run")
+        self.assertEqual(second_payload["active_run_id"], first_payload["run_id"])
+        self.assertEqual(second_payload["active_scope"]["scan_paths"], ["raw-a"])
+        self.assertEqual(second_payload["requested_scope"]["scan_paths"], ["raw-b"])
 
     def test_ingest_v2_start_status_and_cancel_foundation(self) -> None:
         raw_dir = self.root / "raw"
@@ -9142,6 +9232,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         legacy_exit, legacy_payload, _, _ = self.run_cli(
             "ingest",
             str(self.root),
+            "--legacy",
             "--recursive",
             "--path",
             "raw",
@@ -9555,11 +9646,19 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(entity_payload["error"], "active_ingest_run")
         self.assertEqual(entity_payload["active_run_id"], run_id)
 
-        legacy_ingest_exit, legacy_ingest_payload, _, _ = self.run_cli("ingest", str(self.root))
+        legacy_ingest_exit, legacy_ingest_payload, _, _ = self.run_cli("ingest", str(self.root), "--legacy")
         self.assertEqual(legacy_ingest_exit, 2)
         self.assertIsNotNone(legacy_ingest_payload)
         self.assertEqual(legacy_ingest_payload["error"], "active_ingest_run")
         self.assertEqual(legacy_ingest_payload["active_run_id"], run_id)
+
+        facade_ingest_exit, facade_ingest_payload, _, _ = self.run_cli("ingest", str(self.root))
+        self.assertEqual(facade_ingest_exit, 0)
+        self.assertIsNotNone(facade_ingest_payload)
+        assert facade_ingest_payload is not None
+        self.assertEqual(facade_ingest_payload["pipeline"], "v2")
+        self.assertTrue(facade_ingest_payload["resumed"])
+        self.assertEqual(facade_ingest_payload["run_id"], run_id)
 
     def test_non_attachment_child_documents_are_not_treated_as_attachments(self) -> None:
         parent_path = self.root / "parent.txt"
