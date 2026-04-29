@@ -16698,12 +16698,23 @@ def write_attachment_blob(
     return rel_path.as_posix(), absolute_path
 
 
-def remove_file_if_exists(path: Path) -> None:
-    try:
-        if path.is_file() or path.is_symlink():
-            path.unlink()
-    except FileNotFoundError:
-        return
+def remove_file_if_exists(path: Path, *, ignore_permission_error: bool = False) -> bool:
+    retry_delays = PREVIEW_ARTIFACT_WRITE_RETRY_DELAYS_SECONDS
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                return True
+            return False
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            if attempt < len(retry_delays) and preview_artifact_write_is_retryable(exc):
+                time.sleep(retry_delays[attempt])
+                continue
+            if ignore_permission_error and preview_artifact_write_is_retryable(exc):
+                return False
+            raise
 
 
 def cleanup_document_artifacts(
@@ -16733,7 +16744,10 @@ def cleanup_document_artifacts(
             (preview_row["rel_preview_path"], row["id"]),
         ).fetchone()
         if referenced_elsewhere is None:
-            remove_file_if_exists(paths["state_dir"] / preview_row["rel_preview_path"])
+            remove_file_if_exists(
+                paths["state_dir"] / preview_row["rel_preview_path"],
+                ignore_permission_error=True,
+            )
     if is_internal_rel_path(row["rel_path"]):
         remove_file_if_exists(document_absolute_path(paths, row["rel_path"]))
 

@@ -6937,6 +6937,43 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         sleep_mock.assert_called_once_with(retriever_tools.PREVIEW_ARTIFACT_WRITE_RETRY_DELAYS_SECONDS[0])
         self.assertEqual(list(target_path.parent.glob(".2022-12-16.html.*.tmp")), [])
 
+    def test_preview_cleanup_permission_error_does_not_block_atomic_rewrite(self) -> None:
+        rel_path = "slack/general/2022-12-16.json"
+        target_path = self.paths["state_dir"] / "previews/slack/general/2022-12-16.html"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("old preview", encoding="utf-8")
+        real_unlink = type(target_path).unlink
+        unlink_calls: list[Path] = []
+
+        def unlink_blocked(path: Path, *args: object, **kwargs: object) -> None:
+            if Path(path) == target_path:
+                unlink_calls.append(Path(path))
+                raise PermissionError("preview temporarily locked")
+            real_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(type(target_path), "unlink", autospec=True, side_effect=unlink_blocked),
+            mock.patch.object(retriever_tools.time, "sleep") as sleep_mock,
+        ):
+            removed = retriever_tools.remove_file_if_exists(target_path, ignore_permission_error=True)
+            preview_rows = retriever_tools.write_preview_artifacts(
+                self.paths,
+                rel_path,
+                [
+                    {
+                        "file_name": "2022-12-16.html",
+                        "preview_type": "html",
+                        "content": "<p>new preview</p>",
+                    }
+                ],
+            )
+
+        self.assertFalse(removed)
+        self.assertEqual(len(unlink_calls), len(retriever_tools.PREVIEW_ARTIFACT_WRITE_RETRY_DELAYS_SECONDS) + 1)
+        self.assertEqual(target_path.read_text(encoding="utf-8"), "<p>new preview</p>")
+        self.assertEqual(preview_rows[0]["rel_preview_path"], "previews/slack/general/2022-12-16.html")
+        self.assertEqual(sleep_mock.call_count, len(retriever_tools.PREVIEW_ARTIFACT_WRITE_RETRY_DELAYS_SECONDS))
+
     def test_iter_prepared_loose_file_items_preserves_input_order_with_multiple_workers(self) -> None:
         items = [
             {
