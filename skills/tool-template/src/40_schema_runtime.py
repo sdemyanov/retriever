@@ -913,6 +913,19 @@ def refresh_documents_from_occurrences(connection: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def should_refresh_document_occurrence_caches(
+    *,
+    prior_schema_version: int | None,
+    backfilled_occurrence_dataset_source_ids: int,
+    backfilled_document_occurrences: int,
+) -> bool:
+    # A full occurrence refresh also rebuilds document entity links; keep it off
+    # the read-only command path once the workspace schema is current.
+    if prior_schema_version != SCHEMA_VERSION:
+        return True
+    return backfilled_occurrence_dataset_source_ids > 0 or backfilled_document_occurrences > 0
+
+
 def backfill_control_numbers(connection: sqlite3.Connection) -> int:
     columns = table_columns(connection, "documents")
     required = {
@@ -1564,7 +1577,16 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     rebuilt_control_number_batches = backfill_control_number_batches(connection)
     backfilled_document_occurrences = backfill_document_occurrences(connection)
     backfilled_document_dedupe_keys = backfill_document_dedupe_keys(connection)
-    refreshed_document_occurrence_caches = refresh_documents_from_occurrences(connection)
+    refresh_document_occurrence_caches = should_refresh_document_occurrence_caches(
+        prior_schema_version=prior_schema_version,
+        backfilled_occurrence_dataset_source_ids=backfilled_occurrence_dataset_source_ids,
+        backfilled_document_occurrences=backfilled_document_occurrences,
+    )
+    refreshed_document_occurrence_caches = (
+        refresh_documents_from_occurrences(connection)
+        if refresh_document_occurrence_caches
+        else 0
+    )
     removed_custodian_locks = drop_document_field_locks(connection, "custodian")
     removed_documents_custodian_column = remove_documents_custodian_column(connection)
     rebuilt_documents_fts = ensure_documents_fts(connection)
@@ -1587,6 +1609,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         "rebuilt_control_number_batches": rebuilt_control_number_batches,
         "backfilled_document_occurrences": backfilled_document_occurrences,
         "backfilled_document_dedupe_keys": backfilled_document_dedupe_keys,
+        "refresh_document_occurrence_caches": refresh_document_occurrence_caches,
         "refreshed_document_occurrence_caches": refreshed_document_occurrence_caches,
         "removed_custodian_locks": removed_custodian_locks,
         "removed_documents_custodian_column": removed_documents_custodian_column,
