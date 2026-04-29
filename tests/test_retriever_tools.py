@@ -18916,7 +18916,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(step_exit, 0)
         self.assertIsNotNone(step_payload)
         self.assertEqual(step_payload["run"]["status"], "completed")
-        self.assertEqual(step_payload["run"]["counts"]["by_unit_type"]["csv_entity_row"]["completed"], 1)
+        self.assertEqual(step_payload["run"]["counts"]["by_unit_type"]["csv_entity_batch"]["completed"], 1)
 
         with export_path.open("r", encoding="utf-8", newline="") as handle:
             rows = list(csv.reader(handle))
@@ -18988,7 +18988,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(step_exit, 0)
         self.assertIsNotNone(step_payload)
         self.assertEqual(step_payload["run"]["status"], "completed")
-        self.assertEqual(step_payload["run"]["counts"]["by_unit_type"]["csv_conversation_row"]["completed"], 2)
+        self.assertEqual(step_payload["run"]["counts"]["by_unit_type"]["csv_conversation_batch"]["completed"], 1)
 
         with export_path.open("r", encoding="utf-8", newline="") as handle:
             rows = list(csv.reader(handle))

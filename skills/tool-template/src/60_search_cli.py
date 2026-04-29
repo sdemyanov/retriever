@@ -9740,8 +9740,8 @@ EXPORT_RUN_ACTIVE_STATUSES = {"seeding", "exporting", "finalizing"}
 EXPORT_RUN_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 EXPORT_RUN_STEP_MIN_REMAINING_SECONDS = 1.25
 EXPORT_CSV_ROW_BATCH_SIZE = 100
-EXPORT_CSV_FINALIZE_FRAGMENT_BATCH_SIZE = 1000
-EXPORT_TABLE_CSV_SEED_PAGE_SIZE = 200
+EXPORT_CSV_FINALIZE_FRAGMENT_BATCH_SIZE = 50
+EXPORT_TABLE_CSV_SEED_PAGE_SIZE = 1000
 
 
 def export_run_temp_dir(paths: dict[str, Path], run_id: str) -> Path:
@@ -10150,7 +10150,9 @@ def export_table_csv_start(
             "assembled_ordinal": 0,
             "partial_rel_path": str(Path("tmp") / "exports" / run_id / "output.partial.csv"),
             "seed_offset": 0,
-            "seed_next_ordinal": 1,
+            "seed_next_batch_ordinal": 1,
+            "seed_page_size": EXPORT_TABLE_CSV_SEED_PAGE_SIZE,
+            "seed_batch_mode": "row_batches",
         }
         export_run_csv_rows_dir(paths, run_id).mkdir(parents=True, exist_ok=True)
         if normalized_table_name == "documents":
@@ -10357,23 +10359,74 @@ def export_table_csv_seed_page(
     *,
     offset: int,
     page_size: int,
+    known_total_hits: int | None = None,
 ) -> tuple[list[dict[str, object]], int]:
     normalized_table_name = normalize_export_table_name(table_name)
     if normalized_table_name == "entities":
         sort_specs = coerce_sort_specs(selector.get("sort_specs")) or None
-        payload = list_entities(
-            root,
-            query=str(selector.get("query") or "") or None,
-            limit=page_size,
-            offset=offset,
-            sort_specs=sort_specs,
-            include_ignored=bool(selector.get("include_ignored")),
-        )
-        rows = [dict(item) for item in payload.get("entities", []) if isinstance(item, dict)]
-        for item in rows:
+        normalized_sort_specs = normalize_entity_list_sort_specs(sort_specs=sort_specs) if sort_specs else normalize_entity_list_sort_specs()
+        normalized_query = normalize_whitespace(str(selector.get("query") or "")).lower()
+        include_ignored = bool(selector.get("include_ignored"))
+        where_clauses = ["e.canonical_status != ?"] if include_ignored else ["e.canonical_status = ?"]
+        params: list[object] = [ENTITY_STATUS_MERGED if include_ignored else ENTITY_STATUS_ACTIVE]
+        if normalized_query:
+            like_query = f"%{normalized_query}%"
+            where_clauses.append(
+                """
+                (
+                  LOWER(COALESCE(e.display_name, '')) LIKE ?
+                  OR LOWER(COALESCE(e.primary_email, '')) LIKE ?
+                  OR LOWER(COALESCE(e.primary_phone, '')) LIKE ?
+                  OR EXISTS (
+                    SELECT 1
+                    FROM entity_identifiers ei
+                    WHERE ei.entity_id = e.id
+                      AND (
+                        LOWER(COALESCE(ei.display_value, '')) LIKE ?
+                        OR LOWER(COALESCE(ei.normalized_value, '')) LIKE ?
+                      )
+                  )
+                )
+                """
+            )
+            params.extend([like_query, like_query, like_query, like_query, like_query])
+        where_sql = " AND ".join(where_clauses)
+        if known_total_hits is None:
+            total_row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS total
+                FROM entities e
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            ).fetchone()
+            total_hits = int(total_row["total"] if total_row is not None else 0)
+        else:
+            total_hits = max(0, int(known_total_hits))
+        rows = connection.execute(
+            f"""
+            SELECT e.*,
+                   COUNT(DISTINCT de.document_id) AS document_count,
+                   GROUP_CONCAT(DISTINCT de.role) AS roles
+            FROM entities e
+            LEFT JOIN document_entities de ON de.entity_id = e.id
+            WHERE {where_sql}
+            GROUP BY e.id
+            ORDER BY {entity_list_order_sql(normalized_sort_specs)}
+            LIMIT ?
+            OFFSET ?
+            """,
+            (*params, max(1, int(page_size)), max(0, int(offset))),
+        ).fetchall()
+        entity_ids = [int(row["id"]) for row in rows]
+        identifiers_by_entity = entity_identifiers_by_entity_id(connection, entity_ids)
+        entities = [
+            serialize_entity_summary(row, identifiers_by_entity.get(int(row["id"]), []))
+            for row in rows
+        ]
+        for item in entities:
             item["entity_status"] = item.get("canonical_status")
-        total_hits = int(payload.get("total_hits") or payload.get("total") or 0)
-        return rows, total_hits
+        return entities, total_hits
 
     sort_specs = coerce_sort_specs(selector.get("sort_specs")) or None
     raw_scope = coerce_scope_payload(selector.get("scope"))
@@ -10406,23 +10459,48 @@ def export_table_csv_seed_step(
     if table_name == "documents":
         raise RetrieverError("Document CSV exports do not use table seeding.")
 
+    if cursor.get("seed_batch_mode") != "row_batches":
+        connection.execute("DELETE FROM export_work_items WHERE run_id = ?", (run_id,))
+        cursor["seed_offset"] = 0
+        cursor["seed_next_batch_ordinal"] = 1
+        cursor["seed_page_size"] = EXPORT_TABLE_CSV_SEED_PAGE_SIZE
+        cursor["seed_batch_mode"] = "row_batches"
+        cursor.pop("seed_next_ordinal", None)
+        connection.execute(
+            """
+            UPDATE export_runs
+            SET total_items = 0,
+                completed_items = 0,
+                failed_items = 0,
+                cursor_json = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (compact_json_text(cursor), utc_now(), run_id),
+        )
+        connection.commit()
+
     seed_offset = int(cursor.get("seed_offset") or 0)
-    next_ordinal = int(cursor.get("seed_next_ordinal") or 1)
+    next_batch_ordinal = int(cursor.get("seed_next_batch_ordinal") or 1)
+    page_size = max(1, int(cursor.get("seed_page_size") or EXPORT_TABLE_CSV_SEED_PAGE_SIZE))
+    known_total_hits = int(cursor["seed_total_hits"]) if cursor.get("seed_total_hits") is not None else None
     explicit_limit = normalize_export_table_limit(int(selector["limit"])) if selector.get("limit") is not None else None
-    seeded = 0
+    seeded_rows = 0
+    seeded_batches = 0
     total_to_export = int(row["total_items"] or 0)
+    total_rows = int(cursor.get("seed_total_rows") or 0)
     completed = False
     while ingest_v2_deadline_remaining_seconds(deadline) >= EXPORT_RUN_STEP_MIN_REMAINING_SECONDS:
-        if explicit_limit is not None and next_ordinal > explicit_limit:
-            total_to_export = explicit_limit
+        if explicit_limit is not None and seed_offset >= explicit_limit:
+            total_rows = explicit_limit
             completed = True
             break
-        remaining_limit = None if explicit_limit is None else max(0, explicit_limit - next_ordinal + 1)
+        remaining_limit = None if explicit_limit is None else max(0, explicit_limit - seed_offset)
         if remaining_limit == 0:
-            total_to_export = explicit_limit or total_to_export
+            total_rows = explicit_limit or total_rows
             completed = True
             break
-        page_size = EXPORT_TABLE_CSV_SEED_PAGE_SIZE if remaining_limit is None else min(EXPORT_TABLE_CSV_SEED_PAGE_SIZE, remaining_limit)
+        current_page_size = page_size if remaining_limit is None else min(page_size, remaining_limit)
         page_rows, total_hits = export_table_csv_seed_page(
             root,
             connection,
@@ -10430,47 +10508,53 @@ def export_table_csv_seed_step(
             table_name,
             selector,
             offset=seed_offset,
-            page_size=page_size,
+            page_size=current_page_size,
+            known_total_hits=known_total_hits,
         )
-        total_to_export = min(total_hits, explicit_limit) if explicit_limit is not None else total_hits
+        known_total_hits = total_hits
+        total_rows = min(total_hits, explicit_limit) if explicit_limit is not None else total_hits
+        total_to_export = (total_rows + page_size - 1) // page_size if total_rows else 0
         if not page_rows:
             completed = True
             break
         row_id_key = "entity_id" if table_name == "entities" else "conversation_id"
-        unit_type = "csv_entity_row" if table_name == "entities" else "csv_conversation_row"
+        unit_type = "csv_entity_batch" if table_name == "entities" else "csv_conversation_batch"
         now = utc_now()
-        connection.executemany(
+        connection.execute(
             """
             INSERT INTO export_work_items (
               run_id, unit_type, ordinal, document_id, payload_json, artifact_manifest_json,
               status, created_at, updated_at
             ) VALUES (?, ?, ?, NULL, ?, '{}', 'pending', ?, ?)
             """,
-            [
-                (
-                    run_id,
-                    unit_type,
-                    next_ordinal + index,
-                    compact_json_text(
-                        {
-                            "table": table_name,
-                            row_id_key: int(page_row["id"]),
-                            "row": dict(page_row),
-                        }
-                    ),
-                    now,
-                    now,
-                )
-                for index, page_row in enumerate(page_rows)
-            ],
+            (
+                run_id,
+                unit_type,
+                next_batch_ordinal,
+                compact_json_text(
+                    {
+                        "table": table_name,
+                        "row_id_key": row_id_key,
+                        "offset": seed_offset,
+                        "row_count": len(page_rows),
+                        "rows": [dict(page_row) for page_row in page_rows],
+                    }
+                ),
+                now,
+                now,
+            ),
         )
-        seeded += len(page_rows)
+        seeded_rows += len(page_rows)
+        seeded_batches += 1
         seed_offset += len(page_rows)
-        next_ordinal += len(page_rows)
+        next_batch_ordinal += 1
         cursor["seed_offset"] = seed_offset
-        cursor["seed_next_ordinal"] = next_ordinal
+        cursor["seed_next_batch_ordinal"] = next_batch_ordinal
+        cursor["seed_page_size"] = page_size
         cursor["seed_total_hits"] = total_hits
-        cursor["seed_total_to_export"] = total_to_export
+        cursor["seed_total_rows"] = total_rows
+        cursor["seed_total_to_export"] = total_rows
+        cursor["seed_total_batches"] = total_to_export
         connection.execute(
             """
             UPDATE export_runs
@@ -10482,14 +10566,17 @@ def export_table_csv_seed_step(
             (total_to_export, compact_json_text(cursor), utc_now(), run_id),
         )
         connection.commit()
-        if seed_offset >= total_to_export or len(page_rows) < page_size:
+        if seed_offset >= total_rows or len(page_rows) < current_page_size:
             completed = True
             break
 
     if completed:
         cursor["seed_offset"] = seed_offset
-        cursor["seed_next_ordinal"] = next_ordinal
-        cursor["seed_total_to_export"] = total_to_export
+        cursor["seed_next_batch_ordinal"] = next_batch_ordinal
+        cursor["seed_page_size"] = page_size
+        cursor["seed_total_rows"] = total_rows
+        cursor["seed_total_to_export"] = total_rows
+        cursor["seed_total_batches"] = total_to_export
         cursor["seed_completed"] = True
         next_phase = "exporting" if total_to_export > 0 else "finalizing"
         connection.execute(
@@ -10506,8 +10593,10 @@ def export_table_csv_seed_step(
         )
         connection.commit()
     return {
-        "seeded": seeded,
+        "seeded": seeded_rows,
+        "seeded_batches": seeded_batches,
         "offset": seed_offset,
+        "total_rows": total_rows,
         "total_items": total_to_export,
         "completed": completed,
         "table": table_name,
@@ -10522,6 +10611,23 @@ def render_csv_fragment_for_item(
     payload = decode_json_text(item["payload_json"], default={}) or {}
     table_name = normalize_export_table_name(str(payload.get("table") or "documents"))
     if table_name != "documents":
+        rows = payload.get("rows")
+        if isinstance(rows, list):
+            buffer = io.StringIO()
+            writer = csv.writer(buffer)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                writer.writerow(
+                    [
+                        serialize_export_cell_value(
+                            row.get(str(field_def["field_name"])),
+                            str(field_def["field_type"]),
+                        )
+                        for field_def in field_defs
+                    ]
+                )
+            return buffer.getvalue()
         row = payload.get("row")
         if not isinstance(row, dict):
             raise RetrieverError(f"Missing {table_name} row payload for CSV export item {int(item['id'])}.")

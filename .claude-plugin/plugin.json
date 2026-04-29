@@ -1,6 +1,6 @@
 {
   "name": "retriever",
-  "version": "1.1.14",
+  "version": "1.1.15",
   "description": "Retriever is a local-first document intelligence plugin for Claude Cowork.",
   "author": {
     "name": "Sergey Demyanov"
