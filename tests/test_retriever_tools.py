@@ -6899,6 +6899,42 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ):
                 retriever_tools.acquire_workspace_ingest_lock(self.paths)
 
+    def test_write_preview_artifacts_retries_transient_replace_permission_error(self) -> None:
+        rel_path = "slack/general/2022-12-16.json"
+        target_path = self.paths["state_dir"] / "previews/slack/general/2022-12-16.html"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("old preview", encoding="utf-8")
+        real_replace = retriever_tools.os.replace
+        replace_calls: list[tuple[str, str]] = []
+
+        def replace_once_blocked(src: str, dst: str) -> None:
+            replace_calls.append((src, dst))
+            if len(replace_calls) == 1:
+                raise PermissionError("preview temporarily locked")
+            real_replace(src, dst)
+
+        with (
+            mock.patch.object(retriever_tools.os, "replace", side_effect=replace_once_blocked),
+            mock.patch.object(retriever_tools.time, "sleep") as sleep_mock,
+        ):
+            preview_rows = retriever_tools.write_preview_artifacts(
+                self.paths,
+                rel_path,
+                [
+                    {
+                        "file_name": "2022-12-16.html",
+                        "preview_type": "html",
+                        "content": "<p>new preview</p>",
+                    }
+                ],
+            )
+
+        self.assertEqual(target_path.read_text(encoding="utf-8"), "<p>new preview</p>")
+        self.assertEqual(preview_rows[0]["rel_preview_path"], "previews/slack/general/2022-12-16.html")
+        self.assertEqual(len(replace_calls), 2)
+        sleep_mock.assert_called_once_with(retriever_tools.PREVIEW_ARTIFACT_WRITE_RETRY_DELAYS_SECONDS[0])
+        self.assertEqual(list(target_path.parent.glob(".2022-12-16.html.*.tmp")), [])
+
     def test_iter_prepared_loose_file_items_preserves_input_order_with_multiple_workers(self) -> None:
         items = [
             {
