@@ -18855,6 +18855,145 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertEqual(rows, [["file_name"], ["alpha.txt"]])
 
+    def test_slash_export_table_entities_starts_bounded_csv(self) -> None:
+        self.write_email_message(
+            self.root / "alice-one.eml",
+            subject="Entity export one",
+            body_text="First body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<alice-export-one@example.com>",
+        )
+        self.write_email_message(
+            self.root / "alice-two.eml",
+            subject="Entity export two",
+            body_text="Second body",
+            author="Alice A. <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id="<alice-export-two@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+        rebuild_exit, rebuild_payload, _, _ = self.run_cli("rebuild-entities", str(self.root), "--batch-size", "1")
+        self.assertEqual(rebuild_exit, 0)
+        self.assertIsNotNone(rebuild_payload)
+
+        export_path = self.root / ".retriever" / "exports" / "entities.csv"
+        start_exit, start_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/export",
+            "table",
+            "entities",
+            "entities.csv",
+            "--keyword",
+            "alice@example.com",
+            "--field",
+            "primary_email",
+            "--field",
+            "document_count",
+            "--field",
+            "roles",
+        )
+
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertEqual(start_payload["table"], "entities")
+        self.assertEqual(start_payload["export_kind"], "csv")
+        self.assertEqual(start_payload["counts"]["by_unit_type"]["csv_entity_row"]["pending"], 1)
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "export-csv-run-step",
+            str(self.root),
+            "--run-id",
+            start_payload["run_id"],
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertEqual(step_payload["run"]["status"], "completed")
+
+        with export_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        self.assertEqual(rows[0], ["primary_email", "document_count", "roles"])
+        self.assertEqual(rows[1][0], "alice@example.com")
+        self.assertEqual(rows[1][1], "2")
+        self.assertIn("author", rows[1][2])
+        self.assertEqual(len(rows), 2)
+
+    def test_slash_export_table_conversations_starts_bounded_csv(self) -> None:
+        root_message_id = "<conversation-export-root@example.com>"
+        self.write_email_message(
+            self.root / "root.eml",
+            subject="Conversation Export",
+            body_text="Root body",
+            author="Alice Example <alice@example.com>",
+            recipients="Bob Example <bob@example.com>",
+            message_id=root_message_id,
+        )
+        self.write_email_message(
+            self.root / "reply.eml",
+            subject="Re: Conversation Export",
+            body_text="Reply body",
+            author="Bob Example <bob@example.com>",
+            recipients="Alice Example <alice@example.com>",
+            message_id="<conversation-export-reply@example.com>",
+            in_reply_to=root_message_id,
+            references=root_message_id,
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        export_path = self.root / ".retriever" / "exports" / "conversations.csv"
+        start_exit, start_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/export",
+            "table",
+            "conversations",
+            "conversations.csv",
+            "--keyword",
+            "Conversation Export",
+            "--field",
+            "title",
+            "--field",
+            "document_count",
+            "--field",
+            "conversation_type",
+        )
+
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertEqual(start_payload["table"], "conversations")
+        self.assertEqual(start_payload["export_kind"], "csv")
+        self.assertEqual(start_payload["counts"]["by_unit_type"]["csv_conversation_row"]["pending"], 2)
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "export-csv-run-step",
+            str(self.root),
+            "--run-id",
+            start_payload["run_id"],
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertEqual(step_payload["run"]["status"], "completed")
+
+        with export_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        self.assertEqual(rows[0], ["title", "document_count", "conversation_type"])
+        self.assertTrue(any("Conversation Export" in row[0] for row in rows[1:]))
+        self.assertEqual([row[1] for row in rows[1:]], ["1", "1"])
+        self.assertEqual(len(rows), 3)
+
     def test_export_csv_select_from_scope_and_narrows_with_explicit_filter(self) -> None:
         (self.root / "alpha-one.txt").write_text("alpha body one\n", encoding="utf-8")
         (self.root / "alpha-two.txt").write_text("alpha body two\n", encoding="utf-8")

@@ -934,7 +934,7 @@ SCHEMA_STATEMENTS = [
       run_id TEXT NOT NULL REFERENCES export_runs(run_id) ON DELETE CASCADE,
       unit_type TEXT NOT NULL,
       ordinal INTEGER NOT NULL,
-      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
       payload_json TEXT NOT NULL DEFAULT '{}',
       artifact_manifest_json TEXT NOT NULL DEFAULT '{}',
       status TEXT NOT NULL DEFAULT 'pending',
@@ -1644,6 +1644,57 @@ def ensure_column(connection: sqlite3.Connection, table_name: str, column_defini
     if column_name in table_columns(connection, table_name):
         return
     connection.execute(f"ALTER TABLE {quote_identifier(table_name)} ADD COLUMN {column_definition}")
+
+
+def ensure_export_work_items_nullable_document_id(connection: sqlite3.Connection) -> bool:
+    if not table_exists(connection, "export_work_items"):
+        return False
+    document_id_info = None
+    for row in table_info(connection, "export_work_items"):
+        if row["name"] == "document_id":
+            document_id_info = row
+            break
+    if document_id_info is None or int(document_id_info["notnull"] or 0) == 0:
+        return False
+
+    backup_table = "export_work_items_document_id_notnull_backup"
+    connection.execute(f"DROP TABLE IF EXISTS {quote_identifier(backup_table)}")
+    connection.execute(f"ALTER TABLE export_work_items RENAME TO {quote_identifier(backup_table)}")
+    connection.execute(
+        """
+        CREATE TABLE export_work_items (
+          id INTEGER PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES export_runs(run_id) ON DELETE CASCADE,
+          unit_type TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          artifact_manifest_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'pending',
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(run_id, ordinal)
+        )
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO export_work_items (
+          id, run_id, unit_type, ordinal, document_id, payload_json, artifact_manifest_json,
+          status, last_error, created_at, updated_at
+        )
+        SELECT
+          id, run_id, unit_type, ordinal, document_id, payload_json, artifact_manifest_json,
+          status, last_error, created_at, updated_at
+        FROM {quote_identifier(backup_table)}
+        """
+    )
+    connection.execute(f"DROP TABLE {quote_identifier(backup_table)}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_export_work_items_run_status ON export_work_items(run_id, status, ordinal)"
+    )
+    return True
 
 
 def normalize_string_list(raw_value: object) -> list[str]:

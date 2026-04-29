@@ -6814,9 +6814,18 @@ def run_scope_search_from_session(root: Path, paths: dict[str, Path], scope: dic
     return run_browsing_search_from_session(root, paths, session_state, offset=0, browse_mode=browse_mode)
 
 
-SLASH_EXPORT_TABLE_ALIASES = {"document", "documents", "doc", "docs"}
-SLASH_EXPORT_KNOWN_TABLES = SLASH_EXPORT_TABLE_ALIASES | {"conversation", "conversations", "entity", "entities", "dataset", "datasets"}
-SLASH_EXPORT_BOOLEAN_OPTIONS = {"--no-scope", "--portable", "--portable-workspace"}
+EXPORT_TABLE_ALIASES = {
+    "document": "documents",
+    "documents": "documents",
+    "doc": "documents",
+    "docs": "documents",
+    "entity": "entities",
+    "entities": "entities",
+    "conversation": "conversations",
+    "conversations": "conversations",
+}
+SLASH_EXPORT_KNOWN_TABLES = set(EXPORT_TABLE_ALIASES) | {"dataset", "datasets"}
+SLASH_EXPORT_BOOLEAN_OPTIONS = {"--include-ignored", "--no-scope", "--portable", "--portable-workspace"}
 SLASH_EXPORT_VALUE_OPTIONS = {
     "--bates",
     "--budget-seconds",
@@ -6833,6 +6842,14 @@ SLASH_EXPORT_VALUE_OPTIONS = {
     "--sort-by",
     "--sort-order",
 }
+
+
+def normalize_export_table_name(table_name: str) -> str:
+    normalized = normalize_inline_whitespace(str(table_name or "documents")).lower()
+    table = EXPORT_TABLE_ALIASES.get(normalized)
+    if table is None:
+        raise RetrieverError("Supported export tables are: documents, entities, conversations.")
+    return table
 
 
 def slash_export_timestamp() -> str:
@@ -6896,21 +6913,6 @@ def parse_optional_int_option(options: dict[str, object], option_name: str) -> i
         raise RetrieverError(f"{option_name} must be an integer.") from exc
 
 
-def slash_export_default_document_fields(
-    connection: sqlite3.Connection,
-    paths: dict[str, Path],
-    session_state: dict[str, object],
-) -> list[str]:
-    column_defs, _, _ = resolve_session_display_columns(
-        connection,
-        paths,
-        session_state,
-        browse_mode=BROWSE_MODE_DOCUMENTS,
-    )
-    fields = display_column_names(column_defs)
-    return fields or ["control_number", "file_name", "source_kind", "content_type"]
-
-
 def normalize_slash_export_filters(options: dict[str, object]) -> list[list[str]] | None:
     raw_filters = options.get("--filter")
     if raw_filters is None:
@@ -6936,12 +6938,9 @@ def run_export_table_slash_command(
     positionals, options = parse_slash_export_options(tokens)
     table_name = "documents"
     if positionals and positionals[0].lower() in SLASH_EXPORT_KNOWN_TABLES:
-        raw_table_name = positionals.pop(0).lower()
-        if raw_table_name not in SLASH_EXPORT_TABLE_ALIASES:
-            raise RetrieverError("Only /export table documents is supported right now.")
-        table_name = "documents"
+        table_name = normalize_export_table_name(positionals.pop(0))
 
-    output_path = slash_export_default_output_path("table", "csv")
+    output_path = slash_export_default_output_path(table_name, "csv")
     if positionals and (positionals[0].lower().endswith(".csv") or "/" in positionals[0] or "\\" in positionals[0]):
         output_path = positionals.pop(0)
 
@@ -6950,8 +6949,6 @@ def run_export_table_slash_command(
         query = str(options["--keyword"])
 
     fields = [str(field) for field in options.get("--field", [])] if "--field" in options else None
-    if fields is None:
-        fields = slash_export_default_document_fields(connection, paths, session_state)
 
     document_ids = None
     if "--doc-id" in options:
@@ -6966,17 +6963,21 @@ def run_export_table_slash_command(
                 raise RetrieverError("--doc-id must be an integer.") from exc
 
     budget_seconds = parse_optional_int_option(options, "--budget-seconds")
+    limit = parse_optional_int_option(options, "--limit")
     select_from_scope = not bool(options.get("--no-scope")) and not document_ids
-    payload = export_csv_start(
+    payload = export_table_csv_start(
         root,
         output_path,
-        fields,
-        document_ids,
-        query,
-        normalize_slash_export_filters(options),
-        str(options["--sort"]) if "--sort" in options else None,
-        str(options["--order"]) if "--order" in options else None,
-        select_from_scope,
+        table_name=table_name,
+        raw_fields=fields,
+        document_ids=document_ids,
+        query=query,
+        raw_filters=normalize_slash_export_filters(options),
+        sort_field=str(options["--sort"]) if "--sort" in options else None,
+        order=str(options["--order"]) if "--order" in options else None,
+        select_from_scope=select_from_scope,
+        include_ignored_entities=bool(options.get("--include-ignored")),
+        limit=limit,
         budget_seconds=budget_seconds,
     )
     payload["slash_command"] = "/export table"
@@ -7988,6 +7989,39 @@ def resolve_export_field_definitions(
     return resolved_fields
 
 
+def resolve_table_export_field_definitions(
+    connection: sqlite3.Connection,
+    table_name: str,
+    raw_fields: list[str] | None,
+) -> list[dict[str, str]]:
+    normalized_table_name = normalize_export_table_name(table_name)
+    if normalized_table_name == "documents":
+        return resolve_export_field_definitions(connection, raw_fields or default_display_columns(BROWSE_MODE_DOCUMENTS))
+    fields = list(raw_fields or default_display_columns(
+        BROWSE_MODE_ENTITIES if normalized_table_name == "entities" else BROWSE_MODE_CONVERSATIONS
+    ))
+    if not fields:
+        raise RetrieverError(f"/export table {normalized_table_name} requires at least one field.")
+    browse_mode = BROWSE_MODE_ENTITIES if normalized_table_name == "entities" else BROWSE_MODE_CONVERSATIONS
+    resolved_fields: list[dict[str, str]] = []
+    seen_fields: set[str] = set()
+    for raw_field in fields:
+        field_def = resolve_browse_field_definition(connection, raw_field, browse_mode=browse_mode)
+        normalized_field_name = str(field_def["field_name"])
+        if normalized_field_name in seen_fields:
+            raise RetrieverError(f"Duplicate export field: {normalized_field_name}")
+        seen_fields.add(normalized_field_name)
+        resolved_fields.append(
+            {
+                "requested_name": raw_field,
+                "field_name": normalized_field_name,
+                "field_type": str(field_def["field_type"]),
+                "source": str(field_def.get("source") or ""),
+            }
+        )
+    return resolved_fields
+
+
 def path_within(candidate: Path, parent: Path) -> bool:
     try:
         candidate.relative_to(parent)
@@ -8553,6 +8587,169 @@ def resolve_export_csv_selection(
                 "order": selection["order"],
             }
         rows = [item["row"] for item in selection["results"]]
+    return rows, selector
+
+
+def resolve_export_entity_table_rows(
+    root: Path,
+    *,
+    query: str | None,
+    sort_specs: list[tuple[str, str]] | None,
+    include_ignored: bool,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    offset = 0
+    limit = 200
+    last_payload: dict[str, object] = {}
+    while True:
+        payload = list_entities(
+            root,
+            query=query,
+            limit=limit,
+            offset=offset,
+            sort_specs=sort_specs,
+            include_ignored=include_ignored,
+        )
+        last_payload = payload
+        page_rows = [dict(item) for item in payload.get("entities", []) if isinstance(item, dict)]
+        for item in page_rows:
+            item["entity_status"] = item.get("canonical_status")
+        rows.extend(page_rows)
+        total_hits = int(payload.get("total_hits") or payload.get("total") or 0)
+        if len(rows) >= total_hits or not page_rows:
+            break
+        offset += limit
+    selector = {
+        "mode": "table",
+        "table": "entities",
+        "query": last_payload.get("query") or normalize_whitespace(str(query or "")),
+        "sort": last_payload.get("sort"),
+        "order": last_payload.get("order"),
+        "sort_spec": last_payload.get("sort_spec"),
+        "include_ignored": bool(include_ignored),
+    }
+    return rows, selector
+
+
+def resolve_export_conversation_table_rows(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    raw_scope: object,
+    *,
+    sort_specs: list[tuple[str, str]] | None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    selection = resolve_paged_scope_conversation_search(
+        connection,
+        paths,
+        raw_scope,
+        sort_specs=sort_specs,
+        offset=0,
+        per_page=1_000_000_000,
+    )
+    rows = [dict(item) for item in selection["results"] if isinstance(item, dict)]
+    selector = {
+        "mode": "table",
+        "table": "conversations",
+        "scope": selection["scope"],
+        "query": selection["query"],
+        "filters": selection["filters"],
+        "sort": selection["sort"],
+        "order": selection["order"],
+        "sort_spec": selection["sort_spec"],
+    }
+    return rows, selector
+
+
+def resolve_export_table_csv_selection(
+    root: Path,
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+    table_name: str,
+    document_ids: list[int] | None,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+    select_from_scope: bool = False,
+    include_ignored_entities: bool = False,
+    limit: int | None = None,
+) -> tuple[list[object], dict[str, object]]:
+    normalized_table_name = normalize_export_table_name(table_name)
+    normalized_limit = None if limit is None else max(1, int(limit))
+    if normalized_table_name == "documents":
+        rows, selector = resolve_export_csv_selection(
+            connection,
+            paths,
+            document_ids,
+            query,
+            raw_filters,
+            sort_field,
+            order,
+            select_from_scope,
+        )
+        if normalized_limit is not None:
+            rows = rows[:normalized_limit]
+            selector["limit"] = normalized_limit
+        selector["table"] = "documents"
+        return rows, selector
+
+    if document_ids:
+        raise RetrieverError(f"/export table {normalized_table_name} does not accept --doc-id.")
+
+    if normalized_table_name == "entities":
+        if raw_filters:
+            raise RetrieverError("/export table entities does not support --filter yet. Use an entity query instead.")
+        effective_query = normalize_whitespace(str(query or ""))
+        include_ignored = bool(include_ignored_entities)
+        if select_from_scope and not effective_query:
+            scoped_query, scoped_include_ignored = entity_browsing_options(session_state)
+            effective_query = scoped_query or ""
+            include_ignored = include_ignored or scoped_include_ignored
+        if sort_field or order:
+            sort_specs = normalize_entity_list_sort_specs(sort=sort_field or "document_count", order=order)
+        elif select_from_scope:
+            sort_specs = session_sort_specs(session_state, browse_mode=BROWSE_MODE_ENTITIES) or None
+        else:
+            sort_specs = None
+        rows, selector = resolve_export_entity_table_rows(
+            root,
+            query=effective_query or None,
+            sort_specs=sort_specs,
+            include_ignored=include_ignored,
+        )
+        selector["selected_from_scope"] = bool(select_from_scope)
+        if normalized_limit is not None:
+            rows = rows[:normalized_limit]
+            selector["limit"] = normalized_limit
+        return rows, selector
+
+    effective_scope = build_effective_scope_selector(
+        connection,
+        paths,
+        query=query,
+        raw_bates=None,
+        raw_filters=raw_filters,
+        dataset_names=None,
+        from_run_id=None,
+        select_from_scope=select_from_scope,
+    )
+    if sort_field or order:
+        sort_specs = normalize_conversation_list_sort_specs(connection, sort=sort_field, order=order)
+    elif select_from_scope:
+        sort_specs = session_sort_specs(session_state, browse_mode=BROWSE_MODE_CONVERSATIONS) or None
+    else:
+        sort_specs = None
+    rows, selector = resolve_export_conversation_table_rows(
+        connection,
+        paths,
+        effective_scope,
+        sort_specs=sort_specs,
+    )
+    selector["selected_from_scope"] = bool(select_from_scope)
+    if normalized_limit is not None:
+        rows = rows[:normalized_limit]
+        selector["limit"] = normalized_limit
     return rows, selector
 
 
@@ -9790,6 +9987,144 @@ def export_csv_start(
         connection.close()
 
 
+def export_table_csv_start(
+    root: Path,
+    raw_output_path: str,
+    *,
+    table_name: str,
+    raw_fields: list[str] | None,
+    document_ids: list[int] | None = None,
+    query: str = "",
+    raw_filters: list[list[str]] | None = None,
+    sort_field: str | None = None,
+    order: str | None = None,
+    select_from_scope: bool = False,
+    include_ignored_entities: bool = False,
+    limit: int | None = None,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    normalized_table_name = normalize_export_table_name(table_name)
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        active_row = active_export_run_row(connection, export_kind="csv")
+        if active_row is not None:
+            raise RetrieverError(f"CSV export run {active_row['run_id']} is already active.")
+        session_state = read_session_state(paths)
+        field_defs = resolve_table_export_field_definitions(connection, normalized_table_name, raw_fields)
+        output_path = resolve_export_output_path(paths, raw_output_path)
+        rows, selector = resolve_export_table_csv_selection(
+            root,
+            connection,
+            paths,
+            session_state,
+            normalized_table_name,
+            document_ids,
+            query,
+            raw_filters,
+            sort_field,
+            order,
+            select_from_scope,
+            include_ignored_entities=include_ignored_entities,
+            limit=limit,
+        )
+        run_id = new_ingest_v2_run_id()
+        now = utc_now()
+        output_rel_path = export_run_output_rel_path(root, output_path)
+        config = {
+            "fields": field_defs,
+            "raw_output_path": raw_output_path,
+            "overwrote_existing_file": output_path.exists(),
+            "table": normalized_table_name,
+        }
+        cursor = {
+            "assembled_ordinal": 0,
+            "partial_rel_path": str(Path("tmp") / "exports" / run_id / "output.partial.csv"),
+        }
+        export_run_csv_rows_dir(paths, run_id).mkdir(parents=True, exist_ok=True)
+        if normalized_table_name == "documents":
+            unit_type = "csv_row"
+            work_items = [
+                (
+                    run_id,
+                    unit_type,
+                    index,
+                    int(row["id"]),  # type: ignore[index]
+                    compact_json_text({"table": "documents", "document_id": int(row["id"])}),  # type: ignore[index]
+                    now,
+                    now,
+                )
+                for index, row in enumerate(rows, start=1)
+            ]
+        else:
+            row_id_key = "entity_id" if normalized_table_name == "entities" else "conversation_id"
+            unit_type = "csv_entity_row" if normalized_table_name == "entities" else "csv_conversation_row"
+            work_items = [
+                (
+                    run_id,
+                    unit_type,
+                    index,
+                    None,
+                    compact_json_text(
+                        {
+                            "table": normalized_table_name,
+                            row_id_key: int(row["id"]),  # type: ignore[index]
+                            "row": dict(row),  # type: ignore[arg-type]
+                        }
+                    ),
+                    now,
+                    now,
+                )
+                for index, row in enumerate(rows, start=1)
+            ]
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                INSERT INTO export_runs (
+                  run_id, export_kind, output_path, output_rel_path, selector_json, config_json,
+                  cursor_json, phase, status, total_items, completed_items, failed_items,
+                  created_at, started_at, last_heartbeat_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    "csv",
+                    str(output_path),
+                    output_rel_path,
+                    compact_json_text(selector),
+                    compact_json_text(config),
+                    compact_json_text(cursor),
+                    "exporting",
+                    "exporting" if rows else "finalizing",
+                    len(rows),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO export_work_items (
+                  run_id, unit_type, ordinal, document_id, payload_json, artifact_manifest_json,
+                  status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, '{}', 'pending', ?, ?)
+                """,
+                work_items,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        row = require_export_run_row(connection, export_kind="csv", run_id=run_id)
+        return {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
+    finally:
+        connection.close()
+
+
 def export_archive_start(
     root: Path,
     raw_output_path: str,
@@ -9910,6 +10245,25 @@ def render_csv_fragment_for_item(
     item: sqlite3.Row,
     field_defs: list[dict[str, str]],
 ) -> str:
+    payload = decode_json_text(item["payload_json"], default={}) or {}
+    table_name = normalize_export_table_name(str(payload.get("table") or "documents"))
+    if table_name != "documents":
+        row = payload.get("row")
+        if not isinstance(row, dict):
+            raise RetrieverError(f"Missing {table_name} row payload for CSV export item {int(item['id'])}.")
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                serialize_export_cell_value(
+                    row.get(str(field_def["field_name"])),
+                    str(field_def["field_type"]),
+                )
+                for field_def in field_defs
+            ]
+        )
+        return buffer.getvalue()
+
     document_id = int(item["document_id"])
     rows = fetch_visible_document_rows_by_ids(connection, [document_id])
     if not rows:

@@ -1196,6 +1196,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
     rename_table_if_needed(connection, "display_id_batches", "control_number_batches")
     for statement in SCHEMA_STATEMENTS:
         connection.execute(statement)
+    migrated_export_work_items_nullable_document_id = ensure_export_work_items_nullable_document_id(connection)
 
     if table_exists(connection, "documents"):
         rename_column_if_needed(connection, "documents", "display_id", "control_number")
@@ -1631,6 +1632,7 @@ def apply_schema(connection: sqlite3.Connection, root: Path | None = None) -> di
         "backfilled_control_numbers": backfilled_control_numbers,
         "rebuilt_control_number_batches": rebuilt_control_number_batches,
         "backfilled_document_occurrences": backfilled_document_occurrences,
+        "migrated_export_work_items_nullable_document_id": migrated_export_work_items_nullable_document_id,
         "backfilled_document_dedupe_keys": backfilled_document_dedupe_keys,
         "refresh_document_occurrence_caches": refresh_document_occurrence_caches,
         "refreshed_document_occurrence_caches": refreshed_document_occurrence_caches,
