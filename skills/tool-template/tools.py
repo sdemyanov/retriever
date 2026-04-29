@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover - platform-specific locking
     msvcrt = None
 
 
-TOOL_VERSION = "1.1.11"
+TOOL_VERSION = "1.1.12"
 SCHEMA_VERSION = 25
 SESSION_SCHEMA_VERSION = 2
 REQUIREMENTS_VERSION = "2026-04-21-phase11-document-deduplication"
@@ -6176,21 +6176,23 @@ def bind_document_dedupe_key(
     basis: str,
     key_value: str | None,
     document_id: int,
-) -> None:
+) -> bool:
     normalized_key = normalize_whitespace(str(key_value or ""))
     if not normalized_key:
-        return
+        return False
     now = utc_now()
-    connection.execute(
+    cursor = connection.execute(
         """
         INSERT INTO document_dedupe_keys (basis, key_value, document_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(basis, key_value) DO UPDATE SET
           document_id = excluded.document_id,
           updated_at = excluded.updated_at
+        WHERE document_dedupe_keys.document_id != excluded.document_id
         """,
         (basis, normalized_key, document_id, now, now),
     )
+    return int(cursor.rowcount or 0) > 0
 
 
 def find_active_occurrence_by_source_identity(
@@ -22645,6 +22647,126 @@ def prepare_production_row_plan(
     return prepared_item
 
 
+def production_expected_preview_artifacts_present(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    expected_html_preview_paths: list[str],
+    expected_page_preview_paths: list[str],
+) -> bool:
+    expected_paths = [
+        normalize_whitespace(str(path))
+        for path in [*expected_html_preview_paths, *expected_page_preview_paths]
+        if normalize_whitespace(str(path))
+    ]
+    if not expected_paths:
+        return True
+    rows = connection.execute(
+        """
+        SELECT rel_preview_path
+        FROM document_previews
+        WHERE document_id = ?
+        """,
+        (document_id,),
+    ).fetchall()
+    known_paths = {str(row["rel_preview_path"] or "") for row in rows}
+    for rel_preview_path in expected_paths:
+        if rel_preview_path not in known_paths:
+            return False
+        if not (paths["state_dir"] / rel_preview_path).exists():
+            return False
+    return True
+
+
+def production_plan_matches_existing_document(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    workspace_root: Path,
+    existing_row: sqlite3.Row | None,
+    prepared_plan: dict[str, object],
+    *,
+    production_id: int,
+) -> bool:
+    if existing_row is None or existing_row["lifecycle_status"] != "active":
+        return False
+    try:
+        text_path = Path(prepared_plan["text_path"]) if prepared_plan.get("text_path") is not None else None
+        native_path = Path(prepared_plan["native_path"]) if prepared_plan.get("native_path") is not None else None
+        matching_image_paths = [Path(path) for path in list(prepared_plan.get("matching_image_paths") or [])]
+        available_text_path = text_path if text_path is not None and text_path.exists() else None
+        available_native_path = native_path if native_path is not None and native_path.exists() else None
+        rel_path = production_logical_rel_path(
+            str(prepared_plan["production_rel_root"]),
+            str(prepared_plan["control_number"]),
+        ).as_posix()
+        preview_image_refs = production_preview_page_asset_refs(
+            rel_path,
+            str(prepared_plan["control_number"]),
+            matching_image_paths,
+        )
+        extracted_payload = build_production_extracted_payload(
+            workspace_root,
+            production_name=str(prepared_plan["production_name"]),
+            control_number=str(prepared_plan["control_number"]),
+            begin_bates=str(prepared_plan["begin_bates"]),
+            end_bates=str(prepared_plan["end_bates"]),
+            begin_attachment=prepared_plan.get("begin_attachment"),
+            end_attachment=prepared_plan.get("end_attachment"),
+            text_path=available_text_path,
+            image_paths=matching_image_paths,
+            native_path=available_native_path,
+            preview_image_refs=preview_image_refs,
+        )
+        preferred_native = extracted_payload.get("preferred_native")
+        source_parts = production_source_parts(
+            workspace_root,
+            text_path=available_text_path,
+            image_paths=matching_image_paths,
+            native_path=available_native_path,
+        )
+        file_name = (
+            (preferred_native.name if isinstance(preferred_native, Path) else None)
+            or (available_native_path.name if available_native_path is not None else None)
+            or f"{prepared_plan['control_number']}.production"
+        )
+        desired_signature = production_row_signature(
+            existing_row,
+            rel_path=rel_path,
+            file_name=file_name,
+            source_kind=PRODUCTION_SOURCE_KIND,
+            production_id=production_id,
+            begin_bates=str(prepared_plan["begin_bates"]),
+            end_bates=str(prepared_plan["end_bates"]),
+            begin_attachment=prepared_plan.get("begin_attachment"),
+            end_attachment=prepared_plan.get("end_attachment"),
+            extracted=extracted_payload,
+            source_parts=source_parts,
+        )
+        if existing_production_row_signature(connection, existing_row) != desired_signature:
+            return False
+        preview_base = preview_base_path_for_rel_path(rel_path)
+        expected_html_preview_paths = [
+            (preview_base / str(artifact["file_name"])).as_posix()
+            for artifact in list(extracted_payload.get("preview_artifacts") or [])
+            if isinstance(artifact, dict) and artifact.get("file_name")
+        ]
+        expected_page_preview_paths = [
+            str(ref["rel_preview_path"])
+            for ref in preview_image_refs
+            if ref.get("rel_preview_path")
+        ]
+        return production_expected_preview_artifacts_present(
+            paths,
+            connection,
+            document_id=int(existing_row["id"]),
+            expected_html_preview_paths=expected_html_preview_paths,
+            expected_page_preview_paths=expected_page_preview_paths,
+        )
+    except Exception:
+        return False
+
+
 def iter_prepared_production_row_plans(
     workspace_root: Path,
     production_row_plans: list[dict[str, object]],
@@ -23762,41 +23884,43 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
     if not table_exists(connection, "documents") or not table_exists(connection, "document_occurrences"):
         return 0
 
+    missing_document_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM document_occurrences
+          WHERE document_occurrences.document_id = documents.id
+        )
+          AND canonical_status != ?
+        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
+        """,
+        (CANONICAL_STATUS_MERGED,),
+    ).fetchall()
     preview_counts = {
         int(row["document_id"]): int(row["count"] or 0)
         for row in connection.execute(
             """
             SELECT document_id, COUNT(*) AS count
             FROM document_previews
+            WHERE document_id IN (
+              SELECT id
+              FROM documents
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM document_occurrences
+                WHERE document_occurrences.document_id = documents.id
+              )
+            )
             GROUP BY document_id
             """
         ).fetchall()
-    }
-    occurrence_rows = connection.execute(
-        """
-        SELECT id, document_id, parent_occurrence_id
-        FROM document_occurrences
-        ORDER BY id ASC
-        """
-    ).fetchall()
-    occurrence_ids_by_document: dict[int, list[int]] = defaultdict(list)
-    for row in occurrence_rows:
-        occurrence_ids_by_document[int(row["document_id"])].append(int(row["id"]))
+    } if missing_document_rows else {}
 
     inserted = 0
-    document_rows = connection.execute(
-        """
-        SELECT *
-        FROM documents
-        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
-        """
-    ).fetchall()
-    for row in document_rows:
+    for row in missing_document_rows:
         document_id = int(row["id"])
-        if occurrence_ids_by_document.get(document_id):
-            continue
-        if row["canonical_status"] == CANONICAL_STATUS_MERGED:
-            continue
         legacy_custodian = None
         if "custodian" in row.keys():
             legacy_custodian = row["custodian"]
@@ -23843,21 +23967,30 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
             last_seen_at=str(row["last_seen_at"] or row["ingested_at"] or row["updated_at"] or utc_now()),
             updated_at=str(row["updated_at"] or row["last_seen_at"] or row["ingested_at"] or utc_now()),
         )
-        occurrence_ids_by_document[document_id].append(occurrence_id)
         inserted += 1
 
     child_rows = connection.execute(
         """
-        SELECT id, parent_document_id
-        FROM documents
-        WHERE parent_document_id IS NOT NULL
-        ORDER BY id ASC
+        SELECT child.id, child.parent_document_id, child_occurrence.id AS child_occurrence_id
+        FROM documents child
+        JOIN document_occurrences child_occurrence ON child_occurrence.document_id = child.id
+        WHERE child.parent_document_id IS NOT NULL
+          AND child_occurrence.parent_occurrence_id IS NULL
+        ORDER BY child.id ASC, child_occurrence.id ASC
         """
     ).fetchall()
     for row in child_rows:
-        child_occurrence_ids = occurrence_ids_by_document.get(int(row["id"])) or []
-        parent_occurrence_ids = occurrence_ids_by_document.get(int(row["parent_document_id"])) or []
-        if not child_occurrence_ids or not parent_occurrence_ids:
+        parent_occurrence = connection.execute(
+            """
+            SELECT id
+            FROM document_occurrences
+            WHERE document_id = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (int(row["parent_document_id"]),),
+        ).fetchone()
+        if parent_occurrence is None:
             continue
         connection.execute(
             """
@@ -23865,7 +23998,7 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
             SET parent_occurrence_id = ?
             WHERE id = ? AND parent_occurrence_id IS NULL
             """,
-            (parent_occurrence_ids[0], child_occurrence_ids[0]),
+            (int(parent_occurrence["id"]), int(row["child_occurrence_id"])),
         )
     return inserted
 
@@ -23912,18 +24045,30 @@ def backfill_document_dedupe_keys(connection: sqlite3.Connection) -> int:
     before = connection.total_changes
     rows = connection.execute(
         """
-        SELECT id, source_kind, file_hash
-        FROM documents
-        WHERE parent_document_id IS NULL
-          AND file_hash IS NOT NULL
-          AND lifecycle_status != 'deleted'
-        ORDER BY id ASC
-        """
+        WITH desired_keys AS (
+          SELECT
+            file_hash,
+            MAX(id) AS document_id
+          FROM documents
+          WHERE parent_document_id IS NULL
+            AND file_hash IS NOT NULL
+            AND TRIM(file_hash) != ''
+            AND lifecycle_status != 'deleted'
+            AND LOWER(COALESCE(source_kind, '')) IN (?, ?, ?)
+          GROUP BY file_hash
+        )
+        SELECT desired_keys.document_id AS id, desired_keys.file_hash
+        FROM desired_keys
+        LEFT JOIN document_dedupe_keys existing_key
+          ON existing_key.basis = 'file_hash'
+         AND existing_key.key_value = desired_keys.file_hash
+        WHERE existing_key.document_id IS NULL
+           OR existing_key.document_id != desired_keys.document_id
+        ORDER BY desired_keys.document_id ASC
+        """,
+        (FILESYSTEM_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND),
     ).fetchall()
     for row in rows:
-        source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
-        if source_kind not in {FILESYSTEM_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND}:
-            continue
         bind_document_dedupe_key(
             connection,
             basis="file_hash",
@@ -25480,7 +25625,12 @@ def production_row_signature(
         extracted.get("text_status"),
         sha256_text(str(extracted.get("text_content") or "")),
         extracted.get("page_count"),
-        tuple((part["part_kind"], part["rel_source_path"], int(part.get("ordinal", 0))) for part in source_parts),
+        tuple(
+            sorted(
+                (part["part_kind"], part["rel_source_path"], int(part.get("ordinal", 0)))
+                for part in source_parts
+            )
+        ),
         bool(extracted.get("preview_artifacts")),
         existing_locks,
     )
@@ -32322,7 +32472,9 @@ def ingest_v2_plan_production_root(
     run_id: str,
     signature_payload: dict[str, object],
     next_commit_order: int,
+    paths: dict[str, Path] | None = None,
 ) -> dict[str, object]:
+    resolved_paths = paths if paths is not None else workspace_paths(root)
     signature = ingest_v2_production_signature_from_payload(root, signature_payload)
     production_root = Path(signature["root"])
     metadata_load_path = Path(signature["metadata_load_path"])
@@ -32340,14 +32492,53 @@ def ingest_v2_plan_production_root(
         list(metadata["rows"]),
         resolved_image_rows,
     )
+    production_row = connection.execute(
+        """
+        SELECT id
+        FROM productions
+        WHERE rel_root = ?
+        """,
+        (str(signature["rel_root"]),),
+    ).fetchone()
+    existing_production_id = int(production_row["id"]) if production_row is not None else None
+    existing_by_control_number: dict[str, sqlite3.Row] = {}
+    if existing_production_id is not None:
+        existing_rows = connection.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE production_id = ?
+              AND control_number IS NOT NULL
+            """,
+            (existing_production_id,),
+        ).fetchall()
+        existing_by_control_number = {
+            str(row["control_number"]): row
+            for row in existing_rows
+            if row["control_number"]
+        }
     planned_rows = 0
     planned_preview_batches = 0
+    skipped_unchanged_rows = 0
     current_order = int(next_commit_order)
     for plan in production_row_plans:
-        row_order = current_order
         production_rel_root = str(plan["production_rel_root"])
         control_number = str(plan["control_number"])
         rel_path = production_logical_rel_path(production_rel_root, control_number).as_posix()
+        if (
+            existing_production_id is not None
+            and production_plan_matches_existing_document(
+                resolved_paths,
+                connection,
+                root,
+                existing_by_control_number.get(control_number),
+                plan,
+                production_id=existing_production_id,
+            )
+        ):
+            skipped_unchanged_rows += 1
+            continue
+        row_order = current_order
         inserted = ingest_v2_plan_production_row_item(
             connection,
             run_id=run_id,
@@ -32392,6 +32583,7 @@ def ingest_v2_plan_production_root(
         **signature_payload,
         "planned_rows": planned_rows,
         "planned_preview_batches": planned_preview_batches,
+        "skipped_unchanged_rows": skipped_unchanged_rows,
         "seen_control_numbers": sorted(seen_control_numbers),
         "docs_missing_linked_text": sum(int(plan["missing_linked_text"]) for plan in production_row_plans),
         "docs_missing_linked_images": sum(int(plan["missing_linked_images"]) for plan in production_row_plans),
@@ -36393,6 +36585,7 @@ def ingest_v2_plan_step(
                                 run_id=run_id,
                                 signature_payload=signature_payload,
                                 next_commit_order=int(cursor.get("next_commit_order") or 1),
+                                paths=paths,
                             )
                             work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
                         except Exception as exc:
@@ -36425,6 +36618,10 @@ def ingest_v2_plan_step(
                             int(cursor.get("planned_production_preview_batches") or 0)
                             + int(production_plan.get("planned_preview_batches") or 0)
                         )
+                        cursor["skipped_unchanged_production_rows"] = (
+                            int(cursor.get("skipped_unchanged_production_rows") or 0)
+                            + int(production_plan.get("skipped_unchanged_rows") or 0)
+                        )
                         cursor["production_docs_missing_linked_text"] = (
                             int(cursor.get("production_docs_missing_linked_text") or 0)
                             + int(production_plan["docs_missing_linked_text"] or 0)
@@ -36443,6 +36640,7 @@ def ingest_v2_plan_step(
                             "seen_control_numbers": list(production_plan["seen_control_numbers"]),
                             "planned_rows": int(production_plan["planned_rows"] or 0),
                             "planned_preview_batches": int(production_plan.get("planned_preview_batches") or 0),
+                            "skipped_unchanged_rows": int(production_plan.get("skipped_unchanged_rows") or 0),
                             "docs_missing_linked_text": int(production_plan["docs_missing_linked_text"] or 0),
                             "docs_missing_linked_images": int(production_plan["docs_missing_linked_images"] or 0),
                             "docs_missing_linked_natives": int(production_plan["docs_missing_linked_natives"] or 0),
@@ -36667,6 +36865,7 @@ def ingest_v2_plan_step(
                     "planned_production_roots": len(list(cursor.get("planned_production_roots") or [])),
                     "planned_production_rows": int(cursor.get("planned_production_rows") or 0),
                     "planned_production_preview_batches": int(cursor.get("planned_production_preview_batches") or 0),
+                    "skipped_unchanged_production_rows": int(cursor.get("skipped_unchanged_production_rows") or 0),
                     "planned_slack_export_roots": list(cursor.get("planned_slack_export_roots") or []),
                     "planned_slack_conversations": int(cursor.get("planned_slack_conversations") or 0),
                     "planned_slack_day_documents": int(cursor.get("planned_slack_day_documents") or 0),
@@ -36927,6 +37126,21 @@ def ingest_v2_commit_step(
     actions: dict[str, int] = {}
     freshness_fallbacks = 0
     writer_busy = False
+    load_commit_state_ms = 0.0
+    status_payload_ms = 0.0
+    claim_ms_values: list[float] = []
+    prepared_decode_ms_values: list[float] = []
+    item_commit_ms_values: list[float] = []
+
+    def commit_timing_payload() -> dict[str, object]:
+        return {
+            "load_commit_state_ms": round(load_commit_state_ms, 3),
+            "claim_ms": ingest_v2_timing_summary(claim_ms_values),
+            "prepared_decode_ms": ingest_v2_timing_summary(prepared_decode_ms_values),
+            "item_commit_ms": ingest_v2_timing_summary(item_commit_ms_values),
+            "status_payload_ms": round(status_payload_ms, 3),
+        }
+
     connection = connect_db(paths["db_path"])
     lease_acquired = False
     try:
@@ -36934,6 +37148,12 @@ def ingest_v2_commit_step(
             apply_schema(connection, root)
         row = require_ingest_v2_run_row(connection, run_id)
         if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
+            run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+                connection,
+                root,
+                row,
+                budget_seconds=budget,
+            )
             return {
                 "ok": True,
                 "implemented": True,
@@ -36948,9 +37168,16 @@ def ingest_v2_commit_step(
                 "advanced_to_finalize": False,
                 "more_commit_remaining": False,
                 "more_work_remaining": False,
-                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+                "timings": commit_timing_payload(),
+                "run": run_payload,
             }
         if str(row["phase"]) != "committing":
+            run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+                connection,
+                root,
+                row,
+                budget_seconds=budget,
+            )
             return {
                 "ok": True,
                 "implemented": True,
@@ -36965,13 +37192,20 @@ def ingest_v2_commit_step(
                 "advanced_to_finalize": False,
                 "more_commit_remaining": str(row["phase"]) in {"planning", "preparing"},
                 "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+                "timings": commit_timing_payload(),
+                "run": run_payload,
             }
 
         lease_acquired = ingest_v2_acquire_writer_lease(connection, run_id=run_id, writer_id=writer_id)
         if not lease_acquired:
             writer_busy = True
             updated_row = require_ingest_v2_run_row(connection, run_id)
+            run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+                connection,
+                root,
+                updated_row,
+                budget_seconds=budget,
+            )
             return {
                 "ok": True,
                 "implemented": True,
@@ -36986,17 +37220,20 @@ def ingest_v2_commit_step(
                 "advanced_to_finalize": False,
                 "more_commit_remaining": True,
                 "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-                "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+                "timings": commit_timing_payload(),
+                "run": run_payload,
             }
 
         stale_reclaimed = ingest_v2_reclaim_stale_commit_items(connection, run_id=run_id)
         run_row = require_ingest_v2_run_row(connection, run_id)
+        load_commit_state_started = time.perf_counter()
         existing_by_rel, unseen_existing_by_hash = ingest_v2_load_loose_file_commit_state(
             connection,
             root=root,
             run_row=run_row,
         )
         cursor = ingest_v2_load_commit_cursor(connection, run_id=run_id)
+        load_commit_state_ms = ingest_v2_elapsed_ms(load_commit_state_started)
         filesystem_dataset_id: int | None = None
         filesystem_dataset_source_id: int | None = None
         mbox_contexts: dict[str, dict[str, object]] = {}
@@ -37018,16 +37255,23 @@ def ingest_v2_commit_step(
             ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS
             and (item_limit is None or committed + failed < item_limit)
         ):
+            claim_started = time.perf_counter()
             claimed_row = ingest_v2_claim_next_commit_item(
                 connection,
                 run_id=run_id,
                 writer_id=writer_id,
             )
+            claim_ms_values.append(ingest_v2_elapsed_ms(claim_started))
             if claimed_row is None:
                 break
             work_item_id = int(claimed_row["id"])
+            item_commit_started = time.perf_counter()
             try:
-                prepared_item = ingest_v2_prepared_item_from_row(claimed_row)
+                prepared_decode_started = time.perf_counter()
+                try:
+                    prepared_item = ingest_v2_prepared_item_from_row(claimed_row)
+                finally:
+                    prepared_decode_ms_values.append(ingest_v2_elapsed_ms(prepared_decode_started))
                 payload_kind = str(claimed_row["payload_kind"] or claimed_row["unit_type"] or "")
                 if payload_kind == "production_row" or str(claimed_row["unit_type"] or "") == "production_row":
                     prepared_item = ingest_v2_hydrate_prepared_production_item(prepared_item)
@@ -37372,6 +37616,8 @@ def ingest_v2_commit_step(
                     writer_id=writer_id,
                     message=f"{type(exc).__name__}: {exc}",
                 )
+            finally:
+                item_commit_ms_values.append(ingest_v2_elapsed_ms(item_commit_started))
 
         advanced_after_commit = ingest_v2_maybe_advance_after_commit(connection, run_id=run_id)
         if lease_acquired:
@@ -37392,6 +37638,12 @@ def ingest_v2_commit_step(
             ).fetchone()[0]
             or 0
         )
+        run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+            connection,
+            root,
+            updated_row,
+            budget_seconds=budget,
+        )
         return {
             "ok": True,
             "implemented": True,
@@ -37407,7 +37659,8 @@ def ingest_v2_commit_step(
             "advanced_to_prepare": advanced_to_prepare,
             "more_commit_remaining": remaining_commit_items > 0,
             "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-            "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+            "timings": commit_timing_payload(),
+            "run": run_payload,
         }
     finally:
         if lease_acquired:

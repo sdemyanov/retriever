@@ -9027,7 +9027,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(second_run_exit, 0)
         self.assertIsNotNone(second_run_payload)
         self.assertEqual(second_run_payload["run"]["status"], "completed")
-        self.assertEqual(second_run_payload["run"]["counts"]["by_unit_type"]["production_row"]["committed"], 3)
+        plan_result = next(result for result in second_run_payload["step_results"] if result["step"] == "plan")
+        self.assertEqual(plan_result["cursor"]["planned_production_rows"], 0)
+        self.assertEqual(plan_result["cursor"]["planned_production_preview_batches"], 0)
+        self.assertEqual(plan_result["cursor"]["skipped_unchanged_production_rows"], 3)
+        self.assertNotIn("production_row", second_run_payload["run"]["counts"]["by_unit_type"])
+        self.assertNotIn("production_preview_batch", second_run_payload["run"]["counts"]["by_unit_type"])
 
         retired_row = self.fetch_document_row(
             f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
@@ -9234,6 +9239,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(commit_payload["committed"], 2)
         self.assertEqual(commit_payload["failed"], 0)
         self.assertEqual(commit_payload["actions"], {"new": 2})
+        self.assertIn("timings", commit_payload)
+        commit_timings = commit_payload["timings"]
+        self.assertIn("load_commit_state_ms", commit_timings)
+        self.assertEqual(commit_timings["item_commit_ms"]["count"], 2)
+        self.assertEqual(commit_timings["prepared_decode_ms"]["count"], 2)
+        self.assertGreaterEqual(commit_timings["claim_ms"]["count"], 2)
+        self.assertIn("status_payload_ms", commit_timings)
         self.assertFalse(commit_payload["more_commit_remaining"])
         self.assertTrue(commit_payload["advanced_to_finalize"])
         run_payload = commit_payload["run"]
@@ -9284,6 +9296,72 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(cursor_row["status"], "complete")
         cursor_payload = json.loads(cursor_row["cursor_json"])
         self.assertEqual(cursor_payload["actions"], {"new": 2})
+
+    def test_apply_schema_does_not_rewrite_current_document_dedupe_keys(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        self.run_v2_loose_ingest("raw")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_row = connection.execute(
+                """
+                SELECT id, file_hash
+                FROM documents
+                WHERE rel_path = ?
+                """,
+                ("raw/alpha.txt",),
+            ).fetchone()
+            self.assertIsNotNone(document_row)
+            key_row = connection.execute(
+                """
+                SELECT document_id, updated_at
+                FROM document_dedupe_keys
+                WHERE basis = 'file_hash'
+                  AND key_value = ?
+                """,
+                (document_row["file_hash"],),
+            ).fetchone()
+            self.assertIsNotNone(key_row)
+            self.assertEqual(key_row["document_id"], document_row["id"])
+
+            self.assertFalse(
+                retriever_tools.bind_document_dedupe_key(
+                    connection,
+                    basis="file_hash",
+                    key_value=document_row["file_hash"],
+                    document_id=int(document_row["id"]),
+                )
+            )
+            rebound_row = connection.execute(
+                """
+                SELECT document_id, updated_at
+                FROM document_dedupe_keys
+                WHERE basis = 'file_hash'
+                  AND key_value = ?
+                """,
+                (document_row["file_hash"],),
+            ).fetchone()
+            self.assertEqual(rebound_row["updated_at"], key_row["updated_at"])
+
+            schema_result = retriever_tools.apply_schema(connection, self.root)
+            self.assertEqual(schema_result["backfilled_document_dedupe_keys"], 0)
+            after_schema_row = connection.execute(
+                """
+                SELECT document_id, updated_at
+                FROM document_dedupe_keys
+                WHERE basis = 'file_hash'
+                  AND key_value = ?
+                """,
+                (document_row["file_hash"],),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(after_schema_row["document_id"], document_row["id"])
+        self.assertEqual(after_schema_row["updated_at"], key_row["updated_at"])
 
     def test_ingest_v2_interleaves_prepare_and_commit_batches(self) -> None:
         raw_dir = self.root / "raw"

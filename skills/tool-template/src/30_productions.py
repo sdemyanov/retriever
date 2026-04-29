@@ -7055,6 +7055,126 @@ def prepare_production_row_plan(
     return prepared_item
 
 
+def production_expected_preview_artifacts_present(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    expected_html_preview_paths: list[str],
+    expected_page_preview_paths: list[str],
+) -> bool:
+    expected_paths = [
+        normalize_whitespace(str(path))
+        for path in [*expected_html_preview_paths, *expected_page_preview_paths]
+        if normalize_whitespace(str(path))
+    ]
+    if not expected_paths:
+        return True
+    rows = connection.execute(
+        """
+        SELECT rel_preview_path
+        FROM document_previews
+        WHERE document_id = ?
+        """,
+        (document_id,),
+    ).fetchall()
+    known_paths = {str(row["rel_preview_path"] or "") for row in rows}
+    for rel_preview_path in expected_paths:
+        if rel_preview_path not in known_paths:
+            return False
+        if not (paths["state_dir"] / rel_preview_path).exists():
+            return False
+    return True
+
+
+def production_plan_matches_existing_document(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    workspace_root: Path,
+    existing_row: sqlite3.Row | None,
+    prepared_plan: dict[str, object],
+    *,
+    production_id: int,
+) -> bool:
+    if existing_row is None or existing_row["lifecycle_status"] != "active":
+        return False
+    try:
+        text_path = Path(prepared_plan["text_path"]) if prepared_plan.get("text_path") is not None else None
+        native_path = Path(prepared_plan["native_path"]) if prepared_plan.get("native_path") is not None else None
+        matching_image_paths = [Path(path) for path in list(prepared_plan.get("matching_image_paths") or [])]
+        available_text_path = text_path if text_path is not None and text_path.exists() else None
+        available_native_path = native_path if native_path is not None and native_path.exists() else None
+        rel_path = production_logical_rel_path(
+            str(prepared_plan["production_rel_root"]),
+            str(prepared_plan["control_number"]),
+        ).as_posix()
+        preview_image_refs = production_preview_page_asset_refs(
+            rel_path,
+            str(prepared_plan["control_number"]),
+            matching_image_paths,
+        )
+        extracted_payload = build_production_extracted_payload(
+            workspace_root,
+            production_name=str(prepared_plan["production_name"]),
+            control_number=str(prepared_plan["control_number"]),
+            begin_bates=str(prepared_plan["begin_bates"]),
+            end_bates=str(prepared_plan["end_bates"]),
+            begin_attachment=prepared_plan.get("begin_attachment"),
+            end_attachment=prepared_plan.get("end_attachment"),
+            text_path=available_text_path,
+            image_paths=matching_image_paths,
+            native_path=available_native_path,
+            preview_image_refs=preview_image_refs,
+        )
+        preferred_native = extracted_payload.get("preferred_native")
+        source_parts = production_source_parts(
+            workspace_root,
+            text_path=available_text_path,
+            image_paths=matching_image_paths,
+            native_path=available_native_path,
+        )
+        file_name = (
+            (preferred_native.name if isinstance(preferred_native, Path) else None)
+            or (available_native_path.name if available_native_path is not None else None)
+            or f"{prepared_plan['control_number']}.production"
+        )
+        desired_signature = production_row_signature(
+            existing_row,
+            rel_path=rel_path,
+            file_name=file_name,
+            source_kind=PRODUCTION_SOURCE_KIND,
+            production_id=production_id,
+            begin_bates=str(prepared_plan["begin_bates"]),
+            end_bates=str(prepared_plan["end_bates"]),
+            begin_attachment=prepared_plan.get("begin_attachment"),
+            end_attachment=prepared_plan.get("end_attachment"),
+            extracted=extracted_payload,
+            source_parts=source_parts,
+        )
+        if existing_production_row_signature(connection, existing_row) != desired_signature:
+            return False
+        preview_base = preview_base_path_for_rel_path(rel_path)
+        expected_html_preview_paths = [
+            (preview_base / str(artifact["file_name"])).as_posix()
+            for artifact in list(extracted_payload.get("preview_artifacts") or [])
+            if isinstance(artifact, dict) and artifact.get("file_name")
+        ]
+        expected_page_preview_paths = [
+            str(ref["rel_preview_path"])
+            for ref in preview_image_refs
+            if ref.get("rel_preview_path")
+        ]
+        return production_expected_preview_artifacts_present(
+            paths,
+            connection,
+            document_id=int(existing_row["id"]),
+            expected_html_preview_paths=expected_html_preview_paths,
+            expected_page_preview_paths=expected_page_preview_paths,
+        )
+    except Exception:
+        return False
+
+
 def iter_prepared_production_row_plans(
     workspace_root: Path,
     production_row_plans: list[dict[str, object]],

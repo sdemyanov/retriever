@@ -727,41 +727,43 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
     if not table_exists(connection, "documents") or not table_exists(connection, "document_occurrences"):
         return 0
 
+    missing_document_rows = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM document_occurrences
+          WHERE document_occurrences.document_id = documents.id
+        )
+          AND canonical_status != ?
+        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
+        """,
+        (CANONICAL_STATUS_MERGED,),
+    ).fetchall()
     preview_counts = {
         int(row["document_id"]): int(row["count"] or 0)
         for row in connection.execute(
             """
             SELECT document_id, COUNT(*) AS count
             FROM document_previews
+            WHERE document_id IN (
+              SELECT id
+              FROM documents
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM document_occurrences
+                WHERE document_occurrences.document_id = documents.id
+              )
+            )
             GROUP BY document_id
             """
         ).fetchall()
-    }
-    occurrence_rows = connection.execute(
-        """
-        SELECT id, document_id, parent_occurrence_id
-        FROM document_occurrences
-        ORDER BY id ASC
-        """
-    ).fetchall()
-    occurrence_ids_by_document: dict[int, list[int]] = defaultdict(list)
-    for row in occurrence_rows:
-        occurrence_ids_by_document[int(row["document_id"])].append(int(row["id"]))
+    } if missing_document_rows else {}
 
     inserted = 0
-    document_rows = connection.execute(
-        """
-        SELECT *
-        FROM documents
-        ORDER BY CASE WHEN parent_document_id IS NULL THEN 0 ELSE 1 END ASC, id ASC
-        """
-    ).fetchall()
-    for row in document_rows:
+    for row in missing_document_rows:
         document_id = int(row["id"])
-        if occurrence_ids_by_document.get(document_id):
-            continue
-        if row["canonical_status"] == CANONICAL_STATUS_MERGED:
-            continue
         legacy_custodian = None
         if "custodian" in row.keys():
             legacy_custodian = row["custodian"]
@@ -808,21 +810,30 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
             last_seen_at=str(row["last_seen_at"] or row["ingested_at"] or row["updated_at"] or utc_now()),
             updated_at=str(row["updated_at"] or row["last_seen_at"] or row["ingested_at"] or utc_now()),
         )
-        occurrence_ids_by_document[document_id].append(occurrence_id)
         inserted += 1
 
     child_rows = connection.execute(
         """
-        SELECT id, parent_document_id
-        FROM documents
-        WHERE parent_document_id IS NOT NULL
-        ORDER BY id ASC
+        SELECT child.id, child.parent_document_id, child_occurrence.id AS child_occurrence_id
+        FROM documents child
+        JOIN document_occurrences child_occurrence ON child_occurrence.document_id = child.id
+        WHERE child.parent_document_id IS NOT NULL
+          AND child_occurrence.parent_occurrence_id IS NULL
+        ORDER BY child.id ASC, child_occurrence.id ASC
         """
     ).fetchall()
     for row in child_rows:
-        child_occurrence_ids = occurrence_ids_by_document.get(int(row["id"])) or []
-        parent_occurrence_ids = occurrence_ids_by_document.get(int(row["parent_document_id"])) or []
-        if not child_occurrence_ids or not parent_occurrence_ids:
+        parent_occurrence = connection.execute(
+            """
+            SELECT id
+            FROM document_occurrences
+            WHERE document_id = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (int(row["parent_document_id"]),),
+        ).fetchone()
+        if parent_occurrence is None:
             continue
         connection.execute(
             """
@@ -830,7 +841,7 @@ def backfill_document_occurrences(connection: sqlite3.Connection) -> int:
             SET parent_occurrence_id = ?
             WHERE id = ? AND parent_occurrence_id IS NULL
             """,
-            (parent_occurrence_ids[0], child_occurrence_ids[0]),
+            (int(parent_occurrence["id"]), int(row["child_occurrence_id"])),
         )
     return inserted
 
@@ -877,18 +888,30 @@ def backfill_document_dedupe_keys(connection: sqlite3.Connection) -> int:
     before = connection.total_changes
     rows = connection.execute(
         """
-        SELECT id, source_kind, file_hash
-        FROM documents
-        WHERE parent_document_id IS NULL
-          AND file_hash IS NOT NULL
-          AND lifecycle_status != 'deleted'
-        ORDER BY id ASC
-        """
+        WITH desired_keys AS (
+          SELECT
+            file_hash,
+            MAX(id) AS document_id
+          FROM documents
+          WHERE parent_document_id IS NULL
+            AND file_hash IS NOT NULL
+            AND TRIM(file_hash) != ''
+            AND lifecycle_status != 'deleted'
+            AND LOWER(COALESCE(source_kind, '')) IN (?, ?, ?)
+          GROUP BY file_hash
+        )
+        SELECT desired_keys.document_id AS id, desired_keys.file_hash
+        FROM desired_keys
+        LEFT JOIN document_dedupe_keys existing_key
+          ON existing_key.basis = 'file_hash'
+         AND existing_key.key_value = desired_keys.file_hash
+        WHERE existing_key.document_id IS NULL
+           OR existing_key.document_id != desired_keys.document_id
+        ORDER BY desired_keys.document_id ASC
+        """,
+        (FILESYSTEM_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND),
     ).fetchall()
     for row in rows:
-        source_kind = normalize_whitespace(str(row["source_kind"] or "")).lower()
-        if source_kind not in {FILESYSTEM_SOURCE_KIND, PST_SOURCE_KIND, MBOX_SOURCE_KIND}:
-            continue
         bind_document_dedupe_key(
             connection,
             basis="file_hash",
@@ -2445,7 +2468,12 @@ def production_row_signature(
         extracted.get("text_status"),
         sha256_text(str(extracted.get("text_content") or "")),
         extracted.get("page_count"),
-        tuple((part["part_kind"], part["rel_source_path"], int(part.get("ordinal", 0))) for part in source_parts),
+        tuple(
+            sorted(
+                (part["part_kind"], part["rel_source_path"], int(part.get("ordinal", 0)))
+                for part in source_parts
+            )
+        ),
         bool(extracted.get("preview_artifacts")),
         existing_locks,
     )
