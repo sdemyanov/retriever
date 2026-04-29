@@ -8753,6 +8753,89 @@ def resolve_export_table_csv_selection(
     return rows, selector
 
 
+def normalize_export_table_limit(limit: int | None) -> int | None:
+    return None if limit is None else max(1, int(limit))
+
+
+def build_export_table_csv_seed_selector(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+    table_name: str,
+    *,
+    document_ids: list[int] | None,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+    select_from_scope: bool,
+    include_ignored_entities: bool,
+    limit: int | None,
+) -> dict[str, object]:
+    normalized_table_name = normalize_export_table_name(table_name)
+    normalized_limit = normalize_export_table_limit(limit)
+    if document_ids:
+        raise RetrieverError(f"/export table {normalized_table_name} does not accept --doc-id.")
+
+    if normalized_table_name == "entities":
+        if raw_filters:
+            raise RetrieverError("/export table entities does not support --filter yet. Use an entity query instead.")
+        effective_query = normalize_whitespace(str(query or ""))
+        include_ignored = bool(include_ignored_entities)
+        if select_from_scope and not effective_query:
+            scoped_query, scoped_include_ignored = entity_browsing_options(session_state)
+            effective_query = scoped_query or ""
+            include_ignored = include_ignored or scoped_include_ignored
+        if sort_field or order:
+            sort_specs = normalize_entity_list_sort_specs(sort=sort_field or "document_count", order=order)
+        elif select_from_scope:
+            sort_specs = session_sort_specs(session_state, browse_mode=BROWSE_MODE_ENTITIES) or None
+        else:
+            sort_specs = None
+        normalized_sort_specs = normalize_entity_list_sort_specs(sort_specs=sort_specs) if sort_specs else normalize_entity_list_sort_specs()
+        selector: dict[str, object] = {
+            "mode": "table",
+            "table": "entities",
+            "query": effective_query,
+            "sort": normalized_sort_specs[0][0],
+            "order": normalized_sort_specs[0][1],
+            "sort_spec": entity_list_sort_spec_text(normalized_sort_specs),
+            "sort_specs": serialize_sort_specs(normalized_sort_specs),
+            "include_ignored": include_ignored,
+            "selected_from_scope": bool(select_from_scope),
+        }
+        if normalized_limit is not None:
+            selector["limit"] = normalized_limit
+        return selector
+
+    effective_scope = build_effective_scope_selector(
+        connection,
+        paths,
+        query=query,
+        raw_bates=None,
+        raw_filters=raw_filters,
+        dataset_names=None,
+        from_run_id=None,
+        select_from_scope=select_from_scope,
+    )
+    if sort_field or order:
+        sort_specs = normalize_conversation_list_sort_specs(connection, sort=sort_field, order=order)
+    elif select_from_scope:
+        sort_specs = session_sort_specs(session_state, browse_mode=BROWSE_MODE_CONVERSATIONS) or None
+    else:
+        sort_specs = None
+    selector = {
+        "mode": "table",
+        "table": "conversations",
+        "scope": effective_scope,
+        "sort_specs": serialize_sort_specs(sort_specs),
+        "selected_from_scope": bool(select_from_scope),
+    }
+    if normalized_limit is not None:
+        selector["limit"] = normalized_limit
+    return selector
+
+
 def export_csv(
     root: Path,
     raw_output_path: str,
@@ -9653,10 +9736,12 @@ def export_archive(
         connection.close()
 
 
-EXPORT_RUN_ACTIVE_STATUSES = {"exporting", "finalizing"}
+EXPORT_RUN_ACTIVE_STATUSES = {"seeding", "exporting", "finalizing"}
 EXPORT_RUN_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 EXPORT_RUN_STEP_MIN_REMAINING_SECONDS = 1.25
 EXPORT_CSV_ROW_BATCH_SIZE = 100
+EXPORT_CSV_FINALIZE_FRAGMENT_BATCH_SIZE = 1000
+EXPORT_TABLE_CSV_SEED_PAGE_SIZE = 200
 
 
 def export_run_temp_dir(paths: dict[str, Path], run_id: str) -> Path:
@@ -9739,7 +9824,7 @@ def active_export_run_row(connection: sqlite3.Connection, *, export_kind: str) -
         SELECT *
         FROM export_runs
         WHERE export_kind = ?
-          AND status IN ('exporting', 'finalizing')
+          AND status IN ('seeding', 'exporting', 'finalizing')
         ORDER BY id DESC
         LIMIT 1
         """,
@@ -10016,21 +10101,42 @@ def export_table_csv_start(
         session_state = read_session_state(paths)
         field_defs = resolve_table_export_field_definitions(connection, normalized_table_name, raw_fields)
         output_path = resolve_export_output_path(paths, raw_output_path)
-        rows, selector = resolve_export_table_csv_selection(
-            root,
-            connection,
-            paths,
-            session_state,
-            normalized_table_name,
-            document_ids,
-            query,
-            raw_filters,
-            sort_field,
-            order,
-            select_from_scope,
-            include_ignored_entities=include_ignored_entities,
-            limit=limit,
-        )
+        if normalized_table_name == "documents":
+            rows, selector = resolve_export_table_csv_selection(
+                root,
+                connection,
+                paths,
+                session_state,
+                normalized_table_name,
+                document_ids,
+                query,
+                raw_filters,
+                sort_field,
+                order,
+                select_from_scope,
+                include_ignored_entities=include_ignored_entities,
+                limit=limit,
+            )
+            initial_phase = "exporting" if rows else "finalizing"
+            initial_total_items = len(rows)
+        else:
+            rows = []
+            selector = build_export_table_csv_seed_selector(
+                connection,
+                paths,
+                session_state,
+                normalized_table_name,
+                document_ids=document_ids,
+                query=query,
+                raw_filters=raw_filters,
+                sort_field=sort_field,
+                order=order,
+                select_from_scope=select_from_scope,
+                include_ignored_entities=include_ignored_entities,
+                limit=limit,
+            )
+            initial_phase = "seeding"
+            initial_total_items = 0
         run_id = new_ingest_v2_run_id()
         now = utc_now()
         output_rel_path = export_run_output_rel_path(root, output_path)
@@ -10043,6 +10149,8 @@ def export_table_csv_start(
         cursor = {
             "assembled_ordinal": 0,
             "partial_rel_path": str(Path("tmp") / "exports" / run_id / "output.partial.csv"),
+            "seed_offset": 0,
+            "seed_next_ordinal": 1,
         }
         export_run_csv_rows_dir(paths, run_id).mkdir(parents=True, exist_ok=True)
         if normalized_table_name == "documents":
@@ -10098,9 +10206,9 @@ def export_table_csv_start(
                     compact_json_text(selector),
                     compact_json_text(config),
                     compact_json_text(cursor),
-                    "exporting",
-                    "exporting" if rows else "finalizing",
-                    len(rows),
+                    initial_phase,
+                    initial_phase,
+                    initial_total_items,
                     now,
                     now,
                     now,
@@ -10238,6 +10346,172 @@ def export_archive_start(
         return {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
     finally:
         connection.close()
+
+
+def export_table_csv_seed_page(
+    root: Path,
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    table_name: str,
+    selector: dict[str, object],
+    *,
+    offset: int,
+    page_size: int,
+) -> tuple[list[dict[str, object]], int]:
+    normalized_table_name = normalize_export_table_name(table_name)
+    if normalized_table_name == "entities":
+        sort_specs = coerce_sort_specs(selector.get("sort_specs")) or None
+        payload = list_entities(
+            root,
+            query=str(selector.get("query") or "") or None,
+            limit=page_size,
+            offset=offset,
+            sort_specs=sort_specs,
+            include_ignored=bool(selector.get("include_ignored")),
+        )
+        rows = [dict(item) for item in payload.get("entities", []) if isinstance(item, dict)]
+        for item in rows:
+            item["entity_status"] = item.get("canonical_status")
+        total_hits = int(payload.get("total_hits") or payload.get("total") or 0)
+        return rows, total_hits
+
+    sort_specs = coerce_sort_specs(selector.get("sort_specs")) or None
+    raw_scope = coerce_scope_payload(selector.get("scope"))
+    selection = resolve_paged_scope_conversation_search(
+        connection,
+        paths,
+        raw_scope,
+        sort_specs=sort_specs,
+        offset=offset,
+        per_page=page_size,
+    )
+    rows = [dict(item) for item in selection.get("results", []) if isinstance(item, dict)]
+    total_hits = int(selection.get("total_hits") or 0)
+    return rows, total_hits
+
+
+def export_table_csv_seed_step(
+    root: Path,
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    config = decode_json_text(row["config_json"], default={}) or {}
+    selector = decode_json_text(row["selector_json"], default={}) or {}
+    cursor = decode_json_text(row["cursor_json"], default={}) or {}
+    table_name = normalize_export_table_name(str(config.get("table") or selector.get("table") or "documents"))
+    if table_name == "documents":
+        raise RetrieverError("Document CSV exports do not use table seeding.")
+
+    seed_offset = int(cursor.get("seed_offset") or 0)
+    next_ordinal = int(cursor.get("seed_next_ordinal") or 1)
+    explicit_limit = normalize_export_table_limit(int(selector["limit"])) if selector.get("limit") is not None else None
+    seeded = 0
+    total_to_export = int(row["total_items"] or 0)
+    completed = False
+    while ingest_v2_deadline_remaining_seconds(deadline) >= EXPORT_RUN_STEP_MIN_REMAINING_SECONDS:
+        if explicit_limit is not None and next_ordinal > explicit_limit:
+            total_to_export = explicit_limit
+            completed = True
+            break
+        remaining_limit = None if explicit_limit is None else max(0, explicit_limit - next_ordinal + 1)
+        if remaining_limit == 0:
+            total_to_export = explicit_limit or total_to_export
+            completed = True
+            break
+        page_size = EXPORT_TABLE_CSV_SEED_PAGE_SIZE if remaining_limit is None else min(EXPORT_TABLE_CSV_SEED_PAGE_SIZE, remaining_limit)
+        page_rows, total_hits = export_table_csv_seed_page(
+            root,
+            connection,
+            paths,
+            table_name,
+            selector,
+            offset=seed_offset,
+            page_size=page_size,
+        )
+        total_to_export = min(total_hits, explicit_limit) if explicit_limit is not None else total_hits
+        if not page_rows:
+            completed = True
+            break
+        row_id_key = "entity_id" if table_name == "entities" else "conversation_id"
+        unit_type = "csv_entity_row" if table_name == "entities" else "csv_conversation_row"
+        now = utc_now()
+        connection.executemany(
+            """
+            INSERT INTO export_work_items (
+              run_id, unit_type, ordinal, document_id, payload_json, artifact_manifest_json,
+              status, created_at, updated_at
+            ) VALUES (?, ?, ?, NULL, ?, '{}', 'pending', ?, ?)
+            """,
+            [
+                (
+                    run_id,
+                    unit_type,
+                    next_ordinal + index,
+                    compact_json_text(
+                        {
+                            "table": table_name,
+                            row_id_key: int(page_row["id"]),
+                            "row": dict(page_row),
+                        }
+                    ),
+                    now,
+                    now,
+                )
+                for index, page_row in enumerate(page_rows)
+            ],
+        )
+        seeded += len(page_rows)
+        seed_offset += len(page_rows)
+        next_ordinal += len(page_rows)
+        cursor["seed_offset"] = seed_offset
+        cursor["seed_next_ordinal"] = next_ordinal
+        cursor["seed_total_hits"] = total_hits
+        cursor["seed_total_to_export"] = total_to_export
+        connection.execute(
+            """
+            UPDATE export_runs
+            SET total_items = ?,
+                cursor_json = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (total_to_export, compact_json_text(cursor), utc_now(), run_id),
+        )
+        connection.commit()
+        if seed_offset >= total_to_export or len(page_rows) < page_size:
+            completed = True
+            break
+
+    if completed:
+        cursor["seed_offset"] = seed_offset
+        cursor["seed_next_ordinal"] = next_ordinal
+        cursor["seed_total_to_export"] = total_to_export
+        cursor["seed_completed"] = True
+        next_phase = "exporting" if total_to_export > 0 else "finalizing"
+        connection.execute(
+            """
+            UPDATE export_runs
+            SET phase = ?,
+                status = ?,
+                total_items = ?,
+                cursor_json = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (next_phase, next_phase, total_to_export, compact_json_text(cursor), utc_now(), run_id),
+        )
+        connection.commit()
+    return {
+        "seeded": seeded,
+        "offset": seed_offset,
+        "total_items": total_to_export,
+        "completed": completed,
+        "table": table_name,
+    }
 
 
 def render_csv_fragment_for_item(
@@ -10393,18 +10667,23 @@ def export_csv_finalize_step(
     cursor = decode_json_text(row["cursor_json"], default={}) or {}
     field_defs = list(config.get("fields") or [])
     output_path = Path(str(row["output_path"]))
+    failed_count = int(row["failed_items"] or 0)
+    assembled_ordinal = int(cursor.get("assembled_ordinal") or 0)
+    partial_path = export_run_partial_csv_path(paths, run_id)
+    if assembled_ordinal > 0 and not partial_path.exists():
+        assembled_ordinal = 0
     completed_rows = connection.execute(
         """
         SELECT ordinal, artifact_manifest_json
         FROM export_work_items
         WHERE run_id = ?
           AND status = 'completed'
+          AND ordinal > ?
         ORDER BY ordinal ASC
+        LIMIT ?
         """,
-        (run_id,),
+        (run_id, assembled_ordinal, EXPORT_CSV_FINALIZE_FRAGMENT_BATCH_SIZE),
     ).fetchall()
-    failed_count = int(row["failed_items"] or 0)
-    assembled_ordinal = int(cursor.get("assembled_ordinal") or 0)
     target_ordinal = assembled_ordinal
     fragments: list[tuple[int, Path]] = []
     for item in completed_rows:
@@ -10416,21 +10695,32 @@ def export_csv_finalize_step(
             continue
         target_ordinal = int(item["ordinal"])
         fragments.append((target_ordinal, paths["state_dir"] / fragment_rel_path))
-    partial_path = export_run_partial_csv_path(paths, run_id)
     partial_path.parent.mkdir(parents=True, exist_ok=True)
-    with partial_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow([field_def["field_name"] for field_def in field_defs])
-        handle.flush()
+    mode = "a" if assembled_ordinal > 0 and partial_path.exists() else "w"
+    with partial_path.open(mode, encoding="utf-8", newline="") as handle:
+        if mode == "w":
+            writer = csv.writer(handle)
+            writer.writerow([field_def["field_name"] for field_def in field_defs])
+            handle.flush()
         for _, fragment_path in fragments:
             if fragment_path.exists():
                 handle.write(fragment_path.read_text(encoding="utf-8"))
     cursor["assembled_ordinal"] = target_ordinal
     cursor["partial_rel_path"] = str(partial_path.relative_to(paths["state_dir"]))
     now = utc_now()
-    completed_count = len(completed_rows)
+    completed_count = int(row["completed_items"] or 0)
     total_items = int(row["total_items"] or 0)
-    if completed_count + failed_count >= total_items:
+    remaining_completed = int(connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM export_work_items
+        WHERE run_id = ?
+          AND status = 'completed'
+          AND ordinal > ?
+        """,
+        (run_id, target_ordinal),
+    ).fetchone()["count"])
+    if completed_count + failed_count >= total_items and remaining_completed == 0:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(partial_path, output_path)
         status = "completed" if failed_count == 0 else "failed"
@@ -10459,7 +10749,12 @@ def export_csv_finalize_step(
             (compact_json_text(cursor), now, run_id),
         )
     connection.commit()
-    return {"assembled_rows": completed_count, "failed": failed_count}
+    return {
+        "assembled_rows": target_ordinal,
+        "assembled_this_step": len(fragments),
+        "remaining_completed": remaining_completed,
+        "failed": failed_count,
+    }
 
 
 def archive_reset_after_corrupt_partial_zip(connection: sqlite3.Connection, paths: dict[str, Path], row: sqlite3.Row) -> bool:
@@ -10777,6 +11072,13 @@ def export_run_step(
             status = str(row["status"])
             if status in EXPORT_RUN_TERMINAL_STATUSES:
                 break
+            if phase == "seeding" and export_kind == "csv":
+                step_result = export_table_csv_seed_step(root, connection, paths, row, deadline=deadline)
+                executed_steps.append("seed")
+                step_results.append(step_result)
+                if int(step_result.get("seeded") or 0) == 0 and not bool(step_result.get("completed")):
+                    break
+                continue
             if phase == "exporting":
                 if export_kind == "csv":
                     step_result = export_csv_exporting_step(connection, paths, row, deadline=deadline)
