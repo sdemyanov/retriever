@@ -263,6 +263,39 @@ def uses_legacy_tuple_filters(raw_filters: object | None) -> bool:
     return saw_item
 
 
+def sql_filter_literal_text(value: object) -> str:
+    if value is None:
+        return "NULL"
+    text = str(value).replace("\\", "\\\\").replace("'", "''")
+    return f"'{text}'"
+
+
+def legacy_tuple_filters_to_sql_expressions(raw_filters: list[list[str]] | None) -> list[str]:
+    comparator_map = {
+        "eq": "=",
+        "neq": "!=",
+        "gt": ">",
+        "gte": ">=",
+        "lt": "<",
+        "lte": "<=",
+        "contains": "LIKE",
+        "is-null": "IS NULL",
+        "not-null": "IS NOT NULL",
+    }
+    expressions: list[str] = []
+    for parsed_filter in parse_filter_args(raw_filters):
+        operator = str(parsed_filter["operator"])
+        field_name = str(parsed_filter["field_name"])
+        value = parsed_filter["value"]
+        if operator in {"is-null", "not-null"}:
+            expressions.append(f"{field_name} {comparator_map[operator]}")
+        elif operator == "contains":
+            expressions.append(f"{field_name} LIKE {sql_filter_literal_text(f'%{value}%')}")
+        else:
+            expressions.append(f"{field_name} {comparator_map[operator]} {sql_filter_literal_text(value)}")
+    return expressions
+
+
 def build_legacy_search_filters(
     connection: sqlite3.Connection,
     raw_filters: list[list[str]] | None,
@@ -1166,6 +1199,8 @@ def normalize_sql_filter_expressions(raw_filters: object | None) -> list[str]:
         return [raw_filters] if raw_filters.strip() else []
     if not isinstance(raw_filters, list):
         raise RetrieverError("Filters must be provided as strings or repeatable --filter arguments.")
+    if uses_legacy_tuple_filters(raw_filters):
+        return legacy_tuple_filters_to_sql_expressions(raw_filters)  # type: ignore[arg-type]
     expressions: list[str] = []
     for item in raw_filters:
         if isinstance(item, str):
@@ -3153,29 +3188,7 @@ def derive_search_scope(query: str, raw_filters: object | None) -> dict[str, obj
         scope["keyword"] = query
     if raw_filters:
         if uses_legacy_tuple_filters(raw_filters):
-            parsed_filters = parse_filter_args(raw_filters)  # type: ignore[arg-type]
-            comparator_map = {
-                "eq": "=",
-                "neq": "!=",
-                "gt": ">",
-                "gte": ">=",
-                "lt": "<",
-                "lte": "<=",
-                "contains": "LIKE",
-                "is-null": "IS NULL",
-                "not-null": "IS NOT NULL",
-            }
-            rendered_parts: list[str] = []
-            for parsed_filter in parsed_filters:
-                operator = str(parsed_filter["operator"])
-                field_name = str(parsed_filter["field_name"])
-                value = parsed_filter["value"]
-                if operator in {"is-null", "not-null"}:
-                    rendered_parts.append(f"{field_name} {comparator_map[operator]}")
-                elif operator == "contains":
-                    rendered_parts.append(f"{field_name} LIKE '%{value}%'")
-                else:
-                    rendered_parts.append(f"{field_name} {comparator_map[operator]} {value!r}")
+            rendered_parts = legacy_tuple_filters_to_sql_expressions(raw_filters)  # type: ignore[arg-type]
             if rendered_parts:
                 scope["filter"] = " AND ".join(rendered_parts)
         else:
@@ -6801,6 +6814,302 @@ def run_scope_search_from_session(root: Path, paths: dict[str, Path], scope: dic
     return run_browsing_search_from_session(root, paths, session_state, offset=0, browse_mode=browse_mode)
 
 
+SLASH_EXPORT_TABLE_ALIASES = {"document", "documents", "doc", "docs"}
+SLASH_EXPORT_KNOWN_TABLES = SLASH_EXPORT_TABLE_ALIASES | {"conversation", "conversations", "entity", "entities", "dataset", "datasets"}
+SLASH_EXPORT_BOOLEAN_OPTIONS = {"--no-scope", "--portable", "--portable-workspace"}
+SLASH_EXPORT_VALUE_OPTIONS = {
+    "--bates",
+    "--budget-seconds",
+    "--dataset",
+    "--doc-id",
+    "--family-mode",
+    "--field",
+    "--filter",
+    "--from-run-id",
+    "--keyword",
+    "--limit",
+    "--order",
+    "--sort",
+    "--sort-by",
+    "--sort-order",
+}
+
+
+def slash_export_timestamp() -> str:
+    digits = "".join(character for character in utc_now() if character.isdigit())
+    return digits[:14] or "export"
+
+
+def slash_export_default_output_path(prefix: str, suffix: str) -> str:
+    return f"{prefix}-{slash_export_timestamp()}.{suffix}"
+
+
+def parse_slash_export_options(tokens: list[str]) -> tuple[list[str], dict[str, object]]:
+    positionals: list[str] = []
+    options: dict[str, object] = {}
+    repeat_options = {"--dataset", "--doc-id", "--field", "--filter"}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            positionals.append(token)
+            index += 1
+            continue
+        if token in SLASH_EXPORT_BOOLEAN_OPTIONS:
+            options[token] = True
+            index += 1
+            continue
+        if token not in SLASH_EXPORT_VALUE_OPTIONS:
+            raise RetrieverError(f"Unknown /export option: {token}")
+        index += 1
+        values: list[str] = []
+        while index < len(tokens) and not tokens[index].startswith("--"):
+            values.append(tokens[index])
+            index += 1
+            if token != "--filter":
+                break
+        if not values:
+            raise RetrieverError(f"{token} requires a value.")
+        value: object = values if token == "--filter" else values[0]
+        canonical_token = {
+            "--sort-by": "--sort",
+            "--sort-order": "--order",
+            "--portable": "--portable-workspace",
+        }.get(token, token)
+        if canonical_token in repeat_options:
+            options.setdefault(canonical_token, [])
+            existing_values = options[canonical_token]
+            if not isinstance(existing_values, list):
+                raise RetrieverError(f"Internal /export parse error for {canonical_token}.")
+            existing_values.append(value)
+        else:
+            options[canonical_token] = value
+    return positionals, options
+
+
+def parse_optional_int_option(options: dict[str, object], option_name: str) -> int | None:
+    if option_name not in options:
+        return None
+    try:
+        return int(str(options[option_name]))
+    except ValueError as exc:
+        raise RetrieverError(f"{option_name} must be an integer.") from exc
+
+
+def slash_export_default_document_fields(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    session_state: dict[str, object],
+) -> list[str]:
+    column_defs, _, _ = resolve_session_display_columns(
+        connection,
+        paths,
+        session_state,
+        browse_mode=BROWSE_MODE_DOCUMENTS,
+    )
+    fields = display_column_names(column_defs)
+    return fields or ["control_number", "file_name", "source_kind", "content_type"]
+
+
+def normalize_slash_export_filters(options: dict[str, object]) -> list[list[str]] | None:
+    raw_filters = options.get("--filter")
+    if raw_filters is None:
+        return None
+    if not isinstance(raw_filters, list):
+        raise RetrieverError("Internal /export parse error for --filter.")
+    normalized_filters: list[list[str]] = []
+    for raw_filter in raw_filters:
+        if isinstance(raw_filter, list):
+            normalized_filters.append([str(part) for part in raw_filter])
+        else:
+            normalized_filters.append([str(raw_filter)])
+    return normalized_filters
+
+
+def run_export_table_slash_command(
+    root: Path,
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    session_state: dict[str, object],
+    tokens: list[str],
+) -> dict[str, object]:
+    positionals, options = parse_slash_export_options(tokens)
+    table_name = "documents"
+    if positionals and positionals[0].lower() in SLASH_EXPORT_KNOWN_TABLES:
+        raw_table_name = positionals.pop(0).lower()
+        if raw_table_name not in SLASH_EXPORT_TABLE_ALIASES:
+            raise RetrieverError("Only /export table documents is supported right now.")
+        table_name = "documents"
+
+    output_path = slash_export_default_output_path("table", "csv")
+    if positionals and (positionals[0].lower().endswith(".csv") or "/" in positionals[0] or "\\" in positionals[0]):
+        output_path = positionals.pop(0)
+
+    query = " ".join(positionals).strip()
+    if "--keyword" in options:
+        query = str(options["--keyword"])
+
+    fields = [str(field) for field in options.get("--field", [])] if "--field" in options else None
+    if fields is None:
+        fields = slash_export_default_document_fields(connection, paths, session_state)
+
+    document_ids = None
+    if "--doc-id" in options:
+        raw_document_ids = options["--doc-id"]
+        if not isinstance(raw_document_ids, list):
+            raise RetrieverError("Internal /export parse error for --doc-id.")
+        document_ids = []
+        for raw_document_id in raw_document_ids:
+            try:
+                document_ids.append(int(str(raw_document_id)))
+            except ValueError as exc:
+                raise RetrieverError("--doc-id must be an integer.") from exc
+
+    budget_seconds = parse_optional_int_option(options, "--budget-seconds")
+    select_from_scope = not bool(options.get("--no-scope")) and not document_ids
+    payload = export_csv_start(
+        root,
+        output_path,
+        fields,
+        document_ids,
+        query,
+        normalize_slash_export_filters(options),
+        str(options["--sort"]) if "--sort" in options else None,
+        str(options["--order"]) if "--order" in options else None,
+        select_from_scope,
+        budget_seconds=budget_seconds,
+    )
+    payload["slash_command"] = "/export table"
+    payload["table"] = table_name
+    payload["export_label"] = "table"
+    return payload
+
+
+def run_export_archive_slash_command(root: Path, tokens: list[str]) -> dict[str, object]:
+    positionals, options = parse_slash_export_options(tokens)
+    output_path = slash_export_default_output_path("archive", "zip")
+    if positionals and (positionals[0].lower().endswith(".zip") or "/" in positionals[0] or "\\" in positionals[0]):
+        output_path = positionals.pop(0)
+    query = " ".join(positionals).strip()
+    if "--keyword" in options:
+        query = str(options["--keyword"])
+
+    raw_datasets = options.get("--dataset")
+    dataset_names = [str(item) for item in raw_datasets] if isinstance(raw_datasets, list) else None
+    budget_seconds = parse_optional_int_option(options, "--budget-seconds")
+    from_run_id = parse_optional_int_option(options, "--from-run-id")
+    seed_limit = parse_optional_int_option(options, "--limit")
+    payload = export_archive_start(
+        root,
+        output_path,
+        dataset_names=dataset_names,
+        query=query,
+        raw_bates=str(options["--bates"]) if "--bates" in options else None,
+        raw_filters=normalize_slash_export_filters(options),
+        from_run_id=from_run_id,
+        select_from_scope=not bool(options.get("--no-scope")),
+        family_mode=str(options.get("--family-mode") or "exact"),
+        seed_limit=seed_limit,
+        portable_workspace=bool(options.get("--portable-workspace") or options.get("--portable")),
+        budget_seconds=budget_seconds,
+    )
+    payload["slash_command"] = "/export archive"
+    payload["export_label"] = "archive"
+    return payload
+
+
+def run_export_status_slash_command(root: Path, tokens: list[str]) -> dict[str, object]:
+    positionals, options = parse_slash_export_options(tokens)
+    budget_seconds = parse_optional_int_option(options, "--budget-seconds")
+    kind: str | None = None
+    run_id: str | None = None
+    if positionals:
+        first_token = positionals.pop(0)
+        first_token_normalized = first_token.lower()
+        if first_token_normalized in {"table", "csv"}:
+            kind = "csv"
+        elif first_token_normalized == "archive":
+            kind = "archive"
+        else:
+            run_id = first_token
+    if positionals:
+        if run_id is not None:
+            raise RetrieverError("Usage: /export status [table|archive] [run-id] [--budget-seconds N]")
+        run_id = positionals.pop(0)
+    if positionals:
+        raise RetrieverError("Usage: /export status [table|archive] [run-id] [--budget-seconds N]")
+
+    if kind is not None:
+        payload = export_status(root, export_kind=kind, run_id=run_id, budget_seconds=budget_seconds)
+        payload["slash_command"] = "/export status"
+        payload["export_label"] = "table" if kind == "csv" else kind
+        return payload
+
+    if run_id is not None:
+        for candidate_kind in ("csv", "archive"):
+            candidate_payload = export_status(root, export_kind=candidate_kind, run_id=run_id, budget_seconds=budget_seconds)
+            if candidate_payload.get("run_id"):
+                candidate_payload["slash_command"] = "/export status"
+                candidate_payload["export_label"] = "table" if candidate_kind == "csv" else candidate_kind
+                return candidate_payload
+        return {
+            "ok": True,
+            "status": "none",
+            "run_id": run_id,
+            "exports": {},
+            "next_recommended_commands": [],
+        }
+
+    table_payload = export_status(root, export_kind="csv", budget_seconds=budget_seconds)
+    archive_payload = export_status(root, export_kind="archive", budget_seconds=budget_seconds)
+    active_exports = [
+        {"export_label": label, "run_id": payload.get("run_id"), "status": payload.get("status"), "phase": payload.get("phase")}
+        for label, payload in (("table", table_payload), ("archive", archive_payload))
+        if payload.get("status") in EXPORT_RUN_ACTIVE_STATUSES
+    ]
+    next_commands: list[str] = []
+    for payload in (table_payload, archive_payload):
+        for command in payload.get("next_recommended_commands") or []:
+            if isinstance(command, str) and command not in next_commands:
+                next_commands.append(command)
+    return {
+        "ok": True,
+        "status": "ok",
+        "slash_command": "/export status",
+        "exports": {
+            "table": table_payload,
+            "archive": archive_payload,
+        },
+        "active_exports": active_exports,
+        "next_recommended_commands": next_commands,
+    }
+
+
+def run_export_slash_command(
+    root: Path,
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+    session_state: dict[str, object],
+    normalized_tail: str,
+) -> dict[str, object]:
+    tokens = shlex_split_slash_tail(normalized_tail) if normalized_tail else []
+    if not tokens:
+        raise RetrieverError("Usage: /export <table|archive|status> ...")
+    subcommand = tokens.pop(0).lower()
+    if subcommand in {"table", "csv"}:
+        return run_export_table_slash_command(root, paths, connection, session_state, tokens)
+    if subcommand == "archive":
+        return run_export_archive_slash_command(root, tokens)
+    if subcommand == "status":
+        return run_export_status_slash_command(root, tokens)
+    if subcommand in {"preview", "previews"}:
+        raise RetrieverError(
+            "/export previews is deferred until preview exports are resumable. "
+            "Use export-previews directly only for small/debug exports."
+        )
+    raise RetrieverError("Usage: /export <table|archive|status> ...")
+
+
 def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
     command_name, normalized_tail = parse_slash_command_text(raw_command)
 
@@ -6812,6 +7121,9 @@ def run_slash_command(root: Path, raw_command: str) -> dict[str, object]:
         session_state = read_session_state(paths)
         scope = coerce_scope_payload(session_state.get("scope"))
         active_browse_mode = session_browse_mode(session_state)
+
+        if command_name == "export":
+            return run_export_slash_command(root, paths, connection, session_state, normalized_tail)
 
         if command_name == "scope":
             scope_args = shlex_split_slash_tail(normalized_tail) if normalized_tail else []

@@ -18800,6 +18800,61 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(rows[1], ["alpha.txt"])
         self.assertEqual(len(rows), 2)
 
+    def test_slash_export_table_starts_bounded_csv_from_current_scope(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+
+        export_path = self.root / ".retriever" / "exports" / "slash-scope.csv"
+        start_exit, start_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/export",
+            "table",
+            "documents",
+            "slash-scope.csv",
+            "--field",
+            "file_name",
+        )
+
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertEqual(start_payload["slash_command"], "/export table")
+        self.assertEqual(start_payload["export_kind"], "csv")
+        self.assertEqual(start_payload["export_label"], "table")
+        self.assertEqual(start_payload["table"], "documents")
+        self.assertEqual(start_payload["status"], "exporting")
+        self.assertEqual(start_payload["total_items"], 1)
+        self.assertEqual(start_payload["selector"]["mode"], "scope_search")
+        self.assertTrue(start_payload["selector"]["selected_from_scope"])
+        self.assertEqual(start_payload["selector"]["scope"]["keyword"], "alpha")
+        self.assertIn("export-csv-run-step", start_payload["next_recommended_commands"][0])
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "export-csv-run-step",
+            str(self.root),
+            "--run-id",
+            start_payload["run_id"],
+            "--budget-seconds",
+            "35",
+        )
+
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertEqual(step_payload["run"]["status"], "completed")
+
+        with export_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        self.assertEqual(rows, [["file_name"], ["alpha.txt"]])
+
     def test_export_csv_select_from_scope_and_narrows_with_explicit_filter(self) -> None:
         (self.root / "alpha-one.txt").write_text("alpha body one\n", encoding="utf-8")
         (self.root / "alpha-two.txt").write_text("alpha body two\n", encoding="utf-8")
@@ -18864,6 +18919,53 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIsNotNone(payload)
         self.assertIn("query/filter/scope selectors", payload["error"])
+
+    def test_slash_export_status_reports_table_run(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/export",
+            "table",
+            "documents",
+            "status.csv",
+            "--field",
+            "file_name",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+
+        status_exit, status_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/export",
+            "status",
+            "table",
+            start_payload["run_id"],
+        )
+        self.assertEqual(status_exit, 0)
+        self.assertIsNotNone(status_payload)
+        self.assertEqual(status_payload["slash_command"], "/export status")
+        self.assertEqual(status_payload["export_label"], "table")
+        self.assertEqual(status_payload["run_id"], start_payload["run_id"])
+        self.assertEqual(status_payload["export_kind"], "csv")
+
+        aggregate_exit, aggregate_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/export",
+            "status",
+        )
+        self.assertEqual(aggregate_exit, 0)
+        self.assertIsNotNone(aggregate_payload)
+        self.assertEqual(aggregate_payload["status"], "ok")
+        self.assertEqual(aggregate_payload["exports"]["table"]["run_id"], start_payload["run_id"])
+        self.assertIn("table", {item["export_label"] for item in aggregate_payload["active_exports"]})
 
     def test_export_csv_cli_preserves_explicit_document_order(self) -> None:
         (self.root / "first.txt").write_text("first body\n", encoding="utf-8")
@@ -19400,6 +19502,108 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(manifest["document_count"], 1)
         self.assertEqual(manifest["selector"]["keyword"], "alpha")
 
+    def test_export_archive_start_accepts_legacy_tuple_filter_syntax(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        export_path = self.root / ".retriever" / "exports" / "legacy-filter.zip"
+        start_exit, start_payload, _, _ = self.run_cli(
+            "export-archive-start",
+            str(self.root),
+            "legacy-filter.zip",
+            "--filter",
+            "file_name",
+            "eq",
+            "alpha.txt",
+            "--family-mode",
+            "exact",
+        )
+
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertEqual(start_payload["status"], "exporting")
+        self.assertEqual(start_payload["total_items"], 1)
+        self.assertEqual(start_payload["selector"]["filter"], "(file_name = 'alpha.txt')")
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "export-archive-run-step",
+            str(self.root),
+            "--run-id",
+            start_payload["run_id"],
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertEqual(step_payload["run"]["status"], "completed")
+
+        with zipfile.ZipFile(export_path, "r") as archive:
+            names = set(archive.namelist())
+            manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+
+        self.assertIn("alpha.txt", names)
+        self.assertNotIn("beta.txt", names)
+        self.assertEqual(manifest["document_count"], 1)
+        self.assertEqual(manifest["selector"]["filter"], "(file_name = 'alpha.txt')")
+
+    def test_slash_export_archive_starts_bounded_archive_from_current_scope(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        scope_exit, scope_payload, _, _ = self.run_cli("slash", str(self.root), "/search", "alpha")
+        self.assertEqual(scope_exit, 0)
+        self.assertIsNotNone(scope_payload)
+
+        export_path = self.root / ".retriever" / "exports" / "slash-scope.zip"
+        start_exit, start_payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/export",
+            "archive",
+            "slash-scope.zip",
+            "--family-mode",
+            "exact",
+        )
+
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertEqual(start_payload["slash_command"], "/export archive")
+        self.assertEqual(start_payload["export_kind"], "archive")
+        self.assertEqual(start_payload["export_label"], "archive")
+        self.assertEqual(start_payload["status"], "exporting")
+        self.assertEqual(start_payload["total_items"], 1)
+        self.assertEqual(start_payload["selector"]["keyword"], "alpha")
+        self.assertIn("export-archive-run-step", start_payload["next_recommended_commands"][0])
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "export-archive-run-step",
+            str(self.root),
+            "--run-id",
+            start_payload["run_id"],
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertEqual(step_payload["run"]["status"], "completed")
+
+        with zipfile.ZipFile(export_path, "r") as archive:
+            names = set(archive.namelist())
+            manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+
+        self.assertIn("alpha.txt", names)
+        self.assertNotIn("beta.txt", names)
+        self.assertEqual(manifest["document_count"], 1)
+        self.assertEqual(manifest["selector"]["keyword"], "alpha")
+
     def test_export_archive_resumable_run_step_includes_manifest_and_family(self) -> None:
         email_path = self.root / "thread.eml"
         self.write_email_message(
@@ -19598,6 +19802,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(any(part["part_kind"] == "native" for part in manifest["documents"][0]["source_part_entries"]))
         self.assertEqual(descriptor_payload["document_id"], native_row["id"])
         self.assertEqual(descriptor_payload["control_number"], native_row["control_number"])
+
+    def test_slash_export_previews_is_deferred(self) -> None:
+        exit_code, payload, _, _ = self.run_cli(
+            "slash",
+            str(self.root),
+            "/export",
+            "previews",
+            "preview-out",
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIsNotNone(payload)
+        self.assertIn("deferred", payload["error"])
+        self.assertIn("resumable", payload["error"])
 
     def test_get_doc_and_list_chunks_return_summary_and_exact_chunk_text(self) -> None:
         paragraph = "Termination notice requires careful review and supporting detail. "
