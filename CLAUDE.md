@@ -256,8 +256,14 @@ The authoritative current list of subcommands is regenerated at build time into 
 
 ### Export
 
-- the user asks to export, download, or package results as a zip archive with previews and source files — phrasings like "zip up the matches", "download everything", "package these docs", or "give me a bundle of these" → `export-archive` — write selected documents, previews, and source artifacts to a zip
-- the user asks to export, download, or save results as a CSV or spreadsheet — phrasings like "export these as CSV", "save to Excel", "download as spreadsheet", or "give me a CSV of the matches" → `export-csv` — write selected documents and fields to CSV
+- only when the user asks for a tiny/debug/parity zip archive export where one direct command is acceptable → `export-archive` — write selected documents, previews, and source artifacts to a zip in one direct pass
+- you need to advance a resumable archive export within one bounded call → `export-archive-run-step` — advance a resumable archive export within a bounded call budget
+- the user asks to export, download, or package results as a zip archive with previews/source files and the export may exceed a single Cowork call → `export-archive-start` — start a bounded, resumable archive export run
+- you need status, counts, or next recommended commands for a resumable archive export → `export-archive-status` — show resumable archive export status
+- only when the user asks for a tiny/debug/parity CSV export where one direct command is acceptable → `export-csv` — write selected documents and fields to CSV in one direct pass
+- you need to advance a resumable CSV export within one bounded call → `export-csv-run-step` — advance a resumable CSV export within a bounded call budget
+- the user asks to export, download, or save results as CSV/spreadsheet and the export may exceed a single Cowork call → `export-csv-start` — start a bounded, resumable CSV export run
+- you need status, counts, or next recommended commands for a resumable CSV export → `export-csv-status` — show resumable CSV export status
 - the user asks to export or save HTML previews of selected documents — phrasings like "export the previews", "save rendered HTML", or "give me browsable preview files" → `export-previews` — write HTML preview exports under `.retriever/exports`
 
 ### Custom fields
@@ -278,7 +284,7 @@ The authoritative current list of subcommands is regenerated at build time into 
 - you need to re-run conversation assignment and regenerate previews after ingest or metadata changes → `rebuild-conversations` — re-run conversation assignment and regenerate conversation previews
 - you need to resolve detected duplicates → `reconcile-duplicates` — reconcile detected duplicates
 - you need to rebuild conversation preview HTML → `refresh-conversation-previews` — rebuild conversation preview artifacts
-- you need to regenerate generated document and conversation preview artifacts using the current preview refresh alias → `refresh-previews` — regenerate generated document and conversation preview artifacts
+- you need to regenerate generated document and/or conversation previews with --scope documents, --scope conversations, or --scope all; selectors must stay narrow, --missing-only covers missing rows/files, and document scope includes conversation-owned production documents → `refresh-previews` — regenerate generated document and conversation preview artifacts with bounded selectors
 - the user asks to split, detach, separate, or remove a document from its conversation/thread — phrasings like "split this email off its thread", "detach this message", "separate this from the conversation", or "remove from thread" → `split-from-conversation` — split a document out of a conversation
 
 ### Runs — planning & lifecycle

@@ -7,7 +7,7 @@
 - requirements version: `2026-04-21-phase11-document-deduplication`
 - canonical bundled output file: [tools.py](tools.py)
 - repo source directory: [src/](src/)
-- source checksum (SHA256): `2b3f11e0388a60a713f44261ab79a2a1f86319cf001e755dc5e7a93061861078`
+- source checksum (SHA256): `c2f637c6f07aefc82b81dc71c6732e9a3a4d787df615608c4fcc160b8dc70e8c`
 
 ## Current command surface
 
@@ -16,7 +16,7 @@ Use `python3 skills/tool-template/tools.py --help` as the authoritative command 
 - workspace maintenance: `workspace init`, `workspace status`, `workspace update`, `schema-version`
 - bounded ingest: `ingest`, `ingest-status`, `ingest-run-step`, `ingest-cancel`, plus lower-level `ingest-*` step commands
 - production/PST diagnostics: `ingest-production`, `inspect-pst-properties`
-- browse/search/export: `slash`, `search`, `search-docs`, `search-chunks`, `get-doc`, `list-chunks`, `catalog`, `aggregate`, `export-csv`, `export-archive`, `export-previews`
+- browse/search/export: `slash`, `search`, `search-docs`, `search-chunks`, `get-doc`, `list-chunks`, `catalog`, `aggregate`, `export-csv`, `export-csv-*`, `export-archive`, `export-archive-*`, `export-previews`
 - datasets and fields: `list-datasets`, `create-dataset`, `add-to-dataset`, `remove-from-dataset`, `delete-dataset`, `list-fields`, `add-field`, `rename-field`, `delete-field`, `describe-field`, `change-field-type`, `fill-field`
 - conversations and previews: `merge-into-conversation`, `split-from-conversation`, `clear-conversation-assignment`, `refresh-previews`, `refresh-conversation-previews`, `rebuild-conversations`
 - entities: `entities`, `rebuild-entities-*`, `list-entities`, `show-entity`, `create-entity`, `edit-entity`, `similar-entities`, `merge-entities`, `block-entity-merge`, `ignore-entity`, `split-entity`, `assign-entity`, `unassign-entity`
@@ -42,6 +42,7 @@ For low-level worker protocol work, use:
 - `search`, `search-docs`, `get-doc`, and `search-chunks` return compact JSON by default to keep model context small.
 - Add `--verbose` when you need full document/source metadata, preview target variants, attachment-child payloads, or raw chunk text.
 - `export-previews` writes HTML under `.retriever/exports/` and returns a manifest describing the generated index, unit files, and per-document anchor targets.
+- For Cowork-safe large exports, prefer `export-csv-start` + `export-csv-run-step` + `export-csv-status`, or `export-archive-start` + `export-archive-run-step` + `export-archive-status`. The direct `export-csv` and `export-archive` commands remain useful for tiny exports, deterministic tests, and parity checks.
 - Export preview ownership is shared by the most inclusive useful unit:
   - email export units expand to the full conversation chain
   - chat export units merge contiguous selected documents inside the conversation timeline

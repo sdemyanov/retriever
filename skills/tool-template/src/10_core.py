@@ -906,6 +906,44 @@ SCHEMA_STATEMENTS = [
       UNIQUE(run_id, document_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS export_runs (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL UNIQUE,
+      export_kind TEXT NOT NULL,
+      output_path TEXT NOT NULL,
+      output_rel_path TEXT,
+      selector_json TEXT NOT NULL DEFAULT '{}',
+      config_json TEXT NOT NULL DEFAULT '{}',
+      cursor_json TEXT NOT NULL DEFAULT '{}',
+      phase TEXT NOT NULL DEFAULT 'exporting',
+      status TEXT NOT NULL DEFAULT 'exporting',
+      total_items INTEGER NOT NULL DEFAULT 0,
+      completed_items INTEGER NOT NULL DEFAULT 0,
+      failed_items INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      last_heartbeat_at TEXT,
+      error TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS export_work_items (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES export_runs(run_id) ON DELETE CASCADE,
+      unit_type TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      artifact_manifest_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'pending',
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(run_id, ordinal)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_documents_file_hash ON documents(file_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_documents_lifecycle_status ON documents(lifecycle_status)",
@@ -928,6 +966,8 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_runs_status ON entity_rebuild_runs(status, phase)",
     "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_items_run_status ON entity_rebuild_items(run_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_entity_rebuild_items_lease ON entity_rebuild_items(lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_export_runs_kind_status ON export_runs(export_kind, status, phase)",
+    "CREATE INDEX IF NOT EXISTS idx_export_work_items_run_status ON export_work_items(run_id, status, ordinal)",
 ]
 
 
