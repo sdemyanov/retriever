@@ -1514,7 +1514,9 @@ def ingest_v2_plan_production_root(
     run_id: str,
     signature_payload: dict[str, object],
     next_commit_order: int,
+    paths: dict[str, Path] | None = None,
 ) -> dict[str, object]:
+    resolved_paths = paths if paths is not None else workspace_paths(root)
     signature = ingest_v2_production_signature_from_payload(root, signature_payload)
     production_root = Path(signature["root"])
     metadata_load_path = Path(signature["metadata_load_path"])
@@ -1532,14 +1534,53 @@ def ingest_v2_plan_production_root(
         list(metadata["rows"]),
         resolved_image_rows,
     )
+    production_row = connection.execute(
+        """
+        SELECT id
+        FROM productions
+        WHERE rel_root = ?
+        """,
+        (str(signature["rel_root"]),),
+    ).fetchone()
+    existing_production_id = int(production_row["id"]) if production_row is not None else None
+    existing_by_control_number: dict[str, sqlite3.Row] = {}
+    if existing_production_id is not None:
+        existing_rows = connection.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE production_id = ?
+              AND control_number IS NOT NULL
+            """,
+            (existing_production_id,),
+        ).fetchall()
+        existing_by_control_number = {
+            str(row["control_number"]): row
+            for row in existing_rows
+            if row["control_number"]
+        }
     planned_rows = 0
     planned_preview_batches = 0
+    skipped_unchanged_rows = 0
     current_order = int(next_commit_order)
     for plan in production_row_plans:
-        row_order = current_order
         production_rel_root = str(plan["production_rel_root"])
         control_number = str(plan["control_number"])
         rel_path = production_logical_rel_path(production_rel_root, control_number).as_posix()
+        if (
+            existing_production_id is not None
+            and production_plan_matches_existing_document(
+                resolved_paths,
+                connection,
+                root,
+                existing_by_control_number.get(control_number),
+                plan,
+                production_id=existing_production_id,
+            )
+        ):
+            skipped_unchanged_rows += 1
+            continue
+        row_order = current_order
         inserted = ingest_v2_plan_production_row_item(
             connection,
             run_id=run_id,
@@ -1584,6 +1625,7 @@ def ingest_v2_plan_production_root(
         **signature_payload,
         "planned_rows": planned_rows,
         "planned_preview_batches": planned_preview_batches,
+        "skipped_unchanged_rows": skipped_unchanged_rows,
         "seen_control_numbers": sorted(seen_control_numbers),
         "docs_missing_linked_text": sum(int(plan["missing_linked_text"]) for plan in production_row_plans),
         "docs_missing_linked_images": sum(int(plan["missing_linked_images"]) for plan in production_row_plans),
@@ -5585,6 +5627,7 @@ def ingest_v2_plan_step(
                                 run_id=run_id,
                                 signature_payload=signature_payload,
                                 next_commit_order=int(cursor.get("next_commit_order") or 1),
+                                paths=paths,
                             )
                             work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
                         except Exception as exc:
@@ -5617,6 +5660,10 @@ def ingest_v2_plan_step(
                             int(cursor.get("planned_production_preview_batches") or 0)
                             + int(production_plan.get("planned_preview_batches") or 0)
                         )
+                        cursor["skipped_unchanged_production_rows"] = (
+                            int(cursor.get("skipped_unchanged_production_rows") or 0)
+                            + int(production_plan.get("skipped_unchanged_rows") or 0)
+                        )
                         cursor["production_docs_missing_linked_text"] = (
                             int(cursor.get("production_docs_missing_linked_text") or 0)
                             + int(production_plan["docs_missing_linked_text"] or 0)
@@ -5635,6 +5682,7 @@ def ingest_v2_plan_step(
                             "seen_control_numbers": list(production_plan["seen_control_numbers"]),
                             "planned_rows": int(production_plan["planned_rows"] or 0),
                             "planned_preview_batches": int(production_plan.get("planned_preview_batches") or 0),
+                            "skipped_unchanged_rows": int(production_plan.get("skipped_unchanged_rows") or 0),
                             "docs_missing_linked_text": int(production_plan["docs_missing_linked_text"] or 0),
                             "docs_missing_linked_images": int(production_plan["docs_missing_linked_images"] or 0),
                             "docs_missing_linked_natives": int(production_plan["docs_missing_linked_natives"] or 0),
@@ -5859,6 +5907,7 @@ def ingest_v2_plan_step(
                     "planned_production_roots": len(list(cursor.get("planned_production_roots") or [])),
                     "planned_production_rows": int(cursor.get("planned_production_rows") or 0),
                     "planned_production_preview_batches": int(cursor.get("planned_production_preview_batches") or 0),
+                    "skipped_unchanged_production_rows": int(cursor.get("skipped_unchanged_production_rows") or 0),
                     "planned_slack_export_roots": list(cursor.get("planned_slack_export_roots") or []),
                     "planned_slack_conversations": int(cursor.get("planned_slack_conversations") or 0),
                     "planned_slack_day_documents": int(cursor.get("planned_slack_day_documents") or 0),
@@ -6119,6 +6168,21 @@ def ingest_v2_commit_step(
     actions: dict[str, int] = {}
     freshness_fallbacks = 0
     writer_busy = False
+    load_commit_state_ms = 0.0
+    status_payload_ms = 0.0
+    claim_ms_values: list[float] = []
+    prepared_decode_ms_values: list[float] = []
+    item_commit_ms_values: list[float] = []
+
+    def commit_timing_payload() -> dict[str, object]:
+        return {
+            "load_commit_state_ms": round(load_commit_state_ms, 3),
+            "claim_ms": ingest_v2_timing_summary(claim_ms_values),
+            "prepared_decode_ms": ingest_v2_timing_summary(prepared_decode_ms_values),
+            "item_commit_ms": ingest_v2_timing_summary(item_commit_ms_values),
+            "status_payload_ms": round(status_payload_ms, 3),
+        }
+
     connection = connect_db(paths["db_path"])
     lease_acquired = False
     try:
@@ -6126,6 +6190,12 @@ def ingest_v2_commit_step(
             apply_schema(connection, root)
         row = require_ingest_v2_run_row(connection, run_id)
         if str(row["status"]) in INGEST_V2_TERMINAL_STATUSES or row["cancel_requested_at"] is not None:
+            run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+                connection,
+                root,
+                row,
+                budget_seconds=budget,
+            )
             return {
                 "ok": True,
                 "implemented": True,
@@ -6140,9 +6210,16 @@ def ingest_v2_commit_step(
                 "advanced_to_finalize": False,
                 "more_commit_remaining": False,
                 "more_work_remaining": False,
-                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+                "timings": commit_timing_payload(),
+                "run": run_payload,
             }
         if str(row["phase"]) != "committing":
+            run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+                connection,
+                root,
+                row,
+                budget_seconds=budget,
+            )
             return {
                 "ok": True,
                 "implemented": True,
@@ -6157,13 +6234,20 @@ def ingest_v2_commit_step(
                 "advanced_to_finalize": False,
                 "more_commit_remaining": str(row["phase"]) in {"planning", "preparing"},
                 "more_work_remaining": str(row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-                "run": ingest_v2_status_payload(connection, root, row, budget_seconds=budget),
+                "timings": commit_timing_payload(),
+                "run": run_payload,
             }
 
         lease_acquired = ingest_v2_acquire_writer_lease(connection, run_id=run_id, writer_id=writer_id)
         if not lease_acquired:
             writer_busy = True
             updated_row = require_ingest_v2_run_row(connection, run_id)
+            run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+                connection,
+                root,
+                updated_row,
+                budget_seconds=budget,
+            )
             return {
                 "ok": True,
                 "implemented": True,
@@ -6178,17 +6262,20 @@ def ingest_v2_commit_step(
                 "advanced_to_finalize": False,
                 "more_commit_remaining": True,
                 "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-                "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+                "timings": commit_timing_payload(),
+                "run": run_payload,
             }
 
         stale_reclaimed = ingest_v2_reclaim_stale_commit_items(connection, run_id=run_id)
         run_row = require_ingest_v2_run_row(connection, run_id)
+        load_commit_state_started = time.perf_counter()
         existing_by_rel, unseen_existing_by_hash = ingest_v2_load_loose_file_commit_state(
             connection,
             root=root,
             run_row=run_row,
         )
         cursor = ingest_v2_load_commit_cursor(connection, run_id=run_id)
+        load_commit_state_ms = ingest_v2_elapsed_ms(load_commit_state_started)
         filesystem_dataset_id: int | None = None
         filesystem_dataset_source_id: int | None = None
         mbox_contexts: dict[str, dict[str, object]] = {}
@@ -6210,16 +6297,23 @@ def ingest_v2_commit_step(
             ingest_v2_deadline_remaining_seconds(deadline) >= INGEST_V2_COMMIT_MIN_START_SECONDS
             and (item_limit is None or committed + failed < item_limit)
         ):
+            claim_started = time.perf_counter()
             claimed_row = ingest_v2_claim_next_commit_item(
                 connection,
                 run_id=run_id,
                 writer_id=writer_id,
             )
+            claim_ms_values.append(ingest_v2_elapsed_ms(claim_started))
             if claimed_row is None:
                 break
             work_item_id = int(claimed_row["id"])
+            item_commit_started = time.perf_counter()
             try:
-                prepared_item = ingest_v2_prepared_item_from_row(claimed_row)
+                prepared_decode_started = time.perf_counter()
+                try:
+                    prepared_item = ingest_v2_prepared_item_from_row(claimed_row)
+                finally:
+                    prepared_decode_ms_values.append(ingest_v2_elapsed_ms(prepared_decode_started))
                 payload_kind = str(claimed_row["payload_kind"] or claimed_row["unit_type"] or "")
                 if payload_kind == "production_row" or str(claimed_row["unit_type"] or "") == "production_row":
                     prepared_item = ingest_v2_hydrate_prepared_production_item(prepared_item)
@@ -6564,6 +6658,8 @@ def ingest_v2_commit_step(
                     writer_id=writer_id,
                     message=f"{type(exc).__name__}: {exc}",
                 )
+            finally:
+                item_commit_ms_values.append(ingest_v2_elapsed_ms(item_commit_started))
 
         advanced_after_commit = ingest_v2_maybe_advance_after_commit(connection, run_id=run_id)
         if lease_acquired:
@@ -6584,6 +6680,12 @@ def ingest_v2_commit_step(
             ).fetchone()[0]
             or 0
         )
+        run_payload, status_payload_ms = ingest_v2_status_payload_timed(
+            connection,
+            root,
+            updated_row,
+            budget_seconds=budget,
+        )
         return {
             "ok": True,
             "implemented": True,
@@ -6599,7 +6701,8 @@ def ingest_v2_commit_step(
             "advanced_to_prepare": advanced_to_prepare,
             "more_commit_remaining": remaining_commit_items > 0,
             "more_work_remaining": str(updated_row["status"]) not in INGEST_V2_TERMINAL_STATUSES,
-            "run": ingest_v2_status_payload(connection, root, updated_row, budget_seconds=budget),
+            "timings": commit_timing_payload(),
+            "run": run_payload,
         }
     finally:
         if lease_acquired:

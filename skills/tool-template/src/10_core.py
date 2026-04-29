@@ -5283,21 +5283,23 @@ def bind_document_dedupe_key(
     basis: str,
     key_value: str | None,
     document_id: int,
-) -> None:
+) -> bool:
     normalized_key = normalize_whitespace(str(key_value or ""))
     if not normalized_key:
-        return
+        return False
     now = utc_now()
-    connection.execute(
+    cursor = connection.execute(
         """
         INSERT INTO document_dedupe_keys (basis, key_value, document_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(basis, key_value) DO UPDATE SET
           document_id = excluded.document_id,
           updated_at = excluded.updated_at
+        WHERE document_dedupe_keys.document_id != excluded.document_id
         """,
         (basis, normalized_key, document_id, now, now),
     )
+    return int(cursor.rowcount or 0) > 0
 
 
 def find_active_occurrence_by_source_identity(

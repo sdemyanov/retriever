@@ -5,7 +5,7 @@ description: >
   It defines the pinned generated tools.py bundle, checksum expectations, and
   the current command surface.
 metadata:
-  version: "1.1.11"
+  version: "1.1.12"
 ---
 
 # Retriever Tool Template
