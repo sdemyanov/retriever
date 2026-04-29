@@ -16611,6 +16611,51 @@ def refresh_documents_fts_row(connection: sqlite3.Connection, document_id: int) 
     )
 
 
+PREVIEW_ARTIFACT_WRITE_RETRY_DELAYS_SECONDS = (0.05, 0.15, 0.35)
+
+
+def preview_artifact_write_is_retryable(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "errno", None) in {
+        errno.EACCES,
+        errno.EAGAIN,
+        errno.EBUSY,
+        errno.EPERM,
+    }
+
+
+def write_preview_artifact_text_atomic(path: Path, content: str) -> None:
+    retry_delays = PREVIEW_ARTIFACT_WRITE_RETRY_DELAYS_SECONDS
+    for attempt in range(len(retry_delays) + 1):
+        temp_path: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            )
+            temp_path = Path(temp_file.name)
+            with temp_file:
+                temp_file.write(content)
+                temp_file.flush()
+            os.replace(temp_path, path)
+            return
+        except OSError as exc:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            if attempt >= len(retry_delays) or not preview_artifact_write_is_retryable(exc):
+                raise
+            time.sleep(retry_delays[attempt])
+
+
 def write_preview_artifacts(
     paths: dict[str, Path], rel_path: str, preview_artifacts: list[dict[str, object]]
 ) -> list[dict[str, object]]:
@@ -16619,8 +16664,7 @@ def write_preview_artifacts(
     for artifact in preview_artifacts:
         preview_rel_path = preview_base / str(artifact["file_name"])
         absolute_path = paths["state_dir"] / preview_rel_path
-        absolute_path.parent.mkdir(parents=True, exist_ok=True)
-        absolute_path.write_text(str(artifact["content"]), encoding="utf-8")
+        write_preview_artifact_text_atomic(absolute_path, str(artifact["content"]))
         preview_rows.append(
             {
                 "rel_preview_path": preview_rel_path.as_posix(),
