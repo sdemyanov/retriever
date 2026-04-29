@@ -52404,10 +52404,13 @@ def render_search_markdown(payload: dict[str, object], column_defs: list[dict[st
     if overview_line:
         lines.append(overview_line)
 
-    column_names = [str(column_def["name"]) for column_def in column_defs]
+    column_labels = [
+        markdown_table_cell_text(passive_field_label(column_def.get("name")) or column_def.get("name") or "")
+        for column_def in column_defs
+    ]
     lines.append("")
-    lines.append("| " + " | ".join(column_names) + " |")
-    lines.append("|" + "|".join("---" for _ in column_names) + "|")
+    lines.append("| " + " | ".join(column_labels) + " |")
+    lines.append("|" + "|".join("---" for _ in column_labels) + "|")
 
     results = payload.get("results")
     if isinstance(results, list):

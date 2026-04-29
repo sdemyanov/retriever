@@ -1949,7 +1949,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "/columns set label,primary_email,entity_status",
         )
         self.assertEqual(columns_exit, 0)
-        self.assertIn("| label | primary_email | entity_status |", columns_stdout)
+        self.assertIn("| Label | Primary Email | Entity Status |", columns_stdout)
+        self.assertNotIn("| label | primary_email | entity_status |", columns_stdout)
 
         documents_exit, _, _ = self.run_cli_raw("slash", str(self.root), "/documents")
         self.assertEqual(documents_exit, 0)
@@ -1960,7 +1961,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         entities_exit, entities_stdout, _ = self.run_cli_raw("slash", str(self.root), "/entities")
         self.assertEqual(entities_exit, 0)
-        self.assertIn("| label | primary_email | entity_status |", entities_stdout)
+        self.assertIn("| Label | Primary Email | Entity Status |", entities_stdout)
+        self.assertNotIn("| label | primary_email | entity_status |", entities_stdout)
         self.assertIn("carol@people.test", entities_stdout)
         self.assertIn("dave@people.test", entities_stdout)
         self.assertNotIn("alice@people.test", entities_stdout)
@@ -12671,9 +12673,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("results", search_payload)
         self.assertNotIn("documents", search_payload)
         self.assertIn("rendered_markdown", search_payload)
+        self.assertEqual(search_payload["display"]["columns"], ["title", "control_number"])
         rendered = str(search_payload["rendered_markdown"])
         self.assertIn("Keyword: 'sample'", rendered)
-        self.assertIn("| title | control_number |", rendered)
+        self.assertIn("| Title | Control # |", rendered)
+        self.assertNotIn("| title | control_number |", rendered)
         self.assertIn("](computer://", rendered)
         self.assertIn("Documents 1–1 of 1.", rendered)
         self.assertNotIn("| # |", rendered)
@@ -12697,9 +12701,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(search_payload)
         assert search_payload is not None
         self.assertIn("rendered_markdown", search_payload)
+        self.assertEqual(search_payload["display"]["columns"], ["title", "control_number"])
         rendered = str(search_payload["rendered_markdown"])
         self.assertIn("Keyword: 'sample'", rendered)
-        self.assertIn("| title | control_number |", rendered)
+        self.assertIn("| Title | Control # |", rendered)
+        self.assertNotIn("| title | control_number |", rendered)
         self.assertIn("](computer://", rendered)
         self.assertIn("Documents 1–1 of 1.", rendered)
         self.assertNotIn("| # |", rendered)
@@ -12728,7 +12734,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(parent_exit, 0)
         self.assertIsNotNone(parent_payload)
         assert parent_payload is not None
+        self.assertEqual(
+            parent_payload["display"]["columns"],
+            ["content_type", "title", "author", "date_created", "control_number"],
+        )
         parent_rendered = str(parent_payload["rendered_markdown"])
+        self.assertIn("| Type | Title | Author | Created | Control # |", parent_rendered)
+        self.assertNotIn("| content_type | title | author | date_created | control_number |", parent_rendered)
         self.assertIn("[Upgrade test](computer://", parent_rendered)
         self.assertIn("| E-Doc | [↳ notes.txt](computer://", parent_rendered)
 
