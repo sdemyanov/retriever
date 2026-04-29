@@ -58427,6 +58427,13 @@ def export_run_output_rel_path(root: Path, output_path: Path) -> str | None:
         return None
 
 
+def export_run_current_output_path(root: Path, row: sqlite3.Row) -> Path:
+    output_rel_path = normalize_inline_whitespace(str(row["output_rel_path"] or ""))
+    if output_rel_path:
+        return (root / output_rel_path).resolve()
+    return Path(str(row["output_path"]))
+
+
 def latest_export_run_row(
     connection: sqlite3.Connection,
     *,
@@ -58550,7 +58557,7 @@ def export_run_status_payload(
         "export_kind": row["export_kind"],
         "status": row["status"],
         "phase": row["phase"],
-        "output_path": row["output_path"],
+        "output_path": str(export_run_current_output_path(root, row)),
         "output_rel_path": row["output_rel_path"],
         "selector": decode_json_text(row["selector_json"], default={}) or {},
         "config": decode_json_text(row["config_json"], default={}) or {},
@@ -59404,7 +59411,7 @@ def export_csv_finalize_step(
     config = decode_json_text(row["config_json"], default={}) or {}
     cursor = decode_json_text(row["cursor_json"], default={}) or {}
     field_defs = list(config.get("fields") or [])
-    output_path = Path(str(row["output_path"]))
+    output_path = export_run_current_output_path(paths["root"], row)
     failed_count = int(row["failed_items"] or 0)
     assembled_ordinal = int(cursor.get("assembled_ordinal") or 0)
     partial_path = export_run_partial_csv_path(paths, run_id)
@@ -59446,6 +59453,16 @@ def export_csv_finalize_step(
     cursor["assembled_ordinal"] = target_ordinal
     cursor["partial_rel_path"] = str(partial_path.relative_to(paths["state_dir"]))
     now = utc_now()
+    connection.execute(
+        """
+        UPDATE export_runs
+        SET cursor_json = ?,
+            last_heartbeat_at = ?
+        WHERE run_id = ?
+        """,
+        (compact_json_text(cursor), now, run_id),
+    )
+    connection.commit()
     completed_count = int(row["completed_items"] or 0)
     total_items = int(row["total_items"] or 0)
     remaining_completed = int(connection.execute(
@@ -59476,17 +59493,7 @@ def export_csv_finalize_step(
             """,
             (status, status, compact_json_text(cursor), now, now, error, run_id),
         )
-    else:
-        connection.execute(
-            """
-            UPDATE export_runs
-            SET cursor_json = ?,
-                last_heartbeat_at = ?
-            WHERE run_id = ?
-            """,
-            (compact_json_text(cursor), now, run_id),
-        )
-    connection.commit()
+        connection.commit()
     return {
         "assembled_rows": target_ordinal,
         "assembled_this_step": len(fragments),
@@ -59663,7 +59670,7 @@ def export_archive_finalize_step(
     selector = decode_json_text(row["selector_json"], default={}) or {}
     partial_path = export_run_partial_archive_path(paths, run_id)
     partial_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path = Path(str(row["output_path"]))
+    output_path = export_run_current_output_path(paths["root"], row)
     completed_items = connection.execute(
         """
         SELECT *
