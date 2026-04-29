@@ -8197,6 +8197,53 @@ def serialize_export_cell_value(value: object, field_type: str) -> str:
     return str(value)
 
 
+def resolve_export_csv_selection(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_ids: list[int] | None,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+    select_from_scope: bool = False,
+) -> tuple[list[sqlite3.Row], dict[str, object]]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+    if normalized_document_ids and (query.strip() or raw_filters or sort_field or order or select_from_scope):
+        raise RetrieverError("export-csv accepts either --doc-id selectors or query/filter/scope selectors, not both.")
+
+    if normalized_document_ids:
+        rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
+        selector: dict[str, object] = {
+            "mode": "document_ids",
+            "document_ids": normalized_document_ids,
+        }
+    else:
+        if select_from_scope:
+            session_state = read_session_state(paths)
+            merged_scope = merge_scope_with_search_inputs(session_state.get("scope"), query, raw_filters)
+            selection = resolve_scope_document_search_with_explicit_sort(connection, merged_scope, sort_field, order)
+            selector = {
+                "mode": "scope_search",
+                "selected_from_scope": True,
+                "scope": selection["scope"],
+                "query": selection["query"],
+                "filters": selection["filters"],
+                "sort": selection["sort"],
+                "order": selection["order"],
+            }
+        else:
+            selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
+            selector = {
+                "mode": "search",
+                "query": selection["query"],
+                "filters": selection["filters"],
+                "sort": selection["sort"],
+                "order": selection["order"],
+            }
+        rows = [item["row"] for item in selection["results"]]
+    return rows, selector
+
+
 def export_csv(
     root: Path,
     raw_output_path: str,
@@ -8215,41 +8262,16 @@ def export_csv(
         apply_schema(connection, root)
         field_defs = resolve_export_field_definitions(connection, raw_fields)
         output_path = resolve_export_output_path(paths, raw_output_path)
-
-        normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
-        if normalized_document_ids and (query.strip() or raw_filters or sort_field or order or select_from_scope):
-            raise RetrieverError("export-csv accepts either --doc-id selectors or query/filter/scope selectors, not both.")
-
-        if normalized_document_ids:
-            rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
-            selector: dict[str, object] = {
-                "mode": "document_ids",
-                "document_ids": normalized_document_ids,
-            }
-        else:
-            if select_from_scope:
-                session_state = read_session_state(paths)
-                merged_scope = merge_scope_with_search_inputs(session_state.get("scope"), query, raw_filters)
-                selection = resolve_scope_document_search_with_explicit_sort(connection, merged_scope, sort_field, order)
-                selector = {
-                    "mode": "scope_search",
-                    "selected_from_scope": True,
-                    "scope": selection["scope"],
-                    "query": selection["query"],
-                    "filters": selection["filters"],
-                    "sort": selection["sort"],
-                    "order": selection["order"],
-                }
-            else:
-                selection = resolve_document_search(connection, query, raw_filters, sort_field, order)
-                selector = {
-                    "mode": "search",
-                    "query": selection["query"],
-                    "filters": selection["filters"],
-                    "sort": selection["sort"],
-                    "order": selection["order"],
-                }
-            rows = [item["row"] for item in selection["results"]]
+        rows, selector = resolve_export_csv_selection(
+            connection,
+            paths,
+            document_ids,
+            query,
+            raw_filters,
+            sort_field,
+            order,
+            select_from_scope,
+        )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overwrote_existing_file = output_path.exists()
@@ -8949,6 +8971,43 @@ def build_portable_workspace_db(
         target_connection.close()
 
 
+def resolve_export_archive_selection(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    dataset_names: list[str] | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
+    family_mode: str = "exact",
+    seed_limit: int | None = None,
+) -> tuple[list[dict[str, object]], dict[str, object], str]:
+    normalized_family_mode = normalize_run_family_mode(family_mode)
+    if seed_limit is not None and seed_limit < 1:
+        raise RetrieverError("Archive limit must be >= 1.")
+    selector = build_effective_scope_selector(
+        connection,
+        paths,
+        query=query,
+        raw_bates=raw_bates,
+        raw_filters=raw_filters,
+        dataset_names=dataset_names,
+        from_run_id=from_run_id,
+        select_from_scope=select_from_scope,
+    )
+    if not scope_run_selector_has_inputs(selector):
+        raise RetrieverError("Archive selector must include at least one inclusion input.")
+    selected_documents, _ = plan_scope_selected_documents(
+        connection,
+        selector=selector,
+        family_mode=normalized_family_mode,
+        seed_limit=seed_limit,
+    )
+    return selected_documents, selector, normalized_family_mode
+
+
 def export_archive(
     root: Path,
     raw_output_path: str,
@@ -8963,33 +9022,24 @@ def export_archive(
     seed_limit: int | None = None,
     portable_workspace: bool = False,
 ) -> dict[str, object]:
-    normalized_family_mode = normalize_run_family_mode(family_mode)
-    if seed_limit is not None and seed_limit < 1:
-        raise RetrieverError("Archive limit must be >= 1.")
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        selector = build_effective_scope_selector(
+        selected_documents, selector, normalized_family_mode = resolve_export_archive_selection(
             connection,
             paths,
+            dataset_names=dataset_names,
             query=query,
             raw_bates=raw_bates,
             raw_filters=raw_filters,
-            dataset_names=dataset_names,
             from_run_id=from_run_id,
             select_from_scope=select_from_scope,
-        )
-        if not scope_run_selector_has_inputs(selector):
-            raise RetrieverError("Archive selector must include at least one inclusion input.")
-        output_path = resolve_export_output_path(paths, raw_output_path)
-        selected_documents, _ = plan_scope_selected_documents(
-            connection,
-            selector=selector,
-            family_mode=normalized_family_mode,
+            family_mode=family_mode,
             seed_limit=seed_limit,
         )
+        output_path = resolve_export_output_path(paths, raw_output_path)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overwrote_existing_file = output_path.exists()
@@ -9089,6 +9139,1016 @@ def export_archive(
             "warnings": warnings,
             "overwrote_existing_file": overwrote_existing_file,
             "file_size": file_size_bytes(output_path),
+        }
+    finally:
+        connection.close()
+
+
+EXPORT_RUN_ACTIVE_STATUSES = {"exporting", "finalizing"}
+EXPORT_RUN_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
+EXPORT_RUN_STEP_MIN_REMAINING_SECONDS = 1.25
+EXPORT_CSV_ROW_BATCH_SIZE = 100
+
+
+def export_run_temp_dir(paths: dict[str, Path], run_id: str) -> Path:
+    return paths["state_dir"] / "tmp" / "exports" / run_id
+
+
+def export_run_csv_rows_dir(paths: dict[str, Path], run_id: str) -> Path:
+    return export_run_temp_dir(paths, run_id) / "csv_rows"
+
+
+def export_run_csv_fragment_rel_path(run_id: str, ordinal: int) -> str:
+    return str(Path("tmp") / "exports" / run_id / "csv_rows" / f"{int(ordinal):08d}.csvfrag")
+
+
+def export_run_partial_csv_path(paths: dict[str, Path], run_id: str) -> Path:
+    return export_run_temp_dir(paths, run_id) / "output.partial.csv"
+
+
+def export_run_partial_archive_path(paths: dict[str, Path], run_id: str) -> Path:
+    return export_run_temp_dir(paths, run_id) / "output.partial.zip"
+
+
+def write_text_file_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+    try:
+        with temp_file:
+            temp_file.write(text)
+            temp_file.flush()
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def export_run_output_rel_path(root: Path, output_path: Path) -> str | None:
+    try:
+        return output_path.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
+def latest_export_run_row(
+    connection: sqlite3.Connection,
+    *,
+    export_kind: str,
+    run_id: str | None = None,
+) -> sqlite3.Row | None:
+    if run_id:
+        return connection.execute(
+            "SELECT * FROM export_runs WHERE run_id = ? AND export_kind = ?",
+            (run_id, export_kind),
+        ).fetchone()
+    return connection.execute(
+        """
+        SELECT *
+        FROM export_runs
+        WHERE export_kind = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (export_kind,),
+    ).fetchone()
+
+
+def active_export_run_row(connection: sqlite3.Connection, *, export_kind: str) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM export_runs
+        WHERE export_kind = ?
+          AND status IN ('exporting', 'finalizing')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (export_kind,),
+    ).fetchone()
+
+
+def require_export_run_row(
+    connection: sqlite3.Connection,
+    *,
+    export_kind: str,
+    run_id: str,
+) -> sqlite3.Row:
+    row = latest_export_run_row(connection, export_kind=export_kind, run_id=run_id)
+    if row is None:
+        raise RetrieverError(f"Unknown {export_kind} export run: {run_id}")
+    return row
+
+
+def export_work_item_counts(connection: sqlite3.Connection, *, run_id: str) -> dict[str, int]:
+    counts = {status: 0 for status in ("pending", "running", "completed", "failed")}
+    for row in connection.execute(
+        """
+        SELECT status, COUNT(*) AS count
+        FROM export_work_items
+        WHERE run_id = ?
+        GROUP BY status
+        """,
+        (run_id,),
+    ):
+        counts[str(row["status"])] = int(row["count"] or 0)
+    return counts
+
+
+def export_work_item_counts_by_unit_type(connection: sqlite3.Connection, *, run_id: str) -> dict[str, dict[str, int]]:
+    by_unit_type: dict[str, dict[str, int]] = {}
+    for row in connection.execute(
+        """
+        SELECT unit_type, status, COUNT(*) AS count
+        FROM export_work_items
+        WHERE run_id = ?
+        GROUP BY unit_type, status
+        ORDER BY unit_type ASC, status ASC
+        """,
+        (run_id,),
+    ):
+        unit_type = str(row["unit_type"])
+        by_unit_type.setdefault(unit_type, {status: 0 for status in ("pending", "running", "completed", "failed")})
+        by_unit_type[unit_type][str(row["status"])] = int(row["count"] or 0)
+    return by_unit_type
+
+
+def refresh_export_run_counts(connection: sqlite3.Connection, *, run_id: str, now: str | None = None) -> None:
+    counts = export_work_item_counts(connection, run_id=run_id)
+    connection.execute(
+        """
+        UPDATE export_runs
+        SET completed_items = ?,
+            failed_items = ?,
+            last_heartbeat_at = ?
+        WHERE run_id = ?
+        """,
+        (counts.get("completed", 0), counts.get("failed", 0), now or utc_now(), run_id),
+    )
+
+
+def export_run_next_commands(root: Path, row: sqlite3.Row, *, budget_seconds: int) -> list[str]:
+    run_id = shlex.quote(str(row["run_id"]))
+    root_arg = shlex.quote(str(root))
+    export_kind = str(row["export_kind"])
+    prefix = "export-csv" if export_kind == "csv" else "export-archive"
+    if str(row["status"]) in EXPORT_RUN_TERMINAL_STATUSES:
+        return [f"{prefix}-status {root_arg} --run-id {run_id}"]
+    budget_arg = str(int(budget_seconds))
+    return [
+        f"{prefix}-run-step {root_arg} --run-id {run_id} --budget-seconds {budget_arg}",
+        f"{prefix}-status {root_arg} --run-id {run_id}",
+    ]
+
+
+def export_run_status_payload(
+    connection: sqlite3.Connection,
+    root: Path,
+    row: sqlite3.Row,
+    *,
+    budget_seconds: int = DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    return {
+        "run_id": run_id,
+        "export_kind": row["export_kind"],
+        "status": row["status"],
+        "phase": row["phase"],
+        "output_path": row["output_path"],
+        "output_rel_path": row["output_rel_path"],
+        "selector": decode_json_text(row["selector_json"], default={}) or {},
+        "config": decode_json_text(row["config_json"], default={}) or {},
+        "cursor": decode_json_text(row["cursor_json"], default={}) or {},
+        "total_items": int(row["total_items"] or 0),
+        "completed_items": int(row["completed_items"] or 0),
+        "failed_items": int(row["failed_items"] or 0),
+        "counts": {
+            "work_items": export_work_item_counts(connection, run_id=run_id),
+            "by_unit_type": export_work_item_counts_by_unit_type(connection, run_id=run_id),
+        },
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "last_error": row["error"],
+        "budget_recommendation_seconds": int(budget_seconds),
+        "next_recommended_commands": export_run_next_commands(root, row, budget_seconds=budget_seconds),
+    }
+
+
+def export_status(
+    root: Path,
+    *,
+    export_kind: str,
+    run_id: str | None = None,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        row = latest_export_run_row(connection, export_kind=export_kind, run_id=run_id)
+        if row is None:
+            return {
+                "ok": True,
+                "status": "none",
+                "phase": None,
+                "run_id": None,
+                "export_kind": export_kind,
+                "counts": {
+                    "work_items": {status: 0 for status in ("pending", "running", "completed", "failed")},
+                    "by_unit_type": {},
+                },
+                "next_recommended_commands": [],
+            }
+        return {"ok": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
+    finally:
+        connection.close()
+
+
+def export_csv_start(
+    root: Path,
+    raw_output_path: str,
+    raw_fields: list[str] | None,
+    document_ids: list[int] | None,
+    query: str,
+    raw_filters: list[list[str]] | None,
+    sort_field: str | None,
+    order: str | None,
+    select_from_scope: bool = False,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        active_row = active_export_run_row(connection, export_kind="csv")
+        if active_row is not None:
+            raise RetrieverError(f"CSV export run {active_row['run_id']} is already active.")
+        field_defs = resolve_export_field_definitions(connection, raw_fields)
+        output_path = resolve_export_output_path(paths, raw_output_path)
+        rows, selector = resolve_export_csv_selection(
+            connection,
+            paths,
+            document_ids,
+            query,
+            raw_filters,
+            sort_field,
+            order,
+            select_from_scope,
+        )
+        run_id = new_ingest_v2_run_id()
+        now = utc_now()
+        output_rel_path = export_run_output_rel_path(root, output_path)
+        config = {
+            "fields": field_defs,
+            "raw_output_path": raw_output_path,
+            "overwrote_existing_file": output_path.exists(),
+        }
+        cursor = {
+            "assembled_ordinal": 0,
+            "partial_rel_path": str(Path("tmp") / "exports" / run_id / "output.partial.csv"),
+        }
+        export_run_csv_rows_dir(paths, run_id).mkdir(parents=True, exist_ok=True)
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                INSERT INTO export_runs (
+                  run_id, export_kind, output_path, output_rel_path, selector_json, config_json,
+                  cursor_json, phase, status, total_items, completed_items, failed_items,
+                  created_at, started_at, last_heartbeat_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    "csv",
+                    str(output_path),
+                    output_rel_path,
+                    compact_json_text(selector),
+                    compact_json_text(config),
+                    compact_json_text(cursor),
+                    "exporting",
+                    "exporting" if rows else "finalizing",
+                    len(rows),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO export_work_items (
+                  run_id, unit_type, ordinal, document_id, payload_json, artifact_manifest_json,
+                  status, created_at, updated_at
+                ) VALUES (?, 'csv_row', ?, ?, ?, '{}', 'pending', ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        index,
+                        int(row["id"]),
+                        compact_json_text({"document_id": int(row["id"])}),
+                        now,
+                        now,
+                    )
+                    for index, row in enumerate(rows, start=1)
+                ],
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        row = require_export_run_row(connection, export_kind="csv", run_id=run_id)
+        return {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
+    finally:
+        connection.close()
+
+
+def export_archive_start(
+    root: Path,
+    raw_output_path: str,
+    *,
+    dataset_names: list[str] | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
+    family_mode: str = "exact",
+    seed_limit: int | None = None,
+    portable_workspace: bool = False,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    budget = normalize_resumable_step_budget(budget_seconds)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        active_row = active_export_run_row(connection, export_kind="archive")
+        if active_row is not None:
+            raise RetrieverError(f"Archive export run {active_row['run_id']} is already active.")
+        selected_documents, selector, normalized_family_mode = resolve_export_archive_selection(
+            connection,
+            paths,
+            dataset_names=dataset_names,
+            query=query,
+            raw_bates=raw_bates,
+            raw_filters=raw_filters,
+            from_run_id=from_run_id,
+            select_from_scope=select_from_scope,
+            family_mode=family_mode,
+            seed_limit=seed_limit,
+        )
+        output_path = resolve_export_output_path(paths, raw_output_path)
+        run_id = new_ingest_v2_run_id()
+        now = utc_now()
+        output_rel_path = export_run_output_rel_path(root, output_path)
+        config = {
+            "raw_output_path": raw_output_path,
+            "family_mode": normalized_family_mode,
+            "seed_limit": seed_limit,
+            "portable_workspace": bool(portable_workspace),
+            "overwrote_existing_file": output_path.exists(),
+            "manifest_rel_path": ".retriever/export-manifest.json",
+        }
+        cursor = {
+            "created_at": now,
+            "partial_rel_path": str(Path("tmp") / "exports" / run_id / "output.partial.zip"),
+            "portable_workspace_added": False,
+            "manifest_added": False,
+        }
+        export_run_temp_dir(paths, run_id).mkdir(parents=True, exist_ok=True)
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                INSERT INTO export_runs (
+                  run_id, export_kind, output_path, output_rel_path, selector_json, config_json,
+                  cursor_json, phase, status, total_items, completed_items, failed_items,
+                  created_at, started_at, last_heartbeat_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    "archive",
+                    str(output_path),
+                    output_rel_path,
+                    compact_json_text(selector),
+                    compact_json_text(config),
+                    compact_json_text(cursor),
+                    "exporting",
+                    "exporting" if selected_documents else "finalizing",
+                    len(selected_documents),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO export_work_items (
+                  run_id, unit_type, ordinal, document_id, payload_json, artifact_manifest_json,
+                  status, created_at, updated_at
+                ) VALUES (?, 'archive_document', ?, ?, ?, '{}', 'pending', ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        int(selected_document["ordinal"]),
+                        int(selected_document["document_row"]["id"]),
+                        compact_json_text(
+                            {
+                                "document_id": int(selected_document["document_row"]["id"]),
+                                "inclusion_reason": selected_document["inclusion_reason"],
+                            }
+                        ),
+                        now,
+                        now,
+                    )
+                    for selected_document in selected_documents
+                ],
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        row = require_export_run_row(connection, export_kind="archive", run_id=run_id)
+        return {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
+    finally:
+        connection.close()
+
+
+def render_csv_fragment_for_item(
+    connection: sqlite3.Connection,
+    item: sqlite3.Row,
+    field_defs: list[dict[str, str]],
+) -> str:
+    document_id = int(item["document_id"])
+    rows = fetch_visible_document_rows_by_ids(connection, [document_id])
+    if not rows:
+        raise RetrieverError(f"Document {document_id} is not visible for CSV export.")
+    context = build_export_context(connection, rows, field_defs)
+    row = rows[0]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        [
+            serialize_export_cell_value(
+                export_field_value(row, field_def, context),
+                field_def["field_type"],
+            )
+            for field_def in field_defs
+        ]
+    )
+    return buffer.getvalue()
+
+
+def export_csv_exporting_step(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    config = decode_json_text(row["config_json"], default={}) or {}
+    field_defs = list(config.get("fields") or [])
+    processed = 0
+    failed = 0
+    while ingest_v2_deadline_remaining_seconds(deadline) >= EXPORT_RUN_STEP_MIN_REMAINING_SECONDS:
+        items = connection.execute(
+            """
+            SELECT *
+            FROM export_work_items
+            WHERE run_id = ?
+              AND status = 'pending'
+            ORDER BY ordinal ASC
+            LIMIT ?
+            """,
+            (run_id, EXPORT_CSV_ROW_BATCH_SIZE),
+        ).fetchall()
+        if not items:
+            break
+        for item in items:
+            if ingest_v2_deadline_remaining_seconds(deadline) < EXPORT_RUN_STEP_MIN_REMAINING_SECONDS:
+                break
+            now = utc_now()
+            try:
+                connection.execute(
+                    "UPDATE export_work_items SET status = 'running', updated_at = ? WHERE id = ?",
+                    (now, int(item["id"])),
+                )
+                fragment = render_csv_fragment_for_item(connection, item, field_defs)
+                fragment_rel_path = export_run_csv_fragment_rel_path(run_id, int(item["ordinal"]))
+                fragment_path = paths["state_dir"] / fragment_rel_path
+                write_text_file_atomic(fragment_path, fragment)
+                artifact = {
+                    "fragment_rel_path": fragment_rel_path,
+                    "bytes": len(fragment.encode("utf-8")),
+                }
+                now = utc_now()
+                connection.execute(
+                    """
+                    UPDATE export_work_items
+                    SET status = 'completed',
+                        artifact_manifest_json = ?,
+                        last_error = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (compact_json_text(artifact), now, int(item["id"])),
+                )
+                processed += 1
+            except Exception as exc:
+                now = utc_now()
+                connection.execute(
+                    """
+                    UPDATE export_work_items
+                    SET status = 'failed',
+                        last_error = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (f"{type(exc).__name__}: {exc}", now, int(item["id"])),
+                )
+                failed += 1
+            refresh_export_run_counts(connection, run_id=run_id)
+            connection.commit()
+        if len(items) < EXPORT_CSV_ROW_BATCH_SIZE:
+            break
+    pending = int(connection.execute(
+        "SELECT COUNT(*) AS count FROM export_work_items WHERE run_id = ? AND status = 'pending'",
+        (run_id,),
+    ).fetchone()["count"])
+    running = int(connection.execute(
+        "SELECT COUNT(*) AS count FROM export_work_items WHERE run_id = ? AND status = 'running'",
+        (run_id,),
+    ).fetchone()["count"])
+    if pending == 0 and running == 0:
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE export_runs
+            SET phase = 'finalizing',
+                status = 'finalizing',
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (now, run_id),
+        )
+        connection.commit()
+    return {"processed": processed, "failed": failed, "pending": pending}
+
+
+def export_csv_finalize_step(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    config = decode_json_text(row["config_json"], default={}) or {}
+    cursor = decode_json_text(row["cursor_json"], default={}) or {}
+    field_defs = list(config.get("fields") or [])
+    output_path = Path(str(row["output_path"]))
+    completed_rows = connection.execute(
+        """
+        SELECT ordinal, artifact_manifest_json
+        FROM export_work_items
+        WHERE run_id = ?
+          AND status = 'completed'
+        ORDER BY ordinal ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    failed_count = int(row["failed_items"] or 0)
+    assembled_ordinal = int(cursor.get("assembled_ordinal") or 0)
+    target_ordinal = assembled_ordinal
+    fragments: list[tuple[int, Path]] = []
+    for item in completed_rows:
+        if ingest_v2_deadline_remaining_seconds(deadline) < EXPORT_RUN_STEP_MIN_REMAINING_SECONDS and fragments:
+            break
+        artifact = decode_json_text(item["artifact_manifest_json"], default={}) or {}
+        fragment_rel_path = str(artifact.get("fragment_rel_path") or "")
+        if not fragment_rel_path:
+            continue
+        target_ordinal = int(item["ordinal"])
+        fragments.append((target_ordinal, paths["state_dir"] / fragment_rel_path))
+    partial_path = export_run_partial_csv_path(paths, run_id)
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    with partial_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([field_def["field_name"] for field_def in field_defs])
+        handle.flush()
+        for _, fragment_path in fragments:
+            if fragment_path.exists():
+                handle.write(fragment_path.read_text(encoding="utf-8"))
+    cursor["assembled_ordinal"] = target_ordinal
+    cursor["partial_rel_path"] = str(partial_path.relative_to(paths["state_dir"]))
+    now = utc_now()
+    completed_count = len(completed_rows)
+    total_items = int(row["total_items"] or 0)
+    if completed_count + failed_count >= total_items:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(partial_path, output_path)
+        status = "completed" if failed_count == 0 else "failed"
+        error = None if failed_count == 0 else f"{failed_count} CSV export row(s) failed."
+        connection.execute(
+            """
+            UPDATE export_runs
+            SET phase = ?,
+                status = ?,
+                cursor_json = ?,
+                completed_at = ?,
+                last_heartbeat_at = ?,
+                error = ?
+            WHERE run_id = ?
+            """,
+            (status, status, compact_json_text(cursor), now, now, error, run_id),
+        )
+    else:
+        connection.execute(
+            """
+            UPDATE export_runs
+            SET cursor_json = ?,
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (compact_json_text(cursor), now, run_id),
+        )
+    connection.commit()
+    return {"assembled_rows": completed_count, "failed": failed_count}
+
+
+def archive_reset_after_corrupt_partial_zip(connection: sqlite3.Connection, paths: dict[str, Path], row: sqlite3.Row) -> bool:
+    run_id = str(row["run_id"])
+    partial_path = export_run_partial_archive_path(paths, run_id)
+    if not partial_path.exists() or zipfile.is_zipfile(partial_path):
+        return False
+    partial_path.unlink()
+    now = utc_now()
+    cursor = decode_json_text(row["cursor_json"], default={}) or {}
+    cursor["partial_zip_rebuilt_after_corruption_at"] = now
+    cursor["portable_workspace_added"] = False
+    cursor["manifest_added"] = False
+    connection.execute(
+        """
+        UPDATE export_work_items
+        SET status = 'pending',
+            artifact_manifest_json = '{}',
+            last_error = NULL,
+            updated_at = ?
+        WHERE run_id = ?
+          AND status = 'completed'
+        """,
+        (now, run_id),
+    )
+    connection.execute(
+        """
+        UPDATE export_runs
+        SET phase = 'exporting',
+            status = 'exporting',
+            completed_items = 0,
+            failed_items = 0,
+            cursor_json = ?,
+            last_heartbeat_at = ?
+        WHERE run_id = ?
+        """,
+        (compact_json_text(cursor), now, run_id),
+    )
+    connection.commit()
+    return True
+
+
+def export_archive_exporting_step(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    config = decode_json_text(row["config_json"], default={}) or {}
+    partial_path = export_run_partial_archive_path(paths, run_id)
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    processed = 0
+    failed = 0
+    portable_workspace = bool(config.get("portable_workspace"))
+    while ingest_v2_deadline_remaining_seconds(deadline) >= EXPORT_RUN_STEP_MIN_REMAINING_SECONDS:
+        item = connection.execute(
+            """
+            SELECT *
+            FROM export_work_items
+            WHERE run_id = ?
+              AND status = 'pending'
+            ORDER BY ordinal ASC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if item is None:
+            break
+        now = utc_now()
+        connection.execute(
+            "UPDATE export_work_items SET status = 'running', updated_at = ? WHERE id = ?",
+            (now, int(item["id"])),
+        )
+        connection.commit()
+        try:
+            rows = fetch_visible_document_rows_by_ids(connection, [int(item["document_id"])])
+            if not rows:
+                raise RetrieverError(f"Document {int(item['document_id'])} is not visible for archive export.")
+            payload = decode_json_text(item["payload_json"], default={}) or {}
+            mode = "a" if partial_path.exists() else "w"
+            with zipfile.ZipFile(partial_path, mode, compression=zipfile.ZIP_DEFLATED) as archive:
+                written_member_paths = set(archive.namelist())
+                manifest_entry, document_warnings = archive_document_files(
+                    archive,
+                    written_member_paths,
+                    connection,
+                    paths,
+                    rows[0],
+                )
+                manifest_entry["ordinal"] = int(item["ordinal"])
+                manifest_entry["inclusion_reason"] = payload.get("inclusion_reason") or {}
+                if portable_workspace:
+                    revision_entries, revision_warnings = archive_document_text_revisions(
+                        archive,
+                        written_member_paths,
+                        connection,
+                        paths,
+                        int(item["document_id"]),
+                    )
+                    manifest_entry["text_revision_entries"] = revision_entries
+                    document_warnings.extend(revision_warnings)
+            artifact = {
+                "document": manifest_entry,
+                "warnings": document_warnings,
+            }
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE export_work_items
+                SET status = 'completed',
+                    artifact_manifest_json = ?,
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (compact_json_text(artifact), now, int(item["id"])),
+            )
+            processed += 1
+        except Exception as exc:
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE export_work_items
+                SET status = 'failed',
+                    last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (f"{type(exc).__name__}: {exc}", now, int(item["id"])),
+            )
+            failed += 1
+        refresh_export_run_counts(connection, run_id=run_id)
+        connection.commit()
+    pending = int(connection.execute(
+        "SELECT COUNT(*) AS count FROM export_work_items WHERE run_id = ? AND status IN ('pending', 'running')",
+        (run_id,),
+    ).fetchone()["count"])
+    if pending == 0:
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE export_runs
+            SET phase = 'finalizing',
+                status = 'finalizing',
+                last_heartbeat_at = ?
+            WHERE run_id = ?
+            """,
+            (now, run_id),
+        )
+        connection.commit()
+    return {"processed": processed, "failed": failed, "pending": pending}
+
+
+def export_archive_finalize_step(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> dict[str, object]:
+    run_id = str(row["run_id"])
+    if ingest_v2_deadline_remaining_seconds(deadline) < EXPORT_RUN_STEP_MIN_REMAINING_SECONDS:
+        return {"finalized": False, "reason": "budget_exhausted"}
+    config = decode_json_text(row["config_json"], default={}) or {}
+    cursor = decode_json_text(row["cursor_json"], default={}) or {}
+    selector = decode_json_text(row["selector_json"], default={}) or {}
+    partial_path = export_run_partial_archive_path(paths, run_id)
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = Path(str(row["output_path"]))
+    completed_items = connection.execute(
+        """
+        SELECT *
+        FROM export_work_items
+        WHERE run_id = ?
+          AND status = 'completed'
+        ORDER BY ordinal ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    failed_count = int(row["failed_items"] or 0)
+    manifest_document_entries: list[dict[str, object]] = []
+    warnings: list[str] = []
+    selected_document_ids: list[int] = []
+    for item in completed_items:
+        artifact = decode_json_text(item["artifact_manifest_json"], default={}) or {}
+        document_entry = artifact.get("document") if isinstance(artifact, dict) else None
+        if isinstance(document_entry, dict):
+            manifest_document_entries.append(document_entry)
+            selected_document_ids.append(int(item["document_id"]))
+        for warning in list(artifact.get("warnings") or []) if isinstance(artifact, dict) else []:
+            warnings.append(str(warning))
+    portable_workspace_payload = None
+    with zipfile.ZipFile(partial_path, "a" if partial_path.exists() else "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        written_member_paths = set(archive.namelist())
+        if bool(config.get("portable_workspace")) and not bool(cursor.get("portable_workspace_added")):
+            rows = fetch_visible_document_rows_by_ids(connection, selected_document_ids)
+            with tempfile.TemporaryDirectory(prefix="retriever-portable-workspace-") as tempdir:
+                portable_root = Path(tempdir) / "workspace"
+                portable_workspace_payload = build_portable_workspace_db(connection, portable_root, rows)
+                add_archive_file_once(
+                    archive,
+                    written_member_paths,
+                    Path(portable_workspace_payload["db_path"]),
+                    ".retriever/retriever.db",
+                )
+            cursor["portable_workspace_added"] = True
+            cursor["portable_workspace_payload"] = portable_workspace_payload
+        else:
+            portable_workspace_payload = cursor.get("portable_workspace_payload")
+
+        manifest_payload = {
+            "status": "ok" if failed_count == 0 else "failed",
+            "created_at": cursor.get("created_at") or row["created_at"],
+            "selector": selector,
+            "family_mode": config.get("family_mode"),
+            "seed_limit": config.get("seed_limit"),
+            "document_count": len(manifest_document_entries),
+            "portable_workspace": bool(config.get("portable_workspace")),
+            "portable_workspace_document_ids": (
+                portable_workspace_payload.get("selected_document_ids")
+                if isinstance(portable_workspace_payload, dict)
+                else []
+            ),
+            "portable_workspace_stub_document_ids": (
+                portable_workspace_payload.get("stub_document_ids")
+                if isinstance(portable_workspace_payload, dict)
+                else []
+            ),
+            "documents": manifest_document_entries,
+            "warnings": warnings,
+            "failed_items": failed_count,
+        }
+        if ".retriever/export-manifest.json" not in written_member_paths:
+            add_archive_bytes_once(
+                archive,
+                written_member_paths,
+                (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                ".retriever/export-manifest.json",
+            )
+        cursor["manifest_added"] = True
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(partial_path, output_path)
+    now = utc_now()
+    status = "completed" if failed_count == 0 else "failed"
+    error = None if failed_count == 0 else f"{failed_count} archive export item(s) failed."
+    connection.execute(
+        """
+        UPDATE export_runs
+        SET phase = ?,
+            status = ?,
+            cursor_json = ?,
+            completed_at = ?,
+            last_heartbeat_at = ?,
+            error = ?
+        WHERE run_id = ?
+        """,
+        (status, status, compact_json_text(cursor), now, now, error, run_id),
+    )
+    connection.commit()
+    return {
+        "finalized": True,
+        "document_count": len(manifest_document_entries),
+        "warnings": len(warnings),
+        "failed": failed_count,
+    }
+
+
+def export_run_step(
+    root: Path,
+    *,
+    export_kind: str,
+    run_id: str | None = None,
+    budget_seconds: int | None = None,
+) -> dict[str, object]:
+    budget = normalize_resumable_step_budget(budget_seconds)
+    deadline = time.perf_counter() + max(0.1, float(budget) - 0.25)
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    executed_steps: list[str] = []
+    step_results: list[dict[str, object]] = []
+    try:
+        apply_schema(connection, root)
+        row = latest_export_run_row(connection, export_kind=export_kind, run_id=run_id)
+        if row is None:
+            return {
+                "ok": True,
+                "executed": False,
+                "executed_steps": [],
+                "reason": "no_export_run",
+                "more_work_remaining": False,
+                "run": export_status(root, export_kind=export_kind, run_id=run_id, budget_seconds=budget),
+                "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
+            }
+        resolved_run_id = str(row["run_id"])
+        connection.execute(
+            """
+            UPDATE export_work_items
+            SET status = 'pending',
+                updated_at = ?
+            WHERE run_id = ?
+              AND status = 'running'
+            """,
+            (utc_now(), resolved_run_id),
+        )
+        connection.commit()
+        row = require_export_run_row(connection, export_kind=export_kind, run_id=resolved_run_id)
+        if export_kind == "archive" and archive_reset_after_corrupt_partial_zip(connection, paths, row):
+            row = require_export_run_row(connection, export_kind=export_kind, run_id=resolved_run_id)
+        while ingest_v2_deadline_remaining_seconds(deadline) >= EXPORT_RUN_STEP_MIN_REMAINING_SECONDS:
+            row = require_export_run_row(connection, export_kind=export_kind, run_id=resolved_run_id)
+            phase = str(row["phase"])
+            status = str(row["status"])
+            if status in EXPORT_RUN_TERMINAL_STATUSES:
+                break
+            if phase == "exporting":
+                if export_kind == "csv":
+                    step_result = export_csv_exporting_step(connection, paths, row, deadline=deadline)
+                else:
+                    step_result = export_archive_exporting_step(connection, paths, row, deadline=deadline)
+                executed_steps.append("export")
+                step_results.append(step_result)
+                if int(step_result.get("processed") or 0) == 0 and int(step_result.get("failed") or 0) == 0:
+                    break
+                continue
+            if phase == "finalizing":
+                if export_kind == "csv":
+                    step_result = export_csv_finalize_step(connection, paths, row, deadline=deadline)
+                else:
+                    step_result = export_archive_finalize_step(connection, paths, row, deadline=deadline)
+                executed_steps.append("finalize")
+                step_results.append(step_result)
+                break
+            break
+        updated_row = require_export_run_row(connection, export_kind=export_kind, run_id=resolved_run_id)
+        run_payload = export_run_status_payload(connection, root, updated_row, budget_seconds=budget)
+        reason = (
+            "run_terminal"
+            if str(updated_row["status"]) in EXPORT_RUN_TERMINAL_STATUSES
+            else "budget_exhausted"
+            if ingest_v2_deadline_remaining_seconds(deadline) < EXPORT_RUN_STEP_MIN_REMAINING_SECONDS
+            else "no_runnable_step"
+        )
+        return {
+            "ok": True,
+            "executed": bool(executed_steps),
+            "executed_steps": executed_steps,
+            "reason": reason,
+            "step_result": step_results[-1] if step_results else None,
+            "step_results": step_results,
+            "more_work_remaining": str(updated_row["status"]) not in EXPORT_RUN_TERMINAL_STATUSES,
+            "run": run_payload,
+            "remaining_budget_seconds": round(ingest_v2_deadline_remaining_seconds(deadline), 3),
         }
     finally:
         connection.close()
@@ -10454,6 +11514,56 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field for search-based export or 'relevance'")
     export_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
 
+    export_csv_start_parser = subparsers.add_parser(
+        "export-csv-start",
+        help="Start a resumable CSV export",
+    )
+    export_csv_start_parser.add_argument("workspace", help="Workspace root path")
+    export_csv_start_parser.add_argument("output_path", help="CSV file path; relative paths resolve under .retriever/exports")
+    export_csv_start_parser.add_argument("query", nargs="?", default="", help="Optional keyword query text for search-based export")
+    export_csv_start_parser.add_argument(
+        "--field",
+        dest="fields",
+        action="append",
+        required=True,
+        help="Field to export (repeatable, preserves order)",
+    )
+    export_csv_start_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to export (repeatable, preserves input order)",
+    )
+    export_csv_start_parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        nargs="+",
+        help="Repeatable SQL-like filter expression",
+    )
+    export_csv_start_parser.add_argument(
+        "--select-from-scope",
+        action="store_true",
+        help="AND-narrow the export selector with the persisted workspace scope",
+    )
+    export_csv_start_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field for search-based export or 'relevance'")
+    export_csv_start_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
+    export_csv_start_parser.add_argument("--budget-seconds", type=int, default=None, help="Cowork-safe status budget hint")
+
+    export_csv_run_step_parser = subparsers.add_parser(
+        "export-csv-run-step",
+        help="Run a bounded resumable CSV export step",
+    )
+    export_csv_run_step_parser.add_argument("workspace", help="Workspace root path")
+    export_csv_run_step_parser.add_argument("--run-id", required=True, help="Export run id")
+    export_csv_run_step_parser.add_argument("--budget-seconds", type=int, default=None, help="Cowork-safe time budget")
+
+    export_csv_status_parser = subparsers.add_parser("export-csv-status", help="Inspect a resumable CSV export")
+    export_csv_status_parser.add_argument("workspace", help="Workspace root path")
+    export_csv_status_parser.add_argument("--run-id", help="Export run id; defaults to the latest CSV export")
+    export_csv_status_parser.add_argument("--budget-seconds", type=int, default=None, help="Cowork-safe status budget hint")
+
     export_archive_parser = subparsers.add_parser(
         "export-archive",
         help="Write selected documents, previews, and source artifacts to a zip archive",
@@ -10476,6 +11586,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include a curated subset .retriever/retriever.db for the exported documents",
     )
+
+    export_archive_start_parser = subparsers.add_parser(
+        "export-archive-start",
+        help="Start a resumable zip archive export",
+    )
+    export_archive_start_parser.add_argument("workspace", help="Workspace root path")
+    export_archive_start_parser.add_argument(
+        "output_path",
+        help="Zip file path; relative paths resolve under .retriever/exports",
+    )
+    add_scope_run_selector_arguments(export_archive_start_parser)
+    export_archive_start_parser.add_argument(
+        "--family-mode",
+        default="exact",
+        choices=sorted(RUN_FAMILY_MODES),
+        help="Whether to include only seed docs or their family members too",
+    )
+    export_archive_start_parser.add_argument("--limit", dest="seed_limit", type=int, help="Limit the directly matched seed set")
+    export_archive_start_parser.add_argument(
+        "--portable-workspace",
+        action="store_true",
+        help="Include a curated subset .retriever/retriever.db for the exported documents",
+    )
+    export_archive_start_parser.add_argument("--budget-seconds", type=int, default=None, help="Cowork-safe status budget hint")
+
+    export_archive_run_step_parser = subparsers.add_parser(
+        "export-archive-run-step",
+        help="Run a bounded resumable zip archive export step",
+    )
+    export_archive_run_step_parser.add_argument("workspace", help="Workspace root path")
+    export_archive_run_step_parser.add_argument("--run-id", required=True, help="Export run id")
+    export_archive_run_step_parser.add_argument("--budget-seconds", type=int, default=None, help="Cowork-safe time budget")
+
+    export_archive_status_parser = subparsers.add_parser("export-archive-status", help="Inspect a resumable zip archive export")
+    export_archive_status_parser.add_argument("workspace", help="Workspace root path")
+    export_archive_status_parser.add_argument("--run-id", help="Export run id; defaults to the latest archive export")
+    export_archive_status_parser.add_argument("--budget-seconds", type=int, default=None, help="Cowork-safe status budget hint")
 
     export_previews_parser = subparsers.add_parser(
         "export-previews",
@@ -11729,6 +12876,57 @@ def main() -> int:
             )
             return 0
 
+        if args.command == "export-csv-start":
+            print(
+                json.dumps(
+                    export_csv_start(
+                        root,
+                        args.output_path,
+                        args.fields,
+                        args.document_ids,
+                        args.query,
+                        args.filters,
+                        args.sort,
+                        args.order,
+                        args.select_from_scope,
+                        budget_seconds=args.budget_seconds,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "export-csv-run-step":
+            print(
+                json.dumps(
+                    export_run_step(
+                        root,
+                        export_kind="csv",
+                        run_id=args.run_id,
+                        budget_seconds=args.budget_seconds,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "export-csv-status":
+            print(
+                json.dumps(
+                    export_status(
+                        root,
+                        export_kind="csv",
+                        run_id=args.run_id,
+                        budget_seconds=args.budget_seconds,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
         if args.command == "export-archive":
             print(
                 json.dumps(
@@ -11744,6 +12942,59 @@ def main() -> int:
                         family_mode=args.family_mode,
                         seed_limit=args.seed_limit,
                         portable_workspace=args.portable_workspace,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "export-archive-start":
+            print(
+                json.dumps(
+                    export_archive_start(
+                        root,
+                        args.output_path,
+                        dataset_names=args.dataset_names,
+                        query=args.query,
+                        raw_bates=args.bates,
+                        raw_filters=args.filters,
+                        from_run_id=args.from_run_id,
+                        select_from_scope=args.select_from_scope,
+                        family_mode=args.family_mode,
+                        seed_limit=args.seed_limit,
+                        portable_workspace=args.portable_workspace,
+                        budget_seconds=args.budget_seconds,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "export-archive-run-step":
+            print(
+                json.dumps(
+                    export_run_step(
+                        root,
+                        export_kind="archive",
+                        run_id=args.run_id,
+                        budget_seconds=args.budget_seconds,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if args.command == "export-archive-status":
+            print(
+                json.dumps(
+                    export_status(
+                        root,
+                        export_kind="archive",
+                        run_id=args.run_id,
+                        budget_seconds=args.budget_seconds,
                     ),
                     indent=2,
                     sort_keys=True,

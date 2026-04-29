@@ -18826,6 +18826,60 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(rows[1], ["second.txt", second_row["control_number"]])
         self.assertEqual(rows[2], ["first.txt", first_row["control_number"]])
 
+    def test_export_csv_resumable_run_step_writes_requested_fields(self) -> None:
+        (self.root / "first.txt").write_text("first body\n", encoding="utf-8")
+        (self.root / "second.txt").write_text("second body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        first_row = self.fetch_document_row("first.txt")
+        second_row = self.fetch_document_row("second.txt")
+        export_path = self.root / ".retriever" / "exports" / "resumable.csv"
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "export-csv-start",
+            str(self.root),
+            "resumable.csv",
+            "--field",
+            "file_name",
+            "--field",
+            "control_number",
+            "--doc-id",
+            str(second_row["id"]),
+            "--doc-id",
+            str(first_row["id"]),
+        )
+
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertEqual(start_payload["status"], "exporting")
+        self.assertEqual(start_payload["total_items"], 2)
+        self.assertIn("export-csv-run-step", start_payload["next_recommended_commands"][0])
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "export-csv-run-step",
+            str(self.root),
+            "--run-id",
+            start_payload["run_id"],
+            "--budget-seconds",
+            "35",
+        )
+
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertFalse(step_payload["more_work_remaining"])
+        self.assertEqual(step_payload["run"]["status"], "completed")
+        self.assertEqual(step_payload["run"]["counts"]["work_items"]["completed"], 2)
+
+        with export_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+
+        self.assertEqual(rows[0], ["file_name", "control_number"])
+        self.assertEqual(rows[1], ["second.txt", second_row["control_number"]])
+        self.assertEqual(rows[2], ["first.txt", first_row["control_number"]])
+
     def test_export_csv_relative_output_does_not_get_reingested(self) -> None:
         (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
         (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
@@ -19267,6 +19321,73 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertNotIn("beta.txt", names)
         self.assertEqual(manifest["document_count"], 1)
         self.assertEqual(manifest["selector"]["keyword"], "alpha")
+
+    def test_export_archive_resumable_run_step_includes_manifest_and_family(self) -> None:
+        email_path = self.root / "thread.eml"
+        self.write_email_message(
+            email_path,
+            subject="Resumable archive",
+            body_text="Parent email body text.",
+            attachment_name="notes.txt",
+            attachment_text="resumable attachment detail",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        parent_row = self.fetch_document_row("thread.eml")
+        child_row = self.fetch_child_rows(parent_row["id"])[0]
+        export_path = self.root / ".retriever" / "exports" / "resumable-family.zip"
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "export-archive-start",
+            str(self.root),
+            "resumable-family.zip",
+            "--keyword",
+            "resumable",
+            "--family-mode",
+            "with_family",
+            "--limit",
+            "1",
+        )
+
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        self.assertEqual(start_payload["status"], "exporting")
+        self.assertEqual(start_payload["total_items"], 2)
+        self.assertIn("export-archive-run-step", start_payload["next_recommended_commands"][0])
+
+        step_exit, step_payload, _, _ = self.run_cli(
+            "export-archive-run-step",
+            str(self.root),
+            "--run-id",
+            start_payload["run_id"],
+            "--budget-seconds",
+            "35",
+        )
+
+        self.assertEqual(step_exit, 0)
+        self.assertIsNotNone(step_payload)
+        self.assertFalse(step_payload["more_work_remaining"])
+        self.assertEqual(step_payload["run"]["status"], "completed")
+        self.assertEqual(step_payload["run"]["counts"]["work_items"]["completed"], 2)
+
+        with zipfile.ZipFile(export_path, "r") as archive:
+            names = set(archive.namelist())
+            manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+
+        self.assertIn("thread.eml", names)
+        self.assertIn(child_row["rel_path"], names)
+        self.assertEqual(manifest["document_count"], 2)
+        self.assertEqual(manifest["family_mode"], "with_family")
+        self.assertEqual(
+            {
+                int(item["document_id"])
+                for item in manifest["documents"]
+            },
+            {int(parent_row["id"]), int(child_row["id"])},
+        )
 
     def test_export_archive_portable_workspace_supports_selected_child_with_parent_context_stub(self) -> None:
         email_path = self.root / "thread.eml"
