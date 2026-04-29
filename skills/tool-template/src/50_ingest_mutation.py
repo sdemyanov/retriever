@@ -482,6 +482,8 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
             cursor.setdefault("skipped_pst_sources", 0)
             cursor.setdefault("scanned_pst_source_rel_paths", [])
             cursor.setdefault("pst_failures", [])
+            cursor.setdefault("skipped_unchanged_loose_files", 0)
+            cursor.setdefault("skipped_unchanged_loose_file_rel_paths", [])
             return cursor
 
     recursive = bool(row["recursive"])
@@ -507,6 +509,8 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
         "next_commit_order": int(next_order_row["next_order"] or 1),
         "scanned_paths": 0,
         "planned_loose_files": 0,
+        "skipped_unchanged_loose_files": 0,
+        "skipped_unchanged_loose_file_rel_paths": [],
         "skipped_container_files": 0,
         "skipped_extensionless_files": 0,
         "skipped_filtered_files": 0,
@@ -617,6 +621,57 @@ def ingest_v2_plan_loose_file_item(
         ),
     )
     return int(cursor.rowcount or 0) > 0
+
+
+def ingest_v2_loose_file_matches_existing_snapshot(
+    connection: sqlite3.Connection,
+    path: Path,
+    *,
+    rel_path: str,
+    file_size: int | None,
+) -> bool:
+    if file_size is None or file_size > INGEST_V2_MAX_SINGLE_STEP_HASH_BYTES:
+        return False
+    occurrence_row = connection.execute(
+        """
+        SELECT *
+        FROM document_occurrences
+        WHERE parent_occurrence_id IS NULL
+          AND source_kind = ?
+          AND rel_path = ?
+          AND lifecycle_status = ?
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (FILESYSTEM_SOURCE_KIND, rel_path, ACTIVE_OCCURRENCE_STATUS),
+    ).fetchone()
+    if occurrence_row is None:
+        return False
+    if occurrence_row["file_size"] is None or int(occurrence_row["file_size"]) != int(file_size):
+        return False
+    stored_hash = normalize_whitespace(str(occurrence_row["file_hash"] or ""))
+    if not stored_hash:
+        return False
+    document_row = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE id = ?
+          AND lifecycle_status != 'deleted'
+        """,
+        (int(occurrence_row["document_id"]),),
+    ).fetchone()
+    if document_row is None or document_row["dataset_id"] is None or occurrence_row["dataset_source_id"] is None:
+        return False
+    if not document_row_has_seeded_text_revisions(document_row):
+        return False
+    if not document_row_has_email_threading(connection, document_row):
+        return False
+    try:
+        current_hash = sha256_file(path)
+    except OSError:
+        return False
+    return current_hash == stored_hash
 
 
 def ingest_v2_plan_slack_conversation_item(
@@ -1505,6 +1560,215 @@ def ingest_v2_plan_conversation_preview_items(
         if int(cursor.rowcount or 0) > 0:
             planned += 1
     return {"planned": planned, "next_commit_order": current_order}
+
+
+def ingest_v2_conversation_id_from_preview_rel_path(rel_preview_path: object) -> int | None:
+    normalized = normalize_internal_rel_path(Path(str(rel_preview_path or "")))
+    match = re.match(r"^previews/conversations/conversation-(\d+)(?:/|$)", normalized)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def ingest_v2_run_affected_conversation_ids(connection: sqlite3.Connection, *, run_id: str) -> set[int]:
+    rows = connection.execute(
+        """
+        SELECT affected_document_ids_json
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND status = 'committed'
+          AND unit_type != 'conversation_preview'
+          AND affected_document_ids_json IS NOT NULL
+        """,
+        (run_id,),
+    ).fetchall()
+    affected_document_ids: set[int] = set()
+    for row in rows:
+        raw_document_ids = decode_json_text(row["affected_document_ids_json"], default=[]) or []
+        if not isinstance(raw_document_ids, list):
+            continue
+        for value in raw_document_ids:
+            try:
+                affected_document_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    if not affected_document_ids:
+        return set()
+    placeholders = ", ".join("?" for _ in sorted(affected_document_ids))
+    conversation_ids = {
+        int(row["conversation_id"])
+        for row in connection.execute(
+            f"""
+            SELECT DISTINCT conversation_id
+            FROM documents
+            WHERE id IN ({placeholders})
+              AND conversation_id IS NOT NULL
+              AND lifecycle_status NOT IN ('missing', 'deleted')
+            """,
+            tuple(sorted(affected_document_ids)),
+        ).fetchall()
+        if row["conversation_id"] is not None
+    }
+    preview_rows = connection.execute(
+        f"""
+        SELECT rel_preview_path
+        FROM document_previews
+        WHERE document_id IN ({placeholders})
+        """,
+        tuple(sorted(affected_document_ids)),
+    ).fetchall()
+    for row in preview_rows:
+        conversation_id = ingest_v2_conversation_id_from_preview_rel_path(row["rel_preview_path"])
+        if conversation_id is not None:
+            conversation_ids.add(conversation_id)
+    return conversation_ids
+
+
+def ingest_v2_conversation_preview_row_is_stale(document_updated_at: object, preview_created_at: object) -> bool:
+    document_updated = parse_utc_timestamp(document_updated_at)
+    preview_created = parse_utc_timestamp(preview_created_at)
+    if document_updated is None or preview_created is None:
+        return True
+    return preview_created < document_updated
+
+
+def ingest_v2_conversation_previews_need_refresh(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    conversation_ids: list[int],
+    *,
+    force_conversation_ids: set[int] | None = None,
+) -> list[int]:
+    normalized_conversation_ids = sorted(dict.fromkeys(int(value) for value in conversation_ids))
+    if not normalized_conversation_ids:
+        return []
+    forced = set(force_conversation_ids or set())
+    placeholders = ", ".join("?" for _ in normalized_conversation_ids)
+    conversation_rows = connection.execute(
+        f"""
+        SELECT id, conversation_type
+        FROM conversations
+        WHERE id IN ({placeholders})
+        """,
+        tuple(normalized_conversation_ids),
+    ).fetchall()
+    conversation_type_by_id = {
+        int(row["id"]): normalize_whitespace(str(row["conversation_type"] or "")).lower()
+        for row in conversation_rows
+    }
+    rows = connection.execute(
+        f"""
+        SELECT
+          d.conversation_id,
+          d.id AS document_id,
+          COALESCE(tr.created_at, d.updated_at) AS preview_freshness_at,
+          d.content_type,
+          dp.rel_preview_path,
+          dp.preview_type,
+          dp.created_at AS preview_created_at
+        FROM documents d
+        LEFT JOIN text_revisions tr ON tr.id = d.source_text_revision_id
+        LEFT JOIN document_previews dp ON dp.document_id = d.id
+        WHERE d.conversation_id IN ({placeholders})
+          AND d.lifecycle_status NOT IN ('missing', 'deleted')
+          AND COALESCE(d.child_document_kind, '') != ?
+        ORDER BY d.conversation_id ASC, d.id ASC, dp.ordinal ASC, dp.id ASC
+        """,
+        (*normalized_conversation_ids, CHILD_DOCUMENT_KIND_ATTACHMENT),
+    ).fetchall()
+    doc_ids_by_conversation: dict[int, set[int]] = defaultdict(set)
+    content_types_by_conversation: dict[int, list[str]] = defaultdict(list)
+    preview_rows_by_document: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    preview_freshness_at_by_id: dict[int, object] = {}
+    for row in rows:
+        conversation_id = int(row["conversation_id"])
+        document_id = int(row["document_id"])
+        if document_id not in doc_ids_by_conversation[conversation_id]:
+            content_types_by_conversation[conversation_id].append(
+                normalize_whitespace(str(row["content_type"] or "")).lower()
+            )
+        doc_ids_by_conversation[conversation_id].add(document_id)
+        preview_freshness_at_by_id[document_id] = row["preview_freshness_at"]
+        preview_rows_by_document[document_id].append(row)
+
+    refresh_ids: set[int] = set()
+    for conversation_id in normalized_conversation_ids:
+        if conversation_id in forced:
+            refresh_ids.add(conversation_id)
+            continue
+        document_ids = doc_ids_by_conversation.get(conversation_id) or set()
+        if not document_ids:
+            continue
+        conversation_type = conversation_type_by_id.get(conversation_id, "")
+        content_types = content_types_by_conversation.get(conversation_id) or []
+        writes_conversation_artifacts = (
+            conversation_type == "chat"
+            or (bool(content_types) and all(content_type == "chat" for content_type in content_types))
+            or len(document_ids) > 1
+        )
+        conversation_base = conversation_preview_base_path(conversation_id).as_posix()
+        if writes_conversation_artifacts and not (paths["state_dir"] / conversation_preview_full_rel_path(conversation_id)).exists():
+            refresh_ids.add(conversation_id)
+            continue
+        stale_or_missing = False
+        for document_id in sorted(document_ids):
+            non_native_rows = [
+                row
+                for row in preview_rows_by_document.get(document_id, [])
+                if row["rel_preview_path"] is not None
+                and normalize_whitespace(str(row["preview_type"] or "")).lower() != "native"
+            ]
+            if not non_native_rows:
+                stale_or_missing = True
+                break
+            if writes_conversation_artifacts and not any(
+                normalize_internal_rel_path(Path(str(row["rel_preview_path"] or ""))).startswith(conversation_base + "/")
+                for row in non_native_rows
+            ):
+                stale_or_missing = True
+                break
+            for row in non_native_rows:
+                rel_preview_path = normalize_whitespace(str(row["rel_preview_path"] or ""))
+                if rel_preview_path and not (paths["state_dir"] / rel_preview_path).exists():
+                    stale_or_missing = True
+                    break
+                if ingest_v2_conversation_preview_row_is_stale(
+                    preview_freshness_at_by_id.get(document_id),
+                    row["preview_created_at"],
+                ):
+                    stale_or_missing = True
+                    break
+            if stale_or_missing:
+                break
+        if stale_or_missing:
+            refresh_ids.add(conversation_id)
+            continue
+        if writes_conversation_artifacts:
+            orphan_rows = connection.execute(
+                """
+                SELECT dp.document_id, d.conversation_id, d.lifecycle_status
+                FROM document_previews dp
+                LEFT JOIN documents d ON d.id = dp.document_id
+                WHERE dp.rel_preview_path LIKE ?
+                """,
+                (conversation_base + "/%",),
+            ).fetchall()
+            for row in orphan_rows:
+                if (
+                    row["conversation_id"] is None
+                    or int(row["conversation_id"]) != conversation_id
+                    or normalize_whitespace(str(row["lifecycle_status"] or "")).lower() in {"missing", "deleted"}
+                ):
+                    refresh_ids.add(conversation_id)
+                    break
+    return [
+        conversation_id
+        for conversation_id in normalized_conversation_ids
+        if conversation_id in refresh_ids
+    ]
 
 
 def ingest_v2_plan_production_root(
@@ -3023,7 +3287,26 @@ def ingest_v2_run_loose_rel_paths(connection: sqlite3.Connection, *, run_id: str
         """,
         (run_id,),
     ).fetchall()
-    return {str(row["rel_path"]) for row in rows}
+    rel_paths = {str(row["rel_path"]) for row in rows}
+    cursor_row = connection.execute(
+        """
+        SELECT cursor_json
+        FROM ingest_phase_cursors
+        WHERE run_id = ?
+          AND phase = 'planning'
+          AND cursor_key = 'loose_file_scan'
+        """,
+        (run_id,),
+    ).fetchone()
+    if cursor_row is not None:
+        cursor = decode_json_text(cursor_row["cursor_json"], default={}) or {}
+        if isinstance(cursor, dict):
+            rel_paths.update(
+                normalize_whitespace(str(rel_path or "")).replace("\\", "/").strip("/")
+                for rel_path in list(cursor.get("skipped_unchanged_loose_file_rel_paths") or [])
+                if normalize_whitespace(str(rel_path or ""))
+            )
+    return rel_paths
 
 
 def ingest_v2_run_slack_seen_rel_paths_by_root(
@@ -4722,6 +5005,11 @@ def ingest_v2_load_finalize_cursor(connection: sqlite3.Connection, *, run_id: st
             cursor.setdefault("mbox_documents_missing", 0)
             cursor.setdefault("mbox_documents_redeleted", 0)
             cursor.setdefault("conversation_assignment", {})
+            cursor.setdefault("conversation_preview_active_count", 0)
+            cursor.setdefault("conversation_preview_target_count", 0)
+            cursor.setdefault("conversation_preview_skipped_fresh", 0)
+            cursor.setdefault("conversation_preview_forced_count", 0)
+            cursor.setdefault("conversation_preview_work_items_planned", 0)
             cursor.setdefault("conversation_previews_refreshed", 0)
             cursor.setdefault("pruned_unused_filesystem_dataset", False)
             return cursor
@@ -4738,6 +5026,11 @@ def ingest_v2_load_finalize_cursor(connection: sqlite3.Connection, *, run_id: st
         "mbox_documents_missing": 0,
         "mbox_documents_redeleted": 0,
         "conversation_assignment": {},
+        "conversation_preview_active_count": 0,
+        "conversation_preview_target_count": 0,
+        "conversation_preview_skipped_fresh": 0,
+        "conversation_preview_forced_count": 0,
+        "conversation_preview_work_items_planned": 0,
         "conversation_previews_refreshed": 0,
         "pruned_unused_filesystem_dataset": False,
     }
@@ -5790,21 +6083,35 @@ def ingest_v2_plan_step(
                             cursor["skipped_container_files"] = int(cursor.get("skipped_container_files") or 0) + 1
                         else:
                             file_size, file_mtime_ns = source_file_snapshot(candidate_path)
-                            insert_started = time.perf_counter()
-                            inserted = ingest_v2_plan_loose_file_item(
+                            if ingest_v2_loose_file_matches_existing_snapshot(
                                 connection,
-                                run_id=run_id,
+                                candidate_path,
                                 rel_path=rel_path,
-                                file_type=file_type,
                                 file_size=file_size,
-                                file_mtime_ns=file_mtime_ns,
-                                commit_order=int(cursor.get("next_commit_order") or 1),
-                            )
-                            work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
-                            cursor["next_commit_order"] = int(cursor.get("next_commit_order") or 1) + 1
-                            if inserted:
-                                planned_loose_files += 1
-                                cursor["planned_loose_files"] = int(cursor.get("planned_loose_files") or 0) + 1
+                            ):
+                                cursor["skipped_unchanged_loose_files"] = (
+                                    int(cursor.get("skipped_unchanged_loose_files") or 0) + 1
+                                )
+                                skipped_rel_paths = list(cursor.get("skipped_unchanged_loose_file_rel_paths") or [])
+                                if rel_path not in skipped_rel_paths:
+                                    skipped_rel_paths.append(rel_path)
+                                    cursor["skipped_unchanged_loose_file_rel_paths"] = skipped_rel_paths
+                            else:
+                                insert_started = time.perf_counter()
+                                inserted = ingest_v2_plan_loose_file_item(
+                                    connection,
+                                    run_id=run_id,
+                                    rel_path=rel_path,
+                                    file_type=file_type,
+                                    file_size=file_size,
+                                    file_mtime_ns=file_mtime_ns,
+                                    commit_order=int(cursor.get("next_commit_order") or 1),
+                                )
+                                work_item_insert_ms_values.append(ingest_v2_elapsed_ms(insert_started))
+                                cursor["next_commit_order"] = int(cursor.get("next_commit_order") or 1) + 1
+                                if inserted:
+                                    planned_loose_files += 1
+                                    cursor["planned_loose_files"] = int(cursor.get("planned_loose_files") or 0) + 1
 
                 unsaved_plan_steps += 1
                 if (
@@ -5904,6 +6211,7 @@ def ingest_v2_plan_step(
                     "pending_gmail_mbox_sources": len(list(cursor.get("pending_gmail_mbox_sources") or [])),
                     "scanned_paths": int(cursor.get("scanned_paths") or 0),
                     "planned_loose_files": int(cursor.get("planned_loose_files") or 0),
+                    "skipped_unchanged_loose_files": int(cursor.get("skipped_unchanged_loose_files") or 0),
                     "planned_production_roots": len(list(cursor.get("planned_production_roots") or [])),
                     "planned_production_rows": int(cursor.get("planned_production_rows") or 0),
                     "planned_production_preview_batches": int(cursor.get("planned_production_preview_batches") or 0),
@@ -6879,7 +7187,14 @@ def ingest_v2_finalize_step(
                 }
                 cursor["mbox_documents_redeleted"] = int(mbox_documents_redeleted)
                 cursor["pst_documents_redeleted"] = int(pst_documents_redeleted)
-                target_conversation_ids = list_active_conversation_ids(connection)
+                active_conversation_ids = list_active_conversation_ids(connection)
+                forced_conversation_ids = ingest_v2_run_affected_conversation_ids(connection, run_id=run_id)
+                target_conversation_ids = ingest_v2_conversation_previews_need_refresh(
+                    connection,
+                    paths,
+                    active_conversation_ids,
+                    force_conversation_ids=forced_conversation_ids,
+                )
                 next_commit_order = int(
                     connection.execute(
                         """
@@ -6897,7 +7212,19 @@ def ingest_v2_finalize_step(
                     conversation_ids=target_conversation_ids,
                     next_commit_order=next_commit_order,
                 )
+                cursor["conversation_preview_active_count"] = len(active_conversation_ids)
                 cursor["conversation_preview_target_count"] = len(target_conversation_ids)
+                cursor["conversation_preview_skipped_fresh"] = max(
+                    0,
+                    len(active_conversation_ids) - len(target_conversation_ids),
+                )
+                cursor["conversation_preview_forced_count"] = len(
+                    [
+                        conversation_id
+                        for conversation_id in target_conversation_ids
+                        if conversation_id in forced_conversation_ids
+                    ]
+                )
                 cursor["conversation_preview_work_items_planned"] = int(planned_preview_items["planned"])
                 if int(planned_preview_items["planned"]):
                     cursor["stage"] = "conversation_previews"

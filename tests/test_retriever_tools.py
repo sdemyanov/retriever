@@ -9794,8 +9794,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         original_row = self.fetch_document_row("raw/alpha.txt")
 
         second_payloads = self.run_v2_loose_ingest("raw")
-        self.assertEqual(second_payloads["commit"]["actions"], {"skipped": 1})
-        self.assertEqual(second_payloads["commit"]["committed"], 1)
+        self.assertEqual(second_payloads["plan"]["planned_loose_files"], 0)
+        self.assertEqual(second_payloads["plan"]["cursor"]["skipped_unchanged_loose_files"], 1)
+        self.assertEqual(second_payloads["prepare"]["prepared"], 0)
+        self.assertEqual(second_payloads["commit"]["committed"], 0)
+        self.assertEqual(second_payloads["commit"]["actions"], {})
         self.assertTrue(second_payloads["finalize"]["finalization_complete"])
 
         skipped_row = self.fetch_document_row("raw/alpha.txt")
@@ -9815,8 +9818,54 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(document_count, 1)
-        self.assertIsNotNone(artifact_row)
-        self.assertEqual(json.loads(artifact_row["artifact_manifest_json"])["commit_action"], "skipped")
+        self.assertIsNone(artifact_row)
+
+    def test_ingest_v2_reingest_skips_fresh_conversation_previews(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        self.write_email_message(
+            raw_dir / "alpha.eml",
+            subject="Fresh Preview",
+            body_text="fresh preview body\n",
+            message_id="<fresh-preview@example.com>",
+        )
+
+        first_payloads = self.run_v2_loose_ingest("raw")
+        first_post_steps = list(first_payloads.get("post_finalize_run_steps") or [])
+        self.assertTrue(
+            any(
+                result.get("step") == "commit"
+                and result.get("actions") == {"conversation_preview": 1}
+                for payload in first_post_steps
+                for result in list(payload.get("step_results") or [])
+                if isinstance(result, dict)
+            )
+        )
+
+        second_payloads = self.run_v2_loose_ingest("raw")
+        self.assertEqual(second_payloads["plan"]["planned_loose_files"], 0)
+        self.assertEqual(second_payloads["plan"]["cursor"]["skipped_unchanged_loose_files"], 1)
+        self.assertEqual(second_payloads["finalize"]["cursor"]["conversation_preview_active_count"], 1)
+        self.assertEqual(second_payloads["finalize"]["cursor"]["conversation_preview_target_count"], 0)
+        self.assertEqual(second_payloads["finalize"]["cursor"]["conversation_preview_skipped_fresh"], 1)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            preview_work_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                      AND unit_type = 'conversation_preview'
+                    """,
+                    (second_payloads["run_id"],),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+        self.assertEqual(preview_work_count, 0)
 
     def test_ingest_v2_reingest_updates_modified_loose_file(self) -> None:
         raw_dir = self.root / "raw"
@@ -9837,6 +9886,30 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(updated_row["id"], original_row["id"])
         self.assertEqual(updated_row["control_number"], original_row["control_number"])
         search_payload = retriever_tools.search(self.root, "searchable marker", None, None, None, 1, 20)
+        self.assertEqual(search_payload["total_hits"], 1)
+        self.assertEqual(search_payload["results"][0]["id"], updated_row["id"])
+
+    def test_ingest_v2_reingest_updates_same_size_modified_loose_file(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        alpha_path = raw_dir / "alpha.txt"
+        alpha_path.write_text("same-size marker 111\n", encoding="utf-8")
+
+        first_payloads = self.run_v2_loose_ingest("raw")
+        self.assertEqual(first_payloads["commit"]["actions"], {"new": 1})
+        original_row = self.fetch_document_row("raw/alpha.txt")
+
+        alpha_path.write_text("same-size marker 222\n", encoding="utf-8")
+        second_payloads = self.run_v2_loose_ingest("raw")
+        self.assertEqual(second_payloads["plan"]["planned_loose_files"], 1)
+        self.assertEqual(second_payloads["plan"]["cursor"]["skipped_unchanged_loose_files"], 0)
+        self.assertEqual(second_payloads["commit"]["actions"], {"updated": 1})
+        self.assertTrue(second_payloads["finalize"]["finalization_complete"])
+
+        updated_row = self.fetch_document_row("raw/alpha.txt")
+        self.assertEqual(updated_row["id"], original_row["id"])
+        self.assertEqual(updated_row["control_number"], original_row["control_number"])
+        search_payload = retriever_tools.search(self.root, "marker 222", None, None, None, 1, 20)
         self.assertEqual(search_payload["total_hits"], 1)
         self.assertEqual(search_payload["results"][0]["id"], updated_row["id"])
 
