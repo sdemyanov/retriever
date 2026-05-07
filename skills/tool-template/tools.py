@@ -8498,9 +8498,14 @@ def image_path_preview_raster(path: Path, *, max_dimension: int | None = None) -
     with pil_image_module.open(path) as image:
         restore_bilevel = False
         if image.mode == "1":
-            if output_format == "WEBP" or resized_dimension:
+            if output_format == "WEBP":
+                # Lossless WebP compresses ordinary bilevel production scans
+                # better at source resolution than after an antialiased resize.
                 image = image.convert("L")
-                restore_bilevel = output_format == "PNG" and resized_dimension > 0
+                resized_dimension = 0
+            elif resized_dimension:
+                image = image.convert("L")
+                restore_bilevel = True
         elif image.mode == "P":
             if output_format == "WEBP" or resized_dimension:
                 image = image.convert("RGBA" if image.info.get("transparency") is not None else "RGB")

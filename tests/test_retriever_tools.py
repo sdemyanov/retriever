@@ -10563,31 +10563,40 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             reopened.convert("RGB").save(rgb_buffer, format="PNG", optimize=True)
         self.assertLess(len(generated_preview_bytes), len(rgb_buffer.getvalue()))
 
-    def test_image_path_preview_raster_keeps_resized_bilevel_tiff_previews_compact(self) -> None:
+    def test_image_path_preview_raster_keeps_bilevel_tiff_webp_previews_unscaled(self) -> None:
         try:
             from PIL import Image, ImageDraw
         except Exception as exc:  # pragma: no cover - test helper dependency
             self.skipTest(f"Pillow unavailable for TIFF resize test: {exc}")
 
         image_path = self.root / "monochrome.tif"
-        image = Image.new("1", (800, 1000), color=1)
+        image = Image.new("1", (2560, 3360), color=1)
         draw = ImageDraw.Draw(image)
-        for row in range(20):
-            y = 30 + (row * 40)
-            for col in range(12):
-                x = 25 + (col * 60)
+        for row in range(72):
+            y = 36 + (row * 45)
+            for col in range(28):
+                x = 30 + (col * 86)
                 draw.rectangle((x, y, x + 24, y + 8), fill=0)
                 draw.rectangle((x + 30, y, x + 42, y + 8), fill=0)
         image.save(image_path, format="TIFF")
 
-        preview_raster = retriever_tools.image_path_preview_raster(image_path, max_dimension=140)
+        preview_raster = retriever_tools.image_path_preview_raster(
+            image_path,
+            max_dimension=retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+        )
         self.assertIsNotNone(preview_raster)
 
-        grayscale_buffer = io.BytesIO()
+        resized_webp_buffer = io.BytesIO()
         with Image.open(image_path) as reopened:
-            grayscale = reopened.convert("L")
-            grayscale.thumbnail((140, 140), resample=Image.Resampling.LANCZOS)
-            grayscale.save(grayscale_buffer, format="PNG", optimize=True)
+            resized_webp = reopened.convert("L")
+            resized_webp.thumbnail(
+                (
+                    retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+                    retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+                ),
+                resample=Image.Resampling.LANCZOS,
+            )
+            resized_webp.save(resized_webp_buffer, format="WEBP", lossless=True)
 
         assert preview_raster is not None
         preview_bytes, preview_mime_type, preview_suffix = preview_raster
@@ -10595,8 +10604,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(preview_suffix, retriever_tools.preview_image_output_suffix())
         self.assertEqual(retriever_tools.sniff_image_mime_type(preview_bytes), preview_mime_type)
         with Image.open(io.BytesIO(preview_bytes)) as resized:
-            self.assertEqual(resized.size, (112, 140))
-        self.assertLess(len(preview_bytes), len(grayscale_buffer.getvalue()))
+            if preview_mime_type == "image/webp":
+                self.assertEqual(resized.size, (2560, 3360))
+            else:
+                self.assertEqual(resized.size, (1067, 1400))
+        if preview_mime_type == "image/webp":
+            self.assertLess(len(preview_bytes), len(resized_webp_buffer.getvalue()))
 
     def test_ingest_v2_production_preview_image_default_uses_option_c_dimension(self) -> None:
         self.assertEqual(retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION, 1400)
