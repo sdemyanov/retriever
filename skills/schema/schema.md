@@ -22,6 +22,7 @@ Journal mode policy:
 
 - prefer `WAL` on normal local workspaces
 - if the filesystem or mount rejects `WAL`, fall back to `DELETE`
+- some mounted or sandboxed paths may allow writes to an existing DB while rejecting journal-mode setup for a freshly created DB
 - `bootstrap` may remove obviously stale zero-byte SQLite artifacts and retry once before surfacing an error
 
 ## Table definitions
@@ -618,6 +619,11 @@ Expected JSON shape:
   "journal_mode": "wal"
 }
 ```
+
+Notes:
+
+- `journal_mode` may be `"wal"` or `"delete"`. `DELETE` is a valid success case when the filesystem or mount rejects `WAL`.
+- Some mounted or sandboxed paths may allow writes to an existing DB while failing journal-mode setup for a freshly created DB.
 
 ### `ingest`
 

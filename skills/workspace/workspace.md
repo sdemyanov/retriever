@@ -47,6 +47,39 @@ Follow this order:
 6. Run `python3 skills/tool-template/tools.py workspace init <workspace>` to create or upgrade schema `25`.
 7. Write `runtime.json`.
 
+<a id="mounted-fs-bootstrap"></a>
+## Mounted/sandboxed SQLite bootstrap troubleshooting
+
+If `workspace init` or the first ingest fails with SQLite `WAL`, journal-mode, mount, or sandbox wording, do not conclude the workspace is unsupported from a single error or from host-side filesystem metadata. The source of truth is the exact workspace DB path inside the current runtime: `<workspace>/.retriever/retriever.db`.
+
+Use this order:
+
+1. Run `python3 skills/tool-template/tools.py workspace status --quick <workspace>`.
+2. If `.retriever/retriever.db` already exists, test whether the existing DB can be opened and can enter a write transaction. For example:
+   `python3 -c "import sqlite3; c=sqlite3.connect('<workspace>/.retriever/retriever.db'); c.execute('BEGIN IMMEDIATE'); c.execute('ROLLBACK'); print('ok'); c.close()'"`
+3. Separately test whether a freshly created DB on that target path can switch journal mode. For example:
+   `python3 -c "import sqlite3, pathlib; p=pathlib.Path('<workspace>/.retriever/_probe.db'); p.parent.mkdir(parents=True, exist_ok=True); c=sqlite3.connect(p); print(c.execute('PRAGMA journal_mode=WAL').fetchone()); c.close()'"`
+   If that fails or does not return `wal`, repeat the same probe with `PRAGMA journal_mode=DELETE`.
+4. Only if the fresh-create probe fails on the target path, try the seeded-copy workaround: create an empty DB on a known local filesystem such as `/tmp`, copy it to `<workspace>/.retriever/retriever.db`, and rerun `python3 skills/tool-template/tools.py workspace init <workspace>`.
+5. Report which probes succeeded or failed. Do not declare the workspace unsupported unless the exact target-path probes show Retriever cannot bootstrap there.
+
+Example seeded-copy recovery:
+
+```bash
+mkdir -p <workspace>/.retriever
+sqlite3 /tmp/retriever-seed.db 'PRAGMA journal_mode=WAL;'
+cp /tmp/retriever-seed.db <workspace>/.retriever/retriever.db
+python3 skills/tool-template/tools.py workspace init <workspace>
+```
+
+Notes:
+
+- The seeded-from-`/tmp` recovery is empirical: it was observed to help in the current Cowork sandbox when fresh-create failed on the mounted target path.
+- Use seeded-copy only when the fresh-create probe fails on the target path. If a future sandbox bridge supports fresh-create correctly, do not seed by default.
+- Existing DB writes do not prove fresh bootstrap will succeed.
+- Probe artifacts inside `.retriever/` are plugin-managed state and may be removed after diagnosis.
+- Never use this workaround to replace user source files.
+
 ## Subsequent sessions
 
 On every later session:

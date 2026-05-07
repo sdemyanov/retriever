@@ -172,6 +172,23 @@ For any tool result with `more_work_remaining: true`, continue with the returned
 
 If an active run exists, do not start a new one. Resume it or cancel it intentionally.
 
+### Filesystem and SQLite bootstrap diagnosis
+
+When diagnosing `workspace init` or first-ingest failures involving SQLite, `WAL`, journal mode, mounts, or sandboxed paths, do not infer the root cause from `df`, `mount`, or host filesystem labels alone.
+
+Probe the exact target path inside the same Cowork runtime, normally `<workspace>/.retriever/retriever.db`, before declaring a workspace unsupported.
+
+Distinguish these cases:
+
+1. an existing DB on the target path can be opened and can enter a write transaction
+2. a freshly created DB on that same path can switch to `WAL`
+3. if `WAL` fails, a freshly created DB on that same path can switch to `DELETE`
+4. a DB seeded on a known local filesystem such as `/tmp` and then copied into place can be opened and initialized
+
+Existing DB writes do not prove fresh bootstrap will succeed.
+
+If fresh-create fails on the target path but seeded-copy works, use the seeded DB workaround under `.retriever/`, rerun `workspace init`, and report the observed target-path behavior instead of a filesystem theory.
+
 ## Tier 2 — tools.py Subcommands
 
 If no Tier 1 user-facing surface covers the intent, use a named subcommand of

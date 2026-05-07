@@ -36,8 +36,11 @@ Use this skill when the user says things like:
 ## Execution rules
 
 - Confirm or infer the workspace root.
-- Run `workspace status --quick` if runtime state is unclear.
-- Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, and user-modified tool protection without changing the chosen ingest intent.
+- For a newly selected workspace, always run `python3 skills/tool-template/tools.py workspace status --quick <workspace>` before the first ingest. For already-known workspaces, run it whenever runtime state is unclear.
+- If `workspace init` or the first ingest fails with SQLite `WAL`, journal-mode, mount, or sandbox wording, stop normal ingest execution and follow the [mounted/sandboxed SQLite bootstrap troubleshooting](../workspace/workspace.md#mounted-fs-bootstrap).
+- Do not conclude the workspace is unsupported from `df`, `mount`, or host filesystem labels alone.
+- Existing DB writes do not prove fresh bootstrap will succeed; distinguish existing-DB behavior from fresh-create behavior on the exact target `.retriever/retriever.db` path.
+- Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, user-modified tool protection, and mounted-path bootstrap troubleshooting without changing the chosen ingest intent.
 - Prefer plain `ingest` for normal Cowork indexing and refresh tasks. It is the bounded V2 facade by default.
 - Use one bounded command per Cowork/bash call, normally:
   `python3 skills/tool-template/tools.py ingest <workspace> --recursive --budget-seconds 35`

@@ -29,8 +29,11 @@ Use this skill when the user says things like:
 ## Execution rules
 
 - Confirm or infer both the workspace root and the candidate production root.
-- Run `workspace status --quick` if runtime state is unclear.
-- Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, and user-modified tool protection without changing the chosen production-ingest intent.
+- For a newly selected workspace, always run `python3 skills/tool-template/tools.py workspace status --quick <workspace>` before the first ingest. For already-known workspaces, run it whenever runtime state is unclear.
+- If `workspace init` or the first ingest fails with SQLite `WAL`, journal-mode, mount, or sandbox wording, stop normal production-ingest execution and follow the [mounted/sandboxed SQLite bootstrap troubleshooting](../workspace/workspace.md#mounted-fs-bootstrap).
+- Do not conclude the workspace is unsupported from `df`, `mount`, or host filesystem labels alone.
+- Existing DB writes do not prove fresh bootstrap will succeed; distinguish existing-DB behavior from fresh-create behavior on the exact target `.retriever/retriever.db` path.
+- Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, user-modified tool protection, and mounted-path bootstrap troubleshooting without changing the chosen production-ingest intent.
 - Validate that the target looks like a supported processed production root, not just a loose folder of files.
 - For normal Cowork execution, prefer the bounded plain ingest facade and pass the production root as a scoped path:
   `python3 skills/tool-template/tools.py ingest <workspace> --recursive --path <production-root-relative-path> --budget-seconds 35`
