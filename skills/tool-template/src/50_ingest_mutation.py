@@ -74,6 +74,10 @@ INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
 INGEST_V2_PREPARED_COMMIT_BATCH_TARGET = max(25, INGEST_V2_PREPARE_BATCH_SIZE * 5)
 INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE = 12
 INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 1400
+# Cowork's preview iframe does not reliably resolve sibling local image assets,
+# so the resumable production path defaults to embedded page images. Flip this
+# to False to keep HTML <img src="..."> references to batch-generated page PNGs.
+INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES = True
 INGEST_PIPELINE_LEGACY = "legacy"
 INGEST_PIPELINE_V2 = "v2"
 INGEST_PIPELINE_MODE = INGEST_PIPELINE_V2
@@ -1840,6 +1844,12 @@ def ingest_v2_plan_production_root(
                 existing_by_control_number.get(control_number),
                 plan,
                 production_id=existing_production_id,
+                preview_image_max_dimension=(
+                    INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION
+                    if INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES
+                    else None
+                ),
+                embed_preview_images=INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES,
             )
         ):
             skipped_unchanged_rows += 1
@@ -2425,10 +2435,17 @@ def ingest_v2_prepare_production_row_item(
         for path in list(payload_dict.get("matching_image_paths") or [])
         if path
     ]
+    preview_image_refs = production_preview_page_asset_refs(rel_path, control_number, matching_image_paths)
     prepared_item = prepare_production_row_plan(
         root,
         payload_dict,
-        preview_image_refs=production_preview_page_asset_refs(rel_path, control_number, matching_image_paths),
+        preview_image_max_dimension=(
+            INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION
+            if INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES
+            else None
+        ),
+        preview_image_refs=preview_image_refs,
+        embed_preview_images=INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES,
     )
     prepared_item["prepare_hash_ms"] = 0.0
     return prepared_item, source_fingerprint, None
@@ -4057,27 +4074,8 @@ def ingest_v2_commit_production_preview_batch(
         if document_row is None:
             raise RetrieverError(f"Production document {control_number} is not committed yet.")
         document_id = int(document_row["id"])
-        preview_rows: list[dict[str, object]] = []
-        rel_preview_paths: list[str] = []
-        for asset in page_assets:
-            rel_preview_path = normalize_whitespace(str(asset.get("rel_preview_path") or ""))
-            payload = asset.get("payload")
-            if not rel_preview_path or not isinstance(payload, (bytes, bytearray)):
-                continue
-            abs_path = paths["state_dir"] / rel_preview_path
-            abs_path.parent.mkdir(parents=True, exist_ok=True)
-            abs_path.write_bytes(bytes(payload))
-            rel_preview_paths.append(rel_preview_path)
-            preview_rows.append(
-                {
-                    "rel_preview_path": rel_preview_path,
-                    "preview_type": "image",
-                    "target_fragment": None,
-                    "label": asset.get("label"),
-                    "ordinal": int(asset.get("ordinal") or 0),
-                    "created_at": utc_now(),
-                }
-            )
+        preview_rows = write_preview_page_assets(paths, page_assets)
+        rel_preview_paths = [str(row["rel_preview_path"]) for row in preview_rows]
         if rel_preview_paths:
             placeholders = ",".join("?" for _ in rel_preview_paths)
             connection.execute(

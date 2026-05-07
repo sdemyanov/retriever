@@ -468,6 +468,33 @@ def production_preview_page_asset_refs(
     return refs
 
 
+def production_preview_page_assets(
+    preview_image_refs: list[dict[str, object]],
+    *,
+    max_dimension: int | None = None,
+) -> list[dict[str, object]]:
+    assets: list[dict[str, object]] = []
+    for ref in preview_image_refs:
+        source_path = Path(str(ref.get("source_path") or ""))
+        if not source_path.exists():
+            continue
+        png_bytes = image_path_png_bytes(source_path, max_dimension=max_dimension)
+        if png_bytes is None:
+            continue
+        rel_preview_path = normalize_whitespace(str(ref.get("rel_preview_path") or ""))
+        if not rel_preview_path:
+            continue
+        assets.append(
+            {
+                "ordinal": int(ref.get("ordinal") or 0),
+                "label": str(ref.get("label") or ""),
+                "rel_preview_path": rel_preview_path,
+                "payload": png_bytes,
+            }
+        )
+    return assets
+
+
 def infer_production_title(control_number: str, text_content: str, native_path: Path | None) -> str:
     for line in text_content.splitlines():
         candidate = normalize_whitespace(line)
@@ -1122,6 +1149,32 @@ def write_preview_artifacts(
                 "target_fragment": artifact.get("target_fragment"),
                 "label": artifact.get("label"),
                 "ordinal": int(artifact.get("ordinal", 0)),
+                "created_at": utc_now(),
+            }
+        )
+    return preview_rows
+
+
+def write_preview_page_assets(
+    paths: dict[str, Path],
+    page_assets: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    preview_rows: list[dict[str, object]] = []
+    for asset in page_assets:
+        rel_preview_path = normalize_whitespace(str(asset.get("rel_preview_path") or ""))
+        payload = asset.get("payload")
+        if not rel_preview_path or not isinstance(payload, (bytes, bytearray)):
+            continue
+        absolute_path = paths["state_dir"] / rel_preview_path
+        absolute_path.parent.mkdir(parents=True, exist_ok=True)
+        absolute_path.write_bytes(bytes(payload))
+        preview_rows.append(
+            {
+                "rel_preview_path": rel_preview_path,
+                "preview_type": "image",
+                "target_fragment": None,
+                "label": asset.get("label"),
+                "ordinal": int(asset.get("ordinal") or 0),
                 "created_at": utc_now(),
             }
         )
@@ -3253,6 +3306,55 @@ def preview_asset_url_is_relative(value: str) -> bool:
     )
 
 
+def preview_relative_asset_rel_path(
+    value: str,
+    *,
+    source_preview_rel_path: object,
+) -> str | None:
+    normalized_value = str(value or "")
+    if not preview_asset_url_is_relative(normalized_value):
+        return None
+    source_rel_path = normalize_internal_rel_path(Path(str(source_preview_rel_path or "")))
+    if not source_rel_path:
+        return None
+    source_dir = posixpath.dirname(source_rel_path)
+    split_at = len(normalized_value)
+    for separator in ("?", "#"):
+        index = normalized_value.find(separator)
+        if index >= 0:
+            split_at = min(split_at, index)
+    url_path = normalized_value[:split_at]
+    if not url_path:
+        return None
+    asset_rel_path = posixpath.normpath(
+        posixpath.join(source_dir, urllib_request.url2pathname(url_path))
+    )
+    if asset_rel_path == ".." or asset_rel_path.startswith("../"):
+        return None
+    return asset_rel_path
+
+
+def preview_relative_asset_rel_paths_for_html_body(
+    html_body: str,
+    *,
+    source_preview_rel_path: object,
+) -> list[str]:
+    if not html_body or not source_preview_rel_path:
+        return []
+    rel_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for match in HTML_PREVIEW_RELATIVE_ASSET_ATTR_PATTERN.finditer(html_body):
+        asset_rel_path = preview_relative_asset_rel_path(
+            match.group(3),
+            source_preview_rel_path=source_preview_rel_path,
+        )
+        if asset_rel_path is None or asset_rel_path in seen_paths:
+            continue
+        seen_paths.add(asset_rel_path)
+        rel_paths.append(asset_rel_path)
+    return rel_paths
+
+
 def rebase_preview_relative_asset_url(
     value: str,
     *,
@@ -3262,26 +3364,20 @@ def rebase_preview_relative_asset_url(
     normalized_value = str(value or "")
     if not preview_asset_url_is_relative(normalized_value):
         return normalized_value
-    source_rel_path = normalize_internal_rel_path(Path(str(source_preview_rel_path or "")))
     target_rel_path = normalize_internal_rel_path(Path(str(target_preview_rel_path or "")))
-    if not source_rel_path or not target_rel_path:
+    asset_rel_path = preview_relative_asset_rel_path(
+        normalized_value,
+        source_preview_rel_path=source_preview_rel_path,
+    )
+    if asset_rel_path is None or not target_rel_path:
         return normalized_value
-    source_dir = posixpath.dirname(source_rel_path)
     target_dir = posixpath.dirname(target_rel_path)
     split_at = len(normalized_value)
     for separator in ("?", "#"):
         index = normalized_value.find(separator)
         if index >= 0:
             split_at = min(split_at, index)
-    url_path = normalized_value[:split_at]
     suffix = normalized_value[split_at:]
-    if not url_path:
-        return normalized_value
-    asset_rel_path = posixpath.normpath(
-        posixpath.join(source_dir, urllib_request.url2pathname(url_path))
-    )
-    if asset_rel_path == ".." or asset_rel_path.startswith("../"):
-        return normalized_value
     rebased_path = posixpath.relpath(asset_rel_path, start=target_dir or ".")
     return urllib_request.pathname2url(rebased_path) + suffix
 
@@ -6800,6 +6896,7 @@ def build_production_extracted_payload(
     preview_image_limit: int | None = None,
     preview_image_max_dimension: int | None = None,
     preview_image_refs: list[dict[str, object]] | None = None,
+    embed_preview_images: bool = False,
 ) -> dict[str, object]:
     text_content = ""
     text_status = "empty"
@@ -6832,7 +6929,7 @@ def build_production_extracted_payload(
     )
     page_images: list[dict[str, object]] = []
     page_image_note = None
-    if preview_image_refs is not None:
+    if preview_image_refs is not None and not embed_preview_images:
         for ref in preview_image_refs:
             page_images.append(
                 {
@@ -6961,6 +7058,7 @@ def prepare_production_row_plan(
     preview_image_limit: int | None = None,
     preview_image_max_dimension: int | None = None,
     preview_image_refs: list[dict[str, object]] | None = None,
+    embed_preview_images: bool = False,
 ) -> dict[str, object]:
     prepared_item = dict(prepared_plan)
     prepare_started = time.perf_counter()
@@ -6984,6 +7082,7 @@ def prepare_production_row_plan(
             preview_image_limit=preview_image_limit,
             preview_image_max_dimension=preview_image_max_dimension,
             preview_image_refs=preview_image_refs,
+            embed_preview_images=embed_preview_images,
         )
         preferred_native = extracted_payload.pop("preferred_native", None)
         source_parts = production_source_parts(
@@ -6991,6 +7090,14 @@ def prepare_production_row_plan(
             text_path=available_text_path,
             image_paths=matching_image_paths,
             native_path=available_native_path,
+        )
+        preview_page_assets = (
+            production_preview_page_assets(
+                preview_image_refs,
+                max_dimension=preview_image_max_dimension,
+            )
+            if preview_image_refs is not None and not embed_preview_images and preferred_native is None
+            else []
         )
         chunk_started = time.perf_counter()
         prepared_chunks = chunk_text(str(extracted_payload.get("text_content") or ""))
@@ -7009,6 +7116,7 @@ def prepare_production_row_plan(
         prepared_item["preferred_native"] = preferred_native
         prepared_item["preferred_source_path"] = preferred_source_path
         prepared_item["source_parts"] = source_parts
+        prepared_item["preview_page_assets"] = preview_page_assets
         prepared_item["prepared_chunks"] = prepared_chunks
         prepared_item["prepare_chunk_ms"] = (time.perf_counter() - chunk_started) * 1000.0
         prepared_item["rel_path"] = rel_path
@@ -7037,6 +7145,7 @@ def prepare_production_row_plan(
         prepared_item["preferred_native"] = None
         prepared_item["preferred_source_path"] = None
         prepared_item["source_parts"] = []
+        prepared_item["preview_page_assets"] = []
         prepared_item["prepared_chunks"] = []
         prepared_item["prepare_chunk_ms"] = 0.0
         prepared_item["rel_path"] = production_logical_rel_path(
@@ -7095,6 +7204,8 @@ def production_plan_matches_existing_document(
     prepared_plan: dict[str, object],
     *,
     production_id: int,
+    preview_image_max_dimension: int | None = None,
+    embed_preview_images: bool = False,
 ) -> bool:
     if existing_row is None or existing_row["lifecycle_status"] != "active":
         return False
@@ -7124,7 +7235,9 @@ def production_plan_matches_existing_document(
             text_path=available_text_path,
             image_paths=matching_image_paths,
             native_path=available_native_path,
+            preview_image_max_dimension=preview_image_max_dimension,
             preview_image_refs=preview_image_refs,
+            embed_preview_images=embed_preview_images,
         )
         preferred_native = extracted_payload.get("preferred_native")
         source_parts = production_source_parts(
@@ -7189,7 +7302,32 @@ def iter_prepared_production_row_plans(
         )
     yield from iter_staged_prepared_items(
         production_row_plans,
-        prepare_item=lambda plan: prepare_production_row_plan(workspace_root, plan),
+        prepare_item=lambda plan: prepare_production_row_plan(
+            workspace_root,
+            plan,
+            preview_image_max_dimension=(
+                INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION
+                if not INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES
+                else None
+            ),
+            preview_image_refs=(
+                production_preview_page_asset_refs(
+                    production_logical_rel_path(
+                        str(plan["production_rel_root"]),
+                        str(plan["control_number"]),
+                    ).as_posix(),
+                    str(plan["control_number"]),
+                    [
+                        Path(str(path))
+                        for path in list(plan.get("matching_image_paths") or [])
+                        if path
+                    ],
+                )
+                if not INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES
+                else None
+            ),
+            embed_preview_images=INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES,
+        ),
         config_benchmark_name="ingest_production_prepare_config",
         queue_done_benchmark_name="ingest_production_prepare_queue_done",
         spill_subdir_name="prepared-production",
@@ -7278,6 +7416,7 @@ def commit_prepared_production_row(
             dataset_source_id=dataset_source_id,
         )
         preview_rows = write_preview_artifacts(paths, str(prepared_item["rel_path"]), list(extracted.get("preview_artifacts", [])))
+        preview_rows.extend(write_preview_page_assets(paths, list(prepared_item.get("preview_page_assets", []))))
         replace_document_related_rows(
             connection,
             document_id,
