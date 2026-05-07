@@ -2480,18 +2480,19 @@ def ingest_v2_prepare_production_preview_batch_item(
         source_path = Path(str(ref.get("source_path") or ""))
         if not source_path.exists():
             continue
-        png_bytes = image_path_png_bytes(
+        preview_raster = image_path_preview_raster(
             source_path,
             max_dimension=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
         )
-        if png_bytes is None:
+        if preview_raster is None:
             continue
+        preview_bytes, _, _ = preview_raster
         page_assets.append(
             {
                 "ordinal": int(ref.get("ordinal") or 0),
                 "label": str(ref.get("label") or ""),
                 "rel_preview_path": str(ref.get("rel_preview_path") or ""),
-                "payload": png_bytes,
+                "payload": preview_bytes,
             }
         )
     prepared_item = {

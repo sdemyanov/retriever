@@ -8985,7 +8985,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         preview_html = (self.paths["state_dir"] / html_rows[0]["rel_preview_path"]).read_text(encoding="utf-8")
         self.assertEqual(preview_html.count("<figure>"), page_count)
         self.assertNotIn("Preview shows the first", preview_html)
-        self.assertIn("data:image/png;base64,", preview_html)
+        self.assertIn(f"data:{retriever_tools.preview_image_output_mime_type()};base64,", preview_html)
         for row in image_rows:
             self.assertTrue((self.paths["state_dir"] / row["rel_preview_path"]).exists())
 
@@ -10535,7 +10535,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.assertEqual(result["preview_rel_path"], file_name)
             self.assertEqual(result["preview_targets"][0]["preview_type"], "native")
 
-    def test_image_path_data_url_preserves_compact_tiff_modes_before_rgb_fallback(self) -> None:
+    def test_image_path_data_url_uses_preview_raster_format_for_tiff(self) -> None:
         try:
             from PIL import Image
         except Exception as exc:  # pragma: no cover - test helper dependency
@@ -10548,17 +10548,22 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 image.putpixel((x, y), (x + y) % 2)
         image.save(image_path, format="TIFF")
 
-        data_url = retriever_tools.image_path_data_url(image_path)
+        expected_mime_type = retriever_tools.preview_image_output_mime_type()
+        data_url = retriever_tools.image_path_data_url(
+            image_path,
+            max_dimension=retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+        )
         self.assertIsNotNone(data_url)
-        self.assertTrue(str(data_url).startswith("data:image/png;base64,"))
-        generated_png_bytes = base64.b64decode(str(data_url).split(",", 1)[1])
+        self.assertTrue(str(data_url).startswith(f"data:{expected_mime_type};base64,"))
+        generated_preview_bytes = base64.b64decode(str(data_url).split(",", 1)[1])
+        self.assertEqual(retriever_tools.sniff_image_mime_type(generated_preview_bytes), expected_mime_type)
 
         rgb_buffer = io.BytesIO()
         with Image.open(image_path) as reopened:
             reopened.convert("RGB").save(rgb_buffer, format="PNG", optimize=True)
-        self.assertLess(len(generated_png_bytes), len(rgb_buffer.getvalue()))
+        self.assertLess(len(generated_preview_bytes), len(rgb_buffer.getvalue()))
 
-    def test_image_path_png_bytes_keeps_resized_bilevel_tiff_previews_compact(self) -> None:
+    def test_image_path_preview_raster_keeps_resized_bilevel_tiff_previews_compact(self) -> None:
         try:
             from PIL import Image, ImageDraw
         except Exception as exc:  # pragma: no cover - test helper dependency
@@ -10575,8 +10580,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 draw.rectangle((x + 30, y, x + 42, y + 8), fill=0)
         image.save(image_path, format="TIFF")
 
-        png_bytes = retriever_tools.image_path_png_bytes(image_path, max_dimension=140)
-        self.assertIsNotNone(png_bytes)
+        preview_raster = retriever_tools.image_path_preview_raster(image_path, max_dimension=140)
+        self.assertIsNotNone(preview_raster)
 
         grayscale_buffer = io.BytesIO()
         with Image.open(image_path) as reopened:
@@ -10584,13 +10589,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             grayscale.thumbnail((140, 140), resample=Image.Resampling.LANCZOS)
             grayscale.save(grayscale_buffer, format="PNG", optimize=True)
 
-        assert png_bytes is not None
-        with Image.open(io.BytesIO(png_bytes)) as resized:
+        assert preview_raster is not None
+        preview_bytes, preview_mime_type, preview_suffix = preview_raster
+        self.assertEqual(preview_mime_type, retriever_tools.preview_image_output_mime_type())
+        self.assertEqual(preview_suffix, retriever_tools.preview_image_output_suffix())
+        self.assertEqual(retriever_tools.sniff_image_mime_type(preview_bytes), preview_mime_type)
+        with Image.open(io.BytesIO(preview_bytes)) as resized:
             self.assertEqual(resized.size, (112, 140))
-            self.assertEqual(resized.mode, "1")
-            self.assertTrue(any(pixel == 0 for pixel in resized.getdata()))
-            self.assertTrue(any(pixel == 255 for pixel in resized.getdata()))
-        self.assertLess(len(png_bytes), len(grayscale_buffer.getvalue()))
+        self.assertLess(len(preview_bytes), len(grayscale_buffer.getvalue()))
 
     def test_ingest_v2_production_preview_image_default_uses_option_c_dimension(self) -> None:
         self.assertEqual(retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION, 1400)
@@ -10626,6 +10632,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         preview_content = payload["preview_artifacts"][0]["content"]
         self.assertEqual(preview_content.count("<figure>"), 1)
         self.assertIn("Preview shows the first 1 of 3 produced pages", preview_content)
+        self.assertIn(f"data:{retriever_tools.preview_image_output_mime_type()};base64,", preview_content)
 
     def test_ingest_supports_rtf_text_extraction(self) -> None:
         rtf_path = self.root / "memo.rtf"
@@ -18635,7 +18642,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn(f'href="{expected_href}"', preview_html)
         self.assertIn("PDX000001", preview_html)
         self.assertIn("Discuss attachment handling.", preview_html)
-        self.assertIn("data:image/png;base64,", preview_html)
+        self.assertIn(f"data:{retriever_tools.preview_image_output_mime_type()};base64,", preview_html)
 
     def test_ingest_production_link_mode_writes_preview_page_assets(self) -> None:
         production_root = self.write_production_fixture()
@@ -18656,9 +18663,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertTrue(image_result["preview_rel_path"].endswith(".html"))
         preview_html = Path(image_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
-        self.assertIn('src="PDX000005-pages/page-0001.png"', preview_html)
-        self.assertIn('src="PDX000005-pages/page-0002.png"', preview_html)
-        self.assertNotIn("data:image/png;base64,", preview_html)
+        page_suffix = retriever_tools.preview_image_output_suffix()
+        self.assertIn(f'src="PDX000005-pages/page-0001{page_suffix}"', preview_html)
+        self.assertIn(f'src="PDX000005-pages/page-0002{page_suffix}"', preview_html)
+        self.assertNotIn(f"data:{retriever_tools.preview_image_output_mime_type()};base64,", preview_html)
 
         workspace_page_dir = (
             self.paths["state_dir"]
@@ -18669,8 +18677,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             / "PDX000005-pages"
         )
         workspace_page_paths = [
-            workspace_page_dir / "page-0001.png",
-            workspace_page_dir / "page-0002.png",
+            workspace_page_dir / f"page-0001{page_suffix}",
+            workspace_page_dir / f"page-0002{page_suffix}",
         ]
         self.assertTrue(all(path.exists() for path in workspace_page_paths))
 
@@ -18692,8 +18700,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             [(row["preview_type"], Path(row["rel_preview_path"]).name, row["ordinal"]) for row in preview_rows],
             [
                 ("html", "PDX000005.html", 0),
-                ("image", "page-0001.png", 1),
-                ("image", "page-0002.png", 2),
+                ("image", f"page-0001{page_suffix}", 1),
+                ("image", f"page-0002{page_suffix}", 2),
             ],
         )
 
@@ -19573,8 +19581,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             / "documents"
             / "PDX000005.html"
         ).read_text(encoding="utf-8")
-        self.assertIn('src="PDX000005-pages/page-0001.png"', linked_preview_html)
-        self.assertNotIn("data:image/png;base64,", linked_preview_html)
+        page_suffix = retriever_tools.preview_image_output_suffix()
+        self.assertIn(f'src="PDX000005-pages/page-0001{page_suffix}"', linked_preview_html)
+        self.assertNotIn(f"data:{retriever_tools.preview_image_output_mime_type()};base64,", linked_preview_html)
         workspace_page_dir = (
             self.paths["state_dir"]
             / "previews"
@@ -19584,8 +19593,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             / "PDX000005-pages"
         )
         workspace_page_paths = [
-            workspace_page_dir / "page-0001.png",
-            workspace_page_dir / "page-0002.png",
+            workspace_page_dir / f"page-0001{page_suffix}",
+            workspace_page_dir / f"page-0002{page_suffix}",
         ]
         self.assertTrue(all(path.exists() for path in workspace_page_paths))
 
@@ -19606,25 +19615,25 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         output_dir = Path(payload["output_path"])
         manifest = json.loads(Path(payload["manifest_path"]).read_text(encoding="utf-8"))
         exported_page_paths = [
-            output_dir / "previews" / "productions" / "Synthetic_Production" / "documents" / "PDX000005-pages" / "page-0001.png",
-            output_dir / "previews" / "productions" / "Synthetic_Production" / "documents" / "PDX000005-pages" / "page-0002.png",
+            output_dir / "previews" / "productions" / "Synthetic_Production" / "documents" / "PDX000005-pages" / f"page-0001{page_suffix}",
+            output_dir / "previews" / "productions" / "Synthetic_Production" / "documents" / "PDX000005-pages" / f"page-0002{page_suffix}",
         ]
 
         unit_html = unit_path.read_text(encoding="utf-8")
         self.assertIn(
-            'src="../previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0001.png"',
+            f'src="../previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0001{page_suffix}"',
             unit_html,
         )
         self.assertIn(
-            'src="../previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0002.png"',
+            f'src="../previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0002{page_suffix}"',
             unit_html,
         )
-        self.assertNotIn('src="PDX000005-pages/page-0001.png"', unit_html)
+        self.assertNotIn(f'src="PDX000005-pages/page-0001{page_suffix}"', unit_html)
         self.assertEqual(
             sorted(manifest["asset_rel_paths"]),
             [
-                "previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0001.png",
-                "previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0002.png",
+                f"previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0001{page_suffix}",
+                f"previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0002{page_suffix}",
             ],
         )
         for exported_path, workspace_path in zip(exported_page_paths, workspace_page_paths):

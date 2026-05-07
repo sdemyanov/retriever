@@ -452,9 +452,10 @@ def production_preview_page_asset_refs(
 ) -> list[dict[str, object]]:
     preview_base = preview_base_path_for_rel_path(rel_path)
     page_dir_name = f"{sanitize_storage_filename(control_number)}-pages"
+    page_suffix = preview_image_output_suffix()
     refs: list[dict[str, object]] = []
     for index, image_path in enumerate(image_paths, start=1):
-        page_file_name = f"page-{index:04d}.png"
+        page_file_name = f"page-{index:04d}{page_suffix}"
         rel_preview_path = preview_base / page_dir_name / page_file_name
         refs.append(
             {
@@ -478,9 +479,10 @@ def production_preview_page_assets(
         source_path = Path(str(ref.get("source_path") or ""))
         if not source_path.exists():
             continue
-        png_bytes = image_path_png_bytes(source_path, max_dimension=max_dimension)
-        if png_bytes is None:
+        preview_raster = image_path_preview_raster(source_path, max_dimension=max_dimension)
+        if preview_raster is None:
             continue
+        preview_bytes, _, _ = preview_raster
         rel_preview_path = normalize_whitespace(str(ref.get("rel_preview_path") or ""))
         if not rel_preview_path:
             continue
@@ -489,7 +491,7 @@ def production_preview_page_assets(
                 "ordinal": int(ref.get("ordinal") or 0),
                 "label": str(ref.get("label") or ""),
                 "rel_preview_path": rel_preview_path,
-                "payload": png_bytes,
+                "payload": preview_bytes,
             }
         )
     return assets
@@ -829,7 +831,10 @@ def regenerate_production_preview_for_document(
         abs_image = paths["root"] / row["rel_source_path"]
         if not abs_image.exists():
             continue
-        data_url = image_path_data_url(abs_image)
+        data_url = image_path_data_url(
+            abs_image,
+            max_dimension=INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION,
+        )
         if data_url is None:
             continue
         page_images.append(

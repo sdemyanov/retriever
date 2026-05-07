@@ -7608,21 +7608,57 @@ def ooxml_image_mime_type(part_name: str) -> str | None:
     return None
 
 
-def image_path_png_bytes(path: Path, *, max_dimension: int | None = None) -> bytes | None:
+_PREVIEW_IMAGE_OUTPUT_PROFILE: tuple[str, str, str] | None = None
+
+
+def preview_image_output_profile() -> tuple[str, str, str]:
+    global _PREVIEW_IMAGE_OUTPUT_PROFILE
+    if _PREVIEW_IMAGE_OUTPUT_PROFILE is not None:
+        return _PREVIEW_IMAGE_OUTPUT_PROFILE
+    pil_image_module = load_dependency("PilImage")
+    if pil_image_module is None:
+        _PREVIEW_IMAGE_OUTPUT_PROFILE = ("PNG", "image/png", ".png")
+        return _PREVIEW_IMAGE_OUTPUT_PROFILE
+    try:
+        probe_buffer = io.BytesIO()
+        pil_image_module.new("L", (1, 1), 255).save(probe_buffer, format="WEBP", lossless=True)
+        _PREVIEW_IMAGE_OUTPUT_PROFILE = ("WEBP", "image/webp", ".webp")
+    except Exception:
+        _PREVIEW_IMAGE_OUTPUT_PROFILE = ("PNG", "image/png", ".png")
+    return _PREVIEW_IMAGE_OUTPUT_PROFILE
+
+
+def preview_image_output_mime_type() -> str:
+    return preview_image_output_profile()[1]
+
+
+def preview_image_output_suffix() -> str:
+    return preview_image_output_profile()[2]
+
+
+def image_path_preview_raster(path: Path, *, max_dimension: int | None = None) -> tuple[bytes, str, str] | None:
     resized_dimension = max(0, int(max_dimension or 0))
     pil_image_module = load_dependency("PilImage")
     if pil_image_module is None:
         return None
+    output_format, mime_type, output_suffix = preview_image_output_profile()
     with pil_image_module.open(path) as image:
         restore_bilevel = False
+        if image.mode == "1":
+            if output_format == "WEBP" or resized_dimension:
+                image = image.convert("L")
+                restore_bilevel = output_format == "PNG" and resized_dimension > 0
+        elif image.mode == "P":
+            if output_format == "WEBP" or resized_dimension:
+                image = image.convert("RGBA" if image.info.get("transparency") is not None else "RGB")
+        elif output_format == "WEBP" and image.mode not in {"L", "RGB", "RGBA"}:
+            image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
         if resized_dimension:
             # Normalize low-bit-depth images before resizing so Pillow can use
             # antialiased resampling instead of mode-1 nearest-neighbor.
             if image.mode == "1":
                 image = image.convert("L")
                 restore_bilevel = True
-            elif image.mode == "P":
-                image = image.convert("RGB")
             resampling = getattr(pil_image_module, "Resampling", pil_image_module)
             lanczos = getattr(resampling, "LANCZOS", None)
             if lanczos is None:
@@ -7638,11 +7674,20 @@ def image_path_png_bytes(path: Path, *, max_dimension: int | None = None) -> byt
             dither = getattr(getattr(pil_image_module, "Dither", pil_image_module), "NONE", None)
             image = image.convert("1") if dither is None else image.convert("1", dither=dither)
         buffer = io.BytesIO()
+        if output_format == "WEBP":
+            try:
+                image.save(buffer, format="WEBP", lossless=True)
+                return buffer.getvalue(), mime_type, output_suffix
+            except (OSError, ValueError):
+                output_format = "PNG"
+                mime_type = "image/png"
+                output_suffix = ".png"
+                buffer = io.BytesIO()
         try:
             image.save(buffer, format="PNG", optimize=True)
         except (OSError, ValueError):
-            image.convert("RGB").save(buffer, format="PNG", optimize=True)
-    return buffer.getvalue()
+            image.convert("RGBA" if "A" in image.getbands() else "RGB").save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue(), mime_type, output_suffix
 
 
 def image_path_data_url(path: Path, *, max_dimension: int | None = None) -> str | None:
@@ -7650,12 +7695,13 @@ def image_path_data_url(path: Path, *, max_dimension: int | None = None) -> str 
     normalized_suffix = path.suffix.lower()
     resized_dimension = max(0, int(max_dimension or 0))
     if normalized_suffix in {".tif", ".tiff"} or resized_dimension:
-        png_bytes = image_path_png_bytes(path, max_dimension=resized_dimension)
-        if png_bytes is None:
+        preview_raster = image_path_preview_raster(path, max_dimension=resized_dimension)
+        if preview_raster is None:
             if normalized_suffix not in {".tif", ".tiff"} and mime_type is not None and mime_type.startswith("image/"):
                 return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
             return None
-        return f"data:image/png;base64,{base64.b64encode(png_bytes).decode('ascii')}"
+        preview_bytes, preview_mime_type, _ = preview_raster
+        return f"data:{preview_mime_type};base64,{base64.b64encode(preview_bytes).decode('ascii')}"
     if mime_type is None or not mime_type.startswith("image/"):
         return None
     return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
