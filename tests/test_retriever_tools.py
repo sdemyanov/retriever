@@ -8956,9 +8956,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(run_exit, 0)
         self.assertIsNotNone(run_payload)
         self.assertEqual(run_payload["run"]["status"], "completed")
+        plan_result = next(result for result in run_payload["step_results"] if result["step"] == "plan")
+        self.assertEqual(plan_result["cursor"]["planned_production_preview_batches"], 0)
         by_unit_type = run_payload["run"]["counts"]["by_unit_type"]
         self.assertEqual(by_unit_type["production_row"]["committed"], 1)
-        self.assertEqual(by_unit_type["production_preview_batch"]["committed"], 2)
+        self.assertNotIn("production_preview_batch", by_unit_type)
         self.assertTrue(retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES)
 
         document_row = self.fetch_document_row(
@@ -8981,13 +8983,74 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         html_rows = [row for row in preview_rows if row["preview_type"] == "html"]
         image_rows = [row for row in preview_rows if row["preview_type"] == "image"]
         self.assertEqual(len(html_rows), 1)
-        self.assertEqual(len(image_rows), page_count)
+        self.assertEqual(len(image_rows), 0)
         preview_html = (self.paths["state_dir"] / html_rows[0]["rel_preview_path"]).read_text(encoding="utf-8")
         self.assertEqual(preview_html.count("<figure>"), page_count)
         self.assertNotIn("Preview shows the first", preview_html)
         self.assertIn(f"data:{retriever_tools.preview_image_output_mime_type()};base64,", preview_html)
-        for row in image_rows:
-            self.assertTrue((self.paths["state_dir"] / row["rel_preview_path"]).exists())
+
+    def test_ingest_v2_embed_mode_cleans_up_stale_production_page_assets(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES", False):
+            ingest_result = retriever_tools.ingest_production(self.root, production_root)
+
+        self.assertEqual(ingest_result["created"], 4)
+        page_suffix = retriever_tools.preview_image_output_suffix()
+        workspace_page_dir = (
+            self.paths["state_dir"]
+            / "previews"
+            / "productions"
+            / "Synthetic_Production"
+            / "documents"
+            / "PDX000005-pages"
+        )
+        workspace_page_paths = [
+            workspace_page_dir / f"page-0001{page_suffix}",
+            workspace_page_dir / f"page-0002{page_suffix}",
+        ]
+        self.assertTrue(all(path.exists() for path in workspace_page_paths))
+
+        start_exit, start_payload, _, _ = self.run_cli("ingest-start", str(self.root), "--recursive")
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        run_exit, run_payload, _, _ = self.run_cli(
+            "ingest-run-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(run_exit, 0)
+        self.assertIsNotNone(run_payload)
+        self.assertEqual(run_payload["run"]["status"], "completed")
+        self.assertNotIn("production_preview_batch", run_payload["run"]["counts"]["by_unit_type"])
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            preview_rows = connection.execute(
+                """
+                SELECT rel_preview_path, preview_type, ordinal
+                FROM document_previews
+                WHERE document_id = ?
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (image_only_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual([(row["preview_type"], row["ordinal"]) for row in preview_rows], [("html", 0)])
+        preview_html = (self.paths["state_dir"] / str(preview_rows[0]["rel_preview_path"])).read_text(encoding="utf-8")
+        self.assertIn(f"data:{retriever_tools.preview_image_output_mime_type()};base64,", preview_html)
+        self.assertFalse(any(path.exists() for path in workspace_page_paths))
 
     def test_ingest_v2_production_rerun_retires_missing_loadfile_rows(self) -> None:
         production_root = self.write_production_fixture()

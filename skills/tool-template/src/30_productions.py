@@ -7277,11 +7277,28 @@ def production_plan_matches_existing_document(
             for artifact in list(extracted_payload.get("preview_artifacts") or [])
             if isinstance(artifact, dict) and artifact.get("file_name")
         ]
-        expected_page_preview_paths = [
-            str(ref["rel_preview_path"])
-            for ref in preview_image_refs
-            if ref.get("rel_preview_path")
-        ]
+        expected_page_preview_paths = (
+            []
+            if embed_preview_images
+            else [
+                str(ref["rel_preview_path"])
+                for ref in preview_image_refs
+                if ref.get("rel_preview_path")
+            ]
+        )
+        if embed_preview_images:
+            stale_page_preview_row = connection.execute(
+                """
+                SELECT 1
+                FROM document_previews
+                WHERE document_id = ?
+                  AND preview_type = 'image'
+                LIMIT 1
+                """,
+                (int(existing_row["id"]),),
+            ).fetchone()
+            if stale_page_preview_row is not None:
+                return False
         return production_expected_preview_artifacts_present(
             paths,
             connection,

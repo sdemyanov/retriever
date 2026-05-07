@@ -1876,7 +1876,10 @@ def ingest_v2_plan_production_root(
                     if path
                 ],
             )
-            if production_previewable_native(native_path) is None
+            if (
+                not INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES
+                and production_previewable_native(native_path) is None
+            )
             else []
         )
         for batch_index, start in enumerate(range(0, len(page_refs), INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE), start=1):
@@ -2473,6 +2476,19 @@ def ingest_v2_prepare_production_preview_batch_item(
     if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
         return None, source_fingerprint, "Not enough budget remaining to start prepare."
     prepare_started = time.perf_counter()
+    if INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES:
+        prepared_item = {
+            **payload_dict,
+            "payload_kind": "production_preview_batch",
+            "source_kind": PRODUCTION_SOURCE_KIND,
+            "page_assets": [],
+            "prepare_ms": ingest_v2_elapsed_ms(prepare_started),
+            "prepare_hash_ms": 0.0,
+            "prepare_extract_ms": ingest_v2_elapsed_ms(prepare_started),
+            "prepare_chunk_ms": 0.0,
+            "prepare_error": None,
+        }
+        return prepared_item, source_fingerprint, None
     page_assets: list[dict[str, object]] = []
     for ref in page_refs:
         if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
