@@ -7615,7 +7615,21 @@ def image_path_png_bytes(path: Path, *, max_dimension: int | None = None) -> byt
         return None
     with pil_image_module.open(path) as image:
         if resized_dimension:
-            image.thumbnail((resized_dimension, resized_dimension))
+            # Normalize low-bit-depth images before resizing so Pillow can use
+            # antialiased resampling instead of mode-1 nearest-neighbor.
+            if image.mode == "1":
+                image = image.convert("L")
+            elif image.mode == "P":
+                image = image.convert("RGB")
+            resampling = getattr(pil_image_module, "Resampling", pil_image_module)
+            lanczos = getattr(resampling, "LANCZOS", None)
+            if lanczos is None:
+                image.thumbnail((resized_dimension, resized_dimension))
+            else:
+                try:
+                    image.thumbnail((resized_dimension, resized_dimension), resample=lanczos)
+                except ValueError:
+                    image.thumbnail((resized_dimension, resized_dimension))
         buffer = io.BytesIO()
         try:
             image.save(buffer, format="PNG", optimize=True)

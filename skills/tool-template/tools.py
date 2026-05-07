@@ -8468,7 +8468,21 @@ def image_path_png_bytes(path: Path, *, max_dimension: int | None = None) -> byt
         return None
     with pil_image_module.open(path) as image:
         if resized_dimension:
-            image.thumbnail((resized_dimension, resized_dimension))
+            # Normalize low-bit-depth images before resizing so Pillow can use
+            # antialiased resampling instead of mode-1 nearest-neighbor.
+            if image.mode == "1":
+                image = image.convert("L")
+            elif image.mode == "P":
+                image = image.convert("RGB")
+            resampling = getattr(pil_image_module, "Resampling", pil_image_module)
+            lanczos = getattr(resampling, "LANCZOS", None)
+            if lanczos is None:
+                image.thumbnail((resized_dimension, resized_dimension))
+            else:
+                try:
+                    image.thumbnail((resized_dimension, resized_dimension), resample=lanczos)
+                except ValueError:
+                    image.thumbnail((resized_dimension, resized_dimension))
         buffer = io.BytesIO()
         try:
             image.save(buffer, format="PNG", optimize=True)
@@ -31223,7 +31237,7 @@ INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL = 25
 INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
 INGEST_V2_PREPARED_COMMIT_BATCH_TARGET = max(25, INGEST_V2_PREPARE_BATCH_SIZE * 5)
 INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE = 12
-INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 1400
+INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 2200
 # Cowork's preview iframe does not reliably resolve sibling local image assets,
 # so the resumable production path defaults to embedded page images. Flip this
 # to False to keep HTML <img src="..."> references to batch-generated page PNGs.

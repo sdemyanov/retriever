@@ -10558,6 +10558,31 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             reopened.convert("RGB").save(rgb_buffer, format="PNG", optimize=True)
         self.assertLess(len(generated_png_bytes), len(rgb_buffer.getvalue()))
 
+    def test_image_path_png_bytes_antialiases_resized_bilevel_tiff_previews(self) -> None:
+        try:
+            from PIL import Image
+        except Exception as exc:  # pragma: no cover - test helper dependency
+            self.skipTest(f"Pillow unavailable for TIFF resize test: {exc}")
+
+        image_path = self.root / "monochrome.tif"
+        image = Image.new("1", (257, 257))
+        for y in range(257):
+            for x in range(257):
+                image.putpixel((x, y), (x + y) % 2)
+        image.save(image_path, format="TIFF")
+
+        png_bytes = retriever_tools.image_path_png_bytes(image_path, max_dimension=101)
+        self.assertIsNotNone(png_bytes)
+
+        assert png_bytes is not None
+        with Image.open(io.BytesIO(png_bytes)) as resized:
+            self.assertEqual(resized.size, (101, 101))
+            self.assertEqual(resized.mode, "L")
+            self.assertTrue(any(pixel not in {0, 255} for pixel in resized.getdata()))
+
+    def test_ingest_v2_production_preview_image_default_uses_option_b_dimension(self) -> None:
+        self.assertEqual(retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION, 2200)
+
     def test_build_production_extracted_payload_can_limit_preview_images(self) -> None:
         try:
             from PIL import Image

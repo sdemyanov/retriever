@@ -73,7 +73,7 @@ INGEST_V2_PLAN_CURSOR_SAVE_INTERVAL = 25
 INGEST_V2_MBOX_PLAN_BATCH_SIZE = 50
 INGEST_V2_PREPARED_COMMIT_BATCH_TARGET = max(25, INGEST_V2_PREPARE_BATCH_SIZE * 5)
 INGEST_V2_PRODUCTION_PREVIEW_BATCH_SIZE = 12
-INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 1400
+INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 2200
 # Cowork's preview iframe does not reliably resolve sibling local image assets,
 # so the resumable production path defaults to embedded page images. Flip this
 # to False to keep HTML <img src="..."> references to batch-generated page PNGs.
