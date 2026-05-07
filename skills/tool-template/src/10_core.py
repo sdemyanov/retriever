@@ -7614,11 +7614,13 @@ def image_path_png_bytes(path: Path, *, max_dimension: int | None = None) -> byt
     if pil_image_module is None:
         return None
     with pil_image_module.open(path) as image:
+        restore_bilevel = False
         if resized_dimension:
             # Normalize low-bit-depth images before resizing so Pillow can use
             # antialiased resampling instead of mode-1 nearest-neighbor.
             if image.mode == "1":
                 image = image.convert("L")
+                restore_bilevel = True
             elif image.mode == "P":
                 image = image.convert("RGB")
             resampling = getattr(pil_image_module, "Resampling", pil_image_module)
@@ -7630,6 +7632,11 @@ def image_path_png_bytes(path: Path, *, max_dimension: int | None = None) -> byt
                     image.thumbnail((resized_dimension, resized_dimension), resample=lanczos)
                 except ValueError:
                     image.thumbnail((resized_dimension, resized_dimension))
+        if restore_bilevel:
+            # Threshold back to bilevel after the antialiased resize so large
+            # embedded production previews stay compact.
+            dither = getattr(getattr(pil_image_module, "Dither", pil_image_module), "NONE", None)
+            image = image.convert("1") if dither is None else image.convert("1", dither=dither)
         buffer = io.BytesIO()
         try:
             image.save(buffer, format="PNG", optimize=True)

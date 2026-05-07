@@ -10558,30 +10558,42 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             reopened.convert("RGB").save(rgb_buffer, format="PNG", optimize=True)
         self.assertLess(len(generated_png_bytes), len(rgb_buffer.getvalue()))
 
-    def test_image_path_png_bytes_antialiases_resized_bilevel_tiff_previews(self) -> None:
+    def test_image_path_png_bytes_keeps_resized_bilevel_tiff_previews_compact(self) -> None:
         try:
-            from PIL import Image
+            from PIL import Image, ImageDraw
         except Exception as exc:  # pragma: no cover - test helper dependency
             self.skipTest(f"Pillow unavailable for TIFF resize test: {exc}")
 
         image_path = self.root / "monochrome.tif"
-        image = Image.new("1", (257, 257))
-        for y in range(257):
-            for x in range(257):
-                image.putpixel((x, y), (x + y) % 2)
+        image = Image.new("1", (800, 1000), color=1)
+        draw = ImageDraw.Draw(image)
+        for row in range(20):
+            y = 30 + (row * 40)
+            for col in range(12):
+                x = 25 + (col * 60)
+                draw.rectangle((x, y, x + 24, y + 8), fill=0)
+                draw.rectangle((x + 30, y, x + 42, y + 8), fill=0)
         image.save(image_path, format="TIFF")
 
-        png_bytes = retriever_tools.image_path_png_bytes(image_path, max_dimension=101)
+        png_bytes = retriever_tools.image_path_png_bytes(image_path, max_dimension=140)
         self.assertIsNotNone(png_bytes)
+
+        grayscale_buffer = io.BytesIO()
+        with Image.open(image_path) as reopened:
+            grayscale = reopened.convert("L")
+            grayscale.thumbnail((140, 140), resample=Image.Resampling.LANCZOS)
+            grayscale.save(grayscale_buffer, format="PNG", optimize=True)
 
         assert png_bytes is not None
         with Image.open(io.BytesIO(png_bytes)) as resized:
-            self.assertEqual(resized.size, (101, 101))
-            self.assertEqual(resized.mode, "L")
-            self.assertTrue(any(pixel not in {0, 255} for pixel in resized.getdata()))
+            self.assertEqual(resized.size, (112, 140))
+            self.assertEqual(resized.mode, "1")
+            self.assertTrue(any(pixel == 0 for pixel in resized.getdata()))
+            self.assertTrue(any(pixel == 255 for pixel in resized.getdata()))
+        self.assertLess(len(png_bytes), len(grayscale_buffer.getvalue()))
 
-    def test_ingest_v2_production_preview_image_default_uses_option_b_dimension(self) -> None:
-        self.assertEqual(retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION, 2200)
+    def test_ingest_v2_production_preview_image_default_uses_option_c_dimension(self) -> None:
+        self.assertEqual(retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION, 1400)
 
     def test_build_production_extracted_payload_can_limit_preview_images(self) -> None:
         try:
