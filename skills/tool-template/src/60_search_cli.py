@@ -8097,6 +8097,34 @@ def export_preview_document_file_name(document: dict[str, object]) -> str:
     return f"document-{int(document['id']):08d}.html"
 
 
+def copy_export_preview_assets(
+    paths: dict[str, Path],
+    output_dir: Path,
+    documents: list[dict[str, object]],
+) -> list[str]:
+    copied_rel_paths: list[str] = []
+    seen_rel_paths: set[str] = set()
+    for document in documents:
+        body_html = document.get("standalone_preview_body_html")
+        if not isinstance(body_html, str) or not body_html.strip():
+            continue
+        for asset_rel_path in preview_relative_asset_rel_paths_for_html_body(
+            body_html,
+            source_preview_rel_path=document.get("standalone_preview_rel_path"),
+        ):
+            if asset_rel_path in seen_rel_paths:
+                continue
+            source_path = paths["state_dir"] / asset_rel_path
+            if not source_path.exists() or not source_path.is_file():
+                continue
+            target_path = output_dir / asset_rel_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, target_path)
+            seen_rel_paths.add(asset_rel_path)
+            copied_rel_paths.append(asset_rel_path)
+    return copied_rel_paths
+
+
 def build_export_preview_document_html(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
@@ -8104,6 +8132,7 @@ def build_export_preview_document_html(
     unit: dict[str, object],
     document: dict[str, object],
     document_output_path: Path,
+    document_output_rel_path: str,
     unit_output_path: Path,
 ) -> str:
     document_id = int(document["id"])
@@ -8139,6 +8168,7 @@ def build_export_preview_document_html(
             conversation_documents=conversation_documents,
             position_index=position_index,
             thread_link_href=thread_link_href,
+            target_preview_rel_path=document_output_rel_path,
         )
 
     attachment_links = (
@@ -8155,6 +8185,7 @@ def build_export_preview_document_html(
         current_segment_href=document_output_path.name,
         doc_target_hrefs={document_id: f"#{conversation_preview_anchor(document_id)}"},
         attachment_links_by_document_id={document_id: attachment_links} if attachment_links else None,
+        target_preview_rel_path=document_output_rel_path,
     )
     nav_links = ['<a href="../index.html">Contents</a>']
     if len(unit_documents) > 1:
@@ -8188,6 +8219,7 @@ def build_export_preview_unit_html(
     unit: dict[str, object],
     *,
     file_name: str,
+    output_rel_path: str,
 ) -> str:
     documents = list(unit["documents"])
     selected_document_ids = {int(document_id) for document_id in unit["selected_document_ids"]}
@@ -8220,6 +8252,7 @@ def build_export_preview_unit_html(
             document,
             current_segment_href=file_name,
             doc_target_hrefs=doc_target_hrefs,
+            target_preview_rel_path=output_rel_path,
         )
         if int(document["id"]) in selected_document_ids:
             section_html = section_html.replace(
@@ -8302,6 +8335,9 @@ def cleanup_previous_export_preview_outputs(output_dir: Path) -> None:
             value = document_target.get("output_rel_path")
             if isinstance(value, str) and value:
                 relative_paths.add(value)
+    for value in manifest_payload.get("asset_rel_paths", []):
+        if isinstance(value, str) and value:
+            relative_paths.add(value)
     relative_paths.add("manifest.json")
     for relative_path in relative_paths:
         candidate = (output_dir / relative_path).resolve()
@@ -11280,16 +11316,30 @@ def export_previews(
         documents_dir.mkdir(parents=True, exist_ok=True)
 
         units = build_export_preview_units(connection, paths, rows)
+        export_asset_rel_paths = copy_export_preview_assets(
+            paths,
+            output_dir,
+            [
+                dict(document)
+                for unit in units
+                for document in list(unit.get("documents") or [])
+                if isinstance(document, dict)
+            ],
+        )
         unit_payloads: list[dict[str, object]] = []
         document_targets_by_id: dict[int, dict[str, object]] = {}
         for unit in units:
             file_name = export_preview_unit_file_name(unit)
             unit_output_path = units_dir / file_name
+            unit_output_rel_path = Path("units") / file_name
             unit_output_path.write_text(
-                build_export_preview_unit_html(unit, file_name=file_name),
+                build_export_preview_unit_html(
+                    unit,
+                    file_name=file_name,
+                    output_rel_path=unit_output_rel_path.as_posix(),
+                ),
                 encoding="utf-8",
             )
-            unit_output_rel_path = Path("units") / file_name
             unit_payload = {
                 "unit_key": str(unit["unit_key"]),
                 "unit_kind": str(unit["unit_kind"]),
@@ -11314,6 +11364,7 @@ def export_previews(
                 if str(unit["unit_kind"]) == "email_conversation" and len(unit["documents"]) > 1:
                     document_file_name = export_preview_document_file_name(document)
                     document_output_path = documents_dir / document_file_name
+                    document_output_rel_path = Path("documents") / document_file_name
                     document_output_path.write_text(
                         build_export_preview_document_html(
                             connection,
@@ -11321,11 +11372,11 @@ def export_previews(
                             unit=unit,
                             document=document,
                             document_output_path=document_output_path,
+                            document_output_rel_path=document_output_rel_path.as_posix(),
                             unit_output_path=unit_output_path,
                         ),
                         encoding="utf-8",
                     )
-                    document_output_rel_path = Path("documents") / document_file_name
                     target_output_path = document_output_path
                     target_output_rel_path = document_output_rel_path.as_posix()
                     target_href = document_output_rel_path.as_posix()
@@ -11369,6 +11420,7 @@ def export_previews(
             "selector": selector,
             "units": unit_payloads,
             "document_targets": document_targets,
+            "asset_rel_paths": export_asset_rel_paths,
         }
         manifest_path = output_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True), encoding="utf-8")

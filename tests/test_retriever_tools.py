@@ -8959,6 +8959,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         by_unit_type = run_payload["run"]["counts"]["by_unit_type"]
         self.assertEqual(by_unit_type["production_row"]["committed"], 1)
         self.assertEqual(by_unit_type["production_preview_batch"]["committed"], 2)
+        self.assertTrue(retriever_tools.INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES)
 
         document_row = self.fetch_document_row(
             f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/{production_name}/documents/{bates(1)}.logical"
@@ -8984,7 +8985,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         preview_html = (self.paths["state_dir"] / html_rows[0]["rel_preview_path"]).read_text(encoding="utf-8")
         self.assertEqual(preview_html.count("<figure>"), page_count)
         self.assertNotIn("Preview shows the first", preview_html)
-        self.assertNotIn("data:image/png;base64,", preview_html)
+        self.assertIn("data:image/png;base64,", preview_html)
         for row in image_rows:
             self.assertTrue((self.paths["state_dir"] / row["rel_preview_path"]).exists())
 
@@ -18599,6 +18600,66 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Discuss attachment handling.", preview_html)
         self.assertIn("data:image/png;base64,", preview_html)
 
+    def test_ingest_production_link_mode_writes_preview_page_assets(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        with mock.patch.object(retriever_tools, "INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES", False):
+            ingest_result = retriever_tools.ingest_production(self.root, production_root)
+
+        self.assertEqual(ingest_result["created"], 4)
+        self.assertEqual(ingest_result["retired"], 0)
+        self.assertEqual(ingest_result["failures"], [])
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+        image_search = retriever_tools.search(self.root, "PDX000005", None, None, None, 1, 20)
+        image_result = next(item for item in image_search["results"] if item["control_number"] == "PDX000005")
+
+        self.assertTrue(image_result["preview_rel_path"].endswith(".html"))
+        preview_html = Path(image_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn('src="PDX000005-pages/page-0001.png"', preview_html)
+        self.assertIn('src="PDX000005-pages/page-0002.png"', preview_html)
+        self.assertNotIn("data:image/png;base64,", preview_html)
+
+        workspace_page_dir = (
+            self.paths["state_dir"]
+            / "previews"
+            / "productions"
+            / "Synthetic_Production"
+            / "documents"
+            / "PDX000005-pages"
+        )
+        workspace_page_paths = [
+            workspace_page_dir / "page-0001.png",
+            workspace_page_dir / "page-0002.png",
+        ]
+        self.assertTrue(all(path.exists() for path in workspace_page_paths))
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            preview_rows = connection.execute(
+                """
+                SELECT rel_preview_path, preview_type, ordinal
+                FROM document_previews
+                WHERE document_id = ?
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (image_only_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            [(row["preview_type"], Path(row["rel_preview_path"]).name, row["ordinal"]) for row in preview_rows],
+            [
+                ("html", "PDX000005.html", 0),
+                ("image", "page-0001.png", 1),
+                ("image", "page-0002.png", 2),
+            ],
+        )
+
     def test_ingest_production_falls_back_when_loadfile_paths_include_missing_volume_prefix(self) -> None:
         production_root = self.write_production_fixture(loadfile_volume_prefix="Sunrise_Production_01")
 
@@ -19442,6 +19503,96 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         documents_dir = document_path.parent
         self.assertEqual(sorted(path.name for path in units_dir.glob("*.html")), [unit_path.name])
         self.assertEqual(sorted(path.name for path in documents_dir.glob("*.html")), [document_path.name])
+
+    def test_export_previews_copies_v2_production_page_assets_when_link_mode_enabled(self) -> None:
+        self.write_production_fixture()
+
+        start_exit, start_payload, _, _ = self.run_cli("ingest-start", str(self.root), "--recursive")
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        with mock.patch.object(retriever_tools, "INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES", False):
+            run_exit, run_payload, _, _ = self.run_cli(
+                "ingest-run-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
+        self.assertEqual(run_exit, 0)
+        self.assertIsNotNone(run_payload)
+        self.assertEqual(run_payload["run"]["status"], "completed")
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+        linked_preview_html = (
+            self.paths["state_dir"]
+            / "previews"
+            / "productions"
+            / "Synthetic_Production"
+            / "documents"
+            / "PDX000005.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('src="PDX000005-pages/page-0001.png"', linked_preview_html)
+        self.assertNotIn("data:image/png;base64,", linked_preview_html)
+        workspace_page_dir = (
+            self.paths["state_dir"]
+            / "previews"
+            / "productions"
+            / "Synthetic_Production"
+            / "documents"
+            / "PDX000005-pages"
+        )
+        workspace_page_paths = [
+            workspace_page_dir / "page-0001.png",
+            workspace_page_dir / "page-0002.png",
+        ]
+        self.assertTrue(all(path.exists() for path in workspace_page_paths))
+
+        exit_code, payload, _, _ = self.run_cli(
+            "export-previews",
+            str(self.root),
+            "production-pages-export",
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["selected_document_count"], 1)
+        self.assertEqual(payload["unit_count"], 1)
+
+        unit_path = Path(payload["units"][0]["output_path"])
+        output_dir = Path(payload["output_path"])
+        manifest = json.loads(Path(payload["manifest_path"]).read_text(encoding="utf-8"))
+        exported_page_paths = [
+            output_dir / "previews" / "productions" / "Synthetic_Production" / "documents" / "PDX000005-pages" / "page-0001.png",
+            output_dir / "previews" / "productions" / "Synthetic_Production" / "documents" / "PDX000005-pages" / "page-0002.png",
+        ]
+
+        unit_html = unit_path.read_text(encoding="utf-8")
+        self.assertIn(
+            'src="../previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0001.png"',
+            unit_html,
+        )
+        self.assertIn(
+            'src="../previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0002.png"',
+            unit_html,
+        )
+        self.assertNotIn('src="PDX000005-pages/page-0001.png"', unit_html)
+        self.assertEqual(
+            sorted(manifest["asset_rel_paths"]),
+            [
+                "previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0001.png",
+                "previews/productions/Synthetic_Production/documents/PDX000005-pages/page-0002.png",
+            ],
+        )
+        for exported_path, workspace_path in zip(exported_page_paths, workspace_page_paths):
+            self.assertTrue(exported_path.exists())
+            self.assertEqual(exported_path.read_bytes(), workspace_path.read_bytes())
 
     def test_export_previews_merges_contiguous_slack_documents_and_splits_gaps(self) -> None:
         export_root = self.root / "data" / "slack"
