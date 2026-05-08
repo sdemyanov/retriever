@@ -7856,6 +7856,77 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(cancel_payload["status"], "canceled")
         self.assertEqual(cancel_payload["phase"], "canceled")
 
+    def test_ingest_v2_cancel_cleans_up_prepared_payloads(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (raw_dir / "beta.md").write_text("# beta\n\nbody\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        for command in ("ingest-plan-step", "ingest-prepare-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            prepared_before_cancel = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ingest_prepared_items WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+        self.assertEqual(prepared_before_cancel, 2)
+
+        cancel_exit, cancel_payload, _, _ = self.run_cli(
+            "ingest-cancel",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(cancel_exit, 0)
+        self.assertIsNotNone(cancel_payload)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            prepared_after_cancel = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ingest_prepared_items WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            statuses = [
+                str(row["status"])
+                for row in connection.execute(
+                    """
+                    SELECT status
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                    ORDER BY commit_order ASC
+                    """,
+                    (run_id,),
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+        self.assertEqual(prepared_after_cancel, 0)
+        self.assertEqual(statuses, ["cancelled", "cancelled"])
+
     def test_ingest_v2_run_step_reports_no_run(self) -> None:
         exit_code, payload, _, _ = self.run_cli("ingest-run-step", str(self.root))
 
@@ -9208,6 +9279,79 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             first_fingerprint["hash"],
             hashlib.sha256(alpha_text.encode("utf-8")).hexdigest(),
         )
+
+    def test_ingest_v2_commit_step_deletes_prepared_payloads(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (raw_dir / "beta.md").write_text("# beta\n\nbody\n", encoding="utf-8")
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "raw",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        for command in ("ingest-plan-step", "ingest-prepare-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            prepared_before_commit = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ingest_prepared_items WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+        self.assertEqual(prepared_before_commit, 2)
+
+        commit_exit, commit_payload, _, _ = self.run_cli(
+            "ingest-commit-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+        )
+        self.assertEqual(commit_exit, 0)
+        self.assertIsNotNone(commit_payload)
+        self.assertEqual(commit_payload["committed"], 2)
+        self.assertEqual(commit_payload["failed"], 0)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            prepared_after_commit = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ingest_prepared_items WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            statuses = [
+                str(row["status"])
+                for row in connection.execute(
+                    """
+                    SELECT status
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                    ORDER BY commit_order ASC
+                    """,
+                    (run_id,),
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+        self.assertEqual(prepared_after_commit, 0)
+        self.assertEqual(statuses, ["committed", "committed"])
 
     def test_ingest_v2_prepare_step_uses_parallel_workers(self) -> None:
         raw_dir = self.root / "raw"

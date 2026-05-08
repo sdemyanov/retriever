@@ -3719,6 +3719,44 @@ def ingest_v2_prepared_item_from_row(row: sqlite3.Row) -> dict[str, object]:
     raise RetrieverError(f"Prepared payload for work item {row['id']} is malformed.")
 
 
+def ingest_v2_delete_prepared_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    require_present: bool = True,
+) -> bool:
+    cursor = connection.execute(
+        """
+        DELETE FROM ingest_prepared_items
+        WHERE run_id = ?
+          AND work_item_id = ?
+        """,
+        (run_id, work_item_id),
+    )
+    deleted = int(cursor.rowcount or 0) > 0
+    if require_present and not deleted:
+        raise RetrieverError(f"Prepared payload for V2 ingest work item {work_item_id} is missing.")
+    return deleted
+
+
+def ingest_v2_delete_terminal_prepared_items(connection: sqlite3.Connection, *, run_id: str) -> int:
+    cursor = connection.execute(
+        """
+        DELETE FROM ingest_prepared_items
+        WHERE run_id = ?
+          AND work_item_id IN (
+            SELECT id
+            FROM ingest_work_items
+            WHERE run_id = ?
+              AND status IN ('committed', 'failed', 'cancelled')
+          )
+        """,
+        (run_id, run_id),
+    )
+    return int(cursor.rowcount or 0)
+
+
 def ingest_v2_mark_commit_failed(
     connection: sqlite3.Connection,
     *,
@@ -3762,6 +3800,11 @@ def ingest_v2_mark_commit_failed(
                     compact_json_text({"error": message}),
                     now,
                 ),
+            )
+            ingest_v2_delete_prepared_item(
+                connection,
+                run_id=run_id,
+                work_item_id=work_item_id,
             )
         connection.commit()
         return marked
@@ -3846,6 +3889,11 @@ def ingest_v2_commit_work_item_hook(
     )
     if int(update_cursor.rowcount or 0) != 1:
         raise RetrieverError(f"Could not mark V2 ingest work item {work_item_id} committed.")
+    ingest_v2_delete_prepared_item(
+        connection,
+        run_id=run_id,
+        work_item_id=work_item_id,
+    )
     connection.execute(
         """
         UPDATE ingest_runs
@@ -3928,6 +3976,11 @@ def ingest_v2_commit_conversation_preview_work_item(
         )
         if int(update_cursor.rowcount or 0) != 1:
             raise RetrieverError(f"Could not mark V2 ingest conversation preview work item {work_item_id} committed.")
+        ingest_v2_delete_prepared_item(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+        )
         connection.execute(
             """
             UPDATE ingest_runs
@@ -4042,6 +4095,11 @@ def ingest_v2_commit_production_work_item_hook(
     )
     if int(update_cursor.rowcount or 0) != 1:
         raise RetrieverError(f"Could not mark V2 ingest production work item {work_item_id} committed.")
+    ingest_v2_delete_prepared_item(
+        connection,
+        run_id=run_id,
+        work_item_id=work_item_id,
+    )
     connection.execute(
         """
         UPDATE ingest_runs
@@ -4207,6 +4265,11 @@ def ingest_v2_commit_slack_conversation_work_item_hook(
     )
     if int(update_cursor.rowcount or 0) != 1:
         raise RetrieverError(f"Could not mark V2 ingest Slack work item {work_item_id} committed.")
+    ingest_v2_delete_prepared_item(
+        connection,
+        run_id=run_id,
+        work_item_id=work_item_id,
+    )
     connection.execute(
         """
         UPDATE ingest_runs
@@ -4299,6 +4362,11 @@ def ingest_v2_commit_mbox_work_item_hook(
     )
     if int(update_cursor.rowcount or 0) != 1:
         raise RetrieverError(f"Could not mark V2 ingest MBOX work item {work_item_id} committed.")
+    ingest_v2_delete_prepared_item(
+        connection,
+        run_id=run_id,
+        work_item_id=work_item_id,
+    )
     connection.execute(
         """
         UPDATE ingest_runs
@@ -4386,6 +4454,11 @@ def ingest_v2_commit_pst_work_item_hook(
     )
     if int(update_cursor.rowcount or 0) != 1:
         raise RetrieverError(f"Could not mark V2 ingest PST work item {work_item_id} committed.")
+    ingest_v2_delete_prepared_item(
+        connection,
+        run_id=run_id,
+        work_item_id=work_item_id,
+    )
     connection.execute(
         """
         UPDATE ingest_runs
@@ -5589,6 +5662,7 @@ def ingest_v2_cancel(root: Path, *, run_id: str, force: bool = False) -> dict[st
                     (now, run_id),
                 )
                 cancelled_items = int(cursor.rowcount or 0)
+                ingest_v2_delete_terminal_prepared_items(connection, run_id=run_id)
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -7341,6 +7415,12 @@ def ingest_v2_finalize_step(
             except Exception:
                 connection.rollback()
                 raise
+            ingest_v2_delete_terminal_prepared_items(connection, run_id=run_id)
+            connection.commit()
+            try:
+                connection.execute("VACUUM")
+            except sqlite3.DatabaseError:
+                pass
             stages_completed.append("complete")
 
         updated_row = require_ingest_v2_run_row(connection, run_id)
