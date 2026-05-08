@@ -3757,6 +3757,19 @@ def ingest_v2_delete_terminal_prepared_items(connection: sqlite3.Connection, *, 
     return int(cursor.rowcount or 0)
 
 
+def ingest_v2_best_effort_sqlite_cleanup(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("VACUUM")
+    except sqlite3.DatabaseError:
+        return
+    if current_journal_mode(connection) != "wal":
+        return
+    try:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.DatabaseError:
+        pass
+
+
 def ingest_v2_mark_commit_failed(
     connection: sqlite3.Connection,
     *,
@@ -7417,10 +7430,7 @@ def ingest_v2_finalize_step(
                 raise
             ingest_v2_delete_terminal_prepared_items(connection, run_id=run_id)
             connection.commit()
-            try:
-                connection.execute("VACUUM")
-            except sqlite3.DatabaseError:
-                pass
+            ingest_v2_best_effort_sqlite_cleanup(connection)
             stages_completed.append("complete")
 
         updated_row = require_ingest_v2_run_row(connection, run_id)

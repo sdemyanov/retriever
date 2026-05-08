@@ -7927,6 +7927,40 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(prepared_after_cancel, 0)
         self.assertEqual(statuses, ["cancelled", "cancelled"])
 
+    def test_ingest_v2_best_effort_sqlite_cleanup_runs_wal_checkpoint_after_vacuum(self) -> None:
+        statements: list[str] = []
+
+        class FakeConnection:
+            def execute(self, sql: str, parameters: object = ()) -> None:
+                del parameters
+                statements.append(sql)
+
+        with mock.patch.object(retriever_tools, "current_journal_mode", return_value="wal"):
+            retriever_tools.ingest_v2_best_effort_sqlite_cleanup(FakeConnection())
+
+        self.assertEqual(
+            statements,
+            ["VACUUM", "PRAGMA wal_checkpoint(TRUNCATE)"],
+        )
+
+    def test_ingest_v2_best_effort_sqlite_cleanup_ignores_checkpoint_failures(self) -> None:
+        statements: list[str] = []
+
+        class FakeConnection:
+            def execute(self, sql: str, parameters: object = ()) -> None:
+                del parameters
+                statements.append(sql)
+                if sql == "PRAGMA wal_checkpoint(TRUNCATE)":
+                    raise sqlite3.DatabaseError("checkpoint busy")
+
+        with mock.patch.object(retriever_tools, "current_journal_mode", return_value="wal"):
+            retriever_tools.ingest_v2_best_effort_sqlite_cleanup(FakeConnection())
+
+        self.assertEqual(
+            statements,
+            ["VACUUM", "PRAGMA wal_checkpoint(TRUNCATE)"],
+        )
+
     def test_ingest_v2_run_step_reports_no_run(self) -> None:
         exit_code, payload, _, _ = self.run_cli("ingest-run-step", str(self.root))
 
