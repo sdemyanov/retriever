@@ -8551,10 +8551,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(plan_payload["cursor"]["planned_slack_conversations"], 1)
         self.assertEqual(plan_payload["cursor"]["planned_slack_day_documents"], 2)
         self.assertEqual(commit_payload["failed"], 0)
-        self.assertEqual(commit_payload["committed"], 1)
-        self.assertEqual(commit_payload["actions"], {"committed": 1})
+        self.assertEqual(commit_payload["committed"], 3)
+        self.assertEqual(commit_payload["actions"], {"committed": 3})
         self.assertEqual(finalize_payload["run"]["status"], "completed")
-        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["slack_conversation"]["committed"], 1)
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["slack_document"]["committed"], 3)
 
         day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
         day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
@@ -8577,15 +8577,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
-            work_item = connection.execute(
+            work_items = connection.execute(
                 """
-                SELECT affected_document_ids_json, affected_conversation_keys_json, artifact_manifest_json
+                SELECT rel_path, affected_document_ids_json, affected_conversation_keys_json, artifact_manifest_json
                 FROM ingest_work_items
                 WHERE run_id = ?
-                  AND unit_type = 'slack_conversation'
+                  AND unit_type = 'slack_document'
+                ORDER BY commit_order ASC, id ASC
                 """,
                 (run_id,),
-            ).fetchone()
+            ).fetchall()
             source_parts = connection.execute(
                 """
                 SELECT part_kind, rel_source_path
@@ -8598,10 +8599,185 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertIsNotNone(work_item)
-        self.assertEqual(len(json.loads(work_item["affected_document_ids_json"])), 3)
-        self.assertEqual(json.loads(work_item["affected_conversation_keys_json"]), ["data/slack:C04GENERAL1"])
-        self.assertEqual(json.loads(work_item["artifact_manifest_json"])["new"], 3)
+        self.assertEqual(len(work_items), 3)
+        self.assertTrue(all(len(json.loads(row["affected_document_ids_json"])) == 1 for row in work_items))
+        self.assertTrue(
+            all(
+                json.loads(row["affected_conversation_keys_json"]) == ["data/slack:C04GENERAL1"]
+                for row in work_items
+            )
+        )
+        thread_work_item = next(row for row in work_items if row["rel_path"] == child_rel_path)
+        self.assertEqual(json.loads(thread_work_item["artifact_manifest_json"])["document_kind"], "reply_thread")
+        self.assertEqual(json.loads(thread_work_item["artifact_manifest_json"])["new"], 1)
+        self.assertEqual(
+            [(row["part_kind"], row["rel_source_path"]) for row in source_parts],
+            [
+                ("slack_thread_root_day", "data/slack/general/2022-12-16.json"),
+                ("slack_thread_reply_day", "data/slack/general/2022-12-17.json"),
+            ],
+        )
+
+    def test_ingest_v2_slack_rerun_updates_thread_document_after_late_reply_day(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        thread_ts = "1671235434.237949"
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Kickoff thread",
+                        "user": "U04SERGEY1",
+                        "ts": thread_ts,
+                        "thread_ts": thread_ts,
+                        "reply_count": 1,
+                    },
+                    {
+                        "type": "message",
+                        "text": "Standalone channel update",
+                        "user": "U04MAX0001",
+                        "ts": "1671235834.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        first_payloads = self.run_v2_loose_ingest("data/slack")
+        self.assertEqual(dict(first_payloads["commit"])["committed"], 2)
+        self.assertEqual(
+            dict(first_payloads["finalize"])["run"]["counts"]["by_unit_type"]["slack_document"]["committed"],
+            2,
+        )
+
+        day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        child_rel_path = retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
+        child_row = self.fetch_document_row(child_rel_path)
+        first_child_id = child_row["id"]
+        first_child_control_number = child_row["control_number"]
+
+        (channel_dir / "2022-12-17.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Following up on kickoff",
+                        "user": "U04MAX0001",
+                        "ts": "1671321834.237949",
+                        "thread_ts": thread_ts,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        second_payloads = self.run_v2_loose_ingest("data/slack")
+        second_plan_payload = dict(second_payloads["plan"])
+        second_commit_payload = dict(second_payloads["commit"])
+        second_finalize_payload = dict(second_payloads["finalize"])
+
+        self.assertEqual(second_plan_payload["cursor"]["planned_slack_conversations"], 1)
+        self.assertEqual(second_plan_payload["cursor"]["planned_slack_day_documents"], 2)
+        self.assertEqual(second_commit_payload["failed"], 0)
+        self.assertEqual(second_commit_payload["committed"], 3)
+        self.assertEqual(second_commit_payload["actions"], {"committed": 3})
+        self.assertEqual(second_finalize_payload["run"]["counts"]["by_unit_type"]["slack_document"]["committed"], 3)
+
+        updated_day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        updated_child_row = self.fetch_document_row(child_rel_path)
+
+        self.assertEqual(updated_day_one_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(day_two_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(updated_child_row["conversation_id"], day_one_row["conversation_id"])
+        self.assertEqual(updated_child_row["id"], first_child_id)
+        self.assertEqual(updated_child_row["control_number"], first_child_control_number)
+        self.assertEqual(updated_child_row["parent_document_id"], updated_day_one_row["id"])
+        self.assertEqual(day_two_row["text_status"], "empty")
+
+        reply_search = retriever_tools.search(self.root, "Following up on kickoff", None, None, None, 1, 20)
+        self.assertEqual(reply_search["total_hits"], 1)
+        self.assertEqual(reply_search["results"][0]["id"], updated_child_row["id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            work_items = connection.execute(
+                """
+                SELECT rel_path, artifact_manifest_json
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND unit_type = 'slack_document'
+                ORDER BY commit_order ASC, id ASC
+                """,
+                (str(second_payloads["run_id"]),),
+            ).fetchall()
+            source_parts = connection.execute(
+                """
+                SELECT part_kind, rel_source_path, ordinal
+                FROM document_source_parts
+                WHERE document_id = ?
+                ORDER BY ordinal ASC, id ASC
+                """,
+                (updated_child_row["id"],),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(work_items), 3)
+        self.assertEqual(
+            json.loads(next(row for row in work_items if row["rel_path"] == child_rel_path)["artifact_manifest_json"])["updated"],
+            1,
+        )
         self.assertEqual(
             [(row["part_kind"], row["rel_source_path"]) for row in source_parts],
             [

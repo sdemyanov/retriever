@@ -790,6 +790,269 @@ def existing_rows_by_rel_path(
     return {str(row["rel_path"]): row for row in rows}
 
 
+def existing_slack_document_row(
+    connection: sqlite3.Connection,
+    *,
+    rel_path: str,
+    source_rel_path: str,
+    source_item_id: str | None,
+) -> sqlite3.Row | None:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE rel_path = ?
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (rel_path,),
+    ).fetchone()
+    if row is not None:
+        return row
+    if source_item_id is None:
+        return None
+    return connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE source_kind = ?
+          AND source_rel_path = ?
+          AND source_item_id = ?
+          AND lifecycle_status != 'deleted'
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (SLACK_EXPORT_SOURCE_KIND, source_rel_path, source_item_id),
+    ).fetchone()
+
+
+def commit_prepared_slack_day_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    prepared_document: dict[str, object],
+    existing_row: sqlite3.Row | None,
+    *,
+    dataset_id: int,
+    dataset_source_id: int,
+    conversation_id: int,
+    current_batch: int | None,
+) -> dict[str, object]:
+    plan = dict(prepared_document.get("plan") or {})
+    rel_path = str(plan["rel_path"])
+    effective_existing_row = existing_row or existing_slack_document_row(
+        connection,
+        rel_path=rel_path,
+        source_rel_path=str(plan["source_rel_path"]),
+        source_item_id=(
+            str(plan["source_item_id"])
+            if plan.get("source_item_id") is not None
+            else None
+        ),
+    )
+    extracted = apply_manual_locks(effective_existing_row, dict(prepared_document.get("extracted_payload") or {}))
+    if effective_existing_row is None:
+        if current_batch is None:
+            current_batch = allocate_ingestion_batch_number(connection)
+        control_number_batch = int(current_batch)
+        control_number_family_sequence = reserve_control_number_family_sequence(connection, control_number_batch)
+        control_number = format_control_number(control_number_batch, control_number_family_sequence)
+        control_number_attachment_sequence = None
+    else:
+        control_number_batch = int(effective_existing_row["control_number_batch"])
+        control_number_family_sequence = int(effective_existing_row["control_number_family_sequence"])
+        control_number = str(effective_existing_row["control_number"])
+        control_number_attachment_sequence = effective_existing_row["control_number_attachment_sequence"]
+        cleanup_document_artifacts(paths, connection, effective_existing_row)
+    source_path_value = prepared_document.get("source_path")
+    if source_path_value is None:
+        raise RetrieverError(f"Slack day document {rel_path} is missing source_path.")
+    document_id = upsert_document_row(
+        connection,
+        rel_path,
+        Path(str(source_path_value)),
+        effective_existing_row,
+        extracted,
+        file_name=str(plan["file_name"]),
+        parent_document_id=None,
+        control_number=control_number,
+        dataset_id=dataset_id,
+        conversation_id=conversation_id,
+        control_number_batch=control_number_batch,
+        control_number_family_sequence=control_number_family_sequence,
+        control_number_attachment_sequence=control_number_attachment_sequence,
+        source_kind=SLACK_EXPORT_SOURCE_KIND,
+        source_rel_path=str(plan["source_rel_path"]),
+        source_item_id=plan["source_item_id"],
+        source_folder_path=str(plan["source_folder_path"]),
+    )
+    seed_source_text_revision_for_document(
+        connection,
+        paths,
+        document_id=document_id,
+        extracted=extracted,
+        existing_row=effective_existing_row,
+    )
+    ensure_dataset_document_membership(
+        connection,
+        dataset_id=dataset_id,
+        document_id=document_id,
+        dataset_source_id=dataset_source_id,
+    )
+    remove_source_dataset_membership_for_document(
+        connection,
+        document_id=document_id,
+        source_kind=FILESYSTEM_SOURCE_KIND,
+        source_locator=filesystem_dataset_locator(),
+    )
+    preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
+    replace_document_related_rows(
+        connection,
+        document_id,
+        extracted | {"file_name": str(plan["file_name"])},
+        list(prepared_document.get("prepared_chunks") or []),
+        preview_rows,
+    )
+    replace_document_source_parts(
+        connection,
+        document_id,
+        list(plan["source_parts"]),
+    )
+    return {
+        "document_id": int(document_id),
+        "new": 1 if effective_existing_row is None else 0,
+        "updated": 0 if effective_existing_row is None else 1,
+        "current_batch": current_batch,
+        "parent_state": {
+            "document_id": int(document_id),
+            "control_number_batch": int(control_number_batch),
+            "control_number_family_sequence": int(control_number_family_sequence),
+        },
+    }
+
+
+def commit_prepared_slack_thread_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    prepared_document: dict[str, object],
+    existing_row: sqlite3.Row | None,
+    *,
+    dataset_id: int,
+    dataset_source_id: int,
+    conversation_id: int,
+    parent_state_by_rel: dict[str, dict[str, int]] | None = None,
+) -> dict[str, object]:
+    plan = dict(prepared_document.get("plan") or {})
+    rel_path = str(plan["rel_path"])
+    parent_rel_path = str(plan["parent_rel_path"])
+    effective_existing_row = existing_row or existing_slack_document_row(
+        connection,
+        rel_path=rel_path,
+        source_rel_path=str(plan["source_rel_path"]),
+        source_item_id=(
+            str(plan["source_item_id"])
+            if plan.get("source_item_id") is not None
+            else None
+        ),
+    )
+    parent_state = dict((parent_state_by_rel or {}).get(parent_rel_path) or {})
+    if not parent_state:
+        parent_row = connection.execute(
+            """
+            SELECT id, control_number_batch, control_number_family_sequence
+            FROM documents
+            WHERE rel_path = ?
+              AND lifecycle_status != 'deleted'
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (parent_rel_path,),
+        ).fetchone()
+        if parent_row is None:
+            raise RetrieverError(
+                f"Slack thread document {rel_path} is missing parent day document {parent_rel_path}."
+            )
+        parent_state = {
+            "document_id": int(parent_row["id"]),
+            "control_number_batch": int(parent_row["control_number_batch"]),
+            "control_number_family_sequence": int(parent_row["control_number_family_sequence"]),
+        }
+    parent_document_id = int(parent_state["document_id"])
+    extracted = apply_manual_locks(effective_existing_row, dict(prepared_document.get("extracted_payload") or {}))
+    if effective_existing_row is None:
+        control_number_batch = int(parent_state["control_number_batch"])
+        control_number_family_sequence = int(parent_state["control_number_family_sequence"])
+        control_number_attachment_sequence = next_attachment_sequence(connection, parent_document_id)
+        control_number = format_control_number(
+            control_number_batch,
+            control_number_family_sequence,
+            control_number_attachment_sequence,
+        )
+    else:
+        control_number_batch = int(effective_existing_row["control_number_batch"])
+        control_number_family_sequence = int(effective_existing_row["control_number_family_sequence"])
+        control_number_attachment_sequence = int(effective_existing_row["control_number_attachment_sequence"])
+        control_number = str(effective_existing_row["control_number"])
+        cleanup_document_artifacts(paths, connection, effective_existing_row)
+    document_id = upsert_document_row(
+        connection,
+        rel_path,
+        None,
+        effective_existing_row,
+        extracted,
+        file_name=str(plan["file_name"]),
+        parent_document_id=parent_document_id,
+        child_document_kind=CHILD_DOCUMENT_KIND_REPLY_THREAD,
+        control_number=control_number,
+        dataset_id=dataset_id,
+        conversation_id=conversation_id,
+        control_number_batch=control_number_batch,
+        control_number_family_sequence=control_number_family_sequence,
+        control_number_attachment_sequence=control_number_attachment_sequence,
+        root_message_key=str(plan["root_message_key"]),
+        source_kind=SLACK_EXPORT_SOURCE_KIND,
+        source_rel_path=str(plan["source_rel_path"]),
+        source_item_id=str(plan["source_item_id"]),
+        source_folder_path=str(plan["source_folder_path"]),
+    )
+    seed_source_text_revision_for_document(
+        connection,
+        paths,
+        document_id=document_id,
+        extracted=extracted,
+        existing_row=effective_existing_row,
+    )
+    ensure_dataset_document_membership(
+        connection,
+        dataset_id=dataset_id,
+        document_id=document_id,
+        dataset_source_id=dataset_source_id,
+    )
+    remove_source_dataset_membership_for_document(
+        connection,
+        document_id=document_id,
+        source_kind=FILESYSTEM_SOURCE_KIND,
+        source_locator=filesystem_dataset_locator(),
+    )
+    preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
+    replace_document_related_rows(
+        connection,
+        document_id,
+        extracted | {"file_name": str(plan["file_name"])},
+        list(prepared_document.get("prepared_chunks") or []),
+        preview_rows,
+    )
+    replace_document_source_parts(
+        connection,
+        document_id,
+        list(plan["source_parts"]),
+    )
+    return {
+        "document_id": int(document_id),
+        "new": 1 if effective_existing_row is None else 0,
+        "updated": 0 if effective_existing_row is None else 1,
+    }
+
+
 def commit_prepared_slack_conversation(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
@@ -830,163 +1093,38 @@ def commit_prepared_slack_conversation(
         for prepared_document in list(prepared_conversation.get("day_documents") or []):
             plan = dict(prepared_document.get("plan") or {})
             rel_path = str(plan["rel_path"])
-            existing_row = existing_by_rel.get(rel_path)
-            extracted = apply_manual_locks(existing_row, dict(prepared_document.get("extracted_payload") or {}))
-            if existing_row is None:
-                if current_batch is None:
-                    current_batch = allocate_ingestion_batch_number(connection)
-                control_number_batch = current_batch
-                control_number_family_sequence = reserve_control_number_family_sequence(connection, control_number_batch)
-                control_number = format_control_number(control_number_batch, control_number_family_sequence)
-                control_number_attachment_sequence = None
-            else:
-                control_number_batch = int(existing_row["control_number_batch"])
-                control_number_family_sequence = int(existing_row["control_number_family_sequence"])
-                control_number = str(existing_row["control_number"])
-                control_number_attachment_sequence = existing_row["control_number_attachment_sequence"]
-                cleanup_document_artifacts(paths, connection, existing_row)
-            document_id = upsert_document_row(
-                connection,
-                rel_path,
-                Path(prepared_document["source_path"]),
-                existing_row,
-                extracted,
-                file_name=str(plan["file_name"]),
-                parent_document_id=None,
-                control_number=control_number,
-                dataset_id=dataset_id,
-                conversation_id=conversation_id,
-                control_number_batch=control_number_batch,
-                control_number_family_sequence=control_number_family_sequence,
-                control_number_attachment_sequence=control_number_attachment_sequence,
-                source_kind=SLACK_EXPORT_SOURCE_KIND,
-                source_rel_path=str(plan["source_rel_path"]),
-                source_item_id=plan["source_item_id"],
-                source_folder_path=str(plan["source_folder_path"]),
-            )
-            affected_document_ids.append(int(document_id))
-            seed_source_text_revision_for_document(
+            commit_payload = commit_prepared_slack_day_document(
                 connection,
                 paths,
-                document_id=document_id,
-                extracted=extracted,
-                existing_row=existing_row,
-            )
-            ensure_dataset_document_membership(
-                connection,
+                prepared_document,
+                existing_by_rel.get(rel_path),
                 dataset_id=dataset_id,
-                document_id=document_id,
                 dataset_source_id=dataset_source_id,
+                conversation_id=conversation_id,
+                current_batch=current_batch,
             )
-            remove_source_dataset_membership_for_document(
-                connection,
-                document_id=document_id,
-                source_kind=FILESYSTEM_SOURCE_KIND,
-                source_locator=filesystem_dataset_locator(),
-            )
-            preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
-            replace_document_related_rows(
-                connection,
-                document_id,
-                extracted | {"file_name": str(plan["file_name"])},
-                list(prepared_document.get("prepared_chunks", [])),
-                preview_rows,
-            )
-            replace_document_source_parts(
-                connection,
-                document_id,
-                list(plan["source_parts"]),
-            )
-            parent_state_by_rel[rel_path] = {
-                "document_id": document_id,
-                "control_number_batch": int(control_number_batch),
-                "control_number_family_sequence": int(control_number_family_sequence),
-            }
-            if existing_row is None:
-                new_count += 1
-            else:
-                updated_count += 1
+            current_batch = commit_payload["current_batch"]
+            affected_document_ids.append(int(commit_payload["document_id"]))
+            parent_state_by_rel[rel_path] = dict(commit_payload["parent_state"])
+            new_count += int(commit_payload["new"])
+            updated_count += int(commit_payload["updated"])
 
         for prepared_document in list(prepared_conversation.get("thread_documents") or []):
             plan = dict(prepared_document.get("plan") or {})
             rel_path = str(plan["rel_path"])
-            existing_row = existing_by_rel.get(rel_path)
-            parent_state = parent_state_by_rel[str(plan["parent_rel_path"])]
-            parent_document_id = int(parent_state["document_id"])
-            extracted = apply_manual_locks(existing_row, dict(prepared_document.get("extracted_payload") or {}))
-            if existing_row is None:
-                control_number_batch = int(parent_state["control_number_batch"])
-                control_number_family_sequence = int(parent_state["control_number_family_sequence"])
-                control_number_attachment_sequence = next_attachment_sequence(connection, parent_document_id)
-                control_number = format_control_number(
-                    control_number_batch,
-                    control_number_family_sequence,
-                    control_number_attachment_sequence,
-                )
-            else:
-                control_number_batch = int(existing_row["control_number_batch"])
-                control_number_family_sequence = int(existing_row["control_number_family_sequence"])
-                control_number_attachment_sequence = int(existing_row["control_number_attachment_sequence"])
-                control_number = str(existing_row["control_number"])
-                cleanup_document_artifacts(paths, connection, existing_row)
-            document_id = upsert_document_row(
-                connection,
-                rel_path,
-                None,
-                existing_row,
-                extracted,
-                file_name=str(plan["file_name"]),
-                parent_document_id=parent_document_id,
-                child_document_kind=CHILD_DOCUMENT_KIND_REPLY_THREAD,
-                control_number=control_number,
-                dataset_id=dataset_id,
-                conversation_id=conversation_id,
-                control_number_batch=control_number_batch,
-                control_number_family_sequence=control_number_family_sequence,
-                control_number_attachment_sequence=control_number_attachment_sequence,
-                root_message_key=str(plan["root_message_key"]),
-                source_kind=SLACK_EXPORT_SOURCE_KIND,
-                source_rel_path=str(plan["source_rel_path"]),
-                source_item_id=str(plan["source_item_id"]),
-                source_folder_path=str(plan["source_folder_path"]),
-            )
-            affected_document_ids.append(int(document_id))
-            seed_source_text_revision_for_document(
+            commit_payload = commit_prepared_slack_thread_document(
                 connection,
                 paths,
-                document_id=document_id,
-                extracted=extracted,
-                existing_row=existing_row,
-            )
-            ensure_dataset_document_membership(
-                connection,
+                prepared_document,
+                existing_by_rel.get(rel_path),
                 dataset_id=dataset_id,
-                document_id=document_id,
                 dataset_source_id=dataset_source_id,
+                conversation_id=conversation_id,
+                parent_state_by_rel=parent_state_by_rel,
             )
-            remove_source_dataset_membership_for_document(
-                connection,
-                document_id=document_id,
-                source_kind=FILESYSTEM_SOURCE_KIND,
-                source_locator=filesystem_dataset_locator(),
-            )
-            preview_rows = write_preview_artifacts(paths, rel_path, list(extracted.get("preview_artifacts", [])))
-            replace_document_related_rows(
-                connection,
-                document_id,
-                extracted | {"file_name": str(plan["file_name"])},
-                list(prepared_document.get("prepared_chunks", [])),
-                preview_rows,
-            )
-            replace_document_source_parts(
-                connection,
-                document_id,
-                list(plan["source_parts"]),
-            )
-            if existing_row is None:
-                new_count += 1
-            else:
-                updated_count += 1
+            affected_document_ids.append(int(commit_payload["document_id"]))
+            new_count += int(commit_payload["new"])
+            updated_count += int(commit_payload["updated"])
         result = {
             "status": "ok",
             "action": "committed",
@@ -1009,6 +1147,105 @@ def commit_prepared_slack_conversation(
             "action": "failed",
             "current_batch": current_batch,
             "rel_paths": rel_paths,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def commit_prepared_slack_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    prepared_document: dict[str, object],
+    *,
+    dataset_id: int,
+    dataset_source_id: int,
+    current_batch: int | None,
+    before_transaction_commit=None,
+) -> dict[str, object]:
+    prepare_error = prepared_document.get("prepare_error")
+    plan = dict(prepared_document.get("plan") or {})
+    rel_path = str(plan.get("rel_path") or "")
+    if prepare_error:
+        return {
+            "status": "failed",
+            "action": "failed",
+            "current_batch": current_batch,
+            "rel_paths": [rel_path] if rel_path else [],
+            "error": str(prepare_error),
+        }
+
+    source_locator = str(prepared_document.get("source_locator") or "")
+    conversation_key = str(prepared_document.get("conversation_key") or "")
+    conversation_type = str(prepared_document.get("conversation_type") or "")
+    display_name = str(prepared_document.get("display_name") or "")
+    document_kind = str(prepared_document.get("document_kind") or prepared_document.get("kind") or "")
+    connection.execute("BEGIN")
+    try:
+        conversation_id = upsert_conversation_row(
+            connection,
+            source_kind=SLACK_EXPORT_SOURCE_KIND,
+            source_locator=source_locator,
+            conversation_key=conversation_key,
+            conversation_type=conversation_type,
+            display_name=display_name,
+        )
+        existing_row = connection.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE rel_path = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (rel_path,),
+        ).fetchone()
+        if document_kind == "day":
+            commit_payload = commit_prepared_slack_day_document(
+                connection,
+                paths,
+                prepared_document,
+                existing_row,
+                dataset_id=dataset_id,
+                dataset_source_id=dataset_source_id,
+                conversation_id=conversation_id,
+                current_batch=current_batch,
+            )
+            current_batch = commit_payload["current_batch"]
+        elif document_kind == "reply_thread":
+            commit_payload = commit_prepared_slack_thread_document(
+                connection,
+                paths,
+                prepared_document,
+                existing_row,
+                dataset_id=dataset_id,
+                dataset_source_id=dataset_source_id,
+                conversation_id=conversation_id,
+            )
+        else:
+            raise RetrieverError(f"Unsupported Slack document kind: {document_kind or '<missing>'}")
+        result = {
+            "status": "ok",
+            "action": "committed",
+            "current_batch": current_batch,
+            "new": int(commit_payload["new"]),
+            "updated": int(commit_payload["updated"]),
+            "affected_document_ids": [int(commit_payload["document_id"])],
+            "rel_paths": [rel_path] if rel_path else [],
+            "source_locator": source_locator,
+            "conversation_key": conversation_key,
+            "document_kind": document_kind,
+            "conversation_lead_document": bool(prepared_document.get("conversation_lead_document")),
+        }
+        if before_transaction_commit is not None:
+            before_transaction_commit(connection, result)
+        connection.commit()
+        return result
+    except Exception as exc:
+        connection.rollback()
+        return {
+            "status": "failed",
+            "action": "failed",
+            "current_batch": current_batch,
+            "rel_paths": [rel_path] if rel_path else [],
             "error": f"{type(exc).__name__}: {exc}",
         }
 

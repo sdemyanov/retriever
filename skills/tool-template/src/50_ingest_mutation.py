@@ -718,6 +718,54 @@ def ingest_v2_plan_slack_conversation_item(
     return int(cursor.rowcount or 0) > 0
 
 
+def ingest_v2_plan_slack_document_item(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    rel_root: str,
+    conversation_plan: dict[str, object],
+    document_plan: dict[str, object],
+    commit_order: int,
+    conversation_lead_document: bool,
+) -> bool:
+    now = utc_now()
+    conversation_key = str(conversation_plan["conversation_key"])
+    plan = dict(document_plan.get("plan") or {})
+    rel_path = str(plan.get("rel_path") or "")
+    payload = {
+        **ingest_v2_json_safe_value(document_plan),
+        "document_kind": str(document_plan.get("kind") or ""),
+        "source_locator": rel_root,
+        "conversation_key": conversation_key,
+        "conversation_type": str(conversation_plan["conversation_type"]),
+        "display_name": str(conversation_plan["display_name"]),
+        "conversation_lead_document": bool(conversation_lead_document),
+        "planned_at": now,
+    }
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO ingest_work_items (
+          run_id, unit_type, source_kind, source_key, rel_path, commit_order,
+          payload_json, affected_conversation_keys_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "slack_document",
+            SLACK_EXPORT_SOURCE_KIND,
+            f"{rel_root}:{rel_path}",
+            rel_path,
+            int(commit_order),
+            compact_json_text(payload),
+            compact_json_text([f"{rel_root}:{conversation_key}"]),
+            "pending",
+            now,
+            now,
+        ),
+    )
+    return int(cursor.rowcount or 0) > 0
+
+
 def ingest_v2_plan_slack_export_root(
     connection: sqlite3.Connection,
     root: Path,
@@ -748,17 +796,28 @@ def ingest_v2_plan_slack_export_root(
     planned_day_documents = 0
     rel_paths: list[str] = []
     for conversation_plan in conversation_plans:
-        inserted = ingest_v2_plan_slack_conversation_item(
-            connection,
-            run_id=run_id,
-            rel_root=rel_root,
-            conversation_plan=conversation_plan,
-            commit_order=commit_order,
-        )
-        commit_order += 1
-        if inserted:
+        conversation_inserted = False
+        ordered_documents = [
+            *list(conversation_plan.get("day_documents") or []),
+            *list(conversation_plan.get("thread_documents") or []),
+        ]
+        for document_index, document_plan in enumerate(ordered_documents):
+            inserted = ingest_v2_plan_slack_document_item(
+                connection,
+                run_id=run_id,
+                rel_root=rel_root,
+                conversation_plan=conversation_plan,
+                document_plan=document_plan,
+                commit_order=commit_order,
+                conversation_lead_document=document_index == 0,
+            )
+            commit_order += 1
+            if inserted:
+                conversation_inserted = True
+                if str(document_plan.get("kind") or "") == "day":
+                    planned_day_documents += 1
+        if conversation_inserted:
             planned_conversations += 1
-            planned_day_documents += len(list(conversation_plan.get("day_documents") or []))
             rel_paths.extend(str(rel_path) for rel_path in list(conversation_plan.get("rel_paths") or []))
     return {
         "rel_root": rel_root,
@@ -2083,17 +2142,17 @@ def ingest_v2_claim_prepare_items(
             return [], True
 
         claim_rows = connection.execute(
-            """
-            SELECT *
-            FROM ingest_work_items
-            WHERE run_id = ?
-              AND unit_type IN (
-                'loose_file', 'production_row', 'production_preview_batch', 'slack_conversation',
+                """
+                SELECT *
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND unit_type IN (
+                'loose_file', 'production_row', 'production_preview_batch', 'slack_conversation', 'slack_document',
                 'conversation_preview',
                 'mbox_message', 'mbox_source_finalizer',
                 'pst_message', 'pst_source_finalizer'
               )
-              AND status = 'pending'
+                  AND status = 'pending'
             ORDER BY commit_order ASC, id ASC
             LIMIT ?
             """,
@@ -2294,6 +2353,12 @@ def ingest_v2_prepare_claimed_work_item(
             deadline=deadline,
         )
         payload_kind = "slack_conversation"
+    elif unit_type == "slack_document":
+        prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_slack_document_item(
+            work_item_row,
+            deadline=deadline,
+        )
+        payload_kind = "slack_document"
     elif unit_type == "conversation_preview":
         prepared_item, source_fingerprint, defer_message = ingest_v2_prepare_conversation_preview_item(
             work_item_row,
@@ -2573,6 +2638,35 @@ def ingest_v2_prepare_slack_conversation_item(
         return None, source_fingerprint, "Not enough budget remaining to start prepare."
     prepared_item = prepare_slack_conversation_plan(payload_dict)
     prepared_item["payload_kind"] = "slack_conversation"
+    prepared_item["source_kind"] = SLACK_EXPORT_SOURCE_KIND
+    prepared_item["source_locator"] = source_locator
+    prepared_item["prepare_hash_ms"] = 0.0
+    prepared_item["prepare_extract_ms"] = max(
+        0.0,
+        float(prepared_item.get("prepare_ms") or 0.0) - float(prepared_item.get("prepare_chunk_ms") or 0.0),
+    )
+    return prepared_item, source_fingerprint, None
+
+
+def ingest_v2_prepare_slack_document_item(
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
+    payload_dict = payload if isinstance(payload, dict) else {}
+    plan = dict(payload_dict.get("plan") or {})
+    rel_path = str(plan.get("rel_path") or "")
+    source_locator = str(payload_dict.get("source_locator") or "")
+    source_fingerprint = {
+        "source_locator": source_locator,
+        "conversation_key": payload_dict.get("conversation_key"),
+        "rel_path": rel_path,
+    }
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return None, source_fingerprint, "Not enough budget remaining to start prepare."
+    prepared_item = prepare_slack_document_plan(payload_dict)
+    prepared_item["payload_kind"] = "slack_document"
     prepared_item["source_kind"] = SLACK_EXPORT_SOURCE_KIND
     prepared_item["source_locator"] = source_locator
     prepared_item["prepare_hash_ms"] = 0.0
@@ -4265,6 +4359,105 @@ def ingest_v2_commit_slack_conversation_work_item_hook(
                     "source_kind": SLACK_EXPORT_SOURCE_KIND,
                     "source_locator": source_locator,
                     "conversation_key": conversation_key,
+                    "new": int(result.get("new") or 0),
+                    "updated": int(result.get("updated") or 0),
+                    "rel_paths": list(result.get("rel_paths") or []),
+                }
+            ),
+            now,
+            run_id,
+            work_item_id,
+            writer_id,
+        ),
+    )
+    if int(update_cursor.rowcount or 0) != 1:
+        raise RetrieverError(f"Could not mark V2 ingest Slack work item {work_item_id} committed.")
+    ingest_v2_delete_prepared_item(
+        connection,
+        run_id=run_id,
+        work_item_id=work_item_id,
+    )
+    connection.execute(
+        """
+        UPDATE ingest_runs
+        SET committer_heartbeat_at = ?,
+            last_heartbeat_at = ?
+        WHERE run_id = ?
+          AND committer_lease_owner = ?
+        """,
+        (now, now, run_id, writer_id),
+    )
+
+
+def ingest_v2_commit_slack_document_work_item_hook(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    result: dict[str, object],
+) -> None:
+    now = utc_now()
+    action = str(result.get("action") or "")
+    affected_document_ids = [
+        int(document_id)
+        for document_id in list(result.get("affected_document_ids") or [])
+        if document_id is not None
+    ]
+    source_locator = str(result.get("source_locator") or "")
+    conversation_key = str(result.get("conversation_key") or "")
+    current_batch = result.get("current_batch")
+    if current_batch is not None:
+        cursor["current_ingestion_batch"] = int(current_batch)
+    slack_stats = cursor.setdefault("slack_stats", {})
+    if isinstance(slack_stats, dict):
+        if bool(result.get("conversation_lead_document")):
+            slack_stats["slack_conversations"] = int(slack_stats.get("slack_conversations") or 0) + 1
+        slack_stats["slack_documents_created"] = (
+            int(slack_stats.get("slack_documents_created") or 0)
+            + int(result.get("new") or 0)
+        )
+        slack_stats["slack_documents_updated"] = (
+            int(slack_stats.get("slack_documents_updated") or 0)
+            + int(result.get("updated") or 0)
+        )
+    ingest_v2_save_phase_cursor(
+        connection,
+        run_id=run_id,
+        phase="committing",
+        cursor_key="loose_file_commit",
+        cursor=cursor,
+        status="pending",
+    )
+    update_cursor = connection.execute(
+        """
+        UPDATE ingest_work_items
+        SET status = 'committed',
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            affected_document_ids_json = ?,
+            affected_conversation_keys_json = ?,
+            affected_entity_ids_json = ?,
+            artifact_manifest_json = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE run_id = ?
+          AND id = ?
+          AND status = 'committing'
+          AND lease_owner = ?
+        """,
+        (
+            compact_json_text(affected_document_ids),
+            compact_json_text([f"{source_locator}:{conversation_key}"] if source_locator and conversation_key else []),
+            compact_json_text([]),
+            compact_json_text(
+                {
+                    "commit_action": action,
+                    "source_kind": SLACK_EXPORT_SOURCE_KIND,
+                    "source_locator": source_locator,
+                    "conversation_key": conversation_key,
+                    "document_kind": str(result.get("document_kind") or ""),
                     "new": int(result.get("new") or 0),
                     "updated": int(result.get("updated") or 0),
                     "rel_paths": list(result.get("rel_paths") or []),
@@ -6822,6 +7015,40 @@ def ingest_v2_commit_step(
                     )
                     if str(commit_result.get("status") or "") == "failed":
                         raise RetrieverError(str(commit_result.get("error") or "Slack conversation commit failed."))
+                elif payload_kind == "slack_document" or str(claimed_row["unit_type"] or "") == "slack_document":
+                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
+                    if prepare_error:
+                        raise RetrieverError(prepare_error)
+                    source_locator = str(prepared_item.get("source_locator") or "")
+                    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+                        connection,
+                        source_kind=SLACK_EXPORT_SOURCE_KIND,
+                        source_locator=source_locator,
+                        dataset_name=slack_export_dataset_name(source_locator),
+                    )
+                    connection.commit()
+                    commit_result = commit_prepared_slack_document(
+                        connection,
+                        paths,
+                        prepared_item,
+                        dataset_id=int(dataset_id),
+                        dataset_source_id=int(dataset_source_id),
+                        current_batch=(
+                            int(cursor["current_ingestion_batch"])
+                            if cursor.get("current_ingestion_batch") is not None
+                            else None
+                        ),
+                        before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_slack_document_work_item_hook(
+                            commit_connection,
+                            run_id=run_id,
+                            work_item_id=work_item_id,
+                            writer_id=writer_id,
+                            cursor=cursor,
+                            result=result,
+                        ),
+                    )
+                    if str(commit_result.get("status") or "") == "failed":
+                        raise RetrieverError(str(commit_result.get("error") or "Slack document commit failed."))
                 elif payload_kind == "conversation_preview" or str(claimed_row["unit_type"] or "") == "conversation_preview":
                     prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
                     if prepare_error:
