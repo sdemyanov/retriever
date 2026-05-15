@@ -6,7 +6,7 @@ description: >
   the pinned dependency contract for the current runtime, and the current workspace
   maintenance command surface.
 metadata:
-  version: "1.1.11"
+  version: "1.1.16"
 ---
 
 # Retriever Workspace
@@ -35,12 +35,12 @@ Use this skill for any task that needs to bootstrap or maintain a workspace-loca
 
 ## Current outcome
 
-With the current `1.1.11` / schema `25` tool surface, Claude should be able to:
+With the current `1.1.16` / schema `26` tool surface, Claude should be able to:
 
 - verify the runtime with `workspace status`
 - create the `.retriever/` directory structure
 - use the canonical `tools.py` bundle directly
-- initialize or migrate schema `25`
+- initialize or migrate schema `26`
 - write a stable `runtime.json`
 - ingest supported documents through the bounded V2 `ingest` facade
 - verify the required PST backend is present before calling the runtime ready

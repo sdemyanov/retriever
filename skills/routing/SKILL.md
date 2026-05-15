@@ -1,4 +1,15 @@
-# Retriever Claude Operating Rules
+---
+name: routing
+description: >
+  Use this skill when a Retriever task needs the shared routing ladder, result
+  presentation contract, filesystem safety rules, or Tier 1-to-Tier 3 fallback
+  policy. This is the shared operating surface that other Retriever skills
+  reference as `retriever:routing`.
+metadata:
+  version: "1.1.16"
+---
+
+# Retriever Routing and Operating Rules
 
 ## Source File Safety
 
@@ -39,6 +50,7 @@ Tier 1 combines user-facing `retriever:*` skills and the slash commands they wra
 ### Skill Routing (Preferred Wrappers)
 
 List, switch, rename, or clear dataset scope → retriever:dataset
+Guide a first-pass legal review, diligence pass, privilege sweep, or hot-doc workflow in plain English → retriever:legal-review
 Show, list, view, display, browse, find, search, or retrieve documents, conversations, emails, chats, threads, messages, files, or attachments — with or without filters or keywords — and return the standard rendered result format → retriever:search
 Narrow, restrict, constrain, exclude, or clear result filters → retriever:filter
 Change displayed columns → retriever:columns
@@ -51,6 +63,8 @@ Inspect, save, load, or clear a scope → retriever:scope
 Ingest a folder or refresh changed files → retriever:ingest
 Ingest a processed production volume → retriever:ingest-production
 Ingest or inspect a PST archive → retriever:pst
+When the user starts from Google Drive, treat Drive as the source-selection layer and keep persistent review inside the usual workspace/ingest/search/export skills
+Export the current scope as a CSV table or archive, or inspect export progress → retriever:export
 Register, list, rename, delete, or re-describe a custom field, or change a field's storage type → retriever:field
 Populate, tag, mark, label, classify, annotate, flag, or clear values on one document or a filtered result set → retriever:fill
 Execute a planned processing run → retriever:run-job

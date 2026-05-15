@@ -34,6 +34,12 @@ TOOL_TEMPLATE_PATH = REPO_ROOT / "skills" / "tool-template" / "tool-template.md"
 SOURCE_HEADER_PATH = REPO_ROOT / "skills" / "tool-template" / "src" / "00_header.py"
 PLUGIN_MANIFEST_PATH = REPO_ROOT / ".claude-plugin" / "plugin.json"
 PING_SKILL_PATH = REPO_ROOT / "skills" / "ping" / "SKILL.md"
+SKILL_ROOT = REPO_ROOT / "skills"
+ROOT_CLAUDE_PATH = REPO_ROOT / "CLAUDE.md"
+ROUTING_SKILL_PATH = REPO_ROOT / "skills" / "routing" / "SKILL.md"
+WORKSPACE_SKILL_PATH = REPO_ROOT / "skills" / "workspace" / "SKILL.md"
+WORKSPACE_DOC_PATH = REPO_ROOT / "skills" / "workspace" / "workspace.md"
+SCHEMA_DOC_PATH = REPO_ROOT / "skills" / "schema" / "schema.md"
 REGRESSION_CORPUS_ROOT = REPO_ROOT / "phase0" / "regression_corpus"
 
 retriever_tools = None
@@ -133,6 +139,20 @@ def assert_version_metadata_current() -> None:
     if header_match is None:
         raise AssertionError(f"Could not determine TOOL_VERSION from {SOURCE_HEADER_PATH}.")
     expected_version = header_match.group(1)
+    schema_match = re.search(
+        r"^SCHEMA_VERSION = (\d+)$",
+        SOURCE_HEADER_PATH.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if schema_match is None:
+        raise AssertionError(f"Could not determine SCHEMA_VERSION from {SOURCE_HEADER_PATH}.")
+    expected_schema_version = schema_match.group(1)
+
+    if ROOT_CLAUDE_PATH.exists():
+        raise AssertionError(
+            "Root CLAUDE.md is ignored by the plugin loader and causes validation warnings. "
+            "Keep shared plugin instructions in skills/ instead."
+        )
 
     plugin_version = json.loads(PLUGIN_MANIFEST_PATH.read_text(encoding="utf-8")).get("version")
     if plugin_version != expected_version:
@@ -140,6 +160,20 @@ def assert_version_metadata_current() -> None:
             ".claude-plugin/plugin.json has a stale version relative to TOOL_VERSION. "
             "Run ./build.sh to synchronize version metadata before running tests."
         )
+
+    skill_paths = sorted(SKILL_ROOT.glob("*/SKILL.md"))
+    if not skill_paths:
+        raise AssertionError(f"Could not find any skill files under {SKILL_ROOT}.")
+    for skill_path in skill_paths:
+        skill_text = skill_path.read_text(encoding="utf-8")
+        metadata_match = re.search(r'^\s*version:\s*"([^"]+)"\s*$', skill_text, re.MULTILINE)
+        if metadata_match is None:
+            raise AssertionError(f"Could not find a metadata.version entry in {skill_path}.")
+        if metadata_match.group(1) != expected_version:
+            raise AssertionError(
+                f"{skill_path} has stale frontmatter version text relative to TOOL_VERSION. "
+                "Run ./build.sh to synchronize version metadata before running tests."
+            )
 
     ping_text = PING_SKILL_PATH.read_text(encoding="utf-8")
     metadata_match = re.search(r'^\s*version:\s*"([^"]+)"\s*$', ping_text, re.MULTILINE)
@@ -150,6 +184,52 @@ def assert_version_metadata_current() -> None:
         raise AssertionError(
             "skills/ping/SKILL.md has stale version text relative to TOOL_VERSION. "
             "Run ./build.sh to synchronize version metadata before running tests."
+        )
+
+    workspace_skill_text = WORKSPACE_SKILL_PATH.read_text(encoding="utf-8")
+    expected_workspace_surface = (
+        f"With the current `{expected_version}` / schema `{expected_schema_version}` tool surface, "
+        "Claude should be able to:"
+    )
+    if expected_workspace_surface not in workspace_skill_text:
+        raise AssertionError(
+            "skills/workspace/SKILL.md has stale current-version summary text. "
+            "Run ./build.sh to synchronize workspace docs before running tests."
+        )
+    expected_workspace_schema_phrase = f"initialize or migrate schema `{expected_schema_version}`"
+    if expected_workspace_schema_phrase not in workspace_skill_text:
+        raise AssertionError(
+            "skills/workspace/SKILL.md has stale schema-version text. "
+            "Run ./build.sh to synchronize workspace docs before running tests."
+        )
+
+    workspace_doc_text = WORKSPACE_DOC_PATH.read_text(encoding="utf-8")
+    if f'  "tool_version": "{expected_version}"' not in workspace_doc_text:
+        raise AssertionError(
+            "skills/workspace/workspace.md has stale tool_version example text. "
+            "Run ./build.sh to synchronize workspace docs before running tests."
+        )
+    if f"  \"schema_version\": {expected_schema_version}" not in workspace_doc_text:
+        raise AssertionError(
+            "skills/workspace/workspace.md has stale schema_version example text. "
+            "Run ./build.sh to synchronize workspace docs before running tests."
+        )
+
+    schema_doc_text = SCHEMA_DOC_PATH.read_text(encoding="utf-8")
+    if f"- schema version: `{expected_schema_version}`" not in schema_doc_text:
+        raise AssertionError(
+            "skills/schema/schema.md has stale schema version header text. "
+            "Run ./build.sh to synchronize schema docs before running tests."
+        )
+    if f'  "tool_version": "{expected_version}"' not in schema_doc_text:
+        raise AssertionError(
+            "skills/schema/schema.md has stale tool_version example text. "
+            "Run ./build.sh to synchronize schema docs before running tests."
+        )
+    if f"  \"schema_version\": {expected_schema_version}" not in schema_doc_text:
+        raise AssertionError(
+            "skills/schema/schema.md has stale schema_version example text. "
+            "Run ./build.sh to synchronize schema docs before running tests."
         )
 
 
@@ -21445,7 +21525,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("cannot be mixed", mixed_payload["error"])
 
     def test_claude_routing_ladder_lists_entity_subcommands(self) -> None:
-        routing_text = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+        routing_text = ROUTING_SKILL_PATH.read_text(encoding="utf-8")
 
         self.assertIn("### Entities", routing_text)
         self.assertIn("`list-entities`", routing_text)

@@ -1,21 +1,74 @@
 # Retriever
 
-Retriever is a local-first document intelligence plugin for Claude Cowork. It makes a selected folder searchable and filterable, helps users ask questions about their data, and supports intelligent document review at scale without modifying the original source files.
+Retriever is a local-first review workspace for people who need to get through
+a messy document set with Claude. The product story is intentionally simple:
+use Retriever to do three jobs well.
 
-This README is the user guide for the project: what Retriever is good at, what it can ingest, how the browse model works, which slash commands exist, and how to use `/search` and `/filter` effectively.
+## The three jobs
+
+1. Build a review workspace
+   Turn a local folder, processed production, PST/MBOX archive, or bounded
+   Google Drive set into a Retriever workspace that keeps search state, saved
+   scopes, previews, and exports together.
+2. Find the documents that matter
+   Ask for hot docs, key communications, contract-risk terms, privilege
+   candidates, or specific Bates ranges without rebuilding the review context
+   every turn.
+3. Export a review set
+   Once the scope is right, export a shareable table or archive for handoff,
+   QA, or downstream loading.
+
+## Guided surfaces
+
+- `retriever-legal` agent: persona-first wrapper for first-pass legal review,
+  diligence, privilege sweeps, and hot-doc workflows
+- `retriever:export` skill: user-facing CSV/archive export wrapper
+
+Google Drive remains supported as an intake/source option, but not as a
+separate top-level Retriever capability.
+
+Submission and trust docs:
+
+- [MARKETPLACE.md](MARKETPLACE.md)
+- [CONNECTORS.md](CONNECTORS.md)
+- [PRIVACY.md](PRIVACY.md)
+
+## Quick Start
+
+1. Put the documents for one matter or review into a single local folder.
+2. Ask Retriever to ingest that folder.
+3. Ask for the next job in plain English: find hot docs, review contracts, show
+   key emails, or export the current review set.
+
+Example prompts:
+
+- `Ingest /path/to/folder`
+- `Review this folder for hot docs`
+- `Show emails from Alice in 2023`
+- `Export the current review set`
+
+If your source starts as a processed production, PST/MBOX archive, or bounded
+Google Drive set, first turn it into a local Retriever workspace, then continue
+the same way.
 
 ## What Retriever is for
 
-Retriever works best when you need to review or analyze a local document collection and keep that work grounded in the files on disk.
+Retriever works best when you need to review or analyze a local document
+collection and keep that work grounded in the files on disk.
+
+Best-fit users: legal review, investigations, diligence, and internal document
+analysis.
 
 Common use cases:
 
 - searching a matter, investigation, or diligence workspace
-- reviewing PDFs, Office documents, loose emails, PST/MBOX archives, and Slack exports together
+- reviewing PDFs, Office documents, loose emails, PST/MBOX archives, and Slack
+  exports together
 - jumping directly to a Bates number or Bates range in a production
 - building reusable scopes such as "emails from 2023 in the Hot Docs set"
 - creating review sets, CSV exports, preview bundles, or portable archives
-- adding custom metadata fields and running structured extraction jobs over a frozen document set
+- adding custom metadata fields and running structured extraction jobs over a
+  frozen document set
 
 ## Core capabilities
 

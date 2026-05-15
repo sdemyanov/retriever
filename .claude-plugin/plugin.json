@@ -1,14 +1,22 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "retriever",
   "version": "1.1.16",
-  "description": "Retriever is a local-first document intelligence plugin for Claude Cowork.",
+  "description": "Build a review workspace, find the documents that matter, and export a shareable review set.",
   "author": {
-    "name": "Sergey Demyanov"
+    "name": "Sergey Demyanov",
+    "url": "https://github.com/sdemyanov"
   },
+  "homepage": "https://github.com/sdemyanov/retriever",
+  "repository": "https://github.com/sdemyanov/retriever",
+  "license": "Elastic-2.0",
   "keywords": [
     "retriever",
+    "review",
     "documents",
-    "search",
-    "analysis"
+    "legal",
+    "investigations",
+    "diligence",
+    "export"
   ]
 }

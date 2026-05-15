@@ -44,7 +44,7 @@ Follow this order:
 3. Create the `.retriever/` directory tree.
 4. Install pinned dependencies from [requirements.lock.md](requirements.lock.md), including the required PST backend.
 5. Resolve the canonical [../tool-template/tools.py](../tool-template/tools.py) bundle that will manage the workspace.
-6. Run `python3 skills/tool-template/tools.py workspace init <workspace>` to create or upgrade schema `25`.
+6. Run `python3 skills/tool-template/tools.py workspace init <workspace>` to create or upgrade schema `26`.
 7. Write `runtime.json`.
 
 <a id="mounted-fs-bootstrap"></a>
@@ -117,8 +117,8 @@ Write a JSON object with these fields:
 
 ```json
 {
-  "tool_version": "1.1.11",
-  "schema_version": 25,
+  "tool_version": "1.1.16",
+  "schema_version": 26,
   "requirements_version": "2026-04-21-phase11-document-deduplication",
   "template_source": "skills/tool-template/tools.py",
   "template_sha256": "<sha256 of canonical tools.py bundle>",

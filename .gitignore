@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .phase0-venv/
 /data/
+/data-public/
 /plans/
 /backups/
 /phase0/
