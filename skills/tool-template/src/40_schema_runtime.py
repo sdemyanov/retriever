@@ -2170,8 +2170,9 @@ def bootstrap(root: Path) -> dict[str, object]:
         else sha256_file(Path(__file__).resolve())
     )
     recovered_sqlite_artifacts = remove_stale_sqlite_artifacts(paths["db_path"])
+    seeded_sqlite_db: dict[str, object] | None = None
     last_error: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(4):
         try:
             connection = connect_db(paths["db_path"])
             try:
@@ -2194,22 +2195,34 @@ def bootstrap(root: Path) -> dict[str, object]:
                 result["journal_mode"] = journal_mode
             if recovered_sqlite_artifacts:
                 result["recovered_sqlite_artifacts"] = recovered_sqlite_artifacts
+            if seeded_sqlite_db is not None:
+                result["seeded_sqlite_db"] = seeded_sqlite_db
             return result
         except Exception as exc:
             last_error = exc
-            if attempt == 0:
-                retry_artifacts = remove_stale_sqlite_artifacts(paths["db_path"])
-                if retry_artifacts:
-                    for artifact in retry_artifacts:
-                        if artifact not in recovered_sqlite_artifacts:
-                            recovered_sqlite_artifacts.append(artifact)
-                    continue
+            retry_artifacts = remove_stale_sqlite_artifacts(paths["db_path"])
+            if retry_artifacts:
+                for artifact in retry_artifacts:
+                    if artifact not in recovered_sqlite_artifacts:
+                        recovered_sqlite_artifacts.append(artifact)
+                continue
+            if seeded_sqlite_db is None and sqlite_bootstrap_seed_required(paths["db_path"], exc):
+                seeded_sqlite_db = seed_sqlite_db_from_local_temp(paths["db_path"])
+                for artifact in list(seeded_sqlite_db.get("reset_artifacts") or []):
+                    if artifact not in recovered_sqlite_artifacts:
+                        recovered_sqlite_artifacts.append(str(artifact))
+                continue
             break
     detail = f"{type(last_error).__name__}: {last_error}" if last_error is not None else "unknown bootstrap failure"
     if recovered_sqlite_artifacts:
         detail = (
             f"{detail}. Removed stale SQLite artifacts before retry: "
             f"{', '.join(recovered_sqlite_artifacts)}"
+        )
+    if seeded_sqlite_db is not None:
+        detail = (
+            f"{detail}. Seeded SQLite DB from local temp with journal mode "
+            f"{seeded_sqlite_db.get('journal_mode') or 'delete'} before retry"
         )
     raise RetrieverError(f"Bootstrap failed for {paths['db_path']}: {detail}") from last_error
 

@@ -6930,6 +6930,38 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIs(connection, fake_connection)
         self.assertIn("PRAGMA journal_mode = WAL", fake_connection.commands)
         self.assertIn("PRAGMA journal_mode = DELETE", fake_connection.commands)
+        self.assertNotIn("PRAGMA synchronous = NORMAL", fake_connection.commands)
+
+    def test_connect_db_sets_synchronous_normal_when_wal_succeeds(self) -> None:
+        class FakeCursor:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.row_factory = None
+                self.commands: list[str] = []
+
+            def execute(self, statement: str):
+                self.commands.append(statement)
+                if statement == "PRAGMA journal_mode = WAL":
+                    return FakeCursor(["wal"])
+                return FakeCursor(None)
+
+            def close(self) -> None:
+                return None
+
+        fake_connection = FakeConnection()
+        with mock.patch.object(retriever_tools.sqlite3, "connect", return_value=fake_connection):
+            connection = retriever_tools.connect_db(self.paths["db_path"])
+
+        self.assertIs(connection, fake_connection)
+        self.assertIn("PRAGMA journal_mode = WAL", fake_connection.commands)
+        self.assertIn("PRAGMA synchronous = NORMAL", fake_connection.commands)
+        self.assertNotIn("PRAGMA journal_mode = DELETE", fake_connection.commands)
 
     def test_workspace_paths_include_ingest_lock_and_tmp_dirs(self) -> None:
         self.assertEqual(self.paths["tmp_dir"], self.root / ".retriever" / "tmp")
@@ -7207,6 +7239,29 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(result["schema_version"], retriever_tools.SCHEMA_VERSION)
         self.assertIn("recovered_sqlite_artifacts", result)
         self.assertIn(str(self.paths["db_path"]), result["recovered_sqlite_artifacts"])
+        self.assertGreater(self.paths["db_path"].stat().st_size, 0)
+
+    def test_bootstrap_seeds_local_temp_db_when_fresh_workspace_journal_setup_fails(self) -> None:
+        real_connect_db = retriever_tools.connect_db
+        connect_calls: list[Path] = []
+
+        def flaky_connect(db_path: Path):
+            connect_calls.append(Path(db_path))
+            if len(connect_calls) == 1:
+                raise retriever_tools.RetrieverError(
+                    "Unable to configure SQLite journal mode for "
+                    f"{db_path}: WAL failed with OperationalError: disk I/O error; "
+                    "DELETE failed with OperationalError: disk I/O error"
+                )
+            return real_connect_db(db_path)
+
+        with mock.patch.object(retriever_tools, "connect_db", side_effect=flaky_connect):
+            result = retriever_tools.bootstrap(self.root)
+
+        self.assertEqual(len(connect_calls), 2)
+        self.assertEqual(result["schema_version"], retriever_tools.SCHEMA_VERSION)
+        self.assertIn("seeded_sqlite_db", result)
+        self.assertIn(result["seeded_sqlite_db"]["journal_mode"], {"wal", "delete"})
         self.assertGreater(self.paths["db_path"].stat().st_size, 0)
 
     def test_bootstrap_then_ingest_creates_email_attachment_children_and_search_context(self) -> None:
@@ -8212,6 +8267,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(finalize_payload["run"]["status"], "completed")
         self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["mbox_message"]["committed"], 2)
         self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["mbox_source_finalizer"]["committed"], 1)
+        self.assertEqual(finalize_payload["cursor"]["conversation_previews_refreshed"], 2)
 
         parent_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<v2-mbox-msg-001@example.com>")
         sibling_rel_path = retriever_tools.mbox_message_rel_path("mailbox.mbox", "<v2-mbox-msg-002@example.com>")
@@ -8266,7 +8322,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(container_row["last_scan_completed_at"])
         self.assertEqual(
             [row["unit_type"] for row in work_items],
-            ["mbox_message", "mbox_message", "mbox_source_finalizer", "conversation_preview", "conversation_preview"],
+            ["mbox_message", "mbox_message", "mbox_source_finalizer"],
         )
         self.assertTrue(all(row["status"] == "committed" for row in work_items))
         self.assertTrue(json.loads(work_items[0]["affected_document_ids_json"]))
@@ -8275,6 +8331,230 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         mbox_stats = json.loads(cursor_row["cursor_json"])["mbox_stats"]
         self.assertEqual(mbox_stats["mbox_messages_created"], 2)
         self.assertEqual(mbox_stats["mbox_sources_finalized"], 1)
+
+    def test_ingest_v2_prepare_mbox_message_item_uses_inline_payload_bytes_when_available(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Inline MBOX payload",
+                    body_text="Inline payload body",
+                    message_id="<v2-inline-mbox@example.com>",
+                )
+            ]
+        )
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            work_item_row = connection.execute(
+                """
+                SELECT *
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND unit_type = 'mbox_message'
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(work_item_row)
+        payload = json.loads(work_item_row["payload_json"])
+        self.assertIn("payload_bytes", payload)
+
+        with mock.patch.object(retriever_tools.mailbox, "mbox", side_effect=AssertionError("should not reopen")):
+            prepared_item, source_fingerprint, pause_reason = retriever_tools.ingest_v2_prepare_mbox_message_item(
+                self.root,
+                work_item_row,
+                deadline=time.time() + 10.0,
+            )
+
+        self.assertIsNone(pause_reason)
+        self.assertIsNotNone(prepared_item)
+        self.assertEqual(source_fingerprint["source_item_id"], "<v2-inline-mbox@example.com>")
+        self.assertEqual(prepared_item["source_item_id"], "<v2-inline-mbox@example.com>")
+
+    def test_ingest_v2_plan_step_uses_in_memory_parser_for_small_mbox_files(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Planner message one",
+                    body_text="Planner body one",
+                    message_id="<v2-plan-mbox-001@example.com>",
+                ),
+                self.build_fake_mbox_message(
+                    subject="Planner message two",
+                    body_text="Planner body two",
+                    message_id="<v2-plan-mbox-002@example.com>",
+                ),
+            ]
+        )
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        with mock.patch.object(retriever_tools.mailbox, "mbox", side_effect=AssertionError("should not use mailbox.mbox")):
+            plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+        self.assertEqual(plan_payload["cursor"]["planned_mbox_messages"], 2)
+        self.assertEqual(plan_payload["timings"]["mbox_source_plan_ms"]["count"], 1)
+        self.assertEqual(plan_payload["timings"]["mbox_plan_parser_kind_counts"], {"in_memory": 2})
+
+    def test_ingest_v2_records_mbox_plan_prepare_and_commit_worker_events(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Eventful MBOX",
+                    body_text="Event body",
+                    message_id="<v2-mbox-event-001@example.com>",
+                )
+            ]
+        )
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        for command in ("ingest-plan-step", "ingest-prepare-step", "ingest-commit-step", "ingest-finalize-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            event_rows = connection.execute(
+                """
+                SELECT event_type, duration_ms, details_json
+                FROM ingest_worker_events
+                WHERE run_id = ?
+                  AND event_type IN ('plan_mbox_source_batch', 'prepare_mbox_message', 'prepare_store_batch', 'commit_mbox_message')
+                ORDER BY id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        event_details = {
+            str(row["event_type"]): json.loads(row["details_json"] or "{}")
+            for row in event_rows
+        }
+        self.assertEqual([str(row["event_type"]) for row in event_rows], [
+            "plan_mbox_source_batch",
+            "prepare_mbox_message",
+            "prepare_store_batch",
+            "commit_mbox_message",
+        ])
+        self.assertGreaterEqual(float(event_rows[0]["duration_ms"] or 0.0), 0.0)
+        self.assertAlmostEqual(
+            float(event_rows[1]["duration_ms"] or 0.0),
+            float(event_details["prepare_mbox_message"]["prepare_total_step_ms"] or 0.0),
+            delta=0.001,
+        )
+        self.assertGreaterEqual(float(event_rows[2]["duration_ms"] or 0.0), 0.0)
+        self.assertGreaterEqual(float(event_rows[3]["duration_ms"] or 0.0), 0.0)
+        self.assertEqual(event_details["plan_mbox_source_batch"]["source_rel_path"], "mailbox.mbox")
+        self.assertEqual(event_details["plan_mbox_source_batch"]["planned_messages"], 1)
+        self.assertEqual(event_details["plan_mbox_source_batch"]["parser_kind_counts"], {"in_memory": 1})
+        self.assertEqual(event_details["prepare_mbox_message"]["source_rel_path"], "mailbox.mbox")
+        self.assertEqual(event_details["prepare_mbox_message"]["source_item_id"], "<v2-mbox-event-001@example.com>")
+        self.assertEqual(event_details["prepare_store_batch"]["stored"], 2)
+        self.assertEqual(event_details["prepare_store_batch"]["spilled_items"], 0)
+        self.assertEqual(
+            event_details["prepare_store_batch"]["payload_kind_counts"],
+            {"mbox_message": 1, "mbox_source_finalizer": 1},
+        )
+        self.assertEqual(event_details["commit_mbox_message"]["source_rel_path"], "mailbox.mbox")
+        self.assertEqual(event_details["commit_mbox_message"]["batch_size"], 1)
+        self.assertEqual(event_details["commit_mbox_message"]["action"], "new")
+
+    def test_ingest_v2_spills_large_mbox_prepared_payloads_and_cleans_up(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Spilled MBOX",
+                    body_text="payload " * 512,
+                    message_id="<v2-spill-mbox-001@example.com>",
+                )
+            ]
+        )
+
+        with mock.patch.dict(os.environ, {"RETRIEVER_INGEST_V2_PREPARED_PAYLOAD_SPILL_BYTES": "1"}):
+            start_exit, start_payload, _, _ = self.run_cli(
+                "ingest-start",
+                str(self.root),
+                "--recursive",
+            )
+            self.assertEqual(start_exit, 0)
+            self.assertIsNotNone(start_payload)
+            run_id = str(start_payload["run_id"])
+
+            for command in ("ingest-plan-step", "ingest-prepare-step"):
+                exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+                self.assertEqual(exit_code, 0)
+                self.assertIsNotNone(payload)
+                if command == "ingest-prepare-step":
+                    prepare_payload = payload
+
+            self.assertEqual(prepare_payload["timings"]["prepared_spilled_items"], 1)
+            self.assertGreater(prepare_payload["timings"]["prepared_spilled_bytes"], 0)
+            self.assertEqual(prepare_payload["timings"]["prepared_spill_write_ms"]["count"], 1)
+
+            connection = retriever_tools.connect_db(self.paths["db_path"])
+            try:
+                prepared_row = connection.execute(
+                    """
+                    SELECT payload_json, spill_rel_path
+                    FROM ingest_prepared_items
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+            self.assertIsNotNone(prepared_row)
+            spill_rel_path = str(prepared_row["spill_rel_path"] or "")
+            self.assertTrue(spill_rel_path)
+            self.assertTrue(json.loads(prepared_row["payload_json"])["prepared_item_spilled"])
+            spill_path = self.paths["state_dir"] / spill_rel_path
+            self.assertTrue(spill_path.exists())
+
+            for command in ("ingest-commit-step", "ingest-finalize-step"):
+                exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+                self.assertEqual(exit_code, 0)
+                self.assertIsNotNone(payload)
+
+        self.assertFalse(spill_path.exists())
+        document_row = self.fetch_document_row(
+            retriever_tools.mbox_message_rel_path("mailbox.mbox", "<v2-spill-mbox-001@example.com>")
+        )
+        self.assertIsNotNone(document_row)
 
     def test_ingest_v2_mbox_reingest_retires_removed_messages(self) -> None:
         self.write_fake_mbox_file(
@@ -8347,6 +8627,127 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(mbox_stats["mbox_messages_updated"], 1)
         self.assertEqual(mbox_stats["mbox_messages_deleted"], 1)
 
+    def test_ingest_v2_commit_step_falls_back_after_mbox_batch_failure(self) -> None:
+        self.write_fake_mbox_file(
+            [
+                self.build_fake_mbox_message(
+                    subject="Batch fallback one",
+                    body_text="Body one",
+                    message_id="<v2-batch-mbox-001@example.com>",
+                ),
+                self.build_fake_mbox_message(
+                    subject="Batch fallback two",
+                    body_text="Body two",
+                    message_id="<v2-batch-mbox-002@example.com>",
+                ),
+            ]
+        )
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        for command in ("ingest-plan-step", "ingest-prepare-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        real_batch_commit = retriever_tools.ingest_v2_commit_mbox_message_batch
+        failed_once = False
+
+        def flaky_batch_commit(*args, **kwargs):
+            nonlocal failed_once
+            claimed_rows = list(kwargs.get("claimed_rows") or [])
+            if len(claimed_rows) > 1 and not failed_once:
+                failed_once = True
+                raise retriever_tools.RetrieverError("Synthetic MBOX batch failure")
+            return real_batch_commit(*args, **kwargs)
+
+        with mock.patch.object(
+            retriever_tools,
+            "ingest_v2_commit_mbox_message_batch",
+            side_effect=flaky_batch_commit,
+        ):
+            commit_exit, commit_payload, _, _ = self.run_cli(
+                "ingest-commit-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
+
+        self.assertEqual(commit_exit, 0)
+        self.assertIsNotNone(commit_payload)
+        self.assertEqual(commit_payload["failed"], 0)
+        self.assertEqual(commit_payload["committed"], 3)
+        self.assertEqual(commit_payload["actions"], {"new": 2, "finalized": 1})
+        self.assertEqual(
+            commit_payload["batching"],
+            {
+                "mbox_message_batches": 0,
+                "mbox_message_batch_items": 0,
+                "mbox_message_batch_fallbacks": 1,
+                "pst_message_batches": 0,
+                "pst_message_batch_items": 0,
+                "pst_message_batch_fallbacks": 0,
+                "slack_document_batches": 0,
+                "slack_document_batch_items": 0,
+                "slack_document_batch_fallbacks": 0,
+            },
+        )
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "ingest-finalize-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            committed_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                      AND unit_type = 'mbox_message'
+                      AND status = 'committed'
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            prepared_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                      AND unit_type = 'mbox_message'
+                      AND status = 'prepared'
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(committed_count, 2)
+        self.assertEqual(prepared_count, 0)
+
     def test_ingest_v2_pst_creates_message_rows_with_source_context(self) -> None:
         pst_path = self.write_fake_pst_file()
         messages = [
@@ -8386,6 +8787,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(finalize_payload["run"]["status"], "completed")
         self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["pst_message"]["committed"], 2)
         self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["pst_source_finalizer"]["committed"], 1)
+        self.assertEqual(finalize_payload["cursor"]["conversation_previews_refreshed"], 2)
 
         parent_rel_path = retriever_tools.pst_message_rel_path("mailbox.pst", "v2-pst-msg-001")
         sibling_rel_path = retriever_tools.pst_message_rel_path("mailbox.pst", "v2-pst-msg-002")
@@ -8446,7 +8848,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(container_row["last_scan_completed_at"])
         self.assertEqual(
             [row["unit_type"] for row in work_items],
-            ["pst_message", "pst_message", "pst_source_finalizer", "conversation_preview", "conversation_preview"],
+            ["pst_message", "pst_message", "pst_source_finalizer"],
         )
         self.assertTrue(all(row["status"] == "committed" for row in work_items))
         self.assertTrue(json.loads(work_items[0]["affected_document_ids_json"]))
@@ -8455,6 +8857,245 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         pst_stats = json.loads(cursor_row["cursor_json"])["pst_stats"]
         self.assertEqual(pst_stats["pst_messages_created"], 2)
         self.assertEqual(pst_stats["pst_sources_finalized"], 1)
+
+    def test_ingest_v2_records_pst_plan_prepare_and_commit_worker_events(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-event-001",
+                subject="Eventful PST",
+                body_text="Event body",
+                attachment_name="evidence.txt",
+                attachment_text="Attachment body",
+            )
+        ]
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            for command in ("ingest-plan-step", "ingest-prepare-step", "ingest-commit-step", "ingest-finalize-step"):
+                exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+                self.assertEqual(exit_code, 0)
+                self.assertIsNotNone(payload)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            event_rows = connection.execute(
+                """
+                SELECT event_type, duration_ms, details_json
+                FROM ingest_worker_events
+                WHERE run_id = ?
+                  AND event_type IN (
+                    'plan_pst_source_batch',
+                    'prepare_pst_message',
+                    'prepare_store_batch',
+                    'commit_pst_message',
+                    'commit_pst_source_finalizer'
+                  )
+                ORDER BY id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        event_details = {
+            str(row["event_type"]): json.loads(row["details_json"] or "{}")
+            for row in event_rows
+        }
+        self.assertEqual([str(row["event_type"]) for row in event_rows], [
+            "plan_pst_source_batch",
+            "prepare_pst_message",
+            "prepare_store_batch",
+            "commit_pst_message",
+            "commit_pst_source_finalizer",
+        ])
+        self.assertGreaterEqual(float(event_rows[0]["duration_ms"] or 0.0), 0.0)
+        self.assertAlmostEqual(
+            float(event_rows[1]["duration_ms"] or 0.0),
+            float(event_details["prepare_pst_message"]["prepare_total_step_ms"] or 0.0),
+            delta=0.001,
+        )
+        self.assertEqual(event_details["plan_pst_source_batch"]["source_rel_path"], "mailbox.pst")
+        self.assertEqual(event_details["plan_pst_source_batch"]["planned_messages"], 1)
+        self.assertEqual(event_details["plan_pst_source_batch"]["spilled_messages"], 0)
+        self.assertEqual(event_details["plan_pst_source_batch"]["attachment_count"], 1)
+        self.assertGreater(event_details["plan_pst_source_batch"]["attachment_bytes"], 0)
+        self.assertEqual(event_details["prepare_pst_message"]["source_rel_path"], "mailbox.pst")
+        self.assertEqual(event_details["prepare_pst_message"]["source_item_id"], "v2-pst-event-001")
+        self.assertEqual(event_details["prepare_pst_message"]["attachment_count"], 1)
+        self.assertGreater(event_details["prepare_pst_message"]["attachment_bytes"], 0)
+        self.assertEqual(event_details["prepare_store_batch"]["stored"], 2)
+        self.assertEqual(event_details["prepare_store_batch"]["spilled_items"], 0)
+        self.assertEqual(
+            event_details["prepare_store_batch"]["payload_kind_counts"],
+            {"pst_message": 1, "pst_source_finalizer": 1},
+        )
+        self.assertEqual(event_details["commit_pst_message"]["source_rel_path"], "mailbox.pst")
+        self.assertEqual(event_details["commit_pst_message"]["batch_size"], 1)
+        self.assertEqual(event_details["commit_pst_message"]["action"], "new")
+        self.assertEqual(event_details["commit_pst_source_finalizer"]["source_rel_path"], "mailbox.pst")
+        self.assertEqual(event_details["commit_pst_source_finalizer"]["action"], "finalized")
+
+    def test_ingest_v2_spills_large_pst_planned_payloads_and_cleans_up(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-spill-001",
+                subject="Spilled PST",
+                body_text="payload " * 128,
+                attachment_name="large.bin",
+                attachment_text="attachment payload " * 128,
+            )
+        ]
+
+        with mock.patch.dict(os.environ, {"RETRIEVER_INGEST_V2_PST_PLAN_PAYLOAD_SPILL_BYTES": "1"}):
+            start_exit, start_payload, _, _ = self.run_cli(
+                "ingest-start",
+                str(self.root),
+                "--recursive",
+            )
+            self.assertEqual(start_exit, 0)
+            self.assertIsNotNone(start_payload)
+            run_id = str(start_payload["run_id"])
+
+            with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+                plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+            self.assertEqual(plan_exit, 0)
+            self.assertIsNotNone(plan_payload)
+            self.assertEqual(plan_payload["timings"]["pst_plan_spilled_messages"], 1)
+            self.assertGreater(plan_payload["timings"]["pst_plan_spilled_payload_bytes"], 0)
+
+            connection = retriever_tools.connect_db(self.paths["db_path"])
+            try:
+                work_item_row = connection.execute(
+                    """
+                    SELECT payload_json
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                      AND unit_type = 'pst_message'
+                    """,
+                    (run_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+            self.assertIsNotNone(work_item_row)
+            payload = json.loads(work_item_row["payload_json"])
+            spill_rel_path = str(payload.get("raw_message_spill_rel_path") or "")
+            self.assertTrue(spill_rel_path)
+            self.assertTrue(payload["raw_message_spilled"])
+            self.assertNotIn("raw_message", payload)
+            spill_path = self.paths["state_dir"] / spill_rel_path
+            self.assertTrue(spill_path.exists())
+
+            for command in ("ingest-prepare-step", "ingest-commit-step", "ingest-finalize-step"):
+                exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+                self.assertEqual(exit_code, 0)
+                self.assertIsNotNone(payload)
+
+        self.assertFalse(spill_path.exists())
+        document_row = self.fetch_document_row(
+            retriever_tools.pst_message_rel_path("mailbox.pst", "v2-pst-spill-001")
+        )
+        self.assertIsNotNone(document_row)
+
+    def test_ingest_v2_commit_step_falls_back_after_pst_batch_failure(self) -> None:
+        self.write_fake_pst_file()
+        messages = [
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-batch-001",
+                subject="Batch fallback one",
+                body_text="Body one",
+            ),
+            self.build_fake_pst_message(
+                source_item_id="v2-pst-batch-002",
+                subject="Batch fallback two",
+                body_text="Body two",
+            ),
+        ]
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        with mock.patch.object(retriever_tools, "iter_pst_messages", return_value=iter(messages)):
+            plan_exit, plan_payload, _, _ = self.run_cli("ingest-plan-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(plan_exit, 0)
+        self.assertIsNotNone(plan_payload)
+
+        prepare_exit, prepare_payload, _, _ = self.run_cli("ingest-prepare-step", str(self.root), "--run-id", run_id)
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+
+        real_batch_commit = retriever_tools.ingest_v2_commit_pst_message_batch
+        failed_once = False
+
+        def flaky_batch_commit(*args, **kwargs):
+            nonlocal failed_once
+            claimed_rows = list(kwargs.get("claimed_rows") or [])
+            if len(claimed_rows) > 1 and not failed_once:
+                failed_once = True
+                raise retriever_tools.RetrieverError("Synthetic PST batch failure")
+            return real_batch_commit(*args, **kwargs)
+
+        with mock.patch.object(
+            retriever_tools,
+            "ingest_v2_commit_pst_message_batch",
+            side_effect=flaky_batch_commit,
+        ):
+            commit_exit, commit_payload, _, _ = self.run_cli(
+                "ingest-commit-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
+
+        self.assertEqual(commit_exit, 0)
+        self.assertIsNotNone(commit_payload)
+        self.assertEqual(commit_payload["failed"], 0)
+        self.assertEqual(commit_payload["committed"], 3)
+        self.assertEqual(commit_payload["actions"], {"new": 2, "finalized": 1})
+        self.assertEqual(
+            commit_payload["batching"],
+            {
+                "mbox_message_batches": 0,
+                "mbox_message_batch_items": 0,
+                "mbox_message_batch_fallbacks": 0,
+                "pst_message_batches": 0,
+                "pst_message_batch_items": 0,
+                "pst_message_batch_fallbacks": 1,
+                "slack_document_batches": 0,
+                "slack_document_batch_items": 0,
+                "slack_document_batch_fallbacks": 0,
+            },
+        )
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "ingest-finalize-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
 
     def test_ingest_v2_pst_reingest_retires_removed_messages(self) -> None:
         pst_path = self.write_fake_pst_file(content=b"pst-v2-a")
@@ -8633,6 +9274,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(commit_payload["failed"], 0)
         self.assertEqual(commit_payload["committed"], 3)
         self.assertEqual(commit_payload["actions"], {"committed": 3})
+        self.assertEqual(
+            commit_payload["batching"],
+            {
+                "mbox_message_batches": 0,
+                "mbox_message_batch_items": 0,
+                "mbox_message_batch_fallbacks": 0,
+                "pst_message_batches": 0,
+                "pst_message_batch_items": 0,
+                "pst_message_batch_fallbacks": 0,
+                "slack_document_batches": 1,
+                "slack_document_batch_items": 3,
+                "slack_document_batch_fallbacks": 0,
+            },
+        )
         self.assertEqual(finalize_payload["run"]["status"], "completed")
         self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["slack_document"]["committed"], 3)
 
@@ -8865,6 +9520,325 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 ("slack_thread_reply_day", "data/slack/general/2022-12-17.json"),
             ],
         )
+
+    def test_ingest_v2_slack_rerun_reuses_thread_document_when_channel_id_changes(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        thread_ts = "1671235434.237949"
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Kickoff thread",
+                        "user": "U04SERGEY1",
+                        "ts": thread_ts,
+                        "thread_ts": thread_ts,
+                        "reply_count": 1,
+                    },
+                    {
+                        "type": "message",
+                        "text": "Following up on kickoff",
+                        "user": "U04MAX0001",
+                        "ts": "1671235834.237949",
+                        "thread_ts": thread_ts,
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        def write_channels(channel_id: str) -> None:
+            (export_root / "channels.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": channel_id,
+                            "name": "general",
+                            "is_channel": True,
+                        }
+                    ],
+                    ensure_ascii=True,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        write_channels("C04GENERAL1")
+        first_payloads = self.run_v2_loose_ingest("data/slack")
+        self.assertEqual(dict(first_payloads["commit"])["failed"], 0)
+
+        first_child_rel_path = retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
+        first_child_row = self.fetch_document_row(first_child_rel_path)
+        first_child_id = int(first_child_row["id"])
+
+        write_channels("C0000000004")
+        second_payloads = self.run_v2_loose_ingest("data/slack")
+        second_run_id = str(second_payloads["run_id"])
+        second_commit_payload = dict(second_payloads["commit"])
+
+        self.assertEqual(second_commit_payload["failed"], 0)
+        self.assertEqual(second_commit_payload["committed"], 2)
+        self.assertEqual(second_commit_payload["actions"], {"committed": 2})
+
+        updated_child_rel_path = retriever_tools.slack_reply_thread_rel_path("C0000000004", thread_ts)
+        updated_child_row = self.fetch_document_row(updated_child_rel_path)
+        self.assertEqual(int(updated_child_row["id"]), first_child_id)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            old_child_rows = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM documents
+                WHERE rel_path = ?
+                """,
+                (first_child_rel_path,),
+            ).fetchone()
+            failed_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM ingest_work_items
+                WHERE run_id = ?
+                  AND unit_type = 'slack_document'
+                  AND status = 'failed'
+                """,
+                (second_run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(int(old_child_rows[0] or 0), 0)
+        self.assertEqual(int(failed_count[0] or 0), 0)
+
+    def test_ingest_v2_commit_step_falls_back_after_slack_batch_failure(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        thread_ts = "1671235434.237949"
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Kickoff thread",
+                        "user": "U04SERGEY1",
+                        "ts": thread_ts,
+                        "thread_ts": thread_ts,
+                        "reply_count": 1,
+                    },
+                    {
+                        "type": "message",
+                        "text": "Standalone channel update",
+                        "user": "U04MAX0001",
+                        "ts": "1671235834.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (channel_dir / "2022-12-17.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Following up on kickoff",
+                        "user": "U04MAX0001",
+                        "ts": "1671321834.237949",
+                        "thread_ts": thread_ts,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        start_exit, start_payload, _, _ = self.run_cli(
+            "ingest-start",
+            str(self.root),
+            "--recursive",
+            "--path",
+            "data/slack",
+        )
+        self.assertEqual(start_exit, 0)
+        self.assertIsNotNone(start_payload)
+        run_id = str(start_payload["run_id"])
+
+        for command in ("ingest-plan-step", "ingest-prepare-step"):
+            exit_code, payload, _, _ = self.run_cli(command, str(self.root), "--run-id", run_id)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(payload)
+
+        real_batch_commit = retriever_tools.ingest_v2_commit_slack_document_batch
+        failed_once = False
+
+        def flaky_batch_commit(*args, **kwargs):
+            nonlocal failed_once
+            claimed_rows = list(kwargs.get("claimed_rows") or [])
+            if len(claimed_rows) > 1 and not failed_once:
+                failed_once = True
+                raise retriever_tools.RetrieverError("Synthetic Slack batch failure")
+            return real_batch_commit(*args, **kwargs)
+
+        with mock.patch.object(
+            retriever_tools,
+            "ingest_v2_commit_slack_document_batch",
+            side_effect=flaky_batch_commit,
+        ):
+            commit_exit, commit_payload, _, _ = self.run_cli(
+                "ingest-commit-step",
+                str(self.root),
+                "--run-id",
+                run_id,
+                "--budget-seconds",
+                "35",
+            )
+
+        self.assertEqual(commit_exit, 0)
+        self.assertIsNotNone(commit_payload)
+        self.assertEqual(commit_payload["failed"], 0)
+        self.assertEqual(commit_payload["committed"], 3)
+        self.assertEqual(commit_payload["actions"], {"committed": 3})
+        self.assertEqual(
+            commit_payload["batching"],
+            {
+                "mbox_message_batches": 0,
+                "mbox_message_batch_items": 0,
+                "mbox_message_batch_fallbacks": 0,
+                "pst_message_batches": 0,
+                "pst_message_batch_items": 0,
+                "pst_message_batch_fallbacks": 0,
+                "slack_document_batches": 1,
+                "slack_document_batch_items": 2,
+                "slack_document_batch_fallbacks": 1,
+            },
+        )
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "ingest-finalize-step",
+            str(self.root),
+            "--run-id",
+            run_id,
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertTrue(finalize_payload["finalization_complete"])
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            committed_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                      AND unit_type = 'slack_document'
+                      AND status = 'committed'
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            prepared_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                      AND unit_type = 'slack_document'
+                      AND status = 'prepared'
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(committed_count, 3)
+        self.assertEqual(prepared_count, 0)
 
     def test_ingest_v2_gmail_export_preserves_sidecar_enrichment(self) -> None:
         export_root = self.root / "gmail-filtered"
@@ -10221,49 +11195,46 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertIsNotNone(payload)
 
-        finalize_exit, finalize_payload, _, _ = self.run_cli(
-            "ingest-finalize-step",
-            str(self.root),
-            "--run-id",
-            run_id,
-            "--budget-seconds",
-            "35",
-        )
-        self.assertEqual(finalize_exit, 0)
-        self.assertIsNotNone(finalize_payload)
-        self.assertFalse(finalize_payload["finalization_complete"])
-        self.assertEqual(finalize_payload["run"]["phase"], "preparing")
-        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["conversation_preview"]["pending"], 1)
-
         with mock.patch.object(
             retriever_tools,
             "refresh_conversation_previews",
             side_effect=PermissionError("blocked preview write"),
         ):
-            run_exit, run_payload, _, _ = self.run_cli(
-                "ingest-run-step",
+            finalize_exit, finalize_payload, _, _ = self.run_cli(
+                "ingest-finalize-step",
                 str(self.root),
                 "--run-id",
                 run_id,
                 "--budget-seconds",
                 "35",
             )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertTrue(finalize_payload["finalization_complete"])
+        self.assertEqual(
+            finalize_payload["stages_completed"],
+            ["missing", "conversations", "conversation_previews", "prune", "complete"],
+        )
+        self.assertEqual(finalize_payload["run"]["phase"], "completed")
+        self.assertEqual(finalize_payload["run"]["status"], "completed")
+        self.assertEqual(finalize_payload["cursor"]["conversation_previews_refreshed"], 0)
+        self.assertEqual(finalize_payload["cursor"]["conversation_preview_failures"], 1)
+        self.assertIn("PermissionError", finalize_payload["cursor"]["conversation_preview_last_error"])
 
-        self.assertEqual(run_exit, 0)
-        self.assertIsNotNone(run_payload)
-        self.assertEqual(run_payload["run"]["status"], "completed")
-        self.assertEqual(run_payload["run"]["counts"]["by_unit_type"]["conversation_preview"]["failed"], 1)
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
-            failed_row = connection.execute(
-                """
-                SELECT last_error
-                FROM ingest_work_items
-                WHERE run_id = ?
-                  AND unit_type = 'conversation_preview'
-                """,
-                (run_id,),
-            ).fetchone()
+            preview_work_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                      AND unit_type = 'conversation_preview'
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+                or 0
+            )
             cursor_row = connection.execute(
                 """
                 SELECT cursor_json
@@ -10276,10 +11247,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             ).fetchone()
         finally:
             connection.close()
-        self.assertIsNotNone(failed_row)
-        self.assertIn("PermissionError", failed_row["last_error"])
+        self.assertEqual(preview_work_count, 0)
         self.assertIsNotNone(cursor_row)
-        self.assertEqual(json.loads(cursor_row["cursor_json"])["conversation_preview_failures"], 1)
+        cursor = json.loads(cursor_row["cursor_json"])
+        self.assertEqual(cursor["conversation_preview_failures"], 1)
+        self.assertIn("PermissionError", cursor["conversation_preview_last_error"])
 
     def test_ingest_v2_reingest_skips_unchanged_loose_file(self) -> None:
         raw_dir = self.root / "raw"
@@ -10329,16 +11301,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
 
         first_payloads = self.run_v2_loose_ingest("raw")
-        first_post_steps = list(first_payloads.get("post_finalize_run_steps") or [])
-        self.assertTrue(
-            any(
-                result.get("step") == "commit"
-                and result.get("actions") == {"conversation_preview": 1}
-                for payload in first_post_steps
-                for result in list(payload.get("step_results") or [])
-                if isinstance(result, dict)
-            )
-        )
+        self.assertFalse(first_payloads.get("post_finalize_run_steps"))
+        self.assertEqual(first_payloads["finalize"]["cursor"]["conversation_previews_refreshed"], 1)
 
         second_payloads = self.run_v2_loose_ingest("raw")
         self.assertEqual(second_payloads["plan"]["planned_loose_files"], 0)
@@ -10346,10 +11310,23 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(second_payloads["finalize"]["cursor"]["conversation_preview_active_count"], 1)
         self.assertEqual(second_payloads["finalize"]["cursor"]["conversation_preview_target_count"], 0)
         self.assertEqual(second_payloads["finalize"]["cursor"]["conversation_preview_skipped_fresh"], 1)
+        self.assertEqual(second_payloads["finalize"]["cursor"]["conversation_previews_refreshed"], 0)
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
-            preview_work_count = int(
+            first_preview_work_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                      AND unit_type = 'conversation_preview'
+                    """,
+                    (first_payloads["run_id"],),
+                ).fetchone()[0]
+                or 0
+            )
+            second_preview_work_count = int(
                 connection.execute(
                     """
                     SELECT COUNT(*)
@@ -10363,7 +11340,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             )
         finally:
             connection.close()
-        self.assertEqual(preview_work_count, 0)
+        self.assertEqual(first_preview_work_count, 0)
+        self.assertEqual(second_preview_work_count, 0)
 
     def test_ingest_v2_reingest_updates_modified_loose_file(self) -> None:
         raw_dir = self.root / "raw"

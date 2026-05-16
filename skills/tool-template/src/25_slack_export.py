@@ -1151,7 +1151,7 @@ def commit_prepared_slack_conversation(
         }
 
 
-def commit_prepared_slack_document(
+def commit_prepared_slack_document_in_transaction(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
     prepared_document: dict[str, object],
@@ -1159,7 +1159,6 @@ def commit_prepared_slack_document(
     dataset_id: int,
     dataset_source_id: int,
     current_batch: int | None,
-    before_transaction_commit=None,
 ) -> dict[str, object]:
     prepare_error = prepared_document.get("prepare_error")
     plan = dict(prepared_document.get("plan") or {})
@@ -1172,69 +1171,93 @@ def commit_prepared_slack_document(
             "rel_paths": [rel_path] if rel_path else [],
             "error": str(prepare_error),
         }
-
     source_locator = str(prepared_document.get("source_locator") or "")
     conversation_key = str(prepared_document.get("conversation_key") or "")
     conversation_type = str(prepared_document.get("conversation_type") or "")
     display_name = str(prepared_document.get("display_name") or "")
     document_kind = str(prepared_document.get("document_kind") or prepared_document.get("kind") or "")
+    conversation_id = upsert_conversation_row(
+        connection,
+        source_kind=SLACK_EXPORT_SOURCE_KIND,
+        source_locator=source_locator,
+        conversation_key=conversation_key,
+        conversation_type=conversation_type,
+        display_name=display_name,
+    )
+    existing_row = connection.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE rel_path = ?
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (rel_path,),
+    ).fetchone()
+    if document_kind == "day":
+        commit_payload = commit_prepared_slack_day_document(
+            connection,
+            paths,
+            prepared_document,
+            existing_row,
+            dataset_id=dataset_id,
+            dataset_source_id=dataset_source_id,
+            conversation_id=conversation_id,
+            current_batch=current_batch,
+        )
+        current_batch = commit_payload["current_batch"]
+    elif document_kind == "reply_thread":
+        commit_payload = commit_prepared_slack_thread_document(
+            connection,
+            paths,
+            prepared_document,
+            existing_row,
+            dataset_id=dataset_id,
+            dataset_source_id=dataset_source_id,
+            conversation_id=conversation_id,
+        )
+    else:
+        raise RetrieverError(f"Unsupported Slack document kind: {document_kind or '<missing>'}")
+    return {
+        "status": "ok",
+        "action": "committed",
+        "current_batch": current_batch,
+        "new": int(commit_payload["new"]),
+        "updated": int(commit_payload["updated"]),
+        "affected_document_ids": [int(commit_payload["document_id"])],
+        "rel_paths": [rel_path] if rel_path else [],
+        "source_locator": source_locator,
+        "conversation_key": conversation_key,
+        "document_kind": document_kind,
+        "conversation_lead_document": bool(prepared_document.get("conversation_lead_document")),
+    }
+
+
+def commit_prepared_slack_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    prepared_document: dict[str, object],
+    *,
+    dataset_id: int,
+    dataset_source_id: int,
+    current_batch: int | None,
+    before_transaction_commit=None,
+) -> dict[str, object]:
+    plan = dict(prepared_document.get("plan") or {})
+    rel_path = str(plan.get("rel_path") or "")
+    current_batch_value = current_batch
     connection.execute("BEGIN")
     try:
-        conversation_id = upsert_conversation_row(
+        result = commit_prepared_slack_document_in_transaction(
             connection,
-            source_kind=SLACK_EXPORT_SOURCE_KIND,
-            source_locator=source_locator,
-            conversation_key=conversation_key,
-            conversation_type=conversation_type,
-            display_name=display_name,
+            paths,
+            prepared_document,
+            dataset_id=dataset_id,
+            dataset_source_id=dataset_source_id,
+            current_batch=current_batch_value,
         )
-        existing_row = connection.execute(
-            """
-            SELECT *
-            FROM documents
-            WHERE rel_path = ?
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            (rel_path,),
-        ).fetchone()
-        if document_kind == "day":
-            commit_payload = commit_prepared_slack_day_document(
-                connection,
-                paths,
-                prepared_document,
-                existing_row,
-                dataset_id=dataset_id,
-                dataset_source_id=dataset_source_id,
-                conversation_id=conversation_id,
-                current_batch=current_batch,
-            )
-            current_batch = commit_payload["current_batch"]
-        elif document_kind == "reply_thread":
-            commit_payload = commit_prepared_slack_thread_document(
-                connection,
-                paths,
-                prepared_document,
-                existing_row,
-                dataset_id=dataset_id,
-                dataset_source_id=dataset_source_id,
-                conversation_id=conversation_id,
-            )
-        else:
-            raise RetrieverError(f"Unsupported Slack document kind: {document_kind or '<missing>'}")
-        result = {
-            "status": "ok",
-            "action": "committed",
-            "current_batch": current_batch,
-            "new": int(commit_payload["new"]),
-            "updated": int(commit_payload["updated"]),
-            "affected_document_ids": [int(commit_payload["document_id"])],
-            "rel_paths": [rel_path] if rel_path else [],
-            "source_locator": source_locator,
-            "conversation_key": conversation_key,
-            "document_kind": document_kind,
-            "conversation_lead_document": bool(prepared_document.get("conversation_lead_document")),
-        }
+        if result.get("current_batch") is not None:
+            current_batch_value = result.get("current_batch")
         if before_transaction_commit is not None:
             before_transaction_commit(connection, result)
         connection.commit()
@@ -1244,7 +1267,7 @@ def commit_prepared_slack_document(
         return {
             "status": "failed",
             "action": "failed",
-            "current_batch": current_batch,
+            "current_batch": current_batch_value,
             "rel_paths": [rel_path] if rel_path else [],
             "error": f"{type(exc).__name__}: {exc}",
         }

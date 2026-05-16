@@ -1451,6 +1451,33 @@ def remove_stale_sqlite_artifacts(db_path: Path) -> list[str]:
     return removed
 
 
+def best_effort_reset_sqlite_artifacts(db_path: Path) -> list[str]:
+    reset_paths: list[str] = []
+    for path in sqlite_artifact_paths(db_path):
+        if not path.exists():
+            continue
+        try:
+            if path == db_path:
+                with path.open("wb"):
+                    pass
+                reset_paths.append(str(path))
+                continue
+            path.unlink()
+            reset_paths.append(str(path))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            if path == db_path:
+                raise
+            try:
+                with path.open("wb"):
+                    pass
+                reset_paths.append(str(path))
+            except OSError:
+                continue
+    return reset_paths
+
+
 def current_journal_mode(connection: sqlite3.Connection) -> str | None:
     row = connection.execute("PRAGMA journal_mode").fetchone()
     if row is None or row[0] in (None, ""):
@@ -1491,7 +1518,64 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
                 f"WAL failed with {type(wal_error).__name__}: {wal_error}; "
                 f"DELETE failed with {type(exc).__name__}: {exc}"
             ) from exc
+    if journal_mode == "wal":
+        connection.execute("PRAGMA synchronous = NORMAL")
     return connection
+
+
+def sqlite_bootstrap_seed_required(db_path: Path, error: Exception) -> bool:
+    db_size = file_size_bytes(db_path)
+    if db_size not in (None, 0):
+        return False
+    if isinstance(error, RetrieverError):
+        detail = normalize_whitespace(str(error or "")).lower()
+        return (
+            "unable to configure sqlite journal mode" in detail
+            or "disk i/o error" in detail
+            or "unable to open database file" in detail
+            or "readonly" in detail
+            or "read-only" in detail
+            or "permission denied" in detail
+        )
+    return isinstance(error, (sqlite3.DatabaseError, OSError, PermissionError))
+
+
+def seed_sqlite_db_from_local_temp(db_path: Path) -> dict[str, object]:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    reset_artifacts = best_effort_reset_sqlite_artifacts(db_path)
+    seed_file = tempfile.NamedTemporaryFile(
+        prefix="retriever-seed-",
+        suffix=".db",
+        delete=False,
+    )
+    seed_path = Path(seed_file.name)
+    seed_file.close()
+    seed_journal_mode: str | None = None
+    try:
+        seed_connection = sqlite3.connect(seed_path)
+        try:
+            try:
+                seed_journal_mode = set_journal_mode(seed_connection, "WAL")
+            except sqlite3.DatabaseError:
+                seed_journal_mode = None
+            if seed_journal_mode != "wal":
+                seed_journal_mode = set_journal_mode(seed_connection, "DELETE")
+        finally:
+            seed_connection.close()
+        with seed_path.open("rb") as src_handle:
+            db_path.write_bytes(src_handle.read())
+        return {
+            "journal_mode": seed_journal_mode or "delete",
+            "reset_artifacts": reset_artifacts,
+        }
+    finally:
+        for artifact in sqlite_artifact_paths(seed_path):
+            try:
+                artifact.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
 
 
 def file_size_bytes(path: Path) -> int | None:
