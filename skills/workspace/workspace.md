@@ -117,7 +117,7 @@ Write a JSON object with these fields:
 
 ```json
 {
-  "tool_version": "1.1.16",
+  "tool_version": "1.1.17",
   "schema_version": 26,
   "requirements_version": "2026-04-21-phase11-document-deduplication",
   "template_source": "skills/tool-template/tools.py",
