@@ -41,7 +41,7 @@ from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from zoneinfo import ZoneInfo
@@ -33019,6 +33019,7 @@ def ingest_v2_begin_mbox_source_plan(
             message_count=message_count,
             skip_source=True,
             commit_order=commit_order,
+            source_action="skipped",
             linked_drive_rel_paths=list(gmail_payload.get("linked_drive_rel_paths") or []),
         )
         return None, commit_order + 1, True
@@ -33026,6 +33027,7 @@ def ingest_v2_begin_mbox_source_plan(
         {
             "source_rel_path": rel_path,
             "source_plan_kind": source_plan_kind,
+            "source_action": "new" if existing_source is None else "updated",
             "source_file_size": source_file_size,
             "source_file_mtime": source_file_mtime,
             "source_file_hash": source_file_hash,
@@ -33178,6 +33180,7 @@ def ingest_v2_plan_current_mbox_source(
         run_id=run_id,
         source_rel_path=source_rel_path,
         source_plan_kind=source_plan_kind,
+        source_action=str(current_mbox_source.get("source_action") or "updated"),
         source_file_size=(
             int(current_mbox_source["source_file_size"])
             if current_mbox_source.get("source_file_size") is not None
@@ -33315,11 +33318,16 @@ def ingest_v2_plan_pst_source_finalizer_item(
     skip_source: bool,
     commit_order: int,
     source_plan_kind: str = "pst",
+    source_action: str | None = None,
 ) -> bool:
     now = utc_now()
+    normalized_source_action = normalize_whitespace(str(source_action or "")) or (
+        "skipped" if skip_source else "updated"
+    )
     payload = {
         "source_rel_path": source_rel_path,
         "source_plan_kind": source_plan_kind,
+        "source_action": normalized_source_action,
         "source_file_size": source_file_size,
         "source_file_mtime": source_file_mtime,
         "source_file_hash": source_file_hash,
@@ -33406,12 +33414,14 @@ def ingest_v2_begin_pst_source_plan(
             message_count=message_count,
             skip_source=True,
             commit_order=commit_order,
+            source_action="skipped",
         )
         return None, commit_order + 1, True
     return (
         {
             "source_rel_path": rel_path,
             "source_plan_kind": source_plan_kind,
+            "source_action": "new" if existing_source is None else "updated",
             "source_file_size": source_file_size,
             "source_file_mtime": source_file_mtime,
             "source_file_hash": source_file_hash,
@@ -33529,6 +33539,7 @@ def ingest_v2_plan_current_pst_source(
         run_id=run_id,
         source_rel_path=source_rel_path,
         source_plan_kind=source_plan_kind,
+        source_action=str(current_pst_source.get("source_action") or "updated"),
         source_file_size=(
             int(current_pst_source["source_file_size"])
             if current_pst_source.get("source_file_size") is not None
@@ -34829,97 +34840,96 @@ def ingest_v2_pst_message_from_payload(payload: dict[str, object]) -> dict[str, 
     return restored
 
 
-def ingest_v2_prepare_mbox_message_item(
-    root: Path,
-    work_item_row: sqlite3.Row,
-    *,
-    deadline: float,
-) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+def ingest_v2_container_source_config(source_kind: str) -> dict[str, object]:
+    if source_kind == MBOX_SOURCE_KIND:
+        return {
+            "source_label": "MBOX",
+            "source_plan_kind_default": "mbox",
+            "message_payload_kind": "mbox_message",
+            "source_finalizer_payload_kind": "mbox_source_finalizer",
+            "message_commit_event_type": "commit_mbox_message",
+            "source_stats_key": "mbox_stats",
+            "created_stat_key": "mbox_messages_created",
+            "updated_stat_key": "mbox_messages_updated",
+            "skipped_stat_key": "mbox_sources_skipped",
+            "finalized_stat_key": "mbox_sources_finalized",
+            "deleted_stat_key": "mbox_messages_deleted",
+            "commit_batch_max_items": INGEST_V2_MBOX_COMMIT_BATCH_MAX_ITEMS,
+            "commit_batch_max_payload_bytes": INGEST_V2_MBOX_COMMIT_BATCH_MAX_PAYLOAD_BYTES,
+            "dataset_name_builder": mbox_dataset_name,
+        }
+    if source_kind == PST_SOURCE_KIND:
+        return {
+            "source_label": "PST",
+            "source_plan_kind_default": "pst",
+            "message_payload_kind": "pst_message",
+            "source_finalizer_payload_kind": "pst_source_finalizer",
+            "message_commit_event_type": "commit_pst_message",
+            "source_stats_key": "pst_stats",
+            "created_stat_key": "pst_messages_created",
+            "updated_stat_key": "pst_messages_updated",
+            "skipped_stat_key": "pst_sources_skipped",
+            "finalized_stat_key": "pst_sources_finalized",
+            "deleted_stat_key": "pst_messages_deleted",
+            "commit_batch_max_items": INGEST_V2_PST_COMMIT_BATCH_MAX_ITEMS,
+            "commit_batch_max_payload_bytes": INGEST_V2_PST_COMMIT_BATCH_MAX_PAYLOAD_BYTES,
+            "dataset_name_builder": pst_dataset_name,
+        }
+    raise RetrieverError(f"Unsupported container source kind: {source_kind!r}")
+
+
+def ingest_v2_work_item_payload_dict(work_item_row: sqlite3.Row) -> dict[str, object]:
     payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
-    payload_dict = payload if isinstance(payload, dict) else {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def ingest_v2_build_container_source_fingerprint(
+    root: Path,
+    payload_dict: dict[str, object],
+    *,
+    include_message_key: bool = False,
+) -> dict[str, object]:
     source_rel_path = str(payload_dict.get("source_rel_path") or "")
     path = ingest_v2_cursor_path(root, source_rel_path)
     source_fingerprint = {
         "source_rel_path": source_rel_path,
         "message_index": payload_dict.get("message_index"),
-        "message_key": payload_dict.get("message_key"),
         "source_item_id": payload_dict.get("source_item_id"),
         "size": file_size_bytes(path),
         "mtime": file_mtime_timestamp(path),
         "hash": payload_dict.get("source_file_hash"),
     }
-    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
-        return None, source_fingerprint, "Not enough budget remaining to start prepare."
-    if (
-        payload_dict.get("source_file_size") is not None
-        and int(payload_dict.get("source_file_size") or 0) != int(source_fingerprint["size"] or 0)
-    ):
-        return (
-            {
-                "prepare_error": f"MBOX source changed after planning: {source_rel_path}",
-                "prepare_ms": 0.0,
-                "prepare_hash_ms": 0.0,
-                "prepare_extract_ms": 0.0,
-                "prepare_chunk_ms": 0.0,
-                "source_rel_path": source_rel_path,
-                "source_item_id": str(payload_dict.get("source_item_id") or ""),
-            },
-            source_fingerprint,
-            None,
-        )
-    prepare_started = time.perf_counter()
-    raw_message = ingest_v2_mbox_message_from_payload(root, payload_dict)
-    source_plan_kind = str(payload_dict.get("source_plan_kind") or "mbox")
-    if source_plan_kind == "gmail":
-        def normalize_v2_gmail_message(
-            source_rel_path_for_message: str,
-            message_dict: dict[str, object],
-        ) -> dict[str, object] | None:
-            normalized = normalize_mbox_message(source_rel_path_for_message, message_dict)
-            message_metadata = dict(payload_dict.get("message_metadata") or {})
-            linked_drive_records = [
-                dict(record)
-                for record in list(payload_dict.get("linked_drive_records") or [])
-                if isinstance(record, dict)
-            ]
-            linked_drive_attachment_records = [
-                ingest_v2_gmail_drive_record_from_payload(root, dict(record))
-                for record in list(payload_dict.get("linked_drive_attachment_records") or [])
-                if isinstance(record, dict)
-            ]
-            extracted = apply_gmail_email_export_metadata(
-                dict(normalized["extracted"]),
-                message_metadata=message_metadata,
-                linked_drive_records=linked_drive_records,
-            )
-            attachment_payloads = [
-                attachment
-                for attachment in (
-                    gmail_drive_attachment_payload(dict(record))
-                    for record in linked_drive_attachment_records
-                )
-                if attachment is not None
-            ]
-            if attachment_payloads:
-                extracted["attachments"] = [*list(extracted.get("attachments") or []), *attachment_payloads]
-            normalized["extracted"] = extracted
-            normalized["file_hash"] = gmail_enriched_message_file_hash(
-                normalized.get("file_hash"),
-                message_metadata=message_metadata,
-                linked_drive_records=linked_drive_records,
-                linked_drive_attachment_records=linked_drive_attachment_records,
-            )
-            return normalized
+    if include_message_key:
+        source_fingerprint["message_key"] = payload_dict.get("message_key")
+    return source_fingerprint
 
-        normalize_message = normalize_v2_gmail_message
-    else:
-        normalize_message = normalize_mbox_message
-    prepared_item = prepare_container_message_item(
-        source_rel_path,
-        raw_message,
-        normalize_message,
-    )
-    prepared_item["source_kind"] = MBOX_SOURCE_KIND
+
+def ingest_v2_prepare_source_changed_item(
+    source_label: str,
+    source_rel_path: str,
+    source_item_id: object,
+) -> dict[str, object]:
+    return {
+        "prepare_error": f"{source_label} source changed after planning: {source_rel_path}",
+        "prepare_ms": 0.0,
+        "prepare_hash_ms": 0.0,
+        "prepare_extract_ms": 0.0,
+        "prepare_chunk_ms": 0.0,
+        "source_rel_path": source_rel_path,
+        "source_item_id": str(source_item_id or ""),
+    }
+
+
+def ingest_v2_finalize_prepared_container_message_item(
+    prepared_item: dict[str, object],
+    payload_dict: dict[str, object],
+    *,
+    source_kind: str,
+    source_plan_kind: str,
+    source_rel_path: str,
+    prepare_started: float,
+) -> dict[str, object]:
+    prepared_item["source_kind"] = source_kind
     prepared_item["source_plan_kind"] = source_plan_kind
     prepared_item["source_rel_path"] = source_rel_path
     prepared_item["scan_started_at"] = str(payload_dict["scan_started_at"])
@@ -34927,51 +34937,69 @@ def ingest_v2_prepare_mbox_message_item(
     prepared_item["source_file_mtime"] = payload_dict.get("source_file_mtime")
     prepared_item["source_file_hash"] = payload_dict.get("source_file_hash")
     prepared_item["prepare_hash_ms"] = 0.0
-    prepared_item["prepare_extract_ms"] = max(0.0, float(prepared_item.get("prepare_ms") or 0.0) - float(prepared_item.get("prepare_chunk_ms") or 0.0))
+    prepared_item["prepare_extract_ms"] = max(
+        0.0,
+        float(prepared_item.get("prepare_ms") or 0.0)
+        - float(prepared_item.get("prepare_chunk_ms") or 0.0),
+    )
     prepared_item["prepare_total_step_ms"] = ingest_v2_elapsed_ms(prepare_started)
-    return prepared_item, source_fingerprint, None
+    return prepared_item
 
 
-def ingest_v2_prepare_pst_message_item(
+def ingest_v2_build_mbox_message_normalizer(
     root: Path,
-    work_item_row: sqlite3.Row,
-    *,
-    deadline: float,
-) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
-    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
-    payload_dict = payload if isinstance(payload, dict) else {}
-    source_rel_path = str(payload_dict.get("source_rel_path") or "")
-    path = ingest_v2_cursor_path(root, source_rel_path)
-    source_fingerprint = {
-        "source_rel_path": source_rel_path,
-        "message_index": payload_dict.get("message_index"),
-        "source_item_id": payload_dict.get("source_item_id"),
-        "size": file_size_bytes(path),
-        "mtime": file_mtime_timestamp(path),
-        "hash": payload_dict.get("source_file_hash"),
-    }
-    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
-        return None, source_fingerprint, "Not enough budget remaining to start prepare."
-    if (
-        payload_dict.get("source_file_size") is not None
-        and int(payload_dict.get("source_file_size") or 0) != int(source_fingerprint["size"] or 0)
-    ):
-        return (
-            {
-                "prepare_error": f"PST source changed after planning: {source_rel_path}",
-                "prepare_ms": 0.0,
-                "prepare_hash_ms": 0.0,
-                "prepare_extract_ms": 0.0,
-                "prepare_chunk_ms": 0.0,
-                "source_rel_path": source_rel_path,
-                "source_item_id": str(payload_dict.get("source_item_id") or ""),
-            },
-            source_fingerprint,
-            None,
+    payload_dict: dict[str, object],
+) -> Callable[[str, dict[str, object]], dict[str, object] | None]:
+    source_plan_kind = str(payload_dict.get("source_plan_kind") or "mbox")
+    if source_plan_kind != "gmail":
+        return normalize_mbox_message
+
+    def normalize_v2_gmail_message(
+        source_rel_path_for_message: str,
+        message_dict: dict[str, object],
+    ) -> dict[str, object] | None:
+        normalized = normalize_mbox_message(source_rel_path_for_message, message_dict)
+        message_metadata = dict(payload_dict.get("message_metadata") or {})
+        linked_drive_records = [
+            dict(record)
+            for record in list(payload_dict.get("linked_drive_records") or [])
+            if isinstance(record, dict)
+        ]
+        linked_drive_attachment_records = [
+            ingest_v2_gmail_drive_record_from_payload(root, dict(record))
+            for record in list(payload_dict.get("linked_drive_attachment_records") or [])
+            if isinstance(record, dict)
+        ]
+        extracted = apply_gmail_email_export_metadata(
+            dict(normalized["extracted"]),
+            message_metadata=message_metadata,
+            linked_drive_records=linked_drive_records,
         )
-    prepare_started = time.perf_counter()
-    raw_message = ingest_v2_pst_message_from_payload(payload_dict)
-    source_plan_kind = str(payload_dict.get("source_plan_kind") or "pst")
+        attachment_payloads = [
+            attachment
+            for attachment in (
+                gmail_drive_attachment_payload(dict(record))
+                for record in linked_drive_attachment_records
+            )
+            if attachment is not None
+        ]
+        if attachment_payloads:
+            extracted["attachments"] = [*list(extracted.get("attachments") or []), *attachment_payloads]
+        normalized["extracted"] = extracted
+        normalized["file_hash"] = gmail_enriched_message_file_hash(
+            normalized.get("file_hash"),
+            message_metadata=message_metadata,
+            linked_drive_records=linked_drive_records,
+            linked_drive_attachment_records=linked_drive_attachment_records,
+        )
+        return normalized
+
+    return normalize_v2_gmail_message
+
+
+def ingest_v2_build_pst_message_normalizer(
+    payload_dict: dict[str, object],
+) -> Callable[[str, dict[str, object]], dict[str, object] | None]:
     exact_metadata_by_source_item = {
         str(key): dict(value)
         for key, value in dict(payload_dict.get("message_metadata_by_source_item") or {}).items()
@@ -35009,71 +35037,146 @@ def ingest_v2_prepare_pst_message_item(
         )
         return enriched
 
+    return normalize_v2_pst_message
+
+
+def ingest_v2_prepare_container_message_item(
+    root: Path,
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+    source_kind: str,
+    raw_message_loader: Callable[[dict[str, object]], dict[str, object]],
+    normalize_message_builder: Callable[
+        [dict[str, object]],
+        Callable[[str, dict[str, object]], dict[str, object] | None],
+    ],
+    include_message_key: bool = False,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    container_config = ingest_v2_container_source_config(source_kind)
+    payload_dict = ingest_v2_work_item_payload_dict(work_item_row)
+    source_rel_path = str(payload_dict.get("source_rel_path") or "")
+    source_fingerprint = ingest_v2_build_container_source_fingerprint(
+        root,
+        payload_dict,
+        include_message_key=include_message_key,
+    )
+    if ingest_v2_deadline_remaining_seconds(deadline) < INGEST_V2_PREPARE_MIN_START_SECONDS:
+        return None, source_fingerprint, "Not enough budget remaining to start prepare."
+    if (
+        payload_dict.get("source_file_size") is not None
+        and int(payload_dict.get("source_file_size") or 0) != int(source_fingerprint["size"] or 0)
+    ):
+        return (
+            ingest_v2_prepare_source_changed_item(
+                str(container_config["source_label"]),
+                source_rel_path,
+                payload_dict.get("source_item_id"),
+            ),
+            source_fingerprint,
+            None,
+        )
+    prepare_started = time.perf_counter()
     prepared_item = prepare_container_message_item(
         source_rel_path,
-        raw_message,
-        normalize_v2_pst_message,
+        raw_message_loader(payload_dict),
+        normalize_message_builder(payload_dict),
     )
-    prepared_item["source_kind"] = PST_SOURCE_KIND
-    prepared_item["source_plan_kind"] = source_plan_kind
-    prepared_item["source_rel_path"] = source_rel_path
-    prepared_item["scan_started_at"] = str(payload_dict["scan_started_at"])
-    prepared_item["source_file_size"] = payload_dict.get("source_file_size")
-    prepared_item["source_file_mtime"] = payload_dict.get("source_file_mtime")
-    prepared_item["source_file_hash"] = payload_dict.get("source_file_hash")
-    prepared_item["prepare_hash_ms"] = 0.0
-    prepared_item["prepare_extract_ms"] = max(0.0, float(prepared_item.get("prepare_ms") or 0.0) - float(prepared_item.get("prepare_chunk_ms") or 0.0))
-    prepared_item["prepare_total_step_ms"] = ingest_v2_elapsed_ms(prepare_started)
+    source_plan_kind = str(
+        payload_dict.get("source_plan_kind") or container_config["source_plan_kind_default"]
+    )
+    return (
+        ingest_v2_finalize_prepared_container_message_item(
+            prepared_item,
+            payload_dict,
+            source_kind=source_kind,
+            source_plan_kind=source_plan_kind,
+            source_rel_path=source_rel_path,
+            prepare_started=prepare_started,
+        ),
+        source_fingerprint,
+        None,
+    )
+
+
+def ingest_v2_prepare_mbox_message_item(
+    root: Path,
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    return ingest_v2_prepare_container_message_item(
+        root,
+        work_item_row,
+        deadline=deadline,
+        source_kind=MBOX_SOURCE_KIND,
+        raw_message_loader=lambda payload_dict: ingest_v2_mbox_message_from_payload(root, payload_dict),
+        normalize_message_builder=lambda payload_dict: ingest_v2_build_mbox_message_normalizer(root, payload_dict),
+        include_message_key=True,
+    )
+
+
+def ingest_v2_prepare_pst_message_item(
+    root: Path,
+    work_item_row: sqlite3.Row,
+    *,
+    deadline: float,
+) -> tuple[dict[str, object] | None, dict[str, object], str | None]:
+    return ingest_v2_prepare_container_message_item(
+        root,
+        work_item_row,
+        deadline=deadline,
+        source_kind=PST_SOURCE_KIND,
+        raw_message_loader=ingest_v2_pst_message_from_payload,
+        normalize_message_builder=ingest_v2_build_pst_message_normalizer,
+    )
+
+
+def ingest_v2_prepare_container_source_finalizer_item_common(
+    work_item_row: sqlite3.Row,
+    *,
+    source_kind: str,
+    payload_kind: str | None = None,
+) -> tuple[dict[str, object], dict[str, object], None]:
+    payload_dict = ingest_v2_work_item_payload_dict(work_item_row)
+    prepared_item = {
+        **payload_dict,
+        "source_kind": source_kind,
+        "prepare_ms": 0.0,
+        "prepare_hash_ms": 0.0,
+        "prepare_extract_ms": 0.0,
+        "prepare_chunk_ms": 0.0,
+        "prepare_error": None,
+    }
+    if payload_kind is not None:
+        prepared_item["payload_kind"] = payload_kind
+    source_fingerprint = {
+        "source_rel_path": payload_dict.get("source_rel_path"),
+        "size": payload_dict.get("source_file_size"),
+        "mtime": payload_dict.get("source_file_mtime"),
+        "hash": payload_dict.get("source_file_hash"),
+        "message_count": payload_dict.get("message_count"),
+    }
     return prepared_item, source_fingerprint, None
 
 
 def ingest_v2_prepare_mbox_source_finalizer_item(
     work_item_row: sqlite3.Row,
 ) -> tuple[dict[str, object], dict[str, object], None]:
-    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
-    payload_dict = payload if isinstance(payload, dict) else {}
-    prepared_item = {
-        **payload_dict,
-        "source_kind": MBOX_SOURCE_KIND,
-        "prepare_ms": 0.0,
-        "prepare_hash_ms": 0.0,
-        "prepare_extract_ms": 0.0,
-        "prepare_chunk_ms": 0.0,
-        "prepare_error": None,
-    }
-    source_fingerprint = {
-        "source_rel_path": payload_dict.get("source_rel_path"),
-        "size": payload_dict.get("source_file_size"),
-        "mtime": payload_dict.get("source_file_mtime"),
-        "hash": payload_dict.get("source_file_hash"),
-        "message_count": payload_dict.get("message_count"),
-    }
-    return prepared_item, source_fingerprint, None
+    return ingest_v2_prepare_container_source_finalizer_item_common(
+        work_item_row,
+        source_kind=MBOX_SOURCE_KIND,
+    )
 
 
 def ingest_v2_prepare_pst_source_finalizer_item(
     work_item_row: sqlite3.Row,
 ) -> tuple[dict[str, object], dict[str, object], None]:
-    payload = decode_json_text(work_item_row["payload_json"], default={}) or {}
-    payload_dict = payload if isinstance(payload, dict) else {}
-    prepared_item = {
-        **payload_dict,
-        "payload_kind": "pst_source_finalizer",
-        "source_kind": PST_SOURCE_KIND,
-        "prepare_ms": 0.0,
-        "prepare_hash_ms": 0.0,
-        "prepare_extract_ms": 0.0,
-        "prepare_chunk_ms": 0.0,
-        "prepare_error": None,
-    }
-    source_fingerprint = {
-        "source_rel_path": payload_dict.get("source_rel_path"),
-        "size": payload_dict.get("source_file_size"),
-        "mtime": payload_dict.get("source_file_mtime"),
-        "hash": payload_dict.get("source_file_hash"),
-        "message_count": payload_dict.get("message_count"),
-    }
-    return prepared_item, source_fingerprint, None
+    return ingest_v2_prepare_container_source_finalizer_item_common(
+        work_item_row,
+        source_kind=PST_SOURCE_KIND,
+        payload_kind="pst_source_finalizer",
+    )
 
 
 def ingest_v2_hydrate_prepared_production_item(prepared_item: dict[str, object]) -> dict[str, object]:
@@ -36146,17 +36249,18 @@ def ingest_v2_claim_additional_slack_commit_items(
         raise
 
 
-def ingest_v2_claim_additional_mbox_commit_items(
+def ingest_v2_claim_additional_container_commit_items(
     connection: sqlite3.Connection,
     *,
     run_id: str,
     writer_id: str,
     source_rel_path: str,
     current_payload_bytes: int,
-    max_items: int = INGEST_V2_MBOX_COMMIT_BATCH_MAX_ITEMS,
-    max_payload_bytes: int = INGEST_V2_MBOX_COMMIT_BATCH_MAX_PAYLOAD_BYTES,
+    source_kind: str,
 ) -> list[sqlite3.Row]:
-    remaining_item_slots = max(0, int(max_items or 0) - 1)
+    container_config = ingest_v2_container_source_config(source_kind)
+    max_items = int(container_config["commit_batch_max_items"])
+    remaining_item_slots = max(0, max_items - 1)
     if remaining_item_slots <= 0:
         return []
     now_dt = datetime.now(timezone.utc)
@@ -36191,9 +36295,11 @@ def ingest_v2_claim_additional_mbox_commit_items(
         ).fetchall()
         selected_rows: list[sqlite3.Row] = []
         selected_ids: list[int] = []
+        payload_kind = str(container_config["message_payload_kind"])
+        max_payload_bytes = int(container_config["commit_batch_max_payload_bytes"])
         payload_bytes_total = max(0, int(current_payload_bytes or 0))
         for candidate_row in candidate_rows:
-            if str(candidate_row["payload_kind"] or candidate_row["unit_type"] or "") != "mbox_message":
+            if str(candidate_row["payload_kind"] or candidate_row["unit_type"] or "") != payload_kind:
                 break
             try:
                 candidate_prepared_item = ingest_v2_prepared_item_from_row(candidate_row)
@@ -36204,9 +36310,7 @@ def ingest_v2_claim_additional_mbox_commit_items(
             if str(candidate_prepared_item.get("source_rel_path") or "") != source_rel_path:
                 break
             candidate_payload_bytes = int(candidate_row["payload_bytes"] or 0)
-            if selected_rows and payload_bytes_total + candidate_payload_bytes > int(max_payload_bytes or 0):
-                break
-            if not selected_rows and payload_bytes_total + candidate_payload_bytes > int(max_payload_bytes or 0):
+            if payload_bytes_total + candidate_payload_bytes > max_payload_bytes:
                 break
             selected_rows.append(candidate_row)
             selected_ids.append(int(candidate_row["id"]))
@@ -36246,6 +36350,24 @@ def ingest_v2_claim_additional_mbox_commit_items(
     except Exception:
         connection.rollback()
         raise
+
+
+def ingest_v2_claim_additional_mbox_commit_items(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    writer_id: str,
+    source_rel_path: str,
+    current_payload_bytes: int,
+) -> list[sqlite3.Row]:
+    return ingest_v2_claim_additional_container_commit_items(
+        connection,
+        run_id=run_id,
+        writer_id=writer_id,
+        source_rel_path=source_rel_path,
+        current_payload_bytes=current_payload_bytes,
+        source_kind=MBOX_SOURCE_KIND,
+    )
 
 
 def ingest_v2_claim_additional_pst_commit_items(
@@ -36255,99 +36377,15 @@ def ingest_v2_claim_additional_pst_commit_items(
     writer_id: str,
     source_rel_path: str,
     current_payload_bytes: int,
-    max_items: int = INGEST_V2_PST_COMMIT_BATCH_MAX_ITEMS,
-    max_payload_bytes: int = INGEST_V2_PST_COMMIT_BATCH_MAX_PAYLOAD_BYTES,
 ) -> list[sqlite3.Row]:
-    remaining_item_slots = max(0, int(max_items or 0) - 1)
-    if remaining_item_slots <= 0:
-        return []
-    now_dt = datetime.now(timezone.utc)
-    now = format_utc_timestamp(now_dt)
-    lease_expires_at = lease_expiration_after(INGEST_V2_WORK_ITEM_LEASE_SECONDS, now=now_dt)
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        run_row = require_ingest_v2_run_row(connection, run_id)
-        if (
-            str(run_row["phase"]) != "committing"
-            or str(run_row["status"]) != "committing"
-            or run_row["cancel_requested_at"] is not None
-            or run_row["committer_lease_owner"] != writer_id
-            or not lease_is_active(run_row["committer_lease_expires_at"], now=now_dt)
-        ):
-            connection.rollback()
-            return []
-        candidate_rows = connection.execute(
-            """
-            SELECT wi.*, pi.payload_kind, pi.payload_bytes,
-                   pi.payload_json AS prepared_payload_json,
-                   pi.spill_rel_path AS prepared_spill_rel_path,
-                   pi.source_fingerprint_json, pi.error_json
-            FROM ingest_work_items wi
-            JOIN ingest_prepared_items pi ON pi.work_item_id = wi.id
-            WHERE wi.run_id = ?
-              AND wi.status = 'prepared'
-            ORDER BY wi.commit_order ASC, wi.id ASC
-            LIMIT ?
-            """,
-            (run_id, remaining_item_slots),
-        ).fetchall()
-        selected_rows: list[sqlite3.Row] = []
-        selected_ids: list[int] = []
-        payload_bytes_total = max(0, int(current_payload_bytes or 0))
-        for candidate_row in candidate_rows:
-            if str(candidate_row["payload_kind"] or candidate_row["unit_type"] or "") != "pst_message":
-                break
-            try:
-                candidate_prepared_item = ingest_v2_prepared_item_from_row(candidate_row)
-            except Exception:
-                break
-            if bool(candidate_prepared_item.get("skip")):
-                break
-            if str(candidate_prepared_item.get("source_rel_path") or "") != source_rel_path:
-                break
-            candidate_payload_bytes = int(candidate_row["payload_bytes"] or 0)
-            if selected_rows and payload_bytes_total + candidate_payload_bytes > int(max_payload_bytes or 0):
-                break
-            if not selected_rows and payload_bytes_total + candidate_payload_bytes > int(max_payload_bytes or 0):
-                break
-            selected_rows.append(candidate_row)
-            selected_ids.append(int(candidate_row["id"]))
-            payload_bytes_total += candidate_payload_bytes
-        if not selected_ids:
-            connection.commit()
-            return []
-        placeholders = ",".join("?" for _ in selected_ids)
-        update_cursor = connection.execute(
-            f"""
-            UPDATE ingest_work_items
-            SET status = 'committing',
-                lease_owner = ?,
-                lease_expires_at = ?,
-                updated_at = ?
-            WHERE run_id = ?
-              AND id IN ({placeholders})
-              AND status = 'prepared'
-            """,
-            (writer_id, lease_expires_at, now, run_id, *selected_ids),
-        )
-        if int(update_cursor.rowcount or 0) != len(selected_ids):
-            connection.rollback()
-            return []
-        connection.execute(
-            """
-            UPDATE ingest_runs
-            SET committer_heartbeat_at = ?,
-                last_heartbeat_at = ?
-            WHERE run_id = ?
-              AND committer_lease_owner = ?
-            """,
-            (now, now, run_id, writer_id),
-        )
-        connection.commit()
-        return selected_rows
-    except Exception:
-        connection.rollback()
-        raise
+    return ingest_v2_claim_additional_container_commit_items(
+        connection,
+        run_id=run_id,
+        writer_id=writer_id,
+        source_rel_path=source_rel_path,
+        current_payload_bytes=current_payload_bytes,
+        source_kind=PST_SOURCE_KIND,
+    )
 
 
 def ingest_v2_restore_claimed_commit_items(
@@ -37148,195 +37186,7 @@ def ingest_v2_commit_slack_document_batch(
     return results
 
 
-def ingest_v2_commit_mbox_message_batch(
-    connection: sqlite3.Connection,
-    paths: dict[str, Path],
-    *,
-    run_id: str,
-    claimed_rows: list[sqlite3.Row],
-    prepared_items: list[dict[str, object]],
-    writer_id: str,
-    cursor: dict[str, object],
-    context: dict[str, object],
-) -> list[dict[str, object]]:
-    if not claimed_rows or len(claimed_rows) != len(prepared_items):
-        raise RetrieverError("MBOX commit batch rows and prepared items must have the same non-zero length.")
-    batch_cursor = ingest_v2_clone_cursor(cursor)
-    current_batch = (
-        int(context["current_ingestion_batch"])
-        if context.get("current_ingestion_batch") is not None
-        else None
-    )
-    connection.execute("BEGIN")
-    try:
-        results: list[dict[str, object]] = []
-        existing_entries_by_source_item = dict(context.get("existing_entries_by_source_item") or {})
-        for batch_index, (claimed_row, prepared_item) in enumerate(zip(claimed_rows, prepared_items), start=1):
-            work_item_id = int(claimed_row["id"])
-            source_rel_path = str(prepared_item.get("source_rel_path") or "")
-            existing_entry = dict(existing_entries_by_source_item.get(str(prepared_item["source_item_id"])) or {})
-            commit_started = time.perf_counter()
-            commit_result = commit_prepared_container_message_in_transaction(
-                connection,
-                paths,
-                prepared_item,
-                existing_entry.get("document_row"),
-                existing_entry.get("occurrence_row"),
-                current_ingestion_batch=current_batch,
-                dataset_id=int(context["dataset_id"]),
-                dataset_source_id=(
-                    int(context["dataset_source_id"])
-                    if context.get("dataset_source_id") is not None
-                    else None
-                ),
-                source_kind=MBOX_SOURCE_KIND,
-                source_rel_path=source_rel_path,
-                file_type_override=MBOX_SOURCE_KIND,
-                scan_started_at=str(prepared_item["scan_started_at"]),
-                before_transaction_commit=lambda commit_connection, result, claimed_work_item_id=work_item_id, rel_path=source_rel_path, prepared=prepared_item: ingest_v2_commit_mbox_work_item_hook(
-                    commit_connection,
-                    run_id=run_id,
-                    work_item_id=claimed_work_item_id,
-                    writer_id=writer_id,
-                    cursor=batch_cursor,
-                    result={
-                        **result,
-                        "source_kind": MBOX_SOURCE_KIND,
-                        "source_plan_kind": str(prepared.get("source_plan_kind") or "mbox"),
-                        "source_rel_path": rel_path,
-                        "source_item_id": str(prepared["source_item_id"]),
-                    },
-                ),
-            )
-            current_batch = (
-                int(commit_result["current_ingestion_batch"])
-                if commit_result.get("current_ingestion_batch") is not None
-                else current_batch
-            )
-            ingest_v2_record_worker_event(
-                connection,
-                run_id=run_id,
-                worker_id=writer_id,
-                event_type="commit_mbox_message",
-                work_item_id=work_item_id,
-                phase="commit",
-                duration_ms=ingest_v2_elapsed_ms(commit_started),
-                details={
-                    "action": str(commit_result.get("action") or ""),
-                    "source_rel_path": source_rel_path,
-                    "source_item_id": str(prepared_item.get("source_item_id") or ""),
-                    "source_plan_kind": str(prepared_item.get("source_plan_kind") or "mbox"),
-                    "document_id": commit_result.get("document_id"),
-                    "batch_index": int(batch_index),
-                    "batch_size": int(len(claimed_rows)),
-                },
-            )
-            results.append(commit_result)
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    context["current_ingestion_batch"] = current_batch
-    cursor.clear()
-    cursor.update(batch_cursor)
-    return results
-
-
-def ingest_v2_commit_pst_message_batch(
-    connection: sqlite3.Connection,
-    paths: dict[str, Path],
-    *,
-    run_id: str,
-    claimed_rows: list[sqlite3.Row],
-    prepared_items: list[dict[str, object]],
-    writer_id: str,
-    cursor: dict[str, object],
-    context: dict[str, object],
-) -> list[dict[str, object]]:
-    if not claimed_rows or len(claimed_rows) != len(prepared_items):
-        raise RetrieverError("PST commit batch rows and prepared items must have the same non-zero length.")
-    batch_cursor = ingest_v2_clone_cursor(cursor)
-    current_batch = (
-        int(context["current_ingestion_batch"])
-        if context.get("current_ingestion_batch") is not None
-        else None
-    )
-    connection.execute("BEGIN")
-    try:
-        results: list[dict[str, object]] = []
-        existing_entries_by_source_item = dict(context.get("existing_entries_by_source_item") or {})
-        for batch_index, (claimed_row, prepared_item) in enumerate(zip(claimed_rows, prepared_items), start=1):
-            work_item_id = int(claimed_row["id"])
-            source_rel_path = str(prepared_item.get("source_rel_path") or "")
-            existing_entry = dict(existing_entries_by_source_item.get(str(prepared_item["source_item_id"])) or {})
-            commit_started = time.perf_counter()
-            commit_result = commit_prepared_container_message_in_transaction(
-                connection,
-                paths,
-                prepared_item,
-                existing_entry.get("document_row"),
-                existing_entry.get("occurrence_row"),
-                current_ingestion_batch=current_batch,
-                dataset_id=int(context["dataset_id"]),
-                dataset_source_id=(
-                    int(context["dataset_source_id"])
-                    if context.get("dataset_source_id") is not None
-                    else None
-                ),
-                source_kind=PST_SOURCE_KIND,
-                source_rel_path=source_rel_path,
-                file_type_override=PST_SOURCE_KIND,
-                scan_started_at=str(prepared_item["scan_started_at"]),
-                before_transaction_commit=lambda commit_connection, result, claimed_work_item_id=work_item_id, rel_path=source_rel_path, prepared=prepared_item: ingest_v2_commit_pst_work_item_hook(
-                    commit_connection,
-                    run_id=run_id,
-                    work_item_id=claimed_work_item_id,
-                    writer_id=writer_id,
-                    cursor=batch_cursor,
-                    result={
-                        **result,
-                        "source_kind": PST_SOURCE_KIND,
-                        "source_plan_kind": str(prepared.get("source_plan_kind") or "pst"),
-                        "source_rel_path": rel_path,
-                        "source_item_id": str(prepared["source_item_id"]),
-                    },
-                ),
-            )
-            current_batch = (
-                int(commit_result["current_ingestion_batch"])
-                if commit_result.get("current_ingestion_batch") is not None
-                else current_batch
-            )
-            ingest_v2_record_worker_event(
-                connection,
-                run_id=run_id,
-                worker_id=writer_id,
-                event_type="commit_pst_message",
-                work_item_id=work_item_id,
-                phase="commit",
-                duration_ms=ingest_v2_elapsed_ms(commit_started),
-                details={
-                    "action": str(commit_result.get("action") or ""),
-                    "source_rel_path": source_rel_path,
-                    "source_item_id": str(prepared_item.get("source_item_id") or ""),
-                    "source_plan_kind": str(prepared_item.get("source_plan_kind") or "pst"),
-                    "document_id": commit_result.get("document_id"),
-                    "batch_index": int(batch_index),
-                    "batch_size": int(len(claimed_rows)),
-                },
-            )
-            results.append(commit_result)
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    context["current_ingestion_batch"] = current_batch
-    cursor.clear()
-    cursor.update(batch_cursor)
-    return results
-
-
-def ingest_v2_commit_mbox_work_item_hook(
+def ingest_v2_commit_container_work_item_hook(
     connection: sqlite3.Connection,
     *,
     run_id: str,
@@ -37344,30 +37194,40 @@ def ingest_v2_commit_mbox_work_item_hook(
     writer_id: str,
     cursor: dict[str, object],
     result: dict[str, object],
+    source_kind: str,
 ) -> None:
+    container_config = ingest_v2_container_source_config(source_kind)
+    source_label = str(container_config["source_label"])
+    source_stats_key = str(container_config["source_stats_key"])
+    created_stat_key = str(container_config["created_stat_key"])
+    updated_stat_key = str(container_config["updated_stat_key"])
+    skipped_stat_key = str(container_config["skipped_stat_key"])
+    finalized_stat_key = str(container_config["finalized_stat_key"])
+    deleted_stat_key = str(container_config["deleted_stat_key"])
+
     now = utc_now()
     action = str(result.get("action") or "")
     source_rel_path = str(result.get("source_rel_path") or "")
-    affected_document_ids = [
-        int(result["document_id"])
-    ] if result.get("document_id") is not None else []
+    affected_document_ids = (
+        [int(result["document_id"])] if result.get("document_id") is not None else []
+    )
     current_batch = result.get("current_ingestion_batch")
     if source_rel_path and current_batch is not None:
         current_batches = cursor.setdefault("container_current_ingestion_batches", {})
         if isinstance(current_batches, dict):
             current_batches[source_rel_path] = int(current_batch)
-    mbox_stats = cursor.setdefault("mbox_stats", {})
-    if isinstance(mbox_stats, dict):
+    source_stats = cursor.setdefault(source_stats_key, {})
+    if isinstance(source_stats, dict):
         if action == "new":
-            mbox_stats["mbox_messages_created"] = int(mbox_stats.get("mbox_messages_created") or 0) + 1
+            source_stats[created_stat_key] = int(source_stats.get(created_stat_key) or 0) + 1
         elif action == "updated":
-            mbox_stats["mbox_messages_updated"] = int(mbox_stats.get("mbox_messages_updated") or 0) + 1
-        for key in ("mbox_sources_skipped", "mbox_sources_finalized", "mbox_messages_deleted"):
+            source_stats[updated_stat_key] = int(source_stats.get(updated_stat_key) or 0) + 1
+        for key in (skipped_stat_key, finalized_stat_key, deleted_stat_key):
             if result.get(key) is not None:
-                mbox_stats[key] = int(mbox_stats.get(key) or 0) + int(result.get(key) or 0)
-        if result.get("gmail_linked_drive_retired") is not None:
-            mbox_stats["gmail_linked_drive_retired"] = (
-                int(mbox_stats.get("gmail_linked_drive_retired") or 0)
+                source_stats[key] = int(source_stats.get(key) or 0) + int(result.get(key) or 0)
+        if source_kind == MBOX_SOURCE_KIND and result.get("gmail_linked_drive_retired") is not None:
+            source_stats["gmail_linked_drive_retired"] = (
+                int(source_stats.get("gmail_linked_drive_retired") or 0)
                 + int(result.get("gmail_linked_drive_retired") or 0)
             )
     ingest_v2_save_phase_cursor(
@@ -37401,11 +37261,11 @@ def ingest_v2_commit_mbox_work_item_hook(
                 {
                     "commit_action": action,
                     "document_id": result.get("document_id"),
-                    "source_kind": MBOX_SOURCE_KIND,
+                    "source_kind": source_kind,
                     "source_plan_kind": result.get("source_plan_kind"),
                     "source_rel_path": source_rel_path,
                     "source_item_id": result.get("source_item_id"),
-                    "mbox_messages_deleted": int(result.get("mbox_messages_deleted") or 0),
+                    deleted_stat_key: int(result.get(deleted_stat_key) or 0),
                 }
             ),
             now,
@@ -37415,7 +37275,9 @@ def ingest_v2_commit_mbox_work_item_hook(
         ),
     )
     if int(update_cursor.rowcount or 0) != 1:
-        raise RetrieverError(f"Could not mark V2 ingest MBOX work item {work_item_id} committed.")
+        raise RetrieverError(
+            f"Could not mark V2 ingest {source_label} work item {work_item_id} committed."
+        )
     ingest_v2_delete_prepared_item(
         connection,
         run_id=run_id,
@@ -37430,6 +37292,187 @@ def ingest_v2_commit_mbox_work_item_hook(
           AND committer_lease_owner = ?
         """,
         (now, now, run_id, writer_id),
+    )
+
+
+def ingest_v2_commit_container_message_batch(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+    claimed_rows: list[sqlite3.Row],
+    prepared_items: list[dict[str, object]],
+    writer_id: str,
+    cursor: dict[str, object],
+    context: dict[str, object],
+    source_kind: str,
+) -> list[dict[str, object]]:
+    container_config = ingest_v2_container_source_config(source_kind)
+    source_label = str(container_config["source_label"])
+    default_source_plan_kind = str(container_config["source_plan_kind_default"])
+    message_commit_event_type = str(container_config["message_commit_event_type"])
+    if not claimed_rows or len(claimed_rows) != len(prepared_items):
+        raise RetrieverError(
+            f"{source_label} commit batch rows and prepared items must have the same non-zero length."
+        )
+    batch_cursor = ingest_v2_clone_cursor(cursor)
+    current_batch = (
+        int(context["current_ingestion_batch"])
+        if context.get("current_ingestion_batch") is not None
+        else None
+    )
+    connection.execute("BEGIN")
+    try:
+        results: list[dict[str, object]] = []
+        existing_entries_by_source_item = dict(context.get("existing_entries_by_source_item") or {})
+        for batch_index, (claimed_row, prepared_item) in enumerate(
+            zip(claimed_rows, prepared_items),
+            start=1,
+        ):
+            work_item_id = int(claimed_row["id"])
+            source_rel_path = str(prepared_item.get("source_rel_path") or "")
+            existing_entry = dict(
+                existing_entries_by_source_item.get(str(prepared_item["source_item_id"])) or {}
+            )
+            commit_started = time.perf_counter()
+            commit_result = commit_prepared_container_message_in_transaction(
+                connection,
+                paths,
+                prepared_item,
+                existing_entry.get("document_row"),
+                existing_entry.get("occurrence_row"),
+                current_ingestion_batch=current_batch,
+                dataset_id=int(context["dataset_id"]),
+                dataset_source_id=(
+                    int(context["dataset_source_id"])
+                    if context.get("dataset_source_id") is not None
+                    else None
+                ),
+                source_kind=source_kind,
+                source_rel_path=source_rel_path,
+                file_type_override=source_kind,
+                scan_started_at=str(prepared_item["scan_started_at"]),
+                before_transaction_commit=(
+                    lambda commit_connection, result, claimed_work_item_id=work_item_id, rel_path=source_rel_path, prepared=prepared_item: ingest_v2_commit_container_work_item_hook(
+                        commit_connection,
+                        run_id=run_id,
+                        work_item_id=claimed_work_item_id,
+                        writer_id=writer_id,
+                        cursor=batch_cursor,
+                        result={
+                            **result,
+                            "source_kind": source_kind,
+                            "source_plan_kind": str(
+                                prepared.get("source_plan_kind") or default_source_plan_kind
+                            ),
+                            "source_rel_path": rel_path,
+                            "source_item_id": str(prepared["source_item_id"]),
+                        },
+                        source_kind=source_kind,
+                    )
+                ),
+            )
+            current_batch = (
+                int(commit_result["current_ingestion_batch"])
+                if commit_result.get("current_ingestion_batch") is not None
+                else current_batch
+            )
+            ingest_v2_record_worker_event(
+                connection,
+                run_id=run_id,
+                worker_id=writer_id,
+                event_type=message_commit_event_type,
+                work_item_id=work_item_id,
+                phase="commit",
+                duration_ms=ingest_v2_elapsed_ms(commit_started),
+                details={
+                    "action": str(commit_result.get("action") or ""),
+                    "source_rel_path": source_rel_path,
+                    "source_item_id": str(prepared_item.get("source_item_id") or ""),
+                    "source_plan_kind": str(
+                        prepared_item.get("source_plan_kind") or default_source_plan_kind
+                    ),
+                    "document_id": commit_result.get("document_id"),
+                    "batch_index": int(batch_index),
+                    "batch_size": int(len(claimed_rows)),
+                },
+            )
+            results.append(commit_result)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    context["current_ingestion_batch"] = current_batch
+    cursor.clear()
+    cursor.update(batch_cursor)
+    return results
+
+
+def ingest_v2_commit_mbox_message_batch(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+    claimed_rows: list[sqlite3.Row],
+    prepared_items: list[dict[str, object]],
+    writer_id: str,
+    cursor: dict[str, object],
+    context: dict[str, object],
+) -> list[dict[str, object]]:
+    return ingest_v2_commit_container_message_batch(
+        connection,
+        paths,
+        run_id=run_id,
+        claimed_rows=claimed_rows,
+        prepared_items=prepared_items,
+        writer_id=writer_id,
+        cursor=cursor,
+        context=context,
+        source_kind=MBOX_SOURCE_KIND,
+    )
+
+
+def ingest_v2_commit_pst_message_batch(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+    claimed_rows: list[sqlite3.Row],
+    prepared_items: list[dict[str, object]],
+    writer_id: str,
+    cursor: dict[str, object],
+    context: dict[str, object],
+) -> list[dict[str, object]]:
+    return ingest_v2_commit_container_message_batch(
+        connection,
+        paths,
+        run_id=run_id,
+        claimed_rows=claimed_rows,
+        prepared_items=prepared_items,
+        writer_id=writer_id,
+        cursor=cursor,
+        context=context,
+        source_kind=PST_SOURCE_KIND,
+    )
+
+
+def ingest_v2_commit_mbox_work_item_hook(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    result: dict[str, object],
+) -> None:
+    ingest_v2_commit_container_work_item_hook(
+        connection,
+        run_id=run_id,
+        work_item_id=work_item_id,
+        writer_id=writer_id,
+        cursor=cursor,
+        result=result,
+        source_kind=MBOX_SOURCE_KIND,
     )
 
 
@@ -37442,87 +37485,79 @@ def ingest_v2_commit_pst_work_item_hook(
     cursor: dict[str, object],
     result: dict[str, object],
 ) -> None:
-    now = utc_now()
-    action = str(result.get("action") or "")
-    source_rel_path = str(result.get("source_rel_path") or "")
-    affected_document_ids = [
-        int(result["document_id"])
-    ] if result.get("document_id") is not None else []
-    current_batch = result.get("current_ingestion_batch")
-    if source_rel_path and current_batch is not None:
-        current_batches = cursor.setdefault("container_current_ingestion_batches", {})
-        if isinstance(current_batches, dict):
-            current_batches[source_rel_path] = int(current_batch)
-    pst_stats = cursor.setdefault("pst_stats", {})
-    if isinstance(pst_stats, dict):
-        if action == "new":
-            pst_stats["pst_messages_created"] = int(pst_stats.get("pst_messages_created") or 0) + 1
-        elif action == "updated":
-            pst_stats["pst_messages_updated"] = int(pst_stats.get("pst_messages_updated") or 0) + 1
-        for key in ("pst_sources_skipped", "pst_sources_finalized", "pst_messages_deleted"):
-            if result.get(key) is not None:
-                pst_stats[key] = int(pst_stats.get(key) or 0) + int(result.get(key) or 0)
-    ingest_v2_save_phase_cursor(
-        connection,
-        run_id=run_id,
-        phase="committing",
-        cursor_key="loose_file_commit",
-        cursor=cursor,
-        status="pending",
-    )
-    update_cursor = connection.execute(
-        """
-        UPDATE ingest_work_items
-        SET status = 'committed',
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            affected_document_ids_json = ?,
-            affected_entity_ids_json = ?,
-            artifact_manifest_json = ?,
-            updated_at = ?,
-            last_error = NULL
-        WHERE run_id = ?
-          AND id = ?
-          AND status = 'committing'
-          AND lease_owner = ?
-        """,
-        (
-            compact_json_text(affected_document_ids),
-            compact_json_text([]),
-            compact_json_text(
-                {
-                    "commit_action": action,
-                    "document_id": result.get("document_id"),
-                    "source_kind": PST_SOURCE_KIND,
-                    "source_plan_kind": result.get("source_plan_kind"),
-                    "source_rel_path": source_rel_path,
-                    "source_item_id": result.get("source_item_id"),
-                    "pst_messages_deleted": int(result.get("pst_messages_deleted") or 0),
-                }
-            ),
-            now,
-            run_id,
-            work_item_id,
-            writer_id,
-        ),
-    )
-    if int(update_cursor.rowcount or 0) != 1:
-        raise RetrieverError(f"Could not mark V2 ingest PST work item {work_item_id} committed.")
-    ingest_v2_delete_prepared_item(
+    ingest_v2_commit_container_work_item_hook(
         connection,
         run_id=run_id,
         work_item_id=work_item_id,
+        writer_id=writer_id,
+        cursor=cursor,
+        result=result,
+        source_kind=PST_SOURCE_KIND,
     )
-    connection.execute(
-        """
-        UPDATE ingest_runs
-        SET committer_heartbeat_at = ?,
-            last_heartbeat_at = ?
-        WHERE run_id = ?
-          AND committer_lease_owner = ?
-        """,
-        (now, now, run_id, writer_id),
+
+
+def ingest_v2_ensure_container_commit_context(
+    connection: sqlite3.Connection,
+    *,
+    prepared_item: dict[str, object],
+    cursor: dict[str, object],
+    contexts: dict[str, dict[str, object]],
+    source_kind: str,
+) -> dict[str, object]:
+    container_config = ingest_v2_container_source_config(source_kind)
+    source_rel_path = str(prepared_item["source_rel_path"])
+    if source_rel_path in contexts:
+        return contexts[source_rel_path]
+    dataset_name_builder = container_config["dataset_name_builder"]
+    assert callable(dataset_name_builder)
+    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+        connection,
+        source_kind=source_kind,
+        source_locator=source_rel_path,
+        dataset_name=dataset_name_builder(source_rel_path),
     )
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN")
+    try:
+        write_container_source_scan_started(
+            connection,
+            dataset_id=dataset_id,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+            file_size=(
+                int(prepared_item["source_file_size"])
+                if prepared_item.get("source_file_size") is not None
+                else None
+            ),
+            file_mtime=(
+                str(prepared_item["source_file_mtime"])
+                if prepared_item.get("source_file_mtime") is not None
+                else None
+            ),
+            file_hash=str(prepared_item.get("source_file_hash") or ""),
+            scan_started_at=str(prepared_item["scan_started_at"]),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    current_batches = cursor.setdefault("container_current_ingestion_batches", {})
+    current_batch = None
+    if isinstance(current_batches, dict) and current_batches.get(source_rel_path) is not None:
+        current_batch = int(current_batches[source_rel_path])
+    context = {
+        "dataset_id": int(dataset_id),
+        "dataset_source_id": int(dataset_source_id) if dataset_source_id is not None else None,
+        "current_ingestion_batch": current_batch,
+        "existing_entries_by_source_item": existing_container_entries_by_source_item(
+            connection,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+        ),
+    }
+    contexts[source_rel_path] = context
+    return context
 
 
 def ingest_v2_ensure_mbox_commit_context(
@@ -37533,78 +37568,14 @@ def ingest_v2_ensure_mbox_commit_context(
     cursor: dict[str, object],
     contexts: dict[str, dict[str, object]],
 ) -> dict[str, object]:
-    source_rel_path = str(prepared_item["source_rel_path"])
-    if source_rel_path in contexts:
-        return contexts[source_rel_path]
-    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+    _ = root
+    return ingest_v2_ensure_container_commit_context(
         connection,
+        prepared_item=prepared_item,
+        cursor=cursor,
+        contexts=contexts,
         source_kind=MBOX_SOURCE_KIND,
-        source_locator=source_rel_path,
-        dataset_name=mbox_dataset_name(source_rel_path),
     )
-    if connection.in_transaction:
-        connection.commit()
-    connection.execute("BEGIN")
-    try:
-        write_container_source_scan_started(
-            connection,
-            dataset_id=dataset_id,
-            source_kind=MBOX_SOURCE_KIND,
-            source_rel_path=source_rel_path,
-            file_size=(
-                int(prepared_item["source_file_size"])
-                if prepared_item.get("source_file_size") is not None
-                else None
-            ),
-            file_mtime=(
-                str(prepared_item["source_file_mtime"])
-                if prepared_item.get("source_file_mtime") is not None
-                else None
-            ),
-            file_hash=str(prepared_item.get("source_file_hash") or ""),
-            scan_started_at=str(prepared_item["scan_started_at"]),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    current_batches = cursor.setdefault("container_current_ingestion_batches", {})
-    current_batch = None
-    if isinstance(current_batches, dict) and current_batches.get(source_rel_path) is not None:
-        current_batch = int(current_batches[source_rel_path])
-    context = {
-        "dataset_id": int(dataset_id),
-        "dataset_source_id": int(dataset_source_id) if dataset_source_id is not None else None,
-        "current_ingestion_batch": current_batch,
-        "existing_entries_by_source_item": existing_container_entries_by_source_item(
-            connection,
-            source_kind=MBOX_SOURCE_KIND,
-            source_rel_path=source_rel_path,
-        ),
-    }
-    contexts[source_rel_path] = context
-    return context
-
-
-def ingest_v2_mbox_failed_message_count(
-    connection: sqlite3.Connection,
-    *,
-    run_id: str,
-    source_rel_path: str,
-) -> int:
-    prefix = f"{source_rel_path}:"
-    row = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM ingest_work_items
-        WHERE run_id = ?
-          AND unit_type = 'mbox_message'
-          AND status = 'failed'
-          AND SUBSTR(COALESCE(source_key, ''), 1, ?) = ?
-        """,
-        (run_id, len(prefix), prefix),
-    ).fetchone()
-    return int(row[0] or 0) if row is not None else 0
 
 
 def ingest_v2_ensure_pst_commit_context(
@@ -37615,57 +37586,51 @@ def ingest_v2_ensure_pst_commit_context(
     cursor: dict[str, object],
     contexts: dict[str, dict[str, object]],
 ) -> dict[str, object]:
-    source_rel_path = str(prepared_item["source_rel_path"])
-    if source_rel_path in contexts:
-        return contexts[source_rel_path]
-    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+    _ = root
+    return ingest_v2_ensure_container_commit_context(
         connection,
+        prepared_item=prepared_item,
+        cursor=cursor,
+        contexts=contexts,
         source_kind=PST_SOURCE_KIND,
-        source_locator=source_rel_path,
-        dataset_name=pst_dataset_name(source_rel_path),
     )
-    if connection.in_transaction:
-        connection.commit()
-    connection.execute("BEGIN")
-    try:
-        write_container_source_scan_started(
-            connection,
-            dataset_id=dataset_id,
-            source_kind=PST_SOURCE_KIND,
-            source_rel_path=source_rel_path,
-            file_size=(
-                int(prepared_item["source_file_size"])
-                if prepared_item.get("source_file_size") is not None
-                else None
-            ),
-            file_mtime=(
-                str(prepared_item["source_file_mtime"])
-                if prepared_item.get("source_file_mtime") is not None
-                else None
-            ),
-            file_hash=str(prepared_item.get("source_file_hash") or ""),
-            scan_started_at=str(prepared_item["scan_started_at"]),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    current_batches = cursor.setdefault("container_current_ingestion_batches", {})
-    current_batch = None
-    if isinstance(current_batches, dict) and current_batches.get(source_rel_path) is not None:
-        current_batch = int(current_batches[source_rel_path])
-    context = {
-        "dataset_id": int(dataset_id),
-        "dataset_source_id": int(dataset_source_id) if dataset_source_id is not None else None,
-        "current_ingestion_batch": current_batch,
-        "existing_entries_by_source_item": existing_container_entries_by_source_item(
-            connection,
-            source_kind=PST_SOURCE_KIND,
-            source_rel_path=source_rel_path,
-        ),
-    }
-    contexts[source_rel_path] = context
-    return context
+
+
+def ingest_v2_container_failed_message_count(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    source_rel_path: str,
+    source_kind: str,
+) -> int:
+    payload_kind = str(ingest_v2_container_source_config(source_kind)["message_payload_kind"])
+    prefix = f"{source_rel_path}:"
+    row = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND unit_type = ?
+          AND status = 'failed'
+          AND SUBSTR(COALESCE(source_key, ''), 1, ?) = ?
+        """,
+        (run_id, payload_kind, len(prefix), prefix),
+    ).fetchone()
+    return int(row[0] or 0) if row is not None else 0
+
+
+def ingest_v2_mbox_failed_message_count(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    source_rel_path: str,
+) -> int:
+    return ingest_v2_container_failed_message_count(
+        connection,
+        run_id=run_id,
+        source_rel_path=source_rel_path,
+        source_kind=MBOX_SOURCE_KIND,
+    )
 
 
 def ingest_v2_pst_failed_message_count(
@@ -37674,19 +37639,411 @@ def ingest_v2_pst_failed_message_count(
     run_id: str,
     source_rel_path: str,
 ) -> int:
-    prefix = f"{source_rel_path}:"
-    row = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM ingest_work_items
-        WHERE run_id = ?
-          AND unit_type = 'pst_message'
-          AND status = 'failed'
-          AND SUBSTR(COALESCE(source_key, ''), 1, ?) = ?
-        """,
-        (run_id, len(prefix), prefix),
-    ).fetchone()
-    return int(row[0] or 0) if row is not None else 0
+    return ingest_v2_container_failed_message_count(
+        connection,
+        run_id=run_id,
+        source_rel_path=source_rel_path,
+        source_kind=PST_SOURCE_KIND,
+    )
+
+
+def ingest_v2_container_work_item_kind(payload_kind: str, unit_type: str) -> tuple[str, str] | None:
+    for source_kind in (MBOX_SOURCE_KIND, PST_SOURCE_KIND):
+        container_config = ingest_v2_container_source_config(source_kind)
+        message_payload_kind = str(container_config["message_payload_kind"])
+        source_finalizer_payload_kind = str(container_config["source_finalizer_payload_kind"])
+        if payload_kind == message_payload_kind or unit_type == message_payload_kind:
+            return source_kind, "message"
+        if payload_kind == source_finalizer_payload_kind or unit_type == source_finalizer_payload_kind:
+            return source_kind, "finalizer"
+    return None
+
+
+def ingest_v2_raise_prepare_error(prepared_item: dict[str, object]) -> None:
+    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
+    if prepare_error:
+        raise RetrieverError(prepare_error)
+
+
+def ingest_v2_container_message_batch_function(
+    source_kind: str,
+) -> Callable[..., list[dict[str, object]]]:
+    if source_kind == MBOX_SOURCE_KIND:
+        return ingest_v2_commit_mbox_message_batch
+    if source_kind == PST_SOURCE_KIND:
+        return ingest_v2_commit_pst_message_batch
+    raise RetrieverError(f"Unsupported container source kind: {source_kind!r}")
+
+
+def ingest_v2_expand_container_commit_batch(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    writer_id: str,
+    claimed_row: sqlite3.Row,
+    prepared_item: dict[str, object],
+    source_kind: str,
+    prepared_decode_ms_values: list[float],
+) -> tuple[list[sqlite3.Row], list[dict[str, object]]]:
+    batch_claimed_rows = [claimed_row]
+    batch_prepared_items = [prepared_item]
+    additional_rows = ingest_v2_claim_additional_container_commit_items(
+        connection,
+        run_id=run_id,
+        writer_id=writer_id,
+        source_rel_path=str(prepared_item["source_rel_path"]),
+        current_payload_bytes=int(claimed_row["payload_bytes"] or 0),
+        source_kind=source_kind,
+    )
+    if not additional_rows:
+        return batch_claimed_rows, batch_prepared_items
+    additional_prepared_items: list[dict[str, object]] = []
+    additional_decode_started = time.perf_counter()
+    decode_failed = False
+    for additional_row in additional_rows:
+        try:
+            additional_prepared_items.append(ingest_v2_prepared_item_from_row(additional_row))
+        except Exception:
+            decode_failed = True
+            break
+    decoded_count = len(additional_prepared_items)
+    if decoded_count:
+        additional_decode_ms = ingest_v2_elapsed_ms(additional_decode_started)
+        prepared_decode_ms_values.extend([additional_decode_ms / decoded_count] * decoded_count)
+    if decode_failed:
+        ingest_v2_restore_claimed_commit_items(
+            connection,
+            run_id=run_id,
+            work_item_ids=[int(row["id"]) for row in additional_rows],
+            writer_id=writer_id,
+        )
+        return batch_claimed_rows, batch_prepared_items
+    batch_claimed_rows.extend(additional_rows)
+    batch_prepared_items.extend(additional_prepared_items)
+    return batch_claimed_rows, batch_prepared_items
+
+
+def ingest_v2_commit_skipped_container_message(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    prepared_item: dict[str, object],
+    source_kind: str,
+) -> dict[str, object]:
+    container_config = ingest_v2_container_source_config(source_kind)
+    message_commit_event_type = str(container_config["message_commit_event_type"])
+    default_source_plan_kind = str(container_config["source_plan_kind_default"])
+    source_rel_path = str(prepared_item.get("source_rel_path") or "")
+    source_item_id = str(prepared_item.get("source_item_id") or "")
+    connection.execute("BEGIN")
+    try:
+        commit_result = {
+            "action": "skipped",
+            "source_kind": source_kind,
+            "source_plan_kind": str(prepared_item.get("source_plan_kind") or default_source_plan_kind),
+            "source_rel_path": source_rel_path,
+            "source_item_id": source_item_id,
+            "current_ingestion_batch": None,
+            "document_id": None,
+        }
+        ingest_v2_commit_container_work_item_hook(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            writer_id=writer_id,
+            cursor=cursor,
+            result=commit_result,
+            source_kind=source_kind,
+        )
+        ingest_v2_record_worker_event(
+            connection,
+            run_id=run_id,
+            worker_id=writer_id,
+            event_type=message_commit_event_type,
+            work_item_id=work_item_id,
+            phase="commit",
+            duration_ms=0.0,
+            details={
+                "action": "skipped",
+                "source_rel_path": source_rel_path,
+                "source_item_id": source_item_id,
+                "source_plan_kind": str(
+                    prepared_item.get("source_plan_kind") or default_source_plan_kind
+                ),
+                "document_id": None,
+                "batch_index": 1,
+                "batch_size": 1,
+            },
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return commit_result
+
+
+def ingest_v2_commit_container_message_work_item(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+    claimed_row: sqlite3.Row,
+    prepared_item: dict[str, object],
+    writer_id: str,
+    cursor: dict[str, object],
+    container_contexts: dict[str, dict[str, dict[str, object]]],
+    source_kind: str,
+    prepared_decode_ms_values: list[float],
+) -> dict[str, object]:
+    if prepared_item.get("skip"):
+        skipped_result = ingest_v2_commit_skipped_container_message(
+            connection,
+            run_id=run_id,
+            work_item_id=int(claimed_row["id"]),
+            writer_id=writer_id,
+            cursor=cursor,
+            prepared_item=prepared_item,
+            source_kind=source_kind,
+        )
+        return {
+            "batch_results": [skipped_result],
+            "batch_count": 0,
+            "batch_items": 0,
+            "batch_fallbacks": 0,
+            "timing_item_count": 1,
+        }
+    source_contexts = container_contexts.setdefault(source_kind, {})
+    context = ingest_v2_ensure_container_commit_context(
+        connection,
+        prepared_item=prepared_item,
+        cursor=cursor,
+        contexts=source_contexts,
+        source_kind=source_kind,
+    )
+    batch_claimed_rows, batch_prepared_items = ingest_v2_expand_container_commit_batch(
+        connection,
+        run_id=run_id,
+        writer_id=writer_id,
+        claimed_row=claimed_row,
+        prepared_item=prepared_item,
+        source_kind=source_kind,
+        prepared_decode_ms_values=prepared_decode_ms_values,
+    )
+    commit_batch = ingest_v2_container_message_batch_function(source_kind)
+    batch_count = 0
+    batch_items = 0
+    batch_fallbacks = 0
+    try:
+        batch_results = commit_batch(
+            connection,
+            paths,
+            run_id=run_id,
+            claimed_rows=batch_claimed_rows,
+            prepared_items=batch_prepared_items,
+            writer_id=writer_id,
+            cursor=cursor,
+            context=context,
+        )
+        if len(batch_results) > 1:
+            batch_count = 1
+            batch_items = len(batch_results)
+    except Exception:
+        rollback_open_transaction(connection)
+        if len(batch_claimed_rows) <= 1:
+            raise
+        batch_fallbacks = 1
+        ingest_v2_restore_claimed_commit_items(
+            connection,
+            run_id=run_id,
+            work_item_ids=[int(row["id"]) for row in batch_claimed_rows[1:]],
+            writer_id=writer_id,
+        )
+        batch_results = commit_batch(
+            connection,
+            paths,
+            run_id=run_id,
+            claimed_rows=[claimed_row],
+            prepared_items=[prepared_item],
+            writer_id=writer_id,
+            cursor=cursor,
+            context=context,
+        )
+    return {
+        "batch_results": batch_results,
+        "batch_count": batch_count,
+        "batch_items": batch_items,
+        "batch_fallbacks": batch_fallbacks,
+        "timing_item_count": max(1, len(batch_results)),
+    }
+
+
+def ingest_v2_commit_container_source_finalizer(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    run_id: str,
+    work_item_id: int,
+    writer_id: str,
+    cursor: dict[str, object],
+    prepared_item: dict[str, object],
+    source_kind: str,
+) -> dict[str, object]:
+    container_config = ingest_v2_container_source_config(source_kind)
+    source_label = str(container_config["source_label"])
+    default_source_plan_kind = str(container_config["source_plan_kind_default"])
+    skipped_stat_key = str(container_config["skipped_stat_key"])
+    finalized_stat_key = str(container_config["finalized_stat_key"])
+    deleted_stat_key = str(container_config["deleted_stat_key"])
+    dataset_name_builder = container_config["dataset_name_builder"]
+    assert callable(dataset_name_builder)
+    finalizer_started = time.perf_counter()
+    source_rel_path = str(prepared_item["source_rel_path"])
+    failed_messages = ingest_v2_container_failed_message_count(
+        connection,
+        run_id=run_id,
+        source_rel_path=source_rel_path,
+        source_kind=source_kind,
+    )
+    if failed_messages:
+        raise RetrieverError(
+            f"Cannot finalize {source_label} source {source_rel_path}: "
+            f"{failed_messages} message work item(s) failed."
+        )
+    dataset_id, dataset_source_id = ensure_source_backed_dataset(
+        connection,
+        source_kind=source_kind,
+        source_locator=source_rel_path,
+        dataset_name=dataset_name_builder(source_rel_path),
+    )
+    if connection.in_transaction:
+        connection.commit()
+    source_file_size = (
+        int(prepared_item["source_file_size"])
+        if prepared_item.get("source_file_size") is not None
+        else None
+    )
+    source_file_mtime = (
+        str(prepared_item["source_file_mtime"])
+        if prepared_item.get("source_file_mtime") is not None
+        else None
+    )
+    source_file_hash = str(prepared_item.get("source_file_hash") or "")
+    scan_started_at = str(prepared_item["scan_started_at"])
+    skip_source = bool(prepared_item.get("skip_source"))
+    source_plan_kind = str(prepared_item.get("source_plan_kind") or default_source_plan_kind)
+    connection.execute("BEGIN")
+    try:
+        linked_drive_retired = 0
+        linked_drive_rel_paths: set[str] = set()
+        if source_kind == MBOX_SOURCE_KIND:
+            linked_drive_rel_paths = {
+                normalize_whitespace(str(rel_path or "")).replace("\\", "/").strip("/")
+                for rel_path in list(prepared_item.get("linked_drive_rel_paths") or [])
+                if normalize_whitespace(str(rel_path or ""))
+            }
+        if source_kind == MBOX_SOURCE_KIND and source_plan_kind == "gmail" and linked_drive_rel_paths:
+            linked_drive_retired = retire_standalone_filesystem_documents_by_rel_paths(
+                connection,
+                paths,
+                rel_paths=linked_drive_rel_paths,
+            )
+        if skip_source:
+            mark_container_source_documents_active(
+                connection,
+                source_kind=source_kind,
+                source_rel_path=source_rel_path,
+                seen_at=scan_started_at,
+            )
+            assign_dataset_to_container_documents(
+                connection,
+                source_kind=source_kind,
+                source_rel_path=source_rel_path,
+                dataset_id=dataset_id,
+                dataset_source_id=dataset_source_id,
+            )
+            messages_deleted = 0
+            action = "skipped"
+            source_stats = {skipped_stat_key: 1}
+            scan_completed_at = scan_started_at
+        else:
+            messages_deleted = retire_unseen_container_messages(
+                connection,
+                paths,
+                source_kind=source_kind,
+                source_rel_path=source_rel_path,
+                scan_started_at=scan_started_at,
+            )
+            action = "finalized"
+            source_stats = {finalized_stat_key: 1}
+            scan_completed_at = next_monotonic_utc_timestamp([scan_started_at])
+        message_count = int(prepared_item.get("message_count") or 0)
+        if source_kind == PST_SOURCE_KIND and not skip_source:
+            message_count = len(
+                container_root_occurrence_rows_for_source(
+                    connection,
+                    source_kind=source_kind,
+                    source_rel_path=source_rel_path,
+                )
+            )
+        write_container_source_scan_completed(
+            connection,
+            dataset_id=dataset_id,
+            source_kind=source_kind,
+            source_rel_path=source_rel_path,
+            file_size=source_file_size,
+            file_mtime=source_file_mtime,
+            file_hash=source_file_hash,
+            message_count=message_count,
+            scan_started_at=scan_started_at,
+            scan_completed_at=scan_completed_at,
+        )
+        result = {
+            "action": action,
+            "source_kind": source_kind,
+            "source_rel_path": source_rel_path,
+            "source_plan_kind": source_plan_kind,
+            "current_ingestion_batch": None,
+            "document_id": None,
+            deleted_stat_key: messages_deleted,
+            **source_stats,
+        }
+        if source_kind == MBOX_SOURCE_KIND:
+            result["gmail_linked_drive_retired"] = linked_drive_retired
+        ingest_v2_commit_container_work_item_hook(
+            connection,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            writer_id=writer_id,
+            cursor=cursor,
+            result=result,
+            source_kind=source_kind,
+        )
+        if source_kind == PST_SOURCE_KIND:
+            ingest_v2_record_worker_event(
+                connection,
+                run_id=run_id,
+                worker_id=writer_id,
+                event_type="commit_pst_source_finalizer",
+                work_item_id=work_item_id,
+                phase="commit",
+                duration_ms=ingest_v2_elapsed_ms(finalizer_started),
+                details={
+                    "action": action,
+                    "source_rel_path": source_rel_path,
+                    "source_plan_kind": source_plan_kind,
+                    "message_count": message_count,
+                    deleted_stat_key: messages_deleted,
+                    "skip_source": skip_source,
+                },
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return result
 
 
 def ingest_v2_commit_mbox_source_finalizer(
@@ -37699,118 +38056,16 @@ def ingest_v2_commit_mbox_source_finalizer(
     cursor: dict[str, object],
     prepared_item: dict[str, object],
 ) -> dict[str, object]:
-    source_rel_path = str(prepared_item["source_rel_path"])
-    failed_messages = ingest_v2_mbox_failed_message_count(
+    return ingest_v2_commit_container_source_finalizer(
         connection,
+        paths,
         run_id=run_id,
-        source_rel_path=source_rel_path,
-    )
-    if failed_messages:
-        raise RetrieverError(
-            f"Cannot finalize MBOX source {source_rel_path}: {failed_messages} message work item(s) failed."
-        )
-    dataset_id, dataset_source_id = ensure_source_backed_dataset(
-        connection,
+        work_item_id=work_item_id,
+        writer_id=writer_id,
+        cursor=cursor,
+        prepared_item=prepared_item,
         source_kind=MBOX_SOURCE_KIND,
-        source_locator=source_rel_path,
-        dataset_name=mbox_dataset_name(source_rel_path),
     )
-    if connection.in_transaction:
-        connection.commit()
-    source_file_size = (
-        int(prepared_item["source_file_size"])
-        if prepared_item.get("source_file_size") is not None
-        else None
-    )
-    source_file_mtime = (
-        str(prepared_item["source_file_mtime"])
-        if prepared_item.get("source_file_mtime") is not None
-        else None
-    )
-    source_file_hash = str(prepared_item.get("source_file_hash") or "")
-    scan_started_at = str(prepared_item["scan_started_at"])
-    message_count = int(prepared_item.get("message_count") or 0)
-    skip_source = bool(prepared_item.get("skip_source"))
-    source_plan_kind = str(prepared_item.get("source_plan_kind") or "mbox")
-    connection.execute("BEGIN")
-    try:
-        linked_drive_retired = 0
-        linked_drive_rel_paths = {
-            normalize_whitespace(str(rel_path or "")).replace("\\", "/").strip("/")
-            for rel_path in list(prepared_item.get("linked_drive_rel_paths") or [])
-            if normalize_whitespace(str(rel_path or ""))
-        }
-        if source_plan_kind == "gmail" and linked_drive_rel_paths:
-            linked_drive_retired = retire_standalone_filesystem_documents_by_rel_paths(
-                connection,
-                paths,
-                rel_paths=linked_drive_rel_paths,
-            )
-        if skip_source:
-            mark_container_source_documents_active(
-                connection,
-                source_kind=MBOX_SOURCE_KIND,
-                source_rel_path=source_rel_path,
-                seen_at=scan_started_at,
-            )
-            assign_dataset_to_container_documents(
-                connection,
-                source_kind=MBOX_SOURCE_KIND,
-                source_rel_path=source_rel_path,
-                dataset_id=dataset_id,
-                dataset_source_id=dataset_source_id,
-            )
-            messages_deleted = 0
-            action = "skipped"
-            source_stats = {"mbox_sources_skipped": 1}
-            scan_completed_at = scan_started_at
-        else:
-            messages_deleted = retire_unseen_container_messages(
-                connection,
-                paths,
-                source_kind=MBOX_SOURCE_KIND,
-                source_rel_path=source_rel_path,
-                scan_started_at=scan_started_at,
-            )
-            action = "finalized"
-            source_stats = {"mbox_sources_finalized": 1}
-            scan_completed_at = next_monotonic_utc_timestamp([scan_started_at])
-        write_container_source_scan_completed(
-            connection,
-            dataset_id=dataset_id,
-            source_kind=MBOX_SOURCE_KIND,
-            source_rel_path=source_rel_path,
-            file_size=source_file_size,
-            file_mtime=source_file_mtime,
-            file_hash=source_file_hash,
-            message_count=message_count,
-            scan_started_at=scan_started_at,
-            scan_completed_at=scan_completed_at,
-        )
-        result = {
-            "action": action,
-            "source_kind": MBOX_SOURCE_KIND,
-            "source_rel_path": source_rel_path,
-            "source_plan_kind": source_plan_kind,
-            "current_ingestion_batch": None,
-            "document_id": None,
-            "mbox_messages_deleted": messages_deleted,
-            "gmail_linked_drive_retired": linked_drive_retired,
-            **source_stats,
-        }
-        ingest_v2_commit_mbox_work_item_hook(
-            connection,
-            run_id=run_id,
-            work_item_id=work_item_id,
-            writer_id=writer_id,
-            cursor=cursor,
-            result=result,
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    return result
 
 
 def ingest_v2_commit_pst_source_finalizer(
@@ -37823,130 +38078,16 @@ def ingest_v2_commit_pst_source_finalizer(
     cursor: dict[str, object],
     prepared_item: dict[str, object],
 ) -> dict[str, object]:
-    finalizer_started = time.perf_counter()
-    source_rel_path = str(prepared_item["source_rel_path"])
-    failed_messages = ingest_v2_pst_failed_message_count(
+    return ingest_v2_commit_container_source_finalizer(
         connection,
+        paths,
         run_id=run_id,
-        source_rel_path=source_rel_path,
-    )
-    if failed_messages:
-        raise RetrieverError(
-            f"Cannot finalize PST source {source_rel_path}: {failed_messages} message work item(s) failed."
-        )
-    dataset_id, dataset_source_id = ensure_source_backed_dataset(
-        connection,
+        work_item_id=work_item_id,
+        writer_id=writer_id,
+        cursor=cursor,
+        prepared_item=prepared_item,
         source_kind=PST_SOURCE_KIND,
-        source_locator=source_rel_path,
-        dataset_name=pst_dataset_name(source_rel_path),
     )
-    if connection.in_transaction:
-        connection.commit()
-    source_file_size = (
-        int(prepared_item["source_file_size"])
-        if prepared_item.get("source_file_size") is not None
-        else None
-    )
-    source_file_mtime = (
-        str(prepared_item["source_file_mtime"])
-        if prepared_item.get("source_file_mtime") is not None
-        else None
-    )
-    source_file_hash = str(prepared_item.get("source_file_hash") or "")
-    scan_started_at = str(prepared_item["scan_started_at"])
-    skip_source = bool(prepared_item.get("skip_source"))
-    source_plan_kind = str(prepared_item.get("source_plan_kind") or "pst")
-    connection.execute("BEGIN")
-    try:
-        if skip_source:
-            mark_container_source_documents_active(
-                connection,
-                source_kind=PST_SOURCE_KIND,
-                source_rel_path=source_rel_path,
-                seen_at=scan_started_at,
-            )
-            assign_dataset_to_container_documents(
-                connection,
-                source_kind=PST_SOURCE_KIND,
-                source_rel_path=source_rel_path,
-                dataset_id=dataset_id,
-                dataset_source_id=dataset_source_id,
-            )
-            messages_deleted = 0
-            action = "skipped"
-            source_stats = {"pst_sources_skipped": 1}
-            scan_completed_at = scan_started_at
-            message_count = int(prepared_item.get("message_count") or 0)
-        else:
-            messages_deleted = retire_unseen_container_messages(
-                connection,
-                paths,
-                source_kind=PST_SOURCE_KIND,
-                source_rel_path=source_rel_path,
-                scan_started_at=scan_started_at,
-            )
-            action = "finalized"
-            source_stats = {"pst_sources_finalized": 1}
-            scan_completed_at = next_monotonic_utc_timestamp([scan_started_at])
-            message_count = len(
-                container_root_occurrence_rows_for_source(
-                    connection,
-                    source_kind=PST_SOURCE_KIND,
-                    source_rel_path=source_rel_path,
-                )
-            )
-        write_container_source_scan_completed(
-            connection,
-            dataset_id=dataset_id,
-            source_kind=PST_SOURCE_KIND,
-            source_rel_path=source_rel_path,
-            file_size=source_file_size,
-            file_mtime=source_file_mtime,
-            file_hash=source_file_hash,
-            message_count=message_count,
-            scan_started_at=scan_started_at,
-            scan_completed_at=scan_completed_at,
-        )
-        result = {
-            "action": action,
-            "source_kind": PST_SOURCE_KIND,
-            "source_rel_path": source_rel_path,
-            "source_plan_kind": source_plan_kind,
-            "current_ingestion_batch": None,
-            "document_id": None,
-            "pst_messages_deleted": messages_deleted,
-            **source_stats,
-        }
-        ingest_v2_commit_pst_work_item_hook(
-            connection,
-            run_id=run_id,
-            work_item_id=work_item_id,
-            writer_id=writer_id,
-            cursor=cursor,
-            result=result,
-        )
-        ingest_v2_record_worker_event(
-            connection,
-            run_id=run_id,
-            worker_id=writer_id,
-            event_type="commit_pst_source_finalizer",
-            work_item_id=work_item_id,
-            phase="commit",
-            duration_ms=ingest_v2_elapsed_ms(finalizer_started),
-            details={
-                "action": action,
-                "source_rel_path": source_rel_path,
-                "source_plan_kind": source_plan_kind,
-                "message_count": message_count,
-                "pst_messages_deleted": messages_deleted,
-                "skip_source": skip_source,
-            },
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    return result
 
 
 def ingest_v2_maybe_advance_after_commit(connection: sqlite3.Connection, *, run_id: str) -> bool:
@@ -39901,7 +40042,8 @@ def ingest_v2_commit_step(
                 finally:
                     prepared_decode_ms_values.append(ingest_v2_elapsed_ms(prepared_decode_started))
                 payload_kind = str(claimed_row["payload_kind"] or claimed_row["unit_type"] or "")
-                if payload_kind == "production_row" or str(claimed_row["unit_type"] or "") == "production_row":
+                unit_type = str(claimed_row["unit_type"] or "")
+                if payload_kind == "production_row" or unit_type == "production_row":
                     prepared_item = ingest_v2_hydrate_prepared_production_item(prepared_item)
                     dataset_id, dataset_source_id, production_id = ingest_v2_ensure_production_context(
                         connection,
@@ -39936,10 +40078,7 @@ def ingest_v2_commit_step(
                             result=result,
                         ),
                     )
-                elif (
-                    payload_kind == "production_preview_batch"
-                    or str(claimed_row["unit_type"] or "") == "production_preview_batch"
-                ):
+                elif payload_kind == "production_preview_batch" or unit_type == "production_preview_batch":
                     _dataset_id, _dataset_source_id, production_id = ingest_v2_ensure_production_context(
                         connection,
                         root,
@@ -39955,7 +40094,7 @@ def ingest_v2_commit_step(
                         production_id=production_id,
                         prepared_item=prepared_item,
                     )
-                elif payload_kind == "slack_conversation" or str(claimed_row["unit_type"] or "") == "slack_conversation":
+                elif payload_kind == "slack_conversation" or unit_type == "slack_conversation":
                     prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
                     if prepare_error:
                         raise RetrieverError(prepare_error)
@@ -39998,7 +40137,7 @@ def ingest_v2_commit_step(
                     )
                     if str(commit_result.get("status") or "") == "failed":
                         raise RetrieverError(str(commit_result.get("error") or "Slack conversation commit failed."))
-                elif payload_kind == "slack_document" or str(claimed_row["unit_type"] or "") == "slack_document":
+                elif payload_kind == "slack_document" or unit_type == "slack_document":
                     prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
                     if prepare_error:
                         raise RetrieverError(prepare_error)
@@ -40102,10 +40241,8 @@ def ingest_v2_commit_step(
                             if bool(batch_result.get("freshness_fallback")):
                                 freshness_fallbacks += 1
                     continue
-                elif payload_kind == "conversation_preview" or str(claimed_row["unit_type"] or "") == "conversation_preview":
-                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
-                    if prepare_error:
-                        raise RetrieverError(prepare_error)
+                elif payload_kind == "conversation_preview" or unit_type == "conversation_preview":
+                    ingest_v2_raise_prepare_error(prepared_item)
                     commit_result = ingest_v2_commit_conversation_preview_work_item(
                         connection,
                         paths,
@@ -40115,340 +40252,80 @@ def ingest_v2_commit_step(
                         cursor=cursor,
                         prepared_item=prepared_item,
                     )
-                elif payload_kind == "mbox_message" or str(claimed_row["unit_type"] or "") == "mbox_message":
-                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
-                    if prepare_error:
-                        raise RetrieverError(prepare_error)
-                    if prepared_item.get("skip"):
-                        connection.execute("BEGIN")
-                        try:
-                            commit_result = {
-                                "action": "skipped",
-                                "source_kind": MBOX_SOURCE_KIND,
-                                "source_plan_kind": str(prepared_item.get("source_plan_kind") or "mbox"),
-                                "source_rel_path": str(prepared_item.get("source_rel_path") or ""),
-                                "source_item_id": str(prepared_item.get("source_item_id") or ""),
-                                "current_ingestion_batch": None,
-                                "document_id": None,
-                            }
-                            ingest_v2_commit_mbox_work_item_hook(
-                                connection,
-                                run_id=run_id,
-                                work_item_id=work_item_id,
-                                writer_id=writer_id,
-                                cursor=cursor,
-                                result=commit_result,
-                            )
-                            ingest_v2_record_worker_event(
-                                connection,
-                                run_id=run_id,
-                                worker_id=writer_id,
-                                event_type="commit_mbox_message",
-                                work_item_id=work_item_id,
-                                phase="commit",
-                                duration_ms=0.0,
-                                details={
-                                    "action": "skipped",
-                                    "source_rel_path": str(prepared_item.get("source_rel_path") or ""),
-                                    "source_item_id": str(prepared_item.get("source_item_id") or ""),
-                                    "source_plan_kind": str(prepared_item.get("source_plan_kind") or "mbox"),
-                                    "document_id": None,
-                                    "batch_index": 1,
-                                    "batch_size": 1,
-                                },
-                            )
-                            connection.commit()
-                        except Exception:
-                            connection.rollback()
-                            raise
-                    else:
-                        source_rel_path = str(prepared_item["source_rel_path"])
-                        context = ingest_v2_ensure_mbox_commit_context(
-                            connection,
-                            root,
-                            prepared_item=prepared_item,
-                            cursor=cursor,
-                            contexts=mbox_contexts,
-                        )
-                        batch_claimed_rows = [claimed_row]
-                        batch_prepared_items = [prepared_item]
-                        additional_rows = ingest_v2_claim_additional_mbox_commit_items(
-                            connection,
-                            run_id=run_id,
-                            writer_id=writer_id,
-                            source_rel_path=source_rel_path,
-                            current_payload_bytes=int(claimed_row["payload_bytes"] or 0),
-                        )
-                        if additional_rows:
-                            additional_prepared_items: list[dict[str, object]] = []
-                            additional_decode_started = time.perf_counter()
-                            decode_failed = False
-                            for additional_row in additional_rows:
-                                try:
-                                    additional_prepared_items.append(ingest_v2_prepared_item_from_row(additional_row))
-                                except Exception:
-                                    decode_failed = True
-                                    break
-                            decoded_count = len(additional_prepared_items)
-                            if decoded_count:
-                                additional_decode_ms = ingest_v2_elapsed_ms(additional_decode_started)
-                                prepared_decode_ms_values.extend(
-                                    [additional_decode_ms / decoded_count] * decoded_count
-                                )
-                            if decode_failed:
-                                ingest_v2_restore_claimed_commit_items(
-                                    connection,
-                                    run_id=run_id,
-                                    work_item_ids=[int(row["id"]) for row in additional_rows],
-                                    writer_id=writer_id,
-                                )
-                                additional_rows = []
-                            else:
-                                batch_claimed_rows.extend(additional_rows)
-                                batch_prepared_items.extend(additional_prepared_items)
-                        try:
-                            batch_results = ingest_v2_commit_mbox_message_batch(
-                                connection,
-                                paths,
-                                run_id=run_id,
-                                claimed_rows=batch_claimed_rows,
-                                prepared_items=batch_prepared_items,
-                                writer_id=writer_id,
-                                cursor=cursor,
-                                context=context,
-                            )
-                            if len(batch_results) > 1:
-                                mbox_message_batch_count += 1
-                                mbox_message_batch_items += len(batch_results)
-                        except Exception:
-                            rollback_open_transaction(connection)
-                            if len(batch_claimed_rows) > 1:
-                                mbox_message_batch_fallbacks += 1
-                                ingest_v2_restore_claimed_commit_items(
-                                    connection,
-                                    run_id=run_id,
-                                    work_item_ids=[int(row["id"]) for row in batch_claimed_rows[1:]],
-                                    writer_id=writer_id,
-                                )
-                                batch_results = ingest_v2_commit_mbox_message_batch(
-                                    connection,
-                                    paths,
-                                    run_id=run_id,
-                                    claimed_rows=[claimed_row],
-                                    prepared_items=[prepared_item],
-                                    writer_id=writer_id,
-                                    cursor=cursor,
-                                    context=context,
-                                )
-                            else:
-                                raise
-                        timing_item_count = max(1, len(batch_results))
-                        for batch_result in batch_results:
-                            action = str(batch_result.get("action") or "")
-                            if action == "failed":
-                                failed += 1
-                                ingest_v2_mark_commit_failed(
-                                    connection,
-                                    run_id=run_id,
-                                    work_item_id=work_item_id,
-                                    writer_id=writer_id,
-                                    message=str(batch_result.get("error") or "Commit failed."),
-                                )
-                            else:
-                                committed += 1
-                                actions[action] = int(actions.get(action) or 0) + 1
-                        continue
-                elif payload_kind == "mbox_source_finalizer" or str(claimed_row["unit_type"] or "") == "mbox_source_finalizer":
-                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
-                    if prepare_error:
-                        raise RetrieverError(prepare_error)
-                    commit_result = ingest_v2_commit_mbox_source_finalizer(
-                        connection,
-                        paths,
-                        run_id=run_id,
-                        work_item_id=work_item_id,
-                        writer_id=writer_id,
-                        cursor=cursor,
-                        prepared_item=prepared_item,
-                    )
-                elif payload_kind == "pst_message" or str(claimed_row["unit_type"] or "") == "pst_message":
-                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
-                    if prepare_error:
-                        raise RetrieverError(prepare_error)
-                    if prepared_item.get("skip"):
-                        connection.execute("BEGIN")
-                        try:
-                            commit_result = {
-                                "action": "skipped",
-                                "source_kind": PST_SOURCE_KIND,
-                                "source_plan_kind": str(prepared_item.get("source_plan_kind") or "pst"),
-                                "source_rel_path": str(prepared_item.get("source_rel_path") or ""),
-                                "source_item_id": str(prepared_item.get("source_item_id") or ""),
-                                "current_ingestion_batch": None,
-                                "document_id": None,
-                            }
-                            ingest_v2_commit_pst_work_item_hook(
-                                connection,
-                                run_id=run_id,
-                                work_item_id=work_item_id,
-                                writer_id=writer_id,
-                                cursor=cursor,
-                                result=commit_result,
-                            )
-                            ingest_v2_record_worker_event(
-                                connection,
-                                run_id=run_id,
-                                worker_id=writer_id,
-                                event_type="commit_pst_message",
-                                work_item_id=work_item_id,
-                                phase="commit",
-                                duration_ms=0.0,
-                                details={
-                                    "action": "skipped",
-                                    "source_rel_path": str(prepared_item.get("source_rel_path") or ""),
-                                    "source_item_id": str(prepared_item.get("source_item_id") or ""),
-                                    "source_plan_kind": str(prepared_item.get("source_plan_kind") or "pst"),
-                                    "document_id": None,
-                                    "batch_index": 1,
-                                    "batch_size": 1,
-                                },
-                            )
-                            connection.commit()
-                        except Exception:
-                            connection.rollback()
-                            raise
-                    else:
-                        source_rel_path = str(prepared_item["source_rel_path"])
-                        context = ingest_v2_ensure_pst_commit_context(
-                            connection,
-                            root,
-                            prepared_item=prepared_item,
-                            cursor=cursor,
-                            contexts=pst_contexts,
-                        )
-                        batch_claimed_rows = [claimed_row]
-                        batch_prepared_items = [prepared_item]
-                        additional_rows = ingest_v2_claim_additional_pst_commit_items(
-                            connection,
-                            run_id=run_id,
-                            writer_id=writer_id,
-                            source_rel_path=source_rel_path,
-                            current_payload_bytes=int(claimed_row["payload_bytes"] or 0),
-                        )
-                        if additional_rows:
-                            additional_prepared_items: list[dict[str, object]] = []
-                            additional_decode_started = time.perf_counter()
-                            decode_failed = False
-                            for additional_row in additional_rows:
-                                try:
-                                    additional_prepared_items.append(ingest_v2_prepared_item_from_row(additional_row))
-                                except Exception:
-                                    decode_failed = True
-                                    break
-                            decoded_count = len(additional_prepared_items)
-                            if decoded_count:
-                                additional_decode_ms = ingest_v2_elapsed_ms(additional_decode_started)
-                                prepared_decode_ms_values.extend(
-                                    [additional_decode_ms / decoded_count] * decoded_count
-                                )
-                            if decode_failed:
-                                ingest_v2_restore_claimed_commit_items(
-                                    connection,
-                                    run_id=run_id,
-                                    work_item_ids=[int(row["id"]) for row in additional_rows],
-                                    writer_id=writer_id,
-                                )
-                                additional_rows = []
-                            else:
-                                batch_claimed_rows.extend(additional_rows)
-                                batch_prepared_items.extend(additional_prepared_items)
-                        try:
-                            batch_results = ingest_v2_commit_pst_message_batch(
-                                connection,
-                                paths,
-                                run_id=run_id,
-                                claimed_rows=batch_claimed_rows,
-                                prepared_items=batch_prepared_items,
-                                writer_id=writer_id,
-                                cursor=cursor,
-                                context=context,
-                            )
-                            if len(batch_results) > 1:
-                                pst_message_batch_count += 1
-                                pst_message_batch_items += len(batch_results)
-                        except Exception:
-                            rollback_open_transaction(connection)
-                            if len(batch_claimed_rows) > 1:
-                                pst_message_batch_fallbacks += 1
-                                ingest_v2_restore_claimed_commit_items(
-                                    connection,
-                                    run_id=run_id,
-                                    work_item_ids=[int(row["id"]) for row in batch_claimed_rows[1:]],
-                                    writer_id=writer_id,
-                                )
-                                batch_results = ingest_v2_commit_pst_message_batch(
-                                    connection,
-                                    paths,
-                                    run_id=run_id,
-                                    claimed_rows=[claimed_row],
-                                    prepared_items=[prepared_item],
-                                    writer_id=writer_id,
-                                    cursor=cursor,
-                                    context=context,
-                                )
-                            else:
-                                raise
-                        timing_item_count = max(1, len(batch_results))
-                        for batch_result in batch_results:
-                            action = str(batch_result.get("action") or "")
-                            if action == "failed":
-                                failed += 1
-                                ingest_v2_mark_commit_failed(
-                                    connection,
-                                    run_id=run_id,
-                                    work_item_id=work_item_id,
-                                    writer_id=writer_id,
-                                    message=str(batch_result.get("error") or "Commit failed."),
-                                )
-                            else:
-                                committed += 1
-                                actions[action] = int(actions.get(action) or 0) + 1
-                        continue
-                elif payload_kind == "pst_source_finalizer" or str(claimed_row["unit_type"] or "") == "pst_source_finalizer":
-                    prepare_error = normalize_whitespace(str(prepared_item.get("prepare_error") or "")) or None
-                    if prepare_error:
-                        raise RetrieverError(prepare_error)
-                    commit_result = ingest_v2_commit_pst_source_finalizer(
-                        connection,
-                        paths,
-                        run_id=run_id,
-                        work_item_id=work_item_id,
-                        writer_id=writer_id,
-                        cursor=cursor,
-                        prepared_item=prepared_item,
-                    )
                 else:
-                    commit_result = commit_prepared_loose_file(
-                        connection,
-                        paths,
-                        prepared_item,
-                        existing_by_rel,
-                        unseen_existing_by_hash,
-                        ensure_filesystem_dataset,
-                        (
-                            int(cursor["current_ingestion_batch"])
-                            if cursor.get("current_ingestion_batch") is not None
-                            else None
-                        ),
-                        before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_work_item_hook(
-                            commit_connection,
+                    container_work_item = ingest_v2_container_work_item_kind(payload_kind, unit_type)
+                    if container_work_item is not None:
+                        source_kind, container_role = container_work_item
+                        ingest_v2_raise_prepare_error(prepared_item)
+                        if container_role == "message":
+                            container_batch = ingest_v2_commit_container_message_work_item(
+                                connection,
+                                paths,
+                                run_id=run_id,
+                                claimed_row=claimed_row,
+                                prepared_item=prepared_item,
+                                writer_id=writer_id,
+                                cursor=cursor,
+                                container_contexts=container_contexts,
+                                source_kind=source_kind,
+                                prepared_decode_ms_values=prepared_decode_ms_values,
+                            )
+                            if source_kind == MBOX_SOURCE_KIND:
+                                mbox_message_batch_count += int(container_batch["batch_count"])
+                                mbox_message_batch_items += int(container_batch["batch_items"])
+                                mbox_message_batch_fallbacks += int(container_batch["batch_fallbacks"])
+                            else:
+                                pst_message_batch_count += int(container_batch["batch_count"])
+                                pst_message_batch_items += int(container_batch["batch_items"])
+                                pst_message_batch_fallbacks += int(container_batch["batch_fallbacks"])
+                            timing_item_count = int(container_batch["timing_item_count"])
+                            for batch_result in list(container_batch["batch_results"]):
+                                action = str(batch_result.get("action") or "")
+                                if action == "failed":
+                                    failed += 1
+                                    ingest_v2_mark_commit_failed(
+                                        connection,
+                                        run_id=run_id,
+                                        work_item_id=work_item_id,
+                                        writer_id=writer_id,
+                                        message=str(batch_result.get("error") or "Commit failed."),
+                                    )
+                                else:
+                                    committed += 1
+                                    actions[action] = int(actions.get(action) or 0) + 1
+                            continue
+                        commit_result = ingest_v2_commit_container_source_finalizer(
+                            connection,
+                            paths,
                             run_id=run_id,
                             work_item_id=work_item_id,
                             writer_id=writer_id,
                             cursor=cursor,
-                            result=result,
-                        ),
-                    )
+                            prepared_item=prepared_item,
+                            source_kind=source_kind,
+                        )
+                    else:
+                        commit_result = commit_prepared_loose_file(
+                            connection,
+                            paths,
+                            prepared_item,
+                            existing_by_rel,
+                            unseen_existing_by_hash,
+                            ensure_filesystem_dataset,
+                            (
+                                int(cursor["current_ingestion_batch"])
+                                if cursor.get("current_ingestion_batch") is not None
+                                else None
+                            ),
+                            before_transaction_commit=lambda commit_connection, result: ingest_v2_commit_work_item_hook(
+                                commit_connection,
+                                run_id=run_id,
+                                work_item_id=work_item_id,
+                                writer_id=writer_id,
+                                cursor=cursor,
+                                result=result,
+                            ),
+                        )
                 action = str(commit_result.get("action") or "")
                 if action == "failed":
                     failed += 1

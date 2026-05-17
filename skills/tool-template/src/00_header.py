@@ -41,7 +41,7 @@ from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from zoneinfo import ZoneInfo
