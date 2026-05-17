@@ -2345,32 +2345,33 @@ def set_journal_mode(connection: sqlite3.Connection, journal_mode: str) -> str |
     return str(row[0]).lower()
 
 
+def configure_supported_sqlite_journal_mode(connection: sqlite3.Connection) -> tuple[str | None, list[str]]:
+    failures: list[str] = []
+    for requested_mode in ("WAL", "DELETE", "TRUNCATE"):
+        try:
+            journal_mode = set_journal_mode(connection, requested_mode)
+        except sqlite3.DatabaseError as exc:
+            failures.append(f"{requested_mode} failed with {type(exc).__name__}: {exc}")
+            continue
+        normalized_requested_mode = requested_mode.lower()
+        if journal_mode == normalized_requested_mode:
+            return journal_mode, failures
+        failures.append(f"{requested_mode} returned {journal_mode or '<empty>'}")
+    return None, failures
+
+
 def connect_db(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
-    wal_error: sqlite3.DatabaseError | None = None
-    journal_mode = None
-    try:
-        journal_mode = set_journal_mode(connection, "WAL")
-    except sqlite3.DatabaseError as exc:
-        wal_error = exc
-    if journal_mode != "wal":
-        try:
-            journal_mode = set_journal_mode(connection, "DELETE")
-        except sqlite3.DatabaseError as exc:
-            connection.close()
-            if wal_error is None:
-                raise RetrieverError(
-                    f"Unable to configure SQLite journal mode for {db_path}: "
-                    f"DELETE failed with {type(exc).__name__}: {exc}"
-                ) from exc
-            raise RetrieverError(
-                f"Unable to configure SQLite journal mode for {db_path}: "
-                f"WAL failed with {type(wal_error).__name__}: {wal_error}; "
-                f"DELETE failed with {type(exc).__name__}: {exc}"
-            ) from exc
+    journal_mode, journal_mode_failures = configure_supported_sqlite_journal_mode(connection)
+    if journal_mode is None:
+        connection.close()
+        raise RetrieverError(
+            f"Unable to configure SQLite journal mode for {db_path}: "
+            f"{'; '.join(journal_mode_failures)}"
+        )
     if journal_mode == "wal":
         connection.execute("PRAGMA synchronous = NORMAL")
     return connection
@@ -2407,18 +2408,18 @@ def seed_sqlite_db_from_local_temp(db_path: Path) -> dict[str, object]:
     try:
         seed_connection = sqlite3.connect(seed_path)
         try:
-            try:
-                seed_journal_mode = set_journal_mode(seed_connection, "WAL")
-            except sqlite3.DatabaseError:
-                seed_journal_mode = None
-            if seed_journal_mode != "wal":
-                seed_journal_mode = set_journal_mode(seed_connection, "DELETE")
+            seed_journal_mode, seed_journal_mode_failures = configure_supported_sqlite_journal_mode(seed_connection)
+            if seed_journal_mode is None:
+                raise RetrieverError(
+                    f"Unable to configure SQLite journal mode for temporary seed DB {seed_path}: "
+                    f"{'; '.join(seed_journal_mode_failures)}"
+                )
         finally:
             seed_connection.close()
         with seed_path.open("rb") as src_handle:
             db_path.write_bytes(src_handle.read())
         return {
-            "journal_mode": seed_journal_mode or "delete",
+            "journal_mode": seed_journal_mode,
             "reset_artifacts": reset_artifacts,
         }
     finally:
@@ -14563,6 +14564,13 @@ GMAIL_DRIVE_LINKS_REQUIRED_HEADERS = {
     "DriveUrl",
     "DriveItemId",
 }
+GMAIL_RESULT_COUNTS_REQUIRED_HEADERS = {
+    "Email",
+    "AccountStatus",
+    "SuccessCount",
+    "MessageErrorCount",
+    "ChatErrorCount",
+}
 PST_EXPORT_STANDARD_RESULTS_REQUIRED_HEADERS = {
     "Document ID",
     "Item Identity",
@@ -14578,6 +14586,48 @@ PST_EXPORT_ARCHIVE_RESULTS_FILE_PATTERN = re.compile(r"^export_results.*\.csv$",
 PST_EXPORT_SUMMARY_FILE_PATTERN = re.compile(r"^export summary .+\.csv$", re.IGNORECASE)
 PST_EXPORT_MANIFEST_FILE_PATTERN = re.compile(r"^manifest\.xml$", re.IGNORECASE)
 PST_EXPORT_TRACE_LOG_FILE_PATTERN = re.compile(r"^trace\.log$", re.IGNORECASE)
+
+
+def gmail_result_counts_csv_valid(path: Path) -> bool:
+    headers, _ = load_normalized_csv_rows(path)
+    normalized_headers = {
+        normalize_inline_whitespace(str(header or "")).casefold()
+        for header in headers
+        if header
+    }
+    required_headers = {header.casefold() for header in GMAIL_RESULT_COUNTS_REQUIRED_HEADERS}
+    return required_headers.issubset(normalized_headers)
+
+
+def gmail_export_family_keys(value: Path | str) -> set[str]:
+    raw_name = value.stem if isinstance(value, Path) else str(value or "")
+    pending = [normalize_whitespace(raw_name)]
+    seen_candidates: set[str] = set()
+    normalized_keys: set[str] = set()
+
+    while pending:
+        candidate = normalize_whitespace(pending.pop())
+        candidate_key = candidate.casefold()
+        if not candidate or candidate_key in seen_candidates:
+            continue
+        seen_candidates.add(candidate_key)
+
+        normalized_key = re.sub(r"[^a-z0-9]+", "", candidate_key)
+        if normalized_key:
+            normalized_keys.add(normalized_key)
+
+        if "--" in candidate:
+            pending.append(candidate.split("--", 1)[0])
+        if candidate_key.endswith("-errors"):
+            pending.append(candidate[: -len("-errors")])
+        if candidate_key.endswith("-result-counts"):
+            pending.append(candidate[: -len("-result-counts")])
+
+        trimmed_numeric_suffix = re.sub(r"[-_ ]+\d+$", "", candidate)
+        if trimmed_numeric_suffix != candidate:
+            pending.append(trimmed_numeric_suffix)
+
+    return normalized_keys
 
 
 def load_normalized_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -15834,18 +15884,42 @@ def detect_gmail_export_root(candidate_root: Path) -> dict[str, object] | None:
         )
         auxiliary_error_xml_paths = sorted(path for path in candidate_root.rglob("*-errors.xml"))
         result_count_paths = sorted(path for path in candidate_root.rglob("*-result-counts.csv"))
+        valid_result_count_paths = [path for path in result_count_paths if gmail_result_counts_csv_valid(path)]
         md5_paths = sorted(path for path in candidate_root.rglob("*.md5"))
+        zip_paths = sorted(path for path in candidate_root.rglob("*.zip"))
     except OSError:
         return None
 
-    if not (
+    full_export_detected = bool(
         archive_browser_path.exists()
         or metadata_csv_paths
         or drive_links_paths
         or drive_export_dirs
         or drive_export_metadata_paths
-    ):
+    )
+    mbox_family_keys = {
+        key
+        for path in mbox_paths
+        for key in gmail_export_family_keys(path)
+    }
+    degraded_sidecar_paths = [
+        *auxiliary_error_xml_paths,
+        *valid_result_count_paths,
+        *md5_paths,
+    ]
+    degraded_export_detected = any(
+        gmail_export_family_keys(path) & mbox_family_keys
+        for path in degraded_sidecar_paths
+    )
+
+    if not (full_export_detected or degraded_export_detected):
         return None
+
+    owned_zip_paths = sorted(
+        path
+        for path in zip_paths
+        if gmail_export_family_keys(path) & mbox_family_keys
+    )
 
     email_metadata_by_message_id = parse_gmail_metadata_csv(metadata_csv_paths)
     drive_links_by_message_id = parse_gmail_drive_links_csv(drive_links_paths)
@@ -15982,6 +16056,7 @@ def detect_gmail_export_root(candidate_root: Path) -> dict[str, object] | None:
         *(path.resolve() for path in drive_export_error_paths),
         *(path.resolve() for path in result_count_paths),
         *(path.resolve() for path in md5_paths),
+        *(path.resolve() for path in owned_zip_paths),
         *(path.resolve() for path in drive_export_files),
     }
     if archive_browser_path.exists():
@@ -16036,6 +16111,19 @@ def find_gmail_export_roots(
                 if ".retriever" in drive_links_path.parts:
                     continue
                 candidates.add(drive_links_path.parent)
+            for result_count_path in root.rglob("*-result-counts.csv"):
+                if ".retriever" in result_count_path.parts:
+                    continue
+                if gmail_result_counts_csv_valid(result_count_path):
+                    candidates.add(result_count_path.parent)
+            for error_path in root.rglob("*-errors.xml"):
+                if ".retriever" in error_path.parts:
+                    continue
+                candidates.add(error_path.parent)
+            for md5_path in root.rglob("*.md5"):
+                if ".retriever" in md5_path.parts:
+                    continue
+                candidates.add(md5_path.parent)
             for export_dir in root.rglob("*"):
                 if not export_dir.is_dir() or ".retriever" in export_dir.parts:
                     continue
@@ -19245,7 +19333,6 @@ def build_email_preview_head_html() -> str:
         ".retriever-calendar-invite-meta dd { margin: 0; }"
         ".retriever-calendar-invite-meta a { color: #174ea6; text-decoration: none; word-break: break-all; }"
         ".retriever-calendar-invite-meta a:hover { text-decoration: underline; }"
-        ".conversation-document-body img { display: block; max-width: 100%; height: auto; }"
         ".retriever-attachments { margin-top: 1rem; padding-top: 0.8rem; border-top: 1px solid #eceff3; }"
         ".retriever-attachments h2 { margin: 0 0 0.5rem; font-size: 0.86rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #5f6368; }"
         ".retriever-attachments ul { margin: 0; padding-left: 1.1rem; }"
@@ -20353,6 +20440,7 @@ def build_conversation_preview_head_html() -> str:
         ".retriever-calendar-invite-meta dd { margin: 0; }"
         ".retriever-calendar-invite-meta a { color: #174ea6; text-decoration: none; word-break: break-all; }"
         ".retriever-calendar-invite-meta a:hover { text-decoration: underline; }"
+        ".conversation-document-body img { display: block; max-width: 100%; height: auto; }"
         ".conversation-document-body pre { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; margin: 0; background: #f8fafc; border: 1px solid #d7e0ea; border-radius: 14px; padding: 0.9rem 1rem; font-family: inherit; font-size: 1rem; }"
         ".conversation-chat-transcript { display: grid; gap: 0.75rem; }"
         ".conversation-chat-message { display: flex; gap: 0.75rem; align-items: flex-start; min-width: 0; max-width: 100%; border: 1px solid #d0d7de; border-radius: 14px; padding: 0.85rem 0.95rem; background: #f6f8fa; }"

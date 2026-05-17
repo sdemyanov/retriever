@@ -6932,6 +6932,42 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("PRAGMA journal_mode = DELETE", fake_connection.commands)
         self.assertNotIn("PRAGMA synchronous = NORMAL", fake_connection.commands)
 
+    def test_connect_db_falls_back_to_truncate_when_wal_and_delete_fail(self) -> None:
+        class FakeCursor:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.row_factory = None
+                self.commands: list[str] = []
+
+            def execute(self, statement: str):
+                self.commands.append(statement)
+                if statement == "PRAGMA journal_mode = WAL":
+                    raise sqlite3.OperationalError("wal unsupported")
+                if statement == "PRAGMA journal_mode = DELETE":
+                    raise sqlite3.OperationalError("delete unsupported")
+                if statement == "PRAGMA journal_mode = TRUNCATE":
+                    return FakeCursor(["truncate"])
+                return FakeCursor(None)
+
+            def close(self) -> None:
+                return None
+
+        fake_connection = FakeConnection()
+        with mock.patch.object(retriever_tools.sqlite3, "connect", return_value=fake_connection):
+            connection = retriever_tools.connect_db(self.paths["db_path"])
+
+        self.assertIs(connection, fake_connection)
+        self.assertIn("PRAGMA journal_mode = WAL", fake_connection.commands)
+        self.assertIn("PRAGMA journal_mode = DELETE", fake_connection.commands)
+        self.assertIn("PRAGMA journal_mode = TRUNCATE", fake_connection.commands)
+        self.assertNotIn("PRAGMA synchronous = NORMAL", fake_connection.commands)
+
     def test_connect_db_sets_synchronous_normal_when_wal_succeeds(self) -> None:
         class FakeCursor:
             def __init__(self, row):
@@ -7261,7 +7297,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(len(connect_calls), 2)
         self.assertEqual(result["schema_version"], retriever_tools.SCHEMA_VERSION)
         self.assertIn("seeded_sqlite_db", result)
-        self.assertIn(result["seeded_sqlite_db"]["journal_mode"], {"wal", "delete"})
+        self.assertIn(result["seeded_sqlite_db"]["journal_mode"], {"wal", "delete", "truncate"})
         self.assertGreater(self.paths["db_path"].stat().st_size, 0)
 
     def test_bootstrap_then_ingest_creates_email_attachment_children_and_search_context(self) -> None:
@@ -7531,7 +7567,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(doctor_result["workspace_inventory"]["parent_documents"], 1)
         self.assertEqual(doctor_result["workspace_inventory"]["attachment_children"], 1)
         self.assertEqual(doctor_result["workspace_inventory"]["documents_total"], 2)
-        self.assertIn(doctor_result["sqlite_journal_mode"], {"wal", "delete"})
+        self.assertIn(doctor_result["sqlite_journal_mode"], {"wal", "delete", "truncate"})
 
         with self.assertRaises(retriever_tools.RetrieverError) as context:
             retriever_tools.search(self.root, "", None, "is_attachment", None, 1, 20)
@@ -17444,6 +17480,93 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertNotIn("gmail-filtered/Filtered-metadata.csv", parent_rel_paths)
         self.assertNotIn("gmail-filtered/Filtered-drive-links.csv", parent_rel_paths)
         self.assertNotIn("gmail-filtered/Filtered_Drive_Link_Export-metadata.xml", parent_rel_paths)
+
+    def test_ingest_degraded_gmail_export_claims_matching_sidecars(self) -> None:
+        export_root = self.root / "gmail-rowan"
+        export_root.mkdir()
+
+        mbox_path = export_root / "Rowan_Gmail_22-23--rowan@discoverbeagle.com-Dj_YIq.mbox"
+        archive = mailbox.mbox(str(mbox_path), create=True)
+        try:
+            archive.add(
+                self.build_fake_mbox_message(
+                    subject="Stripped Gmail export message",
+                    body_text="This folder only has mbox and sidecars.",
+                    message_id="<gmail-rowan-001@example.com>",
+                    author="Sender Example <sender@example.com>",
+                    recipients="Receiver Example <receiver@example.com>",
+                )
+            )
+            archive.flush()
+        finally:
+            archive.close()
+
+        errors_path = export_root / "Rowan_Gmail_22-23-errors.xml"
+        errors_path.write_text("<Errors/>\n", encoding="utf-8")
+        result_counts_path = export_root / "Rowan_Gmail_22-23-result-counts.csv"
+        result_counts_path.write_text(
+            "Email,AccountStatus,SuccessCount,MessageErrorCount,ChatErrorCount\n"
+            "Totals,,1,0,0\n"
+            "rowan@discoverbeagle.com,Success,1,0,0\n",
+            encoding="utf-8",
+        )
+        md5_path = export_root / "Rowan Gmail 22-23.md5"
+        md5_path.write_text("deadbeef\n", encoding="utf-8")
+        zip_path = export_root / "Rowan_Gmail_22-23-1.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive_zip:
+            archive_zip.write(mbox_path, arcname=mbox_path.name)
+            archive_zip.write(errors_path, arcname=errors_path.name)
+            archive_zip.write(result_counts_path, arcname=result_counts_path.name)
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["gmail_exports_detected"], 1)
+        self.assertEqual(ingest_result["mbox_messages_created"], 1)
+        self.assertEqual(ingest_result["workspace_parent_documents"], 1)
+        self.assertEqual(ingest_result["workspace_documents_total"], 1)
+
+        email_rel_path = retriever_tools.mbox_message_rel_path(
+            "gmail-rowan/Rowan_Gmail_22-23--rowan@discoverbeagle.com-Dj_YIq.mbox",
+            "<gmail-rowan-001@example.com>",
+        )
+        email_row = self.fetch_document_row(email_rel_path)
+        self.assertEqual(email_row["source_kind"], retriever_tools.MBOX_SOURCE_KIND)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            parent_rel_paths = {
+                str(row["rel_path"])
+                for row in connection.execute(
+                    """
+                    SELECT rel_path
+                    FROM documents
+                    WHERE parent_document_id IS NULL
+                    ORDER BY rel_path ASC
+                    """
+                ).fetchall()
+            }
+            failed_paths = {
+                str(row["rel_path"])
+                for row in connection.execute(
+                    """
+                    SELECT rel_path
+                    FROM ingest_work_items
+                    WHERE status = 'failed'
+                    ORDER BY rel_path ASC
+                    """
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+
+        self.assertNotIn("gmail-rowan/Rowan Gmail 22-23.md5", parent_rel_paths)
+        self.assertNotIn("gmail-rowan/Rowan_Gmail_22-23-errors.xml", parent_rel_paths)
+        self.assertNotIn("gmail-rowan/Rowan_Gmail_22-23-result-counts.csv", parent_rel_paths)
+        self.assertNotIn("gmail-rowan/Rowan_Gmail_22-23-1.zip", parent_rel_paths)
+        self.assertNotIn("gmail-rowan/Rowan Gmail 22-23.md5", failed_paths)
+        self.assertNotIn("gmail-rowan/Rowan_Gmail_22-23-1.zip", failed_paths)
 
     def test_ingest_mbox_without_message_id_uses_stable_fallback_source_item_id(self) -> None:
         first_messages = [

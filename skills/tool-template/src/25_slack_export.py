@@ -1451,6 +1451,13 @@ GMAIL_DRIVE_LINKS_REQUIRED_HEADERS = {
     "DriveUrl",
     "DriveItemId",
 }
+GMAIL_RESULT_COUNTS_REQUIRED_HEADERS = {
+    "Email",
+    "AccountStatus",
+    "SuccessCount",
+    "MessageErrorCount",
+    "ChatErrorCount",
+}
 PST_EXPORT_STANDARD_RESULTS_REQUIRED_HEADERS = {
     "Document ID",
     "Item Identity",
@@ -1466,6 +1473,48 @@ PST_EXPORT_ARCHIVE_RESULTS_FILE_PATTERN = re.compile(r"^export_results.*\.csv$",
 PST_EXPORT_SUMMARY_FILE_PATTERN = re.compile(r"^export summary .+\.csv$", re.IGNORECASE)
 PST_EXPORT_MANIFEST_FILE_PATTERN = re.compile(r"^manifest\.xml$", re.IGNORECASE)
 PST_EXPORT_TRACE_LOG_FILE_PATTERN = re.compile(r"^trace\.log$", re.IGNORECASE)
+
+
+def gmail_result_counts_csv_valid(path: Path) -> bool:
+    headers, _ = load_normalized_csv_rows(path)
+    normalized_headers = {
+        normalize_inline_whitespace(str(header or "")).casefold()
+        for header in headers
+        if header
+    }
+    required_headers = {header.casefold() for header in GMAIL_RESULT_COUNTS_REQUIRED_HEADERS}
+    return required_headers.issubset(normalized_headers)
+
+
+def gmail_export_family_keys(value: Path | str) -> set[str]:
+    raw_name = value.stem if isinstance(value, Path) else str(value or "")
+    pending = [normalize_whitespace(raw_name)]
+    seen_candidates: set[str] = set()
+    normalized_keys: set[str] = set()
+
+    while pending:
+        candidate = normalize_whitespace(pending.pop())
+        candidate_key = candidate.casefold()
+        if not candidate or candidate_key in seen_candidates:
+            continue
+        seen_candidates.add(candidate_key)
+
+        normalized_key = re.sub(r"[^a-z0-9]+", "", candidate_key)
+        if normalized_key:
+            normalized_keys.add(normalized_key)
+
+        if "--" in candidate:
+            pending.append(candidate.split("--", 1)[0])
+        if candidate_key.endswith("-errors"):
+            pending.append(candidate[: -len("-errors")])
+        if candidate_key.endswith("-result-counts"):
+            pending.append(candidate[: -len("-result-counts")])
+
+        trimmed_numeric_suffix = re.sub(r"[-_ ]+\d+$", "", candidate)
+        if trimmed_numeric_suffix != candidate:
+            pending.append(trimmed_numeric_suffix)
+
+    return normalized_keys
 
 
 def load_normalized_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -2722,18 +2771,42 @@ def detect_gmail_export_root(candidate_root: Path) -> dict[str, object] | None:
         )
         auxiliary_error_xml_paths = sorted(path for path in candidate_root.rglob("*-errors.xml"))
         result_count_paths = sorted(path for path in candidate_root.rglob("*-result-counts.csv"))
+        valid_result_count_paths = [path for path in result_count_paths if gmail_result_counts_csv_valid(path)]
         md5_paths = sorted(path for path in candidate_root.rglob("*.md5"))
+        zip_paths = sorted(path for path in candidate_root.rglob("*.zip"))
     except OSError:
         return None
 
-    if not (
+    full_export_detected = bool(
         archive_browser_path.exists()
         or metadata_csv_paths
         or drive_links_paths
         or drive_export_dirs
         or drive_export_metadata_paths
-    ):
+    )
+    mbox_family_keys = {
+        key
+        for path in mbox_paths
+        for key in gmail_export_family_keys(path)
+    }
+    degraded_sidecar_paths = [
+        *auxiliary_error_xml_paths,
+        *valid_result_count_paths,
+        *md5_paths,
+    ]
+    degraded_export_detected = any(
+        gmail_export_family_keys(path) & mbox_family_keys
+        for path in degraded_sidecar_paths
+    )
+
+    if not (full_export_detected or degraded_export_detected):
         return None
+
+    owned_zip_paths = sorted(
+        path
+        for path in zip_paths
+        if gmail_export_family_keys(path) & mbox_family_keys
+    )
 
     email_metadata_by_message_id = parse_gmail_metadata_csv(metadata_csv_paths)
     drive_links_by_message_id = parse_gmail_drive_links_csv(drive_links_paths)
@@ -2870,6 +2943,7 @@ def detect_gmail_export_root(candidate_root: Path) -> dict[str, object] | None:
         *(path.resolve() for path in drive_export_error_paths),
         *(path.resolve() for path in result_count_paths),
         *(path.resolve() for path in md5_paths),
+        *(path.resolve() for path in owned_zip_paths),
         *(path.resolve() for path in drive_export_files),
     }
     if archive_browser_path.exists():
@@ -2924,6 +2998,19 @@ def find_gmail_export_roots(
                 if ".retriever" in drive_links_path.parts:
                     continue
                 candidates.add(drive_links_path.parent)
+            for result_count_path in root.rglob("*-result-counts.csv"):
+                if ".retriever" in result_count_path.parts:
+                    continue
+                if gmail_result_counts_csv_valid(result_count_path):
+                    candidates.add(result_count_path.parent)
+            for error_path in root.rglob("*-errors.xml"):
+                if ".retriever" in error_path.parts:
+                    continue
+                candidates.add(error_path.parent)
+            for md5_path in root.rglob("*.md5"):
+                if ".retriever" in md5_path.parts:
+                    continue
+                candidates.add(md5_path.parent)
             for export_dir in root.rglob("*"):
                 if not export_dir.is_dir() or ".retriever" in export_dir.parts:
                     continue

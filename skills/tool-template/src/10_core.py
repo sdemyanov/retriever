@@ -1492,32 +1492,33 @@ def set_journal_mode(connection: sqlite3.Connection, journal_mode: str) -> str |
     return str(row[0]).lower()
 
 
+def configure_supported_sqlite_journal_mode(connection: sqlite3.Connection) -> tuple[str | None, list[str]]:
+    failures: list[str] = []
+    for requested_mode in ("WAL", "DELETE", "TRUNCATE"):
+        try:
+            journal_mode = set_journal_mode(connection, requested_mode)
+        except sqlite3.DatabaseError as exc:
+            failures.append(f"{requested_mode} failed with {type(exc).__name__}: {exc}")
+            continue
+        normalized_requested_mode = requested_mode.lower()
+        if journal_mode == normalized_requested_mode:
+            return journal_mode, failures
+        failures.append(f"{requested_mode} returned {journal_mode or '<empty>'}")
+    return None, failures
+
+
 def connect_db(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
-    wal_error: sqlite3.DatabaseError | None = None
-    journal_mode = None
-    try:
-        journal_mode = set_journal_mode(connection, "WAL")
-    except sqlite3.DatabaseError as exc:
-        wal_error = exc
-    if journal_mode != "wal":
-        try:
-            journal_mode = set_journal_mode(connection, "DELETE")
-        except sqlite3.DatabaseError as exc:
-            connection.close()
-            if wal_error is None:
-                raise RetrieverError(
-                    f"Unable to configure SQLite journal mode for {db_path}: "
-                    f"DELETE failed with {type(exc).__name__}: {exc}"
-                ) from exc
-            raise RetrieverError(
-                f"Unable to configure SQLite journal mode for {db_path}: "
-                f"WAL failed with {type(wal_error).__name__}: {wal_error}; "
-                f"DELETE failed with {type(exc).__name__}: {exc}"
-            ) from exc
+    journal_mode, journal_mode_failures = configure_supported_sqlite_journal_mode(connection)
+    if journal_mode is None:
+        connection.close()
+        raise RetrieverError(
+            f"Unable to configure SQLite journal mode for {db_path}: "
+            f"{'; '.join(journal_mode_failures)}"
+        )
     if journal_mode == "wal":
         connection.execute("PRAGMA synchronous = NORMAL")
     return connection
@@ -1554,18 +1555,18 @@ def seed_sqlite_db_from_local_temp(db_path: Path) -> dict[str, object]:
     try:
         seed_connection = sqlite3.connect(seed_path)
         try:
-            try:
-                seed_journal_mode = set_journal_mode(seed_connection, "WAL")
-            except sqlite3.DatabaseError:
-                seed_journal_mode = None
-            if seed_journal_mode != "wal":
-                seed_journal_mode = set_journal_mode(seed_connection, "DELETE")
+            seed_journal_mode, seed_journal_mode_failures = configure_supported_sqlite_journal_mode(seed_connection)
+            if seed_journal_mode is None:
+                raise RetrieverError(
+                    f"Unable to configure SQLite journal mode for temporary seed DB {seed_path}: "
+                    f"{'; '.join(seed_journal_mode_failures)}"
+                )
         finally:
             seed_connection.close()
         with seed_path.open("rb") as src_handle:
             db_path.write_bytes(src_handle.read())
         return {
-            "journal_mode": seed_journal_mode or "delete",
+            "journal_mode": seed_journal_mode,
             "reset_artifacts": reset_artifacts,
         }
     finally:
