@@ -574,7 +574,7 @@ Expected JSON shape:
 ```json
 {
   "overall": "pass",
-  "tool_version": "1.1.16",
+  "tool_version": "1.1.17",
   "schema_version": 26,
   "python_version": "3.10.12",
   "pip_version": "25.3",
@@ -614,7 +614,7 @@ Expected JSON shape:
   "status": "initialized",
   "workspace_root": "/path/to/workspace",
   "schema_version": 26,
-  "tool_version": "1.1.16",
+  "tool_version": "1.1.17",
   "requirements_version": "2026-04-21-phase11-document-deduplication",
   "journal_mode": "wal"
 }

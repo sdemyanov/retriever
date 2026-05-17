@@ -6,7 +6,7 @@ description: >
   "find hot docs", "triage these contracts", "build a privilege set", or
   "export a first-pass review set".
 metadata:
-  version: "1.1.16"
+  version: "1.1.17"
 ---
 
 > Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.

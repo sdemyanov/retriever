@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "retriever",
-  "version": "1.1.16",
+  "version": "1.1.17",
   "description": "Build a review workspace, find the documents that matter, and export a shareable review set.",
   "author": {
     "name": "Sergey Demyanov",

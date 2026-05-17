@@ -5,7 +5,7 @@ description: >
   It is the source of truth for table layouts, path rules, custom field registry
   behavior, manual field locks, and schema-version behavior.
 metadata:
-  version: "1.1.16"
+  version: "1.1.17"
 ---
 
 > Operates under `retriever:routing`. If the user's intent actually fits a different tier — another `retriever:*` skill, a Tier 2 slash, a Tier 3 `tools.py` subcommand, or (last resort) direct DB access — stop and re-route against the ladder before continuing.

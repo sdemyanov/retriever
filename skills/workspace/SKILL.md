@@ -6,7 +6,7 @@ description: >
   the pinned dependency contract for the current runtime, and the current workspace
   maintenance command surface.
 metadata:
-  version: "1.1.16"
+  version: "1.1.17"
 ---
 
 # Retriever Workspace
@@ -35,7 +35,7 @@ Use this skill for any task that needs to bootstrap or maintain a workspace-loca
 
 ## Current outcome
 
-With the current `1.1.16` / schema `26` tool surface, Claude should be able to:
+With the current `1.1.17` / schema `26` tool surface, Claude should be able to:
 
 - verify the runtime with `workspace status`
 - create the `.retriever/` directory structure

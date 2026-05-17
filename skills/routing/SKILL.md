@@ -6,7 +6,7 @@ description: >
   policy. This is the shared operating surface that other Retriever skills
   reference as `retriever:routing`.
 metadata:
-  version: "1.1.16"
+  version: "1.1.17"
 ---
 
 # Retriever Routing and Operating Rules
