@@ -69,6 +69,116 @@ def processing_response_schema(
     return processing_job_output_json_schema(job_output_rows)
 
 
+def json_schema_path(path: str, segment: object) -> str:
+    if isinstance(segment, int):
+        return f"{path}[{segment}]"
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(segment or "")):
+        return f"{path}.{segment}"
+    return f'{path}[{json.dumps(str(segment))}]'
+
+
+def json_schema_allowed_types(schema: dict[str, object]) -> list[str]:
+    raw_type = schema.get("type")
+    if isinstance(raw_type, str):
+        return [raw_type]
+    if isinstance(raw_type, list):
+        return [str(item) for item in raw_type if isinstance(item, str)]
+    return []
+
+
+def json_schema_type_matches(value: object, schema_type: str) -> bool:
+    if schema_type == "object":
+        return isinstance(value, dict)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "number":
+        return (isinstance(value, int) and not isinstance(value, bool)) or isinstance(value, float)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    if schema_type == "null":
+        return value is None
+    return True
+
+
+def validate_processing_schema_value(
+    value: object,
+    schema: dict[str, object],
+    *,
+    path: str = "$",
+) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    issues: list[str] = []
+    allowed_types = json_schema_allowed_types(schema)
+    if allowed_types and not any(json_schema_type_matches(value, schema_type) for schema_type in allowed_types):
+        issues.append(f"{path} must be of type {' or '.join(allowed_types)}")
+        return issues
+
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and enum_values and value not in enum_values:
+        issues.append(f"{path} must be one of {enum_values!r}")
+
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        property_schemas = properties if isinstance(properties, dict) else {}
+        required = schema.get("required")
+        if isinstance(required, list):
+            for property_name in required:
+                if isinstance(property_name, str) and property_name not in value:
+                    issues.append(f"{json_schema_path(path, property_name)} is required")
+        additional_properties = schema.get("additionalProperties", True)
+        for key, item in value.items():
+            child_schema = property_schemas.get(key)
+            if isinstance(child_schema, dict):
+                issues.extend(
+                    validate_processing_schema_value(
+                        item,
+                        child_schema,
+                        path=json_schema_path(path, key),
+                    )
+                )
+                continue
+            if additional_properties is False:
+                issues.append(f"{json_schema_path(path, key)} is not allowed")
+            elif isinstance(additional_properties, dict):
+                issues.extend(
+                    validate_processing_schema_value(
+                        item,
+                        additional_properties,
+                        path=json_schema_path(path, key),
+                    )
+                )
+        return issues
+
+    if isinstance(value, list):
+        items_schema = schema.get("items")
+        if isinstance(items_schema, dict):
+            for index, item in enumerate(value):
+                issues.extend(
+                    validate_processing_schema_value(
+                        item,
+                        items_schema,
+                        path=json_schema_path(path, index),
+                    )
+                )
+        return issues
+
+    return issues
+
+
+def validate_processing_response_output(
+    job_version_row: sqlite3.Row,
+    job_output_rows: list[sqlite3.Row],
+    output_value: object,
+) -> list[str]:
+    schema = processing_response_schema(job_version_row, job_output_rows)
+    return validate_processing_schema_value(output_value, schema)
+
+
 def openai_responses_api_url() -> str:
     explicit_url = normalize_whitespace(os.environ.get("OPENAI_RESPONSES_URL", ""))
     if explicit_url:
@@ -368,14 +478,21 @@ def build_openai_translation_payload(
     ).lower()
     if not target_language:
         raise RetrieverError("Translation job versions require parameters_json.target_language.")
-    instruction_text = str(job_version_row["instruction_text"] or "").strip() or (
-        f"Translate the document into {target_language}. Return only the translated text."
-    )
+    instruction_text = str(job_version_row["instruction_text"] or "").strip()
+    prompt_lines = [
+        f"Translate the document into {target_language}. Return only the translated text.",
+        "Preserve the original structure and line breaks.",
+        "Keep dates, numbers, email addresses, URLs, Bates numbers, file names, and header labels/ordering unchanged.",
+        "Keep proper names unchanged unless the source itself provides a translated form.",
+        "Do not summarize or omit content.",
+    ]
+    if instruction_text:
+        prompt_lines.append(f"Job instruction: {instruction_text}")
     payload: dict[str, object] = {
         "model": model,
         "store": False,
         "input": [
-            {"role": "system", "content": instruction_text},
+            {"role": "system", "content": "\n".join(prompt_lines)},
             {
                 "role": "user",
                 "content": f"<document>\n{text_input or ''}\n</document>",

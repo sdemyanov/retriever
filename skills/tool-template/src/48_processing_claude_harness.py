@@ -86,6 +86,10 @@ def build_translation_execution_payload(job_version_row: sqlite3.Row) -> dict[st
     prompt_lines = [
         f"Translate the entire input text into {target_language or 'the requested target language'}.",
         "Return only the translated text, with no JSON wrapper or commentary.",
+        "Preserve the original structure and line breaks.",
+        "Keep dates, numbers, email addresses, URLs, Bates numbers, file names, and header labels/order unchanged.",
+        "Keep proper names unchanged unless the source itself provides a translated form.",
+        "Do not summarize or omit content.",
     ]
     if instruction_text:
         prompt_lines.append(f"Job instruction: {instruction_text}")
@@ -116,6 +120,8 @@ def build_vision_ocr_execution_payload(job_version_row: sqlite3.Row) -> dict[str
     instruction_text = normalize_whitespace(str(job_version_row["instruction_text"] or ""))
     prompt_lines = [
         "Read the page image and transcribe all readable text in natural reading order.",
+        "Use the original source image referenced by input.artifact_path whenever possible.",
+        "Do not rely on resized previews, screenshots, or re-encoded copies unless the original artifact is unavailable or unreadable.",
         "Return plain text only. Do not wrap the output in JSON or Markdown.",
     ]
     if instruction_text:
