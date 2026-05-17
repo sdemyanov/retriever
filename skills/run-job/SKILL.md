@@ -101,8 +101,6 @@ python3 skills/tool-template/tools.py run-job-step <workspace> --run-id <RUN_ID>
 
 If the result contains a non-empty `batch`, process those items and call `complete-run-item` or `fail-run-item` for each one. Then call `run-job-step` again if the run still needs work.
 
-Do not use `execute-run` for normal Cowork execution. That command remains the legacy direct executor for deterministic tests and future external-provider work.
-
 ## Execution Loop
 
 Whether running inline or in a subagent, use the same small-batch loop.

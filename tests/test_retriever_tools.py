@@ -331,6 +331,76 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             payloads["post_finalize_run_steps"] = post_finalize_steps
         return payloads
 
+    def complete_structured_run_batch(
+        self,
+        run_id: int,
+        *,
+        claimed_by: str,
+        output_values: dict[str, object],
+        provider_request_id: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost_cents: int | None = None,
+        latency_ms: int | None = None,
+    ) -> dict[str, object]:
+        prepare_exit, prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            claimed_by,
+        )
+        self.assertEqual(prepare_exit, 0)
+        self.assertIsNotNone(prepare_payload)
+        assert prepare_payload is not None
+        batch = list(prepare_payload["batch"])
+        if not batch:
+            return {"prepare": prepare_payload, "batch_entry": None, "complete": None}
+
+        batch_entry = batch[0]
+        completion_template = batch_entry["context"]["execution"]["completion_template"]
+        raw_output = dict(completion_template["raw_output_json"])
+        normalized_output = dict(completion_template["normalized_output_json"])
+        completed_values = dict(completion_template["output_values_json"])
+        raw_output.update(output_values)
+        normalized_output.update(output_values)
+        completed_values.update(output_values)
+
+        complete_args = [
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(batch_entry["run_item"]["id"]),
+            "--claimed-by",
+            claimed_by,
+            "--raw-output-json",
+            json.dumps(raw_output),
+            "--normalized-output-json",
+            json.dumps(normalized_output),
+            "--output-values-json",
+            json.dumps(completed_values),
+        ]
+        if provider_request_id is not None:
+            complete_args.extend(["--provider-request-id", provider_request_id])
+        if input_tokens is not None:
+            complete_args.extend(["--input-tokens", str(input_tokens)])
+        if output_tokens is not None:
+            complete_args.extend(["--output-tokens", str(output_tokens)])
+        if cost_cents is not None:
+            complete_args.extend(["--cost-cents", str(cost_cents)])
+        if latency_ms is not None:
+            complete_args.extend(["--latency-ms", str(latency_ms)])
+
+        complete_exit, complete_payload, _, _ = self.run_cli(*complete_args)
+        self.assertEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+        return {
+            "prepare": prepare_payload,
+            "batch_entry": batch_entry,
+            "complete": complete_payload,
+        }
+
     def preview_target_file_path(self, target: dict[str, object]) -> Path:
         file_abs_path = str(target.get("file_abs_path") or target.get("abs_path") or "")
         return Path(file_abs_path.split("#", 1)[0])
@@ -4067,7 +4137,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_execute_run_reuses_results_and_publishes_bound_outputs(self) -> None:
+    def test_run_batch_completion_reuses_results_and_publishes_bound_outputs(self) -> None:
         note_path = self.root / "contract.txt"
         note_path.write_text("This contract mentions Delaware and an automatic renewal clause.", encoding="utf-8")
 
@@ -4141,21 +4211,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(create_run_payload)
         first_run_id = int(create_run_payload["run"]["id"])
 
-        execute_run_exit, execute_run_payload, _, _ = self.run_cli(
-            "execute-run",
-            str(self.root),
-            "--run-id",
-            str(first_run_id),
+        completion = self.complete_structured_run_batch(
+            first_run_id,
+            claimed_by="worker-structured",
+            output_values={
+                "governing_law": "Delaware",
+                "auto_renewal": True,
+            },
         )
-        self.assertEqual(execute_run_exit, 0)
-        self.assertIsNotNone(execute_run_payload)
-        self.assertEqual(execute_run_payload["run"]["status"], "completed")
-        self.assertEqual(execute_run_payload["run"]["completed_count"], 1)
-        self.assertEqual(execute_run_payload["run"]["skipped_count"], 0)
-        self.assertEqual(len(execute_run_payload["run_items"]), 1)
-        self.assertEqual(execute_run_payload["run_items"][0]["status"], "completed")
-        self.assertEqual(len(execute_run_payload["results"]), 1)
-        first_result = execute_run_payload["results"][0]
+        complete_payload = completion["complete"]
+        assert complete_payload is not None
+        self.assertEqual(complete_payload["run"]["status"], "completed")
+        first_result = complete_payload["result"]
         outputs_by_name = {item["output_name"]: item for item in first_result["outputs"]}
         self.assertEqual(outputs_by_name["governing_law"]["output_value"], "Delaware")
         self.assertEqual(outputs_by_name["auto_renewal"]["output_value"], True)
@@ -4195,19 +4262,33 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(second_run_payload)
         second_run_id = int(second_run_payload["run"]["id"])
 
-        second_execute_exit, second_execute_payload, _, _ = self.run_cli(
-            "execute-run",
+        second_prepare_exit, second_prepare_payload, _, _ = self.run_cli(
+            "prepare-run-batch",
+            str(self.root),
+            "--run-id",
+            str(second_run_id),
+            "--claimed-by",
+            "worker-structured-repeat",
+        )
+        self.assertEqual(second_prepare_exit, 0)
+        self.assertIsNotNone(second_prepare_payload)
+        assert second_prepare_payload is not None
+        self.assertEqual(second_prepare_payload["run"]["status"], "completed")
+        self.assertEqual(second_prepare_payload["run"]["completed_count"], 0)
+        self.assertEqual(second_prepare_payload["run"]["skipped_count"], 1)
+        self.assertEqual(second_prepare_payload["batch"], [])
+
+        repeat_results_exit, repeat_results_payload, _, _ = self.run_cli(
+            "list-results",
             str(self.root),
             "--run-id",
             str(second_run_id),
         )
-        self.assertEqual(second_execute_exit, 0)
-        self.assertIsNotNone(second_execute_payload)
-        self.assertEqual(second_execute_payload["run"]["status"], "completed")
-        self.assertEqual(second_execute_payload["run"]["completed_count"], 0)
-        self.assertEqual(second_execute_payload["run"]["skipped_count"], 1)
-        self.assertEqual(len(second_execute_payload["results"]), 1)
-        self.assertEqual(second_execute_payload["results"][0]["id"], first_result["id"])
+        self.assertEqual(repeat_results_exit, 0)
+        self.assertIsNotNone(repeat_results_payload)
+        assert repeat_results_payload is not None
+        self.assertEqual(len(repeat_results_payload["results"]), 1)
+        self.assertEqual(repeat_results_payload["results"][0]["id"], first_result["id"])
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -6558,7 +6639,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             first_run_artifact_paths,
         )
 
-    def test_execute_openai_structured_extraction_run_uses_provider_api(self) -> None:
+    def test_complete_run_item_records_provider_attempt_metadata(self) -> None:
         note_path = self.root / "party.txt"
         note_path.write_text("Counterparty is Acme Corp.", encoding="utf-8")
 
@@ -6619,24 +6700,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(create_run_payload)
         run_id = int(create_run_payload["run"]["id"])
 
-        fake_response = {
-            "id": "resp_test_123",
-            "status": "completed",
-            "output_text": "{\"counterparty_name\":\"Acme Corp\"}",
-            "usage": {"input_tokens": 17, "output_tokens": 9},
-        }
-        with mock.patch.object(retriever_tools, "call_openai_responses_api", return_value=fake_response):
-            execute_run_exit, execute_run_payload, _, _ = self.run_cli(
-                "execute-run",
-                str(self.root),
-                "--run-id",
-                str(run_id),
-            )
-        self.assertEqual(execute_run_exit, 0)
-        self.assertIsNotNone(execute_run_payload)
-        self.assertEqual(execute_run_payload["run"]["status"], "completed")
-        self.assertEqual(len(execute_run_payload["results"]), 1)
-        result_payload = execute_run_payload["results"][0]
+        completion = self.complete_structured_run_batch(
+            run_id,
+            claimed_by="worker-openai",
+            output_values={"counterparty_name": "Acme Corp"},
+            provider_request_id="resp_test_123",
+            input_tokens=17,
+            output_tokens=9,
+        )
+        complete_payload = completion["complete"]
+        assert complete_payload is not None
+        self.assertEqual(complete_payload["run"]["status"], "completed")
+        result_payload = complete_payload["result"]
         outputs_by_name = {item["output_name"]: item for item in result_payload["outputs"]}
         self.assertEqual(outputs_by_name["counterparty_name"]["output_value"], "Acme Corp")
 
@@ -7358,7 +7433,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachments_only = retriever_tools.search(
             self.root,
             "",
-            [["is_attachment", "eq", "true"]],
+            [["is_attachment = true"]],
             None,
             None,
             1,
@@ -7370,7 +7445,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         parents_with_attachments = retriever_tools.search(
             self.root,
             "",
-            [["has_attachments", "eq", "true"]],
+            [["has_attachments = true"]],
             None,
             None,
             1,
@@ -7436,7 +7511,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachments_only = retriever_tools.search(
             self.root,
             "",
-            [["is_attachment", "eq", "true"]],
+            [["is_attachment = true"]],
             None,
             None,
             1,
@@ -7877,16 +7952,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         exit_code, payload, _, _ = self.run_cli(
             "ingest",
             str(self.root),
-            "--legacy",
             "--recursive",
             "--path",
             "raw",
+            "--budget-seconds",
+            "35",
         )
 
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(payload)
-        self.assertEqual(payload["new"], 1)
-        self.assertEqual(payload["scan_paths"], ["raw"])
+        assert payload is not None
+        self.assertEqual(payload["pipeline"], "v2")
+        self.assertEqual(payload["run"]["scope"], ["raw"])
+        document_row = self.fetch_document_row("raw/sample.txt")
+        self.assertEqual(document_row["file_name"], "sample.txt")
 
     def test_ingest_cli_uses_bounded_v2_facade_and_resumes(self) -> None:
         raw_dir = self.root / "raw"
@@ -11124,17 +11203,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         stale_path = raw_dir / "stale.txt"
         stale_path.write_text("stale body\n", encoding="utf-8")
 
-        legacy_exit, legacy_payload, _, _ = self.run_cli(
+        seed_exit, seed_payload, _, _ = self.run_cli(
             "ingest",
             str(self.root),
-            "--legacy",
             "--recursive",
             "--path",
             "raw",
+            "--budget-seconds",
+            "35",
         )
-        self.assertEqual(legacy_exit, 0)
-        self.assertIsNotNone(legacy_payload)
-        self.assertEqual(legacy_payload["new"], 1)
+        self.assertEqual(seed_exit, 0)
+        self.assertIsNotNone(seed_payload)
+        assert seed_payload is not None
+        self.assertEqual(seed_payload["pipeline"], "v2")
+        self.assertEqual(seed_payload["run"]["scope"], ["raw"])
 
         stale_path.unlink()
         (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
@@ -11618,12 +11700,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(entity_payload["error"], "active_ingest_run")
         self.assertEqual(entity_payload["active_run_id"], run_id)
 
-        legacy_ingest_exit, legacy_ingest_payload, _, _ = self.run_cli("ingest", str(self.root), "--legacy")
-        self.assertEqual(legacy_ingest_exit, 2)
-        self.assertIsNotNone(legacy_ingest_payload)
-        self.assertEqual(legacy_ingest_payload["error"], "active_ingest_run")
-        self.assertEqual(legacy_ingest_payload["active_run_id"], run_id)
-
         facade_ingest_exit, facade_ingest_payload, _, _ = self.run_cli("ingest", str(self.root))
         self.assertEqual(facade_ingest_exit, 0)
         self.assertIsNotNone(facade_ingest_payload)
@@ -11711,7 +11787,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachments_only = retriever_tools.search(
             self.root,
             "",
-            [["is_attachment", "eq", "true"]],
+            [["is_attachment = true"]],
             None,
             None,
             1,
@@ -11722,7 +11798,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         parents_with_attachments = retriever_tools.search(
             self.root,
             "",
-            [["has_attachments", "eq", "true"]],
+            [["has_attachments = true"]],
             None,
             None,
             1,
@@ -14171,7 +14247,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         dataset_filtered = retriever_tools.search(
             self.root,
             "",
-            [["dataset_name", "eq", "Review Set"]],
+            [["dataset_name = 'Review Set'"]],
             None,
             None,
             1,
@@ -14203,7 +14279,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         dataset_filtered = retriever_tools.search(
             self.root,
             "",
-            [["dataset_name", "eq", "Review Set"]],
+            [["dataset_name = 'Review Set'"]],
             None,
             None,
             1,
@@ -15910,7 +15986,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         attachments_only = retriever_tools.search(
             self.root,
             "",
-            [["is_attachment", "eq", "true"]],
+            [["is_attachment = true"]],
             None,
             None,
             1,
@@ -15973,7 +16049,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         dataset_filtered = retriever_tools.search(
             self.root,
             "",
-            [["dataset", "eq", self.root.name]],
+            [[f"dataset = '{self.root.name}'"]],
             None,
             None,
             1,
@@ -16007,7 +16083,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         dataset_filtered = retriever_tools.search(
             self.root,
             "",
-            [["dataset_name", "eq", "Review Set"]],
+            [["dataset_name = 'Review Set'"]],
             None,
             None,
             1,
@@ -16079,7 +16155,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         filtered_result = retriever_tools.search(
             self.root,
             "",
-            [["rel_path", "eq", "custodian-b/dup-copy.txt"]],
+            [["rel_path = 'custodian-b/dup-copy.txt'"]],
             None,
             None,
             1,
@@ -16200,7 +16276,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         deleted_filter_result = retriever_tools.search(
             self.root,
             "",
-            [["rel_path", "eq", "custodian-b/dup-copy.txt"]],
+            [["rel_path = 'custodian-b/dup-copy.txt'"]],
             None,
             None,
             1,
@@ -16210,7 +16286,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         surviving_filter_result = retriever_tools.search(
             self.root,
             "",
-            [["rel_path", "eq", "custodian-a/dup.txt"]],
+            [["rel_path = 'custodian-a/dup.txt'"]],
             None,
             None,
             1,
@@ -16259,9 +16335,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         kept_row = self.fetch_document_row("keep/b.txt")
         self.assertEqual(kept_row["lifecycle_status"], "active")
 
-        deleted_search = retriever_tools.search(self.root, "", [["rel_path", "eq", "raw/a.txt"]], None, None, 1, 20)
+        deleted_search = retriever_tools.search(self.root, "", [["rel_path = 'raw/a.txt'"]], None, None, 1, 20)
         self.assertEqual(deleted_search["total_hits"], 0)
-        kept_search = retriever_tools.search(self.root, "", [["rel_path", "eq", "keep/b.txt"]], None, None, 1, 20)
+        kept_search = retriever_tools.search(self.root, "", [["rel_path = 'keep/b.txt'"]], None, None, 1, 20)
         self.assertEqual(kept_search["total_hits"], 1)
 
         list_exit, list_payload, _, _ = self.run_cli("list-datasets", str(self.root))
@@ -16427,7 +16503,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         filtered_attachment_search = retriever_tools.search(
             self.root,
             "shared attachment detail",
-            [["rel_path", "eq", right_occurrence_rel_path]],
+            [[f"rel_path = '{right_occurrence_rel_path}'"]],
             None,
             None,
             1,
@@ -16664,7 +16740,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         review_set_result = retriever_tools.search(
             self.root,
             "",
-            [["dataset_name", "eq", "Review Set"]],
+            [["dataset_name = 'Review Set'"]],
             None,
             None,
             1,
@@ -16676,7 +16752,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         rel_path_result = retriever_tools.search(
             self.root,
             "",
-            [["rel_path", "eq", "beta.txt"]],
+            [["rel_path = 'beta.txt'"]],
             None,
             None,
             1,
@@ -16956,7 +17032,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         mbox_only = retriever_tools.search(
             self.root,
             "",
-            [["source_kind", "eq", retriever_tools.MBOX_SOURCE_KIND]],
+            [[f"source_kind = '{retriever_tools.MBOX_SOURCE_KIND}'"]],
             None,
             None,
             1,
@@ -16966,7 +17042,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         dataset_filtered = retriever_tools.search(
             self.root,
             "",
-            [["dataset_name", "eq", "mailbox.mbox"]],
+            [["dataset_name = 'mailbox.mbox'"]],
             None,
             None,
             1,
@@ -18185,7 +18261,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         pst_only = retriever_tools.search(
             self.root,
             "",
-            [["source_kind", "eq", retriever_tools.PST_SOURCE_KIND]],
+            [[f"source_kind = '{retriever_tools.PST_SOURCE_KIND}'"]],
             None,
             None,
             1,
@@ -18195,7 +18271,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         custodian_filtered = retriever_tools.search(
             self.root,
             "",
-            [["custodian", "eq", "mailbox"]],
+            [["custodian = 'mailbox'"]],
             None,
             None,
             1,
@@ -18205,7 +18281,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         dataset_filtered = retriever_tools.search(
             self.root,
             "",
-            [["dataset_name", "eq", "mailbox.pst"]],
+            [["dataset_name = 'mailbox.pst'"]],
             None,
             None,
             1,
@@ -19493,7 +19569,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         search_result = retriever_tools.search(
             self.root,
             "",
-            [["content_type", "eq", "Calendar"], ["source_kind", "eq", retriever_tools.PST_SOURCE_KIND]],
+            [["content_type = 'Calendar'"], [f"source_kind = '{retriever_tools.PST_SOURCE_KIND}'"]],
             None,
             None,
             1,
@@ -20202,7 +20278,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         production_filtered = retriever_tools.search(
             self.root,
             "",
-            [["source_kind", "eq", "production"], ["production_name", "contains", "Synthetic"]],
+            [["source_kind = 'production'"], ["production_name LIKE '%Synthetic%'"]],
             None,
             None,
             1,
@@ -20212,7 +20288,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         dataset_filtered = retriever_tools.search(
             self.root,
             "",
-            [["dataset", "eq", "Synthetic_Production"]],
+            [["dataset = 'Synthetic_Production'"]],
             None,
             None,
             1,
@@ -20389,7 +20465,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(retired_row["lifecycle_status"], "deleted")
 
-    def test_search_docs_cli_alias_matches_search(self) -> None:
+    def test_search_cli_returns_expected_payload_for_term_query(self) -> None:
         document_path = self.root / "sample.txt"
         document_path.write_text("termination notice appears here\n", encoding="utf-8")
 
@@ -20398,19 +20474,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(ingest_result["new"], 1)
 
         search_exit, search_payload, _, _ = self.run_cli("search", str(self.root), "termination")
-        search_docs_exit, search_docs_payload, _, _ = self.run_cli("search-docs", str(self.root), "termination")
-
         self.assertEqual(search_exit, 0)
-        self.assertEqual(search_docs_exit, 0)
         self.assertIsNotNone(search_payload)
-        self.assertIsNotNone(search_docs_payload)
-        self.assertEqual(search_docs_payload["query"], search_payload["query"])
-        self.assertEqual(search_docs_payload["sort"], search_payload["sort"])
-        self.assertEqual(search_docs_payload["total_hits"], search_payload["total_hits"])
-        self.assertEqual(
-            [item["id"] for item in search_docs_payload["results"]],
-            [item["id"] for item in search_payload["results"]],
-        )
+        self.assertEqual(search_payload["query"], "termination")
+        self.assertEqual(search_payload["sort"], "relevance")
+        self.assertEqual(search_payload["total_hits"], 1)
+        self.assertEqual([item["id"] for item in search_payload["results"]], [self.fetch_document_row("sample.txt")["id"]])
 
     def test_search_cli_defaults_to_compact_payload_with_verbose_escape_hatch(self) -> None:
         document_path = self.root / "sample.txt"
@@ -20531,9 +20600,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             "--field",
             "file_name",
             "--filter",
-            "file_name",
-            "eq",
-            "alpha.txt",
+            "file_name = 'alpha.txt'",
             "--sort",
             "file_name",
             "--order",
@@ -21526,7 +21593,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(manifest["document_count"], 1)
         self.assertEqual(manifest["selector"]["keyword"], "alpha")
 
-    def test_export_archive_start_accepts_legacy_tuple_filter_syntax(self) -> None:
+    def test_export_archive_start_accepts_sql_like_filter_syntax(self) -> None:
         (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
         (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
 
@@ -21540,9 +21607,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             str(self.root),
             "legacy-filter.zip",
             "--filter",
-            "file_name",
-            "eq",
-            "alpha.txt",
+            "file_name = 'alpha.txt'",
             "--family-mode",
             "exact",
         )

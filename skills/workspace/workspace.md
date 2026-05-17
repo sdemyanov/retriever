@@ -162,4 +162,4 @@ If bootstrap cannot complete:
 ## Current scope note
 
 - Ingest and entity rebuild have bounded/resumable workflows. Prefer the facade commands (`ingest`, `rebuild-entities-run-step`) over long one-shot commands.
-- Planned processing runs should use `run-job-step` for Cowork-safe execution; `execute-run` is legacy/debug only.
+- Planned processing runs should use `run-job-step` for Cowork-safe execution.

@@ -139,17 +139,13 @@ Recommended:
 python3 skills/tool-template/tools.py ingest ./data --recursive --budget-seconds 35
 ```
 
-If the result has `more_work_remaining: true`, repeat the command from `next_recommended_commands` until `status` is `completed`, `failed`, or `canceled`.
-
-Do not use background jobs. Do not manually loop inside one bash command. Run one bounded command per Cowork call.
-
-Use legacy ingest only when explicitly requested, or when debugging parity with the old pipeline:
+Plain `ingest` is now the one-shot local command:
 
 ```bash
-python3 skills/tool-template/tools.py ingest ./data --recursive --legacy
+python3 skills/tool-template/tools.py ingest ./data --recursive
 ```
 
-Do not use legacy ingest for normal Cowork reingest tasks. It is a one-shot command and may exceed the 45-second command limit on large workspaces.
+Do not use background jobs. Do not manually loop inside one bash command.
 
 Advanced/manual ingest control is available through:
 
@@ -160,7 +156,7 @@ python3 skills/tool-template/tools.py ingest-run-step ./data --run-id <RUN_ID> -
 python3 skills/tool-template/tools.py ingest-cancel ./data --run-id <RUN_ID>
 ```
 
-Prefer the plain `ingest` facade unless you need to inspect or recover a specific run.
+Use `ingest-start` / `ingest-run-step` only when you need to inspect or recover a specific resumable run.
 
 For large workspaces, use the resumable entity rebuild flow:
 
@@ -179,8 +175,6 @@ python3 skills/tool-template/tools.py run-job-step . --run-id <RUN_ID> --budget-
 ```
 
 If it returns a non-empty `batch`, process those items and call `complete-run-item` or `fail-run-item`, then continue with `next_recommended_commands`.
-
-Do not use `execute-run` for normal Cowork execution. It is the legacy direct executor and may exceed the command limit.
 
 For any tool result with `more_work_remaining: true`, continue with the returned `next_recommended_commands`. Stop only on terminal status: `completed`, `failed`, or `canceled`.
 
@@ -249,7 +243,6 @@ The authoritative current list of subcommands is regenerated at build time into 
 
 - you need a programmatic search with explicit filters/sort/columns → `search` — search indexed documents
 - you need citation-ready chunk hits for a query → `search-chunks` — search matching text chunks with citations
-- you need a programmatic document-level search (over parents only) → `search-docs` — search indexed documents at the document level
 - you need to invoke a Tier 1 slash command programmatically → `slash` — execute a scope-aware slash command (see Tier 1)
 
 ### Documents & text
@@ -323,7 +316,6 @@ The authoritative current list of subcommands is regenerated at build time into 
 
 - you need to stop a run from claiming further work → `cancel-run` — stop claiming new work for a run
 - you need to plan a new processing run → `create-run` — create a frozen processing run snapshot
-- you explicitly need the legacy direct executor for debugging, deterministic tests, or parity checks → `execute-run` — execute one planned processing run via the legacy direct executor
 - you need to finalize an image-description run's outputs → `finalize-image-description-run` — finalize an image-description run
 - you need to finalize an OCR run's outputs → `finalize-ocr-run` — finalize an OCR run
 - you need the snapshot of one planned run → `get-run` — fetch one planned processing run

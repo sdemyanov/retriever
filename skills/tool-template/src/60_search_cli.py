@@ -1,19 +1,3 @@
-def parse_filter_args(raw_filters: list[list[str]] | None) -> list[dict[str, object]]:
-    parsed: list[dict[str, object]] = []
-    for item in raw_filters or []:
-        if len(item) < 2:
-            raise RetrieverError("Each --filter requires at least <field> <op>.")
-        field_name = item[0]
-        operator = item[1].lower()
-        value = None if operator in {"is-null", "not-null"} else " ".join(item[2:]) if len(item) > 2 else None
-        if operator not in {"eq", "neq", "gt", "gte", "lt", "lte", "contains", "is-null", "not-null"}:
-            raise RetrieverError(f"Unsupported filter operator: {operator}")
-        if operator not in {"is-null", "not-null"} and value in (None, ""):
-            raise RetrieverError(f"Filter operator '{operator}' requires a value.")
-        parsed.append({"field_name": field_name, "operator": operator, "value": value})
-    return parsed
-
-
 OCCURRENCE_FILTER_FIELDS = {
     "begin_attachment",
     "begin_bates",
@@ -242,87 +226,8 @@ def build_virtual_filter_clause(
 
 def build_search_filters(
     connection: sqlite3.Connection, raw_filters: object | None
-) -> tuple[list[object], list[str], list[object]]:
-    if uses_legacy_tuple_filters(raw_filters):
-        return build_legacy_search_filters(connection, raw_filters)  # type: ignore[arg-type]
+) -> tuple[list[str], list[str], list[object]]:
     return build_sql_like_search_filters(connection, raw_filters)
-
-
-def uses_legacy_tuple_filters(raw_filters: object | None) -> bool:
-    if not isinstance(raw_filters, list) or not raw_filters:
-        return False
-    legacy_operators = {"eq", "neq", "gt", "gte", "lt", "lte", "contains", "is-null", "not-null"}
-    saw_item = False
-    for item in raw_filters:
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            return False
-        operator = normalize_inline_whitespace(str(item[1] or "")).lower()
-        if operator not in legacy_operators:
-            return False
-        saw_item = True
-    return saw_item
-
-
-def sql_filter_literal_text(value: object) -> str:
-    if value is None:
-        return "NULL"
-    text = str(value).replace("\\", "\\\\").replace("'", "''")
-    return f"'{text}'"
-
-
-def legacy_tuple_filters_to_sql_expressions(raw_filters: list[list[str]] | None) -> list[str]:
-    comparator_map = {
-        "eq": "=",
-        "neq": "!=",
-        "gt": ">",
-        "gte": ">=",
-        "lt": "<",
-        "lte": "<=",
-        "contains": "LIKE",
-        "is-null": "IS NULL",
-        "not-null": "IS NOT NULL",
-    }
-    expressions: list[str] = []
-    for parsed_filter in parse_filter_args(raw_filters):
-        operator = str(parsed_filter["operator"])
-        field_name = str(parsed_filter["field_name"])
-        value = parsed_filter["value"]
-        if operator in {"is-null", "not-null"}:
-            expressions.append(f"{field_name} {comparator_map[operator]}")
-        elif operator == "contains":
-            expressions.append(f"{field_name} LIKE {sql_filter_literal_text(f'%{value}%')}")
-        else:
-            expressions.append(f"{field_name} {comparator_map[operator]} {sql_filter_literal_text(value)}")
-    return expressions
-
-
-def build_legacy_search_filters(
-    connection: sqlite3.Connection,
-    raw_filters: list[list[str]] | None,
-) -> tuple[list[dict[str, object]], list[str], list[object]]:
-    parsed_filters = parse_filter_args(raw_filters)
-    clauses = base_document_search_clauses()
-    params: list[object] = []
-    normalized_filters: list[dict[str, object]] = []
-    for raw_filter in parsed_filters:
-        field_def = resolve_field_definition(connection, str(raw_filter["field_name"]))
-        clause, clause_params = build_filter_clause(
-            "d",
-            field_def,
-            str(raw_filter["operator"]),
-            raw_filter["value"],  # type: ignore[arg-type]
-        )
-        clauses.append(clause)
-        params.extend(clause_params)
-        normalized_filters.append(
-            {
-                "field_name": field_def["field_name"],
-                "field_type": field_def["field_type"],
-                "operator": raw_filter["operator"],
-                "value": raw_filter["value"],
-            }
-        )
-    return normalized_filters, clauses, params
 
 
 def base_document_search_clauses() -> list[str]:
@@ -967,12 +872,13 @@ def virtual_field_sql_expression(alias: str, field_name: str) -> str:
             f"WHERE p.id = {alias}.production_id)"
         )
     if field_name == "is_attachment":
-        return f"(CASE WHEN {alias}.parent_document_id IS NOT NULL THEN 1 ELSE 0 END)"
+        return f"(CASE WHEN {attachment_child_filter_sql(alias)} THEN 1 ELSE 0 END)"
     if field_name == "has_attachments":
         return (
             "(CASE WHEN EXISTS ("
             "SELECT 1 FROM documents child "
             f"WHERE child.parent_document_id = {alias}.id "
+            f"AND {attachment_child_filter_sql('child')} "
             "AND child.lifecycle_status NOT IN ('missing', 'deleted')"
             ") THEN 1 ELSE 0 END)"
         )
@@ -1035,7 +941,30 @@ def build_sql_filter_clause(
         if field_name == "dataset_name":
             return build_dataset_name_sql_filter_clause(alias, field_def, operator, operand)
         return build_scalar_sql_filter_clause(virtual_field_sql_expression(alias, field_name), field_def, operator, operand)
-    target_alias = occurrence_alias if occurrence_alias is not None and field_name in OCCURRENCE_FILTER_FIELDS else alias
+    if field_name in OCCURRENCE_FILTER_FIELDS:
+        if occurrence_alias is not None:
+            return build_scalar_sql_filter_clause(
+                f"{occurrence_alias}.{quote_identifier(field_name)}",
+                field_def,
+                operator,
+                operand,
+            )
+        occurrence_clause, occurrence_params = build_scalar_sql_filter_clause(
+            f"o.{quote_identifier(field_name)}",
+            field_def,
+            operator,
+            operand,
+        )
+        return (
+            "EXISTS ("
+            "SELECT 1 FROM document_occurrences o "
+            f"WHERE o.document_id = {alias}.id "
+            "AND o.lifecycle_status = 'active' "
+            f"AND {occurrence_clause}"
+            ")",
+            occurrence_params,
+        )
+    target_alias = alias
     return build_scalar_sql_filter_clause(
         f"{target_alias}.{quote_identifier(field_name)}",
         field_def,
@@ -1199,8 +1128,6 @@ def normalize_sql_filter_expressions(raw_filters: object | None) -> list[str]:
         return [raw_filters] if raw_filters.strip() else []
     if not isinstance(raw_filters, list):
         raise RetrieverError("Filters must be provided as strings or repeatable --filter arguments.")
-    if uses_legacy_tuple_filters(raw_filters):
-        return legacy_tuple_filters_to_sql_expressions(raw_filters)  # type: ignore[arg-type]
     expressions: list[str] = []
     for item in raw_filters:
         if isinstance(item, str):
@@ -1290,30 +1217,14 @@ def build_occurrence_scope_filters(
 ) -> tuple[list[str], list[object]]:
     clauses = ["o.lifecycle_status = 'active'"]
     params: list[object] = []
-    if not uses_legacy_tuple_filters(raw_filters):
-        for expression in normalize_sql_filter_expressions(raw_filters):
-            clause, clause_params = compile_sql_filter_expression(
-                connection,
-                expression,
-                document_alias="d",
-                occurrence_alias="o",
-            )
-            clauses.append(f"({clause})")
-            params.extend(clause_params)
-        return clauses, params
-    for raw_filter in parse_filter_args(raw_filters):
-        field_def = resolve_field_definition(connection, str(raw_filter["field_name"]))
-        if field_def.get("source") == "virtual" and field_def["field_name"] != "custodian":
-            continue
-        if field_def["field_name"] not in OCCURRENCE_FILTER_FIELDS:
-            continue
-        clause, clause_params = build_scalar_filter_clause(
-            f"o.{quote_identifier(field_def['field_name'])}",
-            field_def["field_type"],
-            str(raw_filter["operator"]),
-            raw_filter["value"],  # type: ignore[arg-type]
+    for expression in normalize_sql_filter_expressions(raw_filters):
+        clause, clause_params = compile_sql_filter_expression(
+            connection,
+            expression,
+            document_alias="d",
+            occurrence_alias="o",
         )
-        clauses.append(clause)
+        clauses.append(f"({clause})")
         params.extend(clause_params)
     return clauses, params
 
@@ -1940,7 +1851,7 @@ def compact_search_chunks_payload(payload: dict[str, object]) -> dict[str, objec
 def prepare_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> dict[str, object]:
     if verbose:
         return payload
-    if command in {"search", "search-docs"}:
+    if command == "search":
         return compact_search_payload(payload)
     if command == "get-doc":
         return compact_get_doc_payload(payload)
@@ -2484,7 +2395,7 @@ def sql_relevance_order_by(
     )
 
 
-def sql_bates_order_by(*, row_alias: str, prioritize_rank: bool) -> str:
+def sql_bates_order_by(*, row_alias: str, prioritize_rank: bool, id_alias: str | None = None) -> str:
     terms: list[str] = []
     if prioritize_rank:
         terms.extend(
@@ -2497,7 +2408,7 @@ def sql_bates_order_by(*, row_alias: str, prioritize_rank: bool) -> str:
         [
             f"CASE WHEN {row_alias}.bates_sort_value IS NULL THEN 1 ELSE 0 END ASC",
             f"{row_alias}.bates_sort_value ASC",
-            f"{row_alias}.id ASC",
+            f"{id_alias or row_alias}.id ASC",
         ]
     )
     return ", ".join(terms)
@@ -3117,33 +3028,6 @@ def search(
         connection.close()
 
 
-def search_docs(
-    root: Path,
-    query: str,
-    raw_filters: list[list[str]] | None,
-    sort_field: str | None,
-    order: str | None,
-    page: int,
-    per_page: int | None,
-    raw_columns: str | None = None,
-    mode: str = "compose",
-    *,
-    compact_mode: bool = False,
-) -> dict[str, object]:
-    return search(
-        root,
-        query,
-        raw_filters,
-        sort_field,
-        order,
-        page,
-        per_page,
-        raw_columns,
-        mode,
-        compact_mode=compact_mode,
-    )
-
-
 def format_scope_bates_value(bates_scope: object) -> str:
     if not isinstance(bates_scope, dict):
         return ""
@@ -3187,14 +3071,9 @@ def derive_search_scope(query: str, raw_filters: object | None) -> dict[str, obj
     elif query.strip():
         scope["keyword"] = query
     if raw_filters:
-        if uses_legacy_tuple_filters(raw_filters):
-            rendered_parts = legacy_tuple_filters_to_sql_expressions(raw_filters)  # type: ignore[arg-type]
-            if rendered_parts:
-                scope["filter"] = " AND ".join(rendered_parts)
-        else:
-            expressions = normalize_sql_filter_expressions(raw_filters)
-            if expressions:
-                scope["filter"] = " AND ".join(f"({expression})" for expression in expressions)
+        expressions = normalize_sql_filter_expressions(raw_filters)
+        if expressions:
+            scope["filter"] = " AND ".join(f"({expression})" for expression in expressions)
     return scope
 
 
@@ -4619,21 +4498,6 @@ def resolve_paged_scope_document_search(
     bates_begin = normalize_inline_whitespace(str(bates_scope.get("begin") or "")) if isinstance(bates_scope, dict) else ""
     bates_end = normalize_inline_whitespace(str(bates_scope.get("end") or "")) if isinstance(bates_scope, dict) else ""
 
-    if bates_query and keyword_query:
-        legacy_selection = resolve_scope_document_search(connection, scope, sort_specs=sort_specs)
-        total_hits = len(legacy_selection["results"])
-        paged_results = legacy_selection["results"][offset: offset + per_page]
-        return {
-            "scope": scope,
-            "query": legacy_selection["query"],
-            "filters": filter_summary,
-            "sort": legacy_selection["sort"],
-            "order": legacy_selection["order"],
-            "sort_spec": legacy_selection["sort_spec"],
-            "results": paged_results,
-            "total_hits": total_hits,
-        }
-
     if sort_specs:
         sort_name = sort_specs[0][0]
         order_name = sort_specs[0][1]
@@ -4651,7 +4515,113 @@ def resolve_paged_scope_document_search(
         order_name = "desc"
         sort_spec = "date_created desc"
 
-    if bates_query:
+    if bates_query and keyword_query:
+        where_clause = " AND ".join(clauses)
+        range_begin_expr = "COALESCE(d.begin_bates, d.control_number)"
+        range_end_expr = "COALESCE(d.end_bates, d.control_number)"
+        single_value = bates_begin == bates_end
+        if single_value:
+            match_clause = (
+                "d.control_number = ? OR d.begin_bates = ? OR d.end_bates = ? "
+                f"OR ({range_begin_expr} <= ? AND {range_end_expr} >= ?)"
+            )
+            match_params: list[object] = [bates_begin, bates_begin, bates_begin, bates_begin, bates_begin]
+        else:
+            match_clause = f"{range_begin_expr} <= ? AND {range_end_expr} >= ?"
+            match_params = [bates_end, bates_begin]
+        if sort_specs:
+            order_by_sql = sql_order_by_for_sort_specs(connection, sort_specs, alias="d")
+        else:
+            order_by_sql = sql_bates_order_by(row_alias="bt", prioritize_rank=False, id_alias="d")
+        cte_sql = f"""
+            WITH chunk_matches AS (
+                SELECT d.id AS document_id, dc.text_content AS snippet_source, bm25(chunks_fts) AS rank, 0 AS source_priority
+                FROM chunks_fts
+                JOIN document_chunks dc ON dc.id = CAST(chunks_fts.chunk_id AS INTEGER)
+                JOIN documents d ON d.id = dc.document_id
+                WHERE chunks_fts MATCH ? AND {where_clause}
+            ),
+            metadata_matches AS (
+                SELECT d.id AS document_id, NULL AS snippet_source, bm25(documents_fts) AS rank, 1 AS source_priority
+                FROM documents_fts
+                JOIN documents d ON d.id = CAST(documents_fts.document_id AS INTEGER)
+                WHERE documents_fts MATCH ? AND {where_clause}
+            ),
+            all_matches AS (
+                SELECT * FROM chunk_matches
+                UNION ALL
+                SELECT * FROM metadata_matches
+            ),
+            ranked_matches AS (
+                SELECT
+                    document_id,
+                    snippet_source,
+                    rank,
+                    source_priority,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY document_id
+                        ORDER BY rank ASC, source_priority ASC, document_id ASC
+                    ) AS row_number
+                FROM all_matches
+            ),
+            best_matches AS (
+                SELECT document_id, snippet_source, rank
+                FROM ranked_matches
+                WHERE row_number = 1
+            ),
+            bates_matches AS (
+                SELECT d.id AS document_id, {range_begin_expr} AS bates_sort_value
+                FROM documents d
+                WHERE {where_clause}
+                  AND ({match_clause})
+            )
+        """
+
+        def combined_params(fts_query: str) -> list[object]:
+            return [fts_query, *params, fts_query, *params, *params, *match_params]
+
+        effective_query = keyword_query
+        count_sql = f"""
+            {cte_sql}
+            SELECT COUNT(*) AS total_hits
+            FROM best_matches bm
+            JOIN bates_matches bt ON bt.document_id = bm.document_id
+        """
+        try:
+            count_row = connection.execute(count_sql, combined_params(effective_query)).fetchone()
+        except sqlite3.OperationalError:
+            effective_query = f'"{keyword_query}"'
+            count_row = connection.execute(count_sql, combined_params(effective_query)).fetchone()
+        total_hits = int(count_row["total_hits"] or 0) if count_row is not None else 0
+        rows = connection.execute(
+            f"""
+            {cte_sql}
+            SELECT d.*, bm.rank AS rank, bm.snippet_source AS snippet_source, bt.bates_sort_value AS bates_sort_value
+            FROM best_matches bm
+            JOIN bates_matches bt ON bt.document_id = bm.document_id
+            JOIN documents d ON d.id = bm.document_id
+            ORDER BY {order_by_sql}
+            LIMIT ? OFFSET ?
+            """,
+            [*combined_params(effective_query), per_page, offset],
+        ).fetchall()
+        selection_page = {
+            "total_hits": total_hits,
+            "results": [
+                {
+                    "id": int(row["id"]),
+                    "rank": float(row["rank"]) if row["rank"] is not None else None,
+                    "snippet": make_snippet(
+                        row["snippet_source"] if row["snippet_source"] else metadata_snippet(row),
+                        keyword_query,
+                    ),
+                    "bates_sort_key": bates_sort_key(row["bates_sort_value"] or row["control_number"]),
+                    "row": row,
+                }
+                for row in rows
+            ],
+        }
+    elif bates_query:
         if sort_specs:
             selection_page = search_bates_page(
                 connection,
@@ -12474,26 +12444,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated file types to include, e.g. pdf,docx,eml",
     )
     ingest_parser.add_argument(
-        "--pipeline",
-        choices=(INGEST_PIPELINE_V2, INGEST_PIPELINE_LEGACY),
-        default=INGEST_PIPELINE_MODE,
-        help="Ingest implementation to use; v2 is bounded and resumable",
-    )
-    ingest_parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help="Compatibility alias for --pipeline legacy",
-    )
-    ingest_parser.add_argument(
         "--budget-seconds",
         type=int,
         default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
-        help="V2 per-call budget; values above the bounded-worker cap are rejected",
-    )
-    ingest_parser.add_argument(
-        "--run-to-completion",
-        action="store_true",
-        help="For local terminals only: keep invoking V2 steps until the run reaches a terminal state",
+        help="Per-call budget for the bounded resumable ingest facade",
     )
 
     ingest_start_parser = subparsers.add_parser("ingest-start", help="Start a resumable V2 ingest run")
@@ -12603,9 +12557,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     search_parser = subparsers.add_parser("search", help="Search indexed documents")
     add_search_arguments(search_parser)
-
-    search_docs_parser = subparsers.add_parser("search-docs", help="Search indexed documents at the document level")
-    add_search_arguments(search_docs_parser)
 
     slash_parser = subparsers.add_parser("slash", help="Execute a scope-aware slash command")
     slash_parser.add_argument("workspace", help="Workspace root path")
@@ -13337,13 +13288,6 @@ def build_parser() -> argparse.ArgumentParser:
     list_results_parser.add_argument("--run-id", type=int, help="Filter results to one run")
     list_results_parser.add_argument("--doc-id", dest="document_id", type=int, help="Filter results to one document")
 
-    execute_run_parser = subparsers.add_parser(
-        "execute-run",
-        help="Execute one planned processing run via the legacy direct executor",
-    )
-    execute_run_parser.add_argument("workspace", help="Workspace root path")
-    execute_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
-
     claim_run_items_parser = subparsers.add_parser("claim-run-items", help="Atomically claim pending run items for one worker")
     claim_run_items_parser.add_argument("workspace", help="Workspace root path")
     claim_run_items_parser.add_argument("--run-id", type=int, required=True, help="Run id")
@@ -13846,8 +13790,6 @@ def main() -> int:
         _auto_upgrade_and_maybe_reexec(root, args.command)
 
         if args.command == "ingest":
-            if args.legacy or args.pipeline == INGEST_PIPELINE_LEGACY:
-                return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types, raw_paths=args.paths))
             return emit_cli_payload(
                 "ingest",
                 ingest_v2_facade(
@@ -13856,7 +13798,6 @@ def main() -> int:
                     raw_file_types=args.file_types,
                     raw_paths=args.paths,
                     budget_seconds=args.budget_seconds,
-                    run_to_completion=args.run_to_completion,
                 ),
             )
 
@@ -13943,24 +13884,6 @@ def main() -> int:
             return emit_cli_payload(
                 "search",
                 search(
-                    root,
-                    args.query,
-                    args.filters,
-                    args.sort,
-                    args.order,
-                    args.page,
-                    args.per_page,
-                    args.columns,
-                    args.mode,
-                    compact_mode=(not args.verbose and args.mode == "compose"),
-                ),
-                verbose=args.verbose,
-            )
-
-        if args.command == "search-docs":
-            return emit_cli_payload(
-                "search-docs",
-                search_docs(
                     root,
                     args.query,
                     args.filters,
@@ -14568,10 +14491,6 @@ def main() -> int:
                     sort_keys=True,
                 )
             )
-            return 0
-
-        if args.command == "execute-run":
-            print(json.dumps(execute_run(root, run_id=args.run_id), indent=2, sort_keys=True))
             return 0
 
         if args.command == "claim-run-items":

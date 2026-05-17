@@ -30684,248 +30684,6 @@ def load_text_input_for_snapshot_row(
     if revision_body is None:
         raise RetrieverError(f"Text revision {pinned_input_revision_id} has no readable body on disk.")
     return revision_body
-
-
-async def execute_run_async(
-    connection: sqlite3.Connection,
-    paths: dict[str, Path],
-    *,
-    run_id: int,
-) -> dict[str, object]:
-    run_row = connection.execute(
-        """
-        SELECT *
-        FROM runs
-        WHERE id = ?
-        """,
-        (run_id,),
-    ).fetchone()
-    if run_row is None:
-        raise RetrieverError(f"Unknown run id: {run_id}")
-    job_version_row = require_job_version_row_by_id(connection, int(run_row["job_version_id"]))
-    job_row = connection.execute(
-        """
-        SELECT *
-        FROM jobs
-        WHERE id = ?
-        """,
-        (job_version_row["job_id"],),
-    ).fetchone()
-    assert job_row is not None
-    job_kind = normalize_job_kind(str(job_row["job_kind"]))
-    if job_kind not in {"structured_extraction", "translation"}:
-        raise RetrieverError(
-            "Run execution currently supports structured_extraction and translation jobs only."
-        )
-    snapshot_rows = load_run_snapshot_rows(connection, run_id)
-    job_output_rows = connection.execute(
-        """
-        SELECT *
-        FROM job_outputs
-        WHERE job_id = ?
-        ORDER BY ordinal ASC, output_name ASC, id ASC
-        """,
-        (job_row["id"],),
-    ).fetchall()
-
-    connection.execute(
-        """
-        UPDATE runs
-        SET status = 'running',
-            started_at = COALESCE(started_at, ?),
-            completed_at = NULL,
-            canceled_at = NULL
-        WHERE id = ?
-        """,
-        (utc_now(), run_id),
-    )
-    connection.commit()
-
-    for snapshot_row in snapshot_rows:
-        run_item_row = ensure_run_item_row(
-            connection,
-            run_id=run_id,
-            run_snapshot_document_id=int(snapshot_row["id"]),
-            item_kind="document",
-            document_id=int(snapshot_row["document_id"]),
-            input_identity=str(snapshot_row["pinned_input_identity"]),
-        )
-        existing_result_row = find_active_result_row(
-            connection,
-            document_id=int(snapshot_row["document_id"]),
-            job_version_id=int(job_version_row["id"]),
-            input_identity=str(snapshot_row["pinned_input_identity"]),
-        )
-        if existing_result_row is not None:
-            maybe_activate_created_text_revision(
-                connection,
-                paths,
-                run_row=run_row,
-                job_version_row=job_version_row,
-                document_id=int(snapshot_row["document_id"]),
-                result_id=int(existing_result_row["id"]),
-                text_revision_id=(
-                    int(existing_result_row["created_text_revision_id"])
-                    if existing_result_row["created_text_revision_id"] is not None
-                    else None
-                ),
-            )
-            terminal_status = str(run_item_row["status"] or "")
-            if terminal_status not in {"completed", "skipped"} or run_item_row["result_id"] != existing_result_row["id"]:
-                update_run_item_row(
-                    connection,
-                    run_item_id=int(run_item_row["id"]),
-                    status="skipped",
-                    result_id=int(existing_result_row["id"]),
-                    last_error=None,
-                    completed_at=utc_now(),
-                )
-                connection.commit()
-            continue
-
-        started_at = utc_now()
-        update_run_item_row(
-            connection,
-            run_item_id=int(run_item_row["id"]),
-            status="running",
-            result_id=None,
-            last_error=None,
-            started_at=(run_item_row["started_at"] or started_at),
-            completed_at=None,
-        )
-        connection.commit()
-
-        attempt_started = time.perf_counter()
-        try:
-            document_row = connection.execute(
-                """
-                SELECT *
-                FROM documents
-                WHERE id = ?
-                """,
-                (snapshot_row["document_id"],),
-            ).fetchone()
-            if document_row is None:
-                raise RetrieverError(f"Unknown document id: {snapshot_row['document_id']}")
-            text_input = load_text_input_for_snapshot_row(connection, paths, snapshot_row)
-            provider_result = await execute_job_provider(
-                job_row=job_row,
-                job_version_row=job_version_row,
-                job_output_rows=job_output_rows,
-                document_row=document_row,
-                text_input=text_input,
-            )
-            created_text_revision_id = None
-            created_text_revision_payload = provider_result.get("created_text_revision")
-            if isinstance(created_text_revision_payload, dict):
-                created_text_content = str(created_text_revision_payload.get("text_content") or "")
-                created_text_revision_id = create_text_revision_row(
-                    connection,
-                    paths,
-                    document_id=int(snapshot_row["document_id"]),
-                    revision_kind=str(created_text_revision_payload.get("revision_kind") or "translation"),
-                    text_content=created_text_content,
-                    language=(
-                        str(created_text_revision_payload["language"])
-                        if created_text_revision_payload.get("language")
-                        else None
-                    ),
-                    parent_revision_id=(
-                        int(snapshot_row["pinned_input_revision_id"])
-                        if snapshot_row["pinned_input_revision_id"] is not None
-                        else None
-                    ),
-                    created_by_job_version_id=int(job_version_row["id"]),
-                    quality_score=None,
-                    provider_metadata=provider_result.get("provider_metadata"),  # type: ignore[arg-type]
-                )
-            latency_ms = int((time.perf_counter() - attempt_started) * 1000)
-            result_id, created = create_result_row(
-                connection,
-                run_id=run_id,
-                document_id=int(snapshot_row["document_id"]),
-                job_version_id=int(job_version_row["id"]),
-                input_revision_id=(
-                    int(snapshot_row["pinned_input_revision_id"])
-                    if snapshot_row["pinned_input_revision_id"] is not None
-                    else None
-                ),
-                input_identity=str(snapshot_row["pinned_input_identity"]),
-                raw_output=provider_result["raw_output"],
-                normalized_output=provider_result["normalized_output"],
-                created_text_revision_id=created_text_revision_id,
-                provider_metadata=provider_result["provider_metadata"],  # type: ignore[arg-type]
-            )
-            if created and job_output_rows:
-                upsert_result_output_rows(
-                    connection,
-                    result_id=result_id,
-                    job_output_rows=job_output_rows,
-                    output_values_by_name=provider_result["output_values"],  # type: ignore[arg-type]
-                )
-            maybe_activate_created_text_revision(
-                connection,
-                paths,
-                run_row=run_row,
-                job_version_row=job_version_row,
-                document_id=int(snapshot_row["document_id"]),
-                result_id=result_id,
-                text_revision_id=created_text_revision_id,
-            )
-            create_attempt_row(
-                connection,
-                run_item_id=int(run_item_row["id"]),
-                provider_request_id=provider_result["provider_request_id"],  # type: ignore[arg-type]
-                input_tokens=provider_result["input_tokens"],  # type: ignore[arg-type]
-                output_tokens=provider_result["output_tokens"],  # type: ignore[arg-type]
-                cost_cents=provider_result["cost_cents"],  # type: ignore[arg-type]
-                latency_ms=latency_ms,
-                provider_metadata=provider_result["provider_metadata"],  # type: ignore[arg-type]
-                error_summary=None,
-            )
-            update_run_item_row(
-                connection,
-                run_item_id=int(run_item_row["id"]),
-                status="completed",
-                result_id=result_id,
-                last_error=None,
-                completed_at=utc_now(),
-                increment_attempt_count=True,
-            )
-            connection.commit()
-        except Exception as exc:
-            latency_ms = int((time.perf_counter() - attempt_started) * 1000)
-            error_summary = f"{type(exc).__name__}: {exc}"
-            create_attempt_row(
-                connection,
-                run_item_id=int(run_item_row["id"]),
-                provider_request_id=None,
-                input_tokens=None,
-                output_tokens=None,
-                cost_cents=None,
-                latency_ms=latency_ms,
-                provider_metadata={"phase": "execute_run"},
-                error_summary=error_summary,
-            )
-            update_run_item_row(
-                connection,
-                run_item_id=int(run_item_row["id"]),
-                status="failed",
-                result_id=None,
-                last_error=error_summary,
-                completed_at=utc_now(),
-                increment_attempt_count=True,
-            )
-            connection.commit()
-
-    refresh_run_progress(connection, run_id)
-    connection.commit()
-    return {
-        "status": "ok",
-        "run": run_summary_by_id(connection, run_id),
-        "run_items": list_run_item_payloads_for_run(connection, run_id),
-        "results": list_result_summaries(connection, run_id=run_id),
-    }
 def job_output_schema_fragment(value_type: str) -> dict[str, object]:
     normalized_value_type = normalize_job_output_value_type(value_type)
     if normalized_value_type == "boolean":
@@ -31805,9 +31563,7 @@ INGEST_V2_PRODUCTION_PREVIEW_IMAGE_MAX_DIMENSION = 1400
 # so the resumable production path defaults to embedded page images. Flip this
 # to False to keep HTML <img src="..."> references to batch-generated page PNGs.
 INGEST_V2_PRODUCTION_PREVIEW_EMBED_IMAGES = True
-INGEST_PIPELINE_LEGACY = "legacy"
 INGEST_PIPELINE_V2 = "v2"
-INGEST_PIPELINE_MODE = INGEST_PIPELINE_V2
 
 
 def ingest_v2_elapsed_ms(started: float) -> float:
@@ -32027,6 +31783,7 @@ def ingest_v2_scope_payload(
     recursive: bool,
     raw_file_types: str | None,
     raw_paths: list[str] | None,
+    skip_unchanged_loose_files: bool = True,
 ) -> dict[str, object]:
     allowed_types = parse_file_types(raw_file_types)
     scan_scope = build_ingest_scan_scope(root, raw_paths)
@@ -32034,6 +31791,7 @@ def ingest_v2_scope_payload(
         "recursive": bool(recursive),
         "file_types": sorted(allowed_types) if allowed_types is not None else None,
         "scan_paths": list(scan_scope.get("display_paths") or []),
+        "skip_unchanged_loose_files": bool(skip_unchanged_loose_files),
     }
 
 
@@ -32894,12 +32652,17 @@ def ingest_v2_plan_mbox_source_finalizer_item(
     skip_source: bool,
     commit_order: int,
     source_plan_kind: str = "mbox",
+    source_action: str | None = None,
     linked_drive_rel_paths: list[str] | None = None,
 ) -> bool:
     now = utc_now()
+    normalized_source_action = normalize_whitespace(str(source_action or "")) or (
+        "skipped" if skip_source else "updated"
+    )
     payload = {
         "source_rel_path": source_rel_path,
         "source_plan_kind": source_plan_kind,
+        "source_action": normalized_source_action,
         "source_file_size": source_file_size,
         "source_file_mtime": source_file_mtime,
         "source_file_hash": source_file_hash,
@@ -38725,12 +38488,19 @@ def ingest_v2_start(
     raw_file_types: str | None,
     raw_paths: list[str] | None = None,
     budget_seconds: int | None = None,
+    skip_unchanged_loose_files: bool = True,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
     paths = workspace_paths(root)
     ensure_layout(paths)
-    scope = ingest_v2_scope_payload(root, recursive=recursive, raw_file_types=raw_file_types, raw_paths=raw_paths)
+    scope = ingest_v2_scope_payload(
+        root,
+        recursive=recursive,
+        raw_file_types=raw_file_types,
+        raw_paths=raw_paths,
+        skip_unchanged_loose_files=skip_unchanged_loose_files,
+    )
     with workspace_ingest_session(paths, command_name="ingest-start"):
         connection = connect_db(paths["db_path"])
         try:
@@ -38962,6 +38732,10 @@ def ingest_v2_plan_step(
             recursive = bool(row["recursive"])
             allowed_types = parse_file_types(row["raw_file_types"])
             scan_scope = ingest_v2_scan_scope_from_run(root, row)
+            scope_payload = decode_json_text(row["scope_json"], default={}) or {}
+            skip_unchanged_loose_files = True
+            if isinstance(scope_payload, dict):
+                skip_unchanged_loose_files = bool(scope_payload.get("skip_unchanged_loose_files", True))
 
             while time.perf_counter() < deadline:
                 current_mbox_source = cursor.get("current_mbox_source")
@@ -39454,7 +39228,7 @@ def ingest_v2_plan_step(
                             cursor["skipped_container_files"] = int(cursor.get("skipped_container_files") or 0) + 1
                         else:
                             file_size, file_mtime_ns = source_file_snapshot(candidate_path)
-                            if ingest_v2_loose_file_matches_existing_snapshot(
+                            if skip_unchanged_loose_files and ingest_v2_loose_file_matches_existing_snapshot(
                                 connection,
                                 candidate_path,
                                 rel_path=rel_path,
@@ -40004,8 +39778,10 @@ def ingest_v2_commit_step(
         load_commit_state_ms = ingest_v2_elapsed_ms(load_commit_state_started)
         filesystem_dataset_id: int | None = None
         filesystem_dataset_source_id: int | None = None
-        mbox_contexts: dict[str, dict[str, object]] = {}
-        pst_contexts: dict[str, dict[str, object]] = {}
+        container_contexts: dict[str, dict[str, dict[str, object]]] = {
+            MBOX_SOURCE_KIND: {},
+            PST_SOURCE_KIND: {},
+        }
 
         def ensure_filesystem_dataset() -> tuple[int, int]:
             nonlocal filesystem_dataset_id, filesystem_dataset_source_id
@@ -40996,6 +40772,7 @@ def ingest_v2_facade(
     raw_paths: list[str] | None = None,
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
+    skip_unchanged_loose_files: bool = True,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -41007,6 +40784,7 @@ def ingest_v2_facade(
         recursive=recursive,
         raw_file_types=raw_file_types,
         raw_paths=raw_paths,
+        skip_unchanged_loose_files=skip_unchanged_loose_files,
     )
     created = False
     resumed = False
@@ -41044,6 +40822,7 @@ def ingest_v2_facade(
             raw_file_types=raw_file_types,
             raw_paths=raw_paths,
             budget_seconds=budget,
+            skip_unchanged_loose_files=skip_unchanged_loose_files,
         )
         run_id = str(start_payload["run_id"])
         created = True
@@ -42108,6 +41887,277 @@ def ingest_production(root: Path, production_root: Path | str) -> dict[str, obje
             connection.close()
 
 
+def ingest_v2_phase_cursor_payload(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    phase: str,
+    cursor_key: str,
+) -> dict[str, object]:
+    row = connection.execute(
+        """
+        SELECT cursor_json
+        FROM ingest_phase_cursors
+        WHERE run_id = ?
+          AND phase = ?
+          AND cursor_key = ?
+        """,
+        (run_id, phase, cursor_key),
+    ).fetchone()
+    if row is None:
+        return {}
+    payload = decode_json_text(row["cursor_json"], default={}) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def ingest_v2_compat_failures(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    plan_cursor: dict[str, object],
+) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    seen_entries: set[tuple[str, str]] = set()
+
+    def append_failure(rel_path: str, error: str) -> None:
+        normalized_rel_path = normalize_whitespace(rel_path)
+        normalized_error = normalize_whitespace(error)
+        if not normalized_rel_path or not normalized_error:
+            return
+        key = (normalized_rel_path, normalized_error)
+        if key in seen_entries:
+            return
+        seen_entries.add(key)
+        failures.append({"rel_path": normalized_rel_path, "error": normalized_error})
+
+    for failure_key, rel_path_key in (
+        ("slack_failures", "slack_rel_root"),
+        ("mbox_failures", "source_rel_path"),
+        ("pst_failures", "source_rel_path"),
+        ("production_failures", "production_rel_root"),
+    ):
+        for item in list(plan_cursor.get(failure_key) or []):
+            if not isinstance(item, dict):
+                continue
+            append_failure(
+                str(item.get(rel_path_key) or ""),
+                str(item.get("error") or ""),
+            )
+
+    failed_rows = connection.execute(
+        """
+        SELECT rel_path, source_key, unit_type, last_error
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND status = 'failed'
+        ORDER BY id ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    for row in failed_rows:
+        append_failure(
+            str(row["rel_path"] or row["source_key"] or row["unit_type"] or ""),
+            str(row["last_error"] or ""),
+        )
+    return failures
+
+
+def ingest_v2_compat_action_counts(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    plan_cursor: dict[str, object],
+) -> dict[str, int]:
+    counts = {
+        "new": 0,
+        "updated": 0,
+        "renamed": 0,
+        "skipped": int(plan_cursor.get("skipped_unchanged_loose_files") or 0),
+    }
+    rows = connection.execute(
+        """
+        SELECT unit_type, payload_json, artifact_manifest_json
+        FROM ingest_work_items
+        WHERE run_id = ?
+          AND status = 'committed'
+        ORDER BY id ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    for row in rows:
+        unit_type = str(row["unit_type"] or "")
+        payload = decode_json_text(row["payload_json"], default={}) or {}
+        payload = payload if isinstance(payload, dict) else {}
+        manifest = decode_json_text(row["artifact_manifest_json"], default={}) or {}
+        manifest = manifest if isinstance(manifest, dict) else {}
+        if unit_type in {"mbox_source_finalizer", "pst_source_finalizer"}:
+            source_action = normalize_whitespace(
+                str(payload.get("source_action") or manifest.get("source_action") or "")
+            )
+            if source_action in counts:
+                counts[source_action] += 1
+            continue
+        if unit_type in {
+            "mbox_message",
+            "pst_message",
+            "conversation_preview",
+            "production_preview_batch",
+            "production_row",
+        }:
+            continue
+        if unit_type in {"slack_conversation", "slack_document"}:
+            counts["new"] += int(manifest.get("new") or 0)
+            counts["updated"] += int(manifest.get("updated") or 0)
+            continue
+        commit_action = normalize_whitespace(str(manifest.get("commit_action") or ""))
+        if commit_action in counts:
+            counts[commit_action] += 1
+    return counts
+
+
+def ingest_v2_compat_summary(
+    connection: sqlite3.Connection,
+    root: Path,
+    *,
+    run_id: str,
+) -> dict[str, object]:
+    run_row = require_ingest_v2_run_row(connection, run_id)
+    scope_payload = decode_json_text(run_row["scope_json"], default={}) or {}
+    scope = scope_payload if isinstance(scope_payload, dict) else {}
+    plan_cursor = ingest_v2_phase_cursor_payload(
+        connection,
+        run_id=run_id,
+        phase="planning",
+        cursor_key="loose_file_scan",
+    )
+    commit_cursor = ingest_v2_phase_cursor_payload(
+        connection,
+        run_id=run_id,
+        phase="committing",
+        cursor_key="loose_file_commit",
+    )
+    finalize_cursor = ingest_v2_phase_cursor_payload(
+        connection,
+        run_id=run_id,
+        phase="finalizing",
+        cursor_key="loose_file_finalize",
+    )
+
+    compat_actions = ingest_v2_compat_action_counts(connection, run_id=run_id, plan_cursor=plan_cursor)
+    special_source_counts = dict(plan_cursor.get("special_source_counts") or {})
+    slack_stats = dict(commit_cursor.get("slack_stats") or {})
+    mbox_stats = dict(commit_cursor.get("mbox_stats") or {})
+    pst_stats = dict(commit_cursor.get("pst_stats") or {})
+    production_commit_stats = dict(commit_cursor.get("production_stats") or {})
+    production_finalize_stats = dict(finalize_cursor.get("production_stats") or {})
+    conversation_assignment = dict(finalize_cursor.get("conversation_assignment") or {})
+
+    planned_slack_export_roots = list(plan_cursor.get("planned_slack_export_roots") or [])
+    planned_gmail_mbox_sources = int(plan_cursor.get("planned_gmail_mbox_sources") or 0)
+    planned_mbox_sources = list(plan_cursor.get("planned_mbox_sources") or [])
+    planned_pst_sources = list(plan_cursor.get("planned_pst_sources") or [])
+    planned_production_roots = list(plan_cursor.get("planned_production_roots") or [])
+    skipped_production_roots = list(plan_cursor.get("skipped_production_roots") or [])
+    failures = ingest_v2_compat_failures(connection, run_id=run_id, plan_cursor=plan_cursor)
+    workspace_inventory = document_inventory_counts(connection)
+
+    warnings = [
+        f"Detected processed production root at {production_rel_root}; use ingest-production instead."
+        for production_rel_root in skipped_production_roots
+        if normalize_whitespace(str(production_rel_root or ""))
+    ]
+    scanned_files = (
+        int(plan_cursor.get("planned_loose_files") or 0)
+        + int(plan_cursor.get("skipped_unchanged_loose_files") or 0)
+        + len(planned_mbox_sources)
+        + len(planned_pst_sources)
+        + int(plan_cursor.get("planned_slack_day_documents") or 0)
+        + planned_gmail_mbox_sources
+    )
+
+    result = default_ingest_stats(
+        int(special_source_counts.get("slack_export_roots") or len(planned_slack_export_roots)),
+        int(special_source_counts.get("gmail_export_roots") or 0),
+    )
+    result.update(
+        {
+            "new": int(compat_actions.get("new") or 0) + int(production_commit_stats.get("created") or 0),
+            "updated": int(compat_actions.get("updated") or 0) + int(production_commit_stats.get("updated") or 0),
+            "renamed": int(compat_actions.get("renamed") or 0),
+            "skipped": int(compat_actions.get("skipped") or 0),
+            "failed": len(failures),
+            "missing": (
+                int(finalize_cursor.get("filesystem_missing") or 0)
+                + int(finalize_cursor.get("pst_sources_missing") or 0)
+                + int(finalize_cursor.get("mbox_sources_missing") or 0)
+                + int(finalize_cursor.get("slack_documents_missing") or 0)
+            ),
+            "pst_sources_skipped": int(pst_stats.get("pst_sources_skipped") or 0),
+            "pst_messages_created": int(pst_stats.get("pst_messages_created") or 0),
+            "pst_messages_updated": int(pst_stats.get("pst_messages_updated") or 0),
+            "pst_messages_deleted": int(pst_stats.get("pst_messages_deleted") or 0),
+            "pst_sources_missing": int(finalize_cursor.get("pst_sources_missing") or 0),
+            "pst_documents_missing": int(finalize_cursor.get("pst_documents_missing") or 0),
+            "mbox_sources_skipped": int(mbox_stats.get("mbox_sources_skipped") or 0),
+            "mbox_messages_created": int(mbox_stats.get("mbox_messages_created") or 0),
+            "mbox_messages_updated": int(mbox_stats.get("mbox_messages_updated") or 0),
+            "mbox_messages_deleted": int(mbox_stats.get("mbox_messages_deleted") or 0),
+            "mbox_sources_missing": int(finalize_cursor.get("mbox_sources_missing") or 0),
+            "mbox_documents_missing": int(finalize_cursor.get("mbox_documents_missing") or 0),
+            "gmail_documents_scanned": planned_gmail_mbox_sources,
+            "slack_day_documents_scanned": int(plan_cursor.get("planned_slack_day_documents") or 0),
+            "slack_documents_created": int(slack_stats.get("slack_documents_created") or 0),
+            "slack_documents_updated": int(slack_stats.get("slack_documents_updated") or 0),
+            "slack_documents_missing": int(finalize_cursor.get("slack_documents_missing") or 0),
+            "slack_conversations": int(slack_stats.get("slack_conversations") or 0),
+            "email_conversations": int(conversation_assignment.get("email_conversations") or 0),
+            "email_documents_reassigned": int(conversation_assignment.get("email_documents_reassigned") or 0),
+            "email_child_documents_updated": int(conversation_assignment.get("email_child_documents_updated") or 0),
+            "pst_chat_conversations": int(conversation_assignment.get("pst_chat_conversations") or 0),
+            "pst_chat_documents_reassigned": int(conversation_assignment.get("pst_chat_documents_reassigned") or 0),
+            "pst_chat_child_documents_updated": int(
+                conversation_assignment.get("pst_chat_child_documents_updated") or 0
+            ),
+            "production_documents_created": int(production_commit_stats.get("created") or 0),
+            "production_documents_updated": int(production_commit_stats.get("updated") or 0),
+            "production_documents_unchanged": int(production_commit_stats.get("unchanged") or 0),
+            "production_documents_retired": int(production_finalize_stats.get("retired") or 0),
+            "production_families_reconstructed": int(
+                production_finalize_stats.get("families_reconstructed") or 0
+            ),
+            "production_docs_missing_linked_text": int(
+                plan_cursor.get("production_docs_missing_linked_text") or 0
+            ),
+            "production_docs_missing_linked_images": int(
+                plan_cursor.get("production_docs_missing_linked_images") or 0
+            ),
+            "production_docs_missing_linked_natives": int(
+                plan_cursor.get("production_docs_missing_linked_natives") or 0
+            ),
+        }
+    )
+
+    result["failures"] = failures
+    result["scanned"] = scanned_files
+    result["scanned_files"] = scanned_files
+    if not bool(scope.get("is_full_workspace")):
+        result["scan_paths"] = list(scope.get("scan_paths") or [])
+    result["pruned_unused_filesystem_dataset"] = int(
+        bool(finalize_cursor.get("pruned_unused_filesystem_dataset") or False)
+    )
+    result["ingested_production_roots"] = list(finalize_cursor.get("production_finalized_roots") or planned_production_roots)
+    result["skipped_production_roots"] = skipped_production_roots
+    if warnings:
+        result["warnings"] = warnings
+    result["workspace_parent_documents"] = workspace_inventory["parent_documents"]
+    result["workspace_missing_parent_documents"] = workspace_inventory["missing_parent_documents"]
+    result["workspace_attachment_children"] = workspace_inventory["attachment_children"]
+    result["workspace_documents_total"] = workspace_inventory["documents_total"]
+    result["run_id"] = run_id
+    result["status"] = str(run_row["status"] or "")
+    return result
+
+
 def ingest(
     root: Path,
     recursive: bool,
@@ -42117,292 +42167,34 @@ def ingest(
     set_active_workspace_root(root)
     paths = workspace_paths(root)
     ensure_layout(paths)
-    allowed_types = parse_file_types(raw_file_types)
-    scan_scope = build_ingest_scan_scope(root, raw_paths)
-    total_started = time.perf_counter()
-    benchmark_mark(
-        "ingest_begin",
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        raise_if_ingest_v2_active(connection, root, command_name="ingest")
+        reconcile_custom_fields_registry(connection, repair=True)
+    finally:
+        connection.close()
+
+    facade_payload = ingest_v2_facade(
+        root,
         recursive=recursive,
-        file_type_filter_count=(len(allowed_types) if allowed_types is not None else 0),
-        scan_paths=list(scan_scope.get("display_paths") or []),
+        raw_file_types=raw_file_types,
+        raw_paths=raw_paths,
+        run_to_completion=True,
+        skip_unchanged_loose_files=False,
     )
-    with workspace_ingest_session(paths, command_name="ingest") as ingest_session:
-        connection = connect_db(paths["db_path"])
-        try:
-            setup_started = time.perf_counter()
-            apply_schema(connection, root)
-            raise_if_ingest_v2_active(connection, root, command_name="ingest")
-            reconcile_custom_fields_registry(connection, repair=True)
-            benchmark_mark(
-                "ingest_setup_done",
-                setup_ms=round((time.perf_counter() - setup_started) * 1000.0, 3),
-            )
-            filesystem_dataset_id: int | None = None
-            filesystem_dataset_source_id: int | None = None
+    run_id = normalize_whitespace(str(facade_payload.get("run_id") or ""))
+    if not run_id:
+        raise RetrieverError("Ingest completed without a resumable run id.")
 
-            def ensure_filesystem_dataset() -> tuple[int, int]:
-                nonlocal filesystem_dataset_id, filesystem_dataset_source_id
-                if filesystem_dataset_id is None or filesystem_dataset_source_id is None:
-                    filesystem_dataset_id, filesystem_dataset_source_id = ensure_source_backed_dataset(
-                        connection,
-                        source_kind=FILESYSTEM_SOURCE_KIND,
-                        source_locator=filesystem_dataset_locator(),
-                        dataset_name=filesystem_dataset_name(root),
-                    )
-                    connection.commit()
-                return filesystem_dataset_id, filesystem_dataset_source_id
-
-            scan_started = time.perf_counter()
-            ingest_plan = plan_ingest_work(root, recursive, allowed_types, connection, scan_scope)
-            production_signatures = list(ingest_plan["production_signatures"])
-            slack_export_descriptors = list(ingest_plan["slack_export_descriptors"])
-            gmail_export_descriptors = list(ingest_plan["gmail_export_descriptors"])
-            pst_export_descriptors = list(ingest_plan["pst_export_descriptors"])
-            scanned_items = list(ingest_plan["scanned_items"])
-            loose_file_items = list(ingest_plan["loose_file_items"])
-            scanned_rel_paths = set(ingest_plan["scanned_rel_paths"])
-            scanned_pst_source_rel_paths = set(ingest_plan["scanned_pst_source_rel_paths"])
-            scanned_mbox_source_rel_paths = set(ingest_plan["scanned_mbox_source_rel_paths"])
-            gmail_owned_rel_paths = set(ingest_plan["gmail_owned_rel_paths"])
-            pst_export_owned_rel_paths = set(ingest_plan["pst_export_owned_rel_paths"])
-            pst_export_descriptors_by_pst_path = dict(ingest_plan["pst_export_descriptors_by_pst_path"])
-            benchmark_mark(
-                "ingest_scan_done",
-                scan_ms=round((time.perf_counter() - scan_started) * 1000.0, 3),
-                hash_ms=round(float(ingest_plan["scan_hash_ms"]), 3),
-                scanned_files=len(list(ingest_plan["scanned_files"])),
-                production_roots=len(production_signatures),
-                slack_export_roots=len(slack_export_descriptors),
-                gmail_export_roots=len(gmail_export_descriptors),
-                pst_export_roots=len(pst_export_descriptors),
-            )
-
-            stats = default_ingest_stats(len(slack_export_descriptors), len(gmail_export_descriptors))
-            failures: list[dict[str, str]] = []
-            special_source_state = ingest_serial_special_sources(
-                connection,
-                paths,
-                root,
-                Path(ingest_session["tmp_dir"]),
-                allowed_types,
-                production_signatures,
-                slack_export_descriptors,
-                gmail_export_descriptors,
-                scanned_rel_paths,
-                scanned_mbox_source_rel_paths,
-                stats,
-                failures,
-            )
-            current_ingestion_batch = special_source_state["current_ingestion_batch"]
-            slack_day_documents_missing = int(special_source_state["slack_day_documents_missing"])
-            ingested_production_roots = list(special_source_state["ingested_production_roots"])
-            skipped_production_roots = list(special_source_state["skipped_production_roots"])
-            warnings = [*list(ingest_session.get("warnings") or []), *list(special_source_state["warnings"])]
-            benchmark_mark(
-                "ingest_special_sources_done",
-                gmail_ms=round(float(special_source_state["gmail_ms"]), 3),
-                slack_ms=round(float(special_source_state["slack_ms"]), 3),
-                production_ms=round(float(special_source_state["production_ms"]), 3),
-                source_failures=stats["failed"],
-            )
-
-            existing_by_rel, unseen_existing_by_hash = load_loose_file_commit_state(
-                connection,
-                scanned_rel_paths,
-                gmail_owned_rel_paths,
-                pst_export_owned_rel_paths,
-                scan_scope=scan_scope,
-            )
-
-            loop_started = time.perf_counter()
-            container_source_ms = 0.0
-            container_prepare_ms = 0.0
-            container_chunk_ms = 0.0
-            container_prepare_wait_ms = 0.0
-            container_commit_ms = 0.0
-            loose_file_ms = 0.0
-            loose_extract_ms = 0.0
-            loose_chunk_ms = 0.0
-            loose_prepare_wait_ms = 0.0
-            loose_commit_ms = 0.0
-            loose_freshness_fallbacks = 0
-            prepared_loose_items = iter_prepared_loose_file_items(
-                loose_file_items,
-                Path(ingest_session["tmp_dir"]),
-            )
-            for item in scanned_items:
-                rel_path = str(item["rel_path"])
-                path = item["path"]
-                file_type = str(item["file_type"])
-                item_started = time.perf_counter()
-                if file_type == PST_SOURCE_KIND:
-                    try:
-                        pst_export_descriptor = pst_export_descriptors_by_pst_path.get(path.resolve().as_posix())
-                        pst_message_metadata_by_source_item = None
-                        pst_message_match_records = None
-                        pst_message_sidecar_hash = None
-                        if pst_export_descriptor is not None:
-                            pst_message_metadata_by_source_item = dict(
-                                dict(pst_export_descriptor.get("message_metadata_by_pst_path") or {}).get(path.resolve().as_posix()) or {}
-                            )
-                            pst_message_match_records = list(
-                                dict(pst_export_descriptor.get("message_match_records_by_pst_path") or {}).get(path.resolve().as_posix()) or []
-                            )
-                            pst_message_sidecar_hash = normalize_whitespace(
-                                str(pst_export_descriptor.get("message_sidecar_hash") or "")
-                            ) or None
-                        pst_result = ingest_pst_source(
-                            connection,
-                            paths,
-                            path,
-                            rel_path,
-                            message_metadata_by_source_item=pst_message_metadata_by_source_item,
-                            message_match_records=pst_message_match_records,
-                            message_sidecar_hash=pst_message_sidecar_hash,
-                            staging_root=Path(ingest_session["tmp_dir"]),
-                        )
-                        stats[str(pst_result["action"])] += 1
-                        stats["pst_sources_skipped"] += int(pst_result["pst_sources_skipped"])
-                        stats["pst_messages_created"] += int(pst_result["pst_messages_created"])
-                        stats["pst_messages_updated"] += int(pst_result["pst_messages_updated"])
-                        stats["pst_messages_deleted"] += int(pst_result["pst_messages_deleted"])
-                        container_prepare_ms += float(pst_result.get("pst_prepare_ms") or 0.0)
-                        container_chunk_ms += float(pst_result.get("pst_chunk_ms") or 0.0)
-                        container_prepare_wait_ms += float(pst_result.get("pst_prepare_wait_ms") or 0.0)
-                        container_commit_ms += float(pst_result.get("pst_commit_ms") or 0.0)
-                    except Exception as exc:
-                        rollback_open_transaction(connection)
-                        stats["failed"] += 1
-                        failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
-                    finally:
-                        container_source_ms += (time.perf_counter() - item_started) * 1000.0
-                    continue
-                if file_type == MBOX_SOURCE_KIND:
-                    try:
-                        mbox_result = ingest_mbox_source(
-                            connection,
-                            paths,
-                            path,
-                            rel_path,
-                            staging_root=Path(ingest_session["tmp_dir"]),
-                        )
-                        stats[str(mbox_result["action"])] += 1
-                        stats["mbox_sources_skipped"] += int(mbox_result["mbox_sources_skipped"])
-                        stats["mbox_messages_created"] += int(mbox_result["mbox_messages_created"])
-                        stats["mbox_messages_updated"] += int(mbox_result["mbox_messages_updated"])
-                        stats["mbox_messages_deleted"] += int(mbox_result["mbox_messages_deleted"])
-                        container_prepare_ms += float(mbox_result.get("mbox_prepare_ms") or 0.0)
-                        container_chunk_ms += float(mbox_result.get("mbox_chunk_ms") or 0.0)
-                        container_prepare_wait_ms += float(mbox_result.get("mbox_prepare_wait_ms") or 0.0)
-                        container_commit_ms += float(mbox_result.get("mbox_commit_ms") or 0.0)
-                    except Exception as exc:
-                        rollback_open_transaction(connection)
-                        stats["failed"] += 1
-                        failures.append({"rel_path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
-                    finally:
-                        container_source_ms += (time.perf_counter() - item_started) * 1000.0
-                    continue
-                try:
-                    prepared_item, wait_ms = next(prepared_loose_items)
-                    if str(prepared_item["rel_path"]) != rel_path:
-                        raise RetrieverError(
-                            f"Prepared loose-file order drifted: expected {rel_path}, got {prepared_item['rel_path']}"
-                        )
-                    loose_prepare_wait_ms += wait_ms
-                    loose_extract_ms += float(prepared_item["prepare_ms"])
-                    loose_chunk_ms += float(prepared_item.get("prepare_chunk_ms") or 0.0)
-                    commit_started = time.perf_counter()
-                    commit_result = commit_prepared_loose_file(
-                        connection,
-                        paths,
-                        prepared_item,
-                        existing_by_rel,
-                        unseen_existing_by_hash,
-                        ensure_filesystem_dataset,
-                        current_ingestion_batch,
-                    )
-                    loose_commit_ms += (time.perf_counter() - commit_started) * 1000.0
-                    current_ingestion_batch = commit_result["current_ingestion_batch"]
-                    if bool(commit_result.get("freshness_fallback")):
-                        loose_freshness_fallbacks += 1
-                    action = str(commit_result["action"])
-                    if action == "failed":
-                        stats["failed"] += 1
-                        failures.append({"rel_path": rel_path, "error": str(commit_result["error"])})
-                    else:
-                        stats[action] += 1
-                finally:
-                    loose_file_ms += (time.perf_counter() - item_started) * 1000.0
-            benchmark_mark(
-                "ingest_item_loop_done",
-                loop_ms=round((time.perf_counter() - loop_started) * 1000.0, 3),
-                loose_file_ms=round(loose_file_ms, 3),
-                loose_extract_ms=round(loose_extract_ms, 3),
-                loose_chunk_ms=round(loose_chunk_ms, 3),
-                loose_prepare_wait_ms=round(loose_prepare_wait_ms, 3),
-                loose_commit_ms=round(loose_commit_ms, 3),
-                loose_freshness_fallbacks=loose_freshness_fallbacks,
-                container_source_ms=round(container_source_ms, 3),
-                container_prepare_ms=round(container_prepare_ms, 3),
-                container_chunk_ms=round(container_chunk_ms, 3),
-                container_prepare_wait_ms=round(container_prepare_wait_ms, 3),
-                container_commit_ms=round(container_commit_ms, 3),
-            )
-
-            postpass_started = time.perf_counter()
-            pruned_unused_filesystem_dataset = finalize_ingest_postpass(
-                connection,
-                paths,
-                allowed_types,
-                scanned_rel_paths,
-                scanned_pst_source_rel_paths,
-                scanned_mbox_source_rel_paths,
-                slack_day_documents_missing,
-                stats,
-                pst_export_owned_rel_paths=pst_export_owned_rel_paths,
-                scan_scope=scan_scope,
-            )
-            benchmark_mark(
-                "ingest_postpass_done",
-                postpass_ms=round((time.perf_counter() - postpass_started) * 1000.0, 3),
-                missing=stats["missing"],
-                email_conversations=stats["email_conversations"],
-                pst_chat_conversations=stats["pst_chat_conversations"],
-            )
-            workspace_inventory = document_inventory_counts(connection)
-            result = dict(stats)
-            result["failures"] = failures
-            result["scanned"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
-            result["scanned_files"] = len(scanned_items) + stats["slack_day_documents_scanned"] + stats["gmail_documents_scanned"]
-            if not bool(scan_scope.get("is_full_workspace")):
-                result["scan_paths"] = list(scan_scope.get("display_paths") or [])
-            result["pruned_unused_filesystem_dataset"] = int(pruned_unused_filesystem_dataset)
-            result["ingested_production_roots"] = ingested_production_roots
-            result["skipped_production_roots"] = skipped_production_roots
-            if warnings:
-                result["warnings"] = warnings
-            result["workspace_parent_documents"] = workspace_inventory["parent_documents"]
-            result["workspace_missing_parent_documents"] = workspace_inventory["missing_parent_documents"]
-            result["workspace_attachment_children"] = workspace_inventory["attachment_children"]
-            result["workspace_documents_total"] = workspace_inventory["documents_total"]
-            benchmark_mark(
-                "ingest_done",
-                total_ms=round((time.perf_counter() - total_started) * 1000.0, 3),
-                scanned=result["scanned"],
-                new=stats["new"],
-                updated=stats["updated"],
-                failed=stats["failed"],
-            )
-            return result
-        except Exception as exc:
-            benchmark_mark(
-                "ingest_failed",
-                total_ms=round((time.perf_counter() - total_started) * 1000.0, 3),
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            raise
-        finally:
-            connection.close()
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        return ingest_v2_compat_summary(connection, root, run_id=run_id)
+    finally:
+        connection.close()
 
 
 def value_from_type(field_type: str, value: str | None) -> object:
@@ -47753,20 +47545,6 @@ def list_results(
         }
     finally:
         connection.close()
-
-
-def execute_run(root: Path, *, run_id: int) -> dict[str, object]:
-    paths = workspace_paths(root)
-    ensure_layout(paths)
-    connection = connect_db(paths["db_path"])
-    try:
-        apply_schema(connection, root)
-        payload = asyncio.run(execute_run_async(connection, paths, run_id=run_id))
-        return payload
-    finally:
-        connection.close()
-
-
 def claim_run_items(
     root: Path,
     *,
@@ -49305,17 +49083,10 @@ def path_prefix_scope_expression(path_prefixes: list[str]) -> str | None:
 
 def raw_filters_include_occurrence_scope(
     connection: sqlite3.Connection,
-    raw_filters: list[list[str]] | None,
+    raw_filters: object | None,
 ) -> bool:
     if not raw_filters:
         return False
-    if uses_legacy_tuple_filters(raw_filters):
-        for raw_filter in parse_filter_args(raw_filters):
-            field_def = resolve_field_definition(connection, str(raw_filter["field_name"]))
-            if str(field_def["field_name"]) in OCCURRENCE_FILTER_FIELDS:
-                return True
-        return False
-
     pattern = re.compile(
         r"\b(?:"
         + "|".join(re.escape(field_name) for field_name in sorted(OCCURRENCE_FILTER_FIELDS, key=len, reverse=True))
@@ -49332,14 +49103,16 @@ def raw_filter_item_includes_occurrence_scope(
     connection: sqlite3.Connection,
     raw_filter_item: object,
 ) -> bool:
-    if not isinstance(raw_filter_item, (list, tuple)):
+    if isinstance(raw_filter_item, str):
+        expression = raw_filter_item
+    elif isinstance(raw_filter_item, (list, tuple)):
+        expression = " ".join(
+            str(part)
+            for part in raw_filter_item
+            if normalize_inline_whitespace(str(part or ""))
+        )
+    else:
         return False
-    if len(raw_filter_item) >= 2:
-        operator = normalize_inline_whitespace(str(raw_filter_item[1] or "")).lower()
-        if operator in {"eq", "neq", "gt", "gte", "lt", "lte", "contains", "is-null", "not-null"}:
-            field_def = resolve_field_definition(connection, str(raw_filter_item[0]))
-            return str(field_def["field_name"]) in OCCURRENCE_FILTER_FIELDS
-    expression = " ".join(str(part) for part in raw_filter_item if normalize_inline_whitespace(str(part or "")))
     if not expression:
         return False
     pattern = re.compile(
@@ -49353,19 +49126,19 @@ def raw_filter_item_includes_occurrence_scope(
 
 def document_only_raw_filters(
     connection: sqlite3.Connection,
-    raw_filters: list[list[str]] | None,
-) -> list[list[str]]:
-    document_filters: list[list[str]] = []
+    raw_filters: object | None,
+) -> list[object]:
+    document_filters: list[object] = []
     for raw_filter_item in raw_filters or []:
         if raw_filter_item_includes_occurrence_scope(connection, raw_filter_item):
             continue
-        document_filters.append(list(raw_filter_item))
+        document_filters.append(raw_filter_item)
     return document_filters
 
 
 def document_ids_matching_occurrence_filters(
     connection: sqlite3.Connection,
-    raw_filters: list[list[str]],
+    raw_filters: object | None,
 ) -> list[int]:
     occurrence_scope_clauses, occurrence_scope_params = build_occurrence_scope_filters(connection, raw_filters)
     rows = connection.execute(
@@ -51329,22 +51102,6 @@ def set_field(root: Path, document_id: int, field_name: str, value: str | None) 
         }
     finally:
         connection.close()
-def parse_filter_args(raw_filters: list[list[str]] | None) -> list[dict[str, object]]:
-    parsed: list[dict[str, object]] = []
-    for item in raw_filters or []:
-        if len(item) < 2:
-            raise RetrieverError("Each --filter requires at least <field> <op>.")
-        field_name = item[0]
-        operator = item[1].lower()
-        value = None if operator in {"is-null", "not-null"} else " ".join(item[2:]) if len(item) > 2 else None
-        if operator not in {"eq", "neq", "gt", "gte", "lt", "lte", "contains", "is-null", "not-null"}:
-            raise RetrieverError(f"Unsupported filter operator: {operator}")
-        if operator not in {"is-null", "not-null"} and value in (None, ""):
-            raise RetrieverError(f"Filter operator '{operator}' requires a value.")
-        parsed.append({"field_name": field_name, "operator": operator, "value": value})
-    return parsed
-
-
 OCCURRENCE_FILTER_FIELDS = {
     "begin_attachment",
     "begin_bates",
@@ -51573,87 +51330,8 @@ def build_virtual_filter_clause(
 
 def build_search_filters(
     connection: sqlite3.Connection, raw_filters: object | None
-) -> tuple[list[object], list[str], list[object]]:
-    if uses_legacy_tuple_filters(raw_filters):
-        return build_legacy_search_filters(connection, raw_filters)  # type: ignore[arg-type]
+) -> tuple[list[str], list[str], list[object]]:
     return build_sql_like_search_filters(connection, raw_filters)
-
-
-def uses_legacy_tuple_filters(raw_filters: object | None) -> bool:
-    if not isinstance(raw_filters, list) or not raw_filters:
-        return False
-    legacy_operators = {"eq", "neq", "gt", "gte", "lt", "lte", "contains", "is-null", "not-null"}
-    saw_item = False
-    for item in raw_filters:
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            return False
-        operator = normalize_inline_whitespace(str(item[1] or "")).lower()
-        if operator not in legacy_operators:
-            return False
-        saw_item = True
-    return saw_item
-
-
-def sql_filter_literal_text(value: object) -> str:
-    if value is None:
-        return "NULL"
-    text = str(value).replace("\\", "\\\\").replace("'", "''")
-    return f"'{text}'"
-
-
-def legacy_tuple_filters_to_sql_expressions(raw_filters: list[list[str]] | None) -> list[str]:
-    comparator_map = {
-        "eq": "=",
-        "neq": "!=",
-        "gt": ">",
-        "gte": ">=",
-        "lt": "<",
-        "lte": "<=",
-        "contains": "LIKE",
-        "is-null": "IS NULL",
-        "not-null": "IS NOT NULL",
-    }
-    expressions: list[str] = []
-    for parsed_filter in parse_filter_args(raw_filters):
-        operator = str(parsed_filter["operator"])
-        field_name = str(parsed_filter["field_name"])
-        value = parsed_filter["value"]
-        if operator in {"is-null", "not-null"}:
-            expressions.append(f"{field_name} {comparator_map[operator]}")
-        elif operator == "contains":
-            expressions.append(f"{field_name} LIKE {sql_filter_literal_text(f'%{value}%')}")
-        else:
-            expressions.append(f"{field_name} {comparator_map[operator]} {sql_filter_literal_text(value)}")
-    return expressions
-
-
-def build_legacy_search_filters(
-    connection: sqlite3.Connection,
-    raw_filters: list[list[str]] | None,
-) -> tuple[list[dict[str, object]], list[str], list[object]]:
-    parsed_filters = parse_filter_args(raw_filters)
-    clauses = base_document_search_clauses()
-    params: list[object] = []
-    normalized_filters: list[dict[str, object]] = []
-    for raw_filter in parsed_filters:
-        field_def = resolve_field_definition(connection, str(raw_filter["field_name"]))
-        clause, clause_params = build_filter_clause(
-            "d",
-            field_def,
-            str(raw_filter["operator"]),
-            raw_filter["value"],  # type: ignore[arg-type]
-        )
-        clauses.append(clause)
-        params.extend(clause_params)
-        normalized_filters.append(
-            {
-                "field_name": field_def["field_name"],
-                "field_type": field_def["field_type"],
-                "operator": raw_filter["operator"],
-                "value": raw_filter["value"],
-            }
-        )
-    return normalized_filters, clauses, params
 
 
 def base_document_search_clauses() -> list[str]:
@@ -52298,12 +51976,13 @@ def virtual_field_sql_expression(alias: str, field_name: str) -> str:
             f"WHERE p.id = {alias}.production_id)"
         )
     if field_name == "is_attachment":
-        return f"(CASE WHEN {alias}.parent_document_id IS NOT NULL THEN 1 ELSE 0 END)"
+        return f"(CASE WHEN {attachment_child_filter_sql(alias)} THEN 1 ELSE 0 END)"
     if field_name == "has_attachments":
         return (
             "(CASE WHEN EXISTS ("
             "SELECT 1 FROM documents child "
             f"WHERE child.parent_document_id = {alias}.id "
+            f"AND {attachment_child_filter_sql('child')} "
             "AND child.lifecycle_status NOT IN ('missing', 'deleted')"
             ") THEN 1 ELSE 0 END)"
         )
@@ -52366,7 +52045,30 @@ def build_sql_filter_clause(
         if field_name == "dataset_name":
             return build_dataset_name_sql_filter_clause(alias, field_def, operator, operand)
         return build_scalar_sql_filter_clause(virtual_field_sql_expression(alias, field_name), field_def, operator, operand)
-    target_alias = occurrence_alias if occurrence_alias is not None and field_name in OCCURRENCE_FILTER_FIELDS else alias
+    if field_name in OCCURRENCE_FILTER_FIELDS:
+        if occurrence_alias is not None:
+            return build_scalar_sql_filter_clause(
+                f"{occurrence_alias}.{quote_identifier(field_name)}",
+                field_def,
+                operator,
+                operand,
+            )
+        occurrence_clause, occurrence_params = build_scalar_sql_filter_clause(
+            f"o.{quote_identifier(field_name)}",
+            field_def,
+            operator,
+            operand,
+        )
+        return (
+            "EXISTS ("
+            "SELECT 1 FROM document_occurrences o "
+            f"WHERE o.document_id = {alias}.id "
+            "AND o.lifecycle_status = 'active' "
+            f"AND {occurrence_clause}"
+            ")",
+            occurrence_params,
+        )
+    target_alias = alias
     return build_scalar_sql_filter_clause(
         f"{target_alias}.{quote_identifier(field_name)}",
         field_def,
@@ -52530,8 +52232,6 @@ def normalize_sql_filter_expressions(raw_filters: object | None) -> list[str]:
         return [raw_filters] if raw_filters.strip() else []
     if not isinstance(raw_filters, list):
         raise RetrieverError("Filters must be provided as strings or repeatable --filter arguments.")
-    if uses_legacy_tuple_filters(raw_filters):
-        return legacy_tuple_filters_to_sql_expressions(raw_filters)  # type: ignore[arg-type]
     expressions: list[str] = []
     for item in raw_filters:
         if isinstance(item, str):
@@ -52621,30 +52321,14 @@ def build_occurrence_scope_filters(
 ) -> tuple[list[str], list[object]]:
     clauses = ["o.lifecycle_status = 'active'"]
     params: list[object] = []
-    if not uses_legacy_tuple_filters(raw_filters):
-        for expression in normalize_sql_filter_expressions(raw_filters):
-            clause, clause_params = compile_sql_filter_expression(
-                connection,
-                expression,
-                document_alias="d",
-                occurrence_alias="o",
-            )
-            clauses.append(f"({clause})")
-            params.extend(clause_params)
-        return clauses, params
-    for raw_filter in parse_filter_args(raw_filters):
-        field_def = resolve_field_definition(connection, str(raw_filter["field_name"]))
-        if field_def.get("source") == "virtual" and field_def["field_name"] != "custodian":
-            continue
-        if field_def["field_name"] not in OCCURRENCE_FILTER_FIELDS:
-            continue
-        clause, clause_params = build_scalar_filter_clause(
-            f"o.{quote_identifier(field_def['field_name'])}",
-            field_def["field_type"],
-            str(raw_filter["operator"]),
-            raw_filter["value"],  # type: ignore[arg-type]
+    for expression in normalize_sql_filter_expressions(raw_filters):
+        clause, clause_params = compile_sql_filter_expression(
+            connection,
+            expression,
+            document_alias="d",
+            occurrence_alias="o",
         )
-        clauses.append(clause)
+        clauses.append(f"({clause})")
         params.extend(clause_params)
     return clauses, params
 
@@ -53271,7 +52955,7 @@ def compact_search_chunks_payload(payload: dict[str, object]) -> dict[str, objec
 def prepare_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> dict[str, object]:
     if verbose:
         return payload
-    if command in {"search", "search-docs"}:
+    if command == "search":
         return compact_search_payload(payload)
     if command == "get-doc":
         return compact_get_doc_payload(payload)
@@ -53815,7 +53499,7 @@ def sql_relevance_order_by(
     )
 
 
-def sql_bates_order_by(*, row_alias: str, prioritize_rank: bool) -> str:
+def sql_bates_order_by(*, row_alias: str, prioritize_rank: bool, id_alias: str | None = None) -> str:
     terms: list[str] = []
     if prioritize_rank:
         terms.extend(
@@ -53828,7 +53512,7 @@ def sql_bates_order_by(*, row_alias: str, prioritize_rank: bool) -> str:
         [
             f"CASE WHEN {row_alias}.bates_sort_value IS NULL THEN 1 ELSE 0 END ASC",
             f"{row_alias}.bates_sort_value ASC",
-            f"{row_alias}.id ASC",
+            f"{id_alias or row_alias}.id ASC",
         ]
     )
     return ", ".join(terms)
@@ -54448,33 +54132,6 @@ def search(
         connection.close()
 
 
-def search_docs(
-    root: Path,
-    query: str,
-    raw_filters: list[list[str]] | None,
-    sort_field: str | None,
-    order: str | None,
-    page: int,
-    per_page: int | None,
-    raw_columns: str | None = None,
-    mode: str = "compose",
-    *,
-    compact_mode: bool = False,
-) -> dict[str, object]:
-    return search(
-        root,
-        query,
-        raw_filters,
-        sort_field,
-        order,
-        page,
-        per_page,
-        raw_columns,
-        mode,
-        compact_mode=compact_mode,
-    )
-
-
 def format_scope_bates_value(bates_scope: object) -> str:
     if not isinstance(bates_scope, dict):
         return ""
@@ -54518,14 +54175,9 @@ def derive_search_scope(query: str, raw_filters: object | None) -> dict[str, obj
     elif query.strip():
         scope["keyword"] = query
     if raw_filters:
-        if uses_legacy_tuple_filters(raw_filters):
-            rendered_parts = legacy_tuple_filters_to_sql_expressions(raw_filters)  # type: ignore[arg-type]
-            if rendered_parts:
-                scope["filter"] = " AND ".join(rendered_parts)
-        else:
-            expressions = normalize_sql_filter_expressions(raw_filters)
-            if expressions:
-                scope["filter"] = " AND ".join(f"({expression})" for expression in expressions)
+        expressions = normalize_sql_filter_expressions(raw_filters)
+        if expressions:
+            scope["filter"] = " AND ".join(f"({expression})" for expression in expressions)
     return scope
 
 
@@ -55950,21 +55602,6 @@ def resolve_paged_scope_document_search(
     bates_begin = normalize_inline_whitespace(str(bates_scope.get("begin") or "")) if isinstance(bates_scope, dict) else ""
     bates_end = normalize_inline_whitespace(str(bates_scope.get("end") or "")) if isinstance(bates_scope, dict) else ""
 
-    if bates_query and keyword_query:
-        legacy_selection = resolve_scope_document_search(connection, scope, sort_specs=sort_specs)
-        total_hits = len(legacy_selection["results"])
-        paged_results = legacy_selection["results"][offset: offset + per_page]
-        return {
-            "scope": scope,
-            "query": legacy_selection["query"],
-            "filters": filter_summary,
-            "sort": legacy_selection["sort"],
-            "order": legacy_selection["order"],
-            "sort_spec": legacy_selection["sort_spec"],
-            "results": paged_results,
-            "total_hits": total_hits,
-        }
-
     if sort_specs:
         sort_name = sort_specs[0][0]
         order_name = sort_specs[0][1]
@@ -55982,7 +55619,113 @@ def resolve_paged_scope_document_search(
         order_name = "desc"
         sort_spec = "date_created desc"
 
-    if bates_query:
+    if bates_query and keyword_query:
+        where_clause = " AND ".join(clauses)
+        range_begin_expr = "COALESCE(d.begin_bates, d.control_number)"
+        range_end_expr = "COALESCE(d.end_bates, d.control_number)"
+        single_value = bates_begin == bates_end
+        if single_value:
+            match_clause = (
+                "d.control_number = ? OR d.begin_bates = ? OR d.end_bates = ? "
+                f"OR ({range_begin_expr} <= ? AND {range_end_expr} >= ?)"
+            )
+            match_params: list[object] = [bates_begin, bates_begin, bates_begin, bates_begin, bates_begin]
+        else:
+            match_clause = f"{range_begin_expr} <= ? AND {range_end_expr} >= ?"
+            match_params = [bates_end, bates_begin]
+        if sort_specs:
+            order_by_sql = sql_order_by_for_sort_specs(connection, sort_specs, alias="d")
+        else:
+            order_by_sql = sql_bates_order_by(row_alias="bt", prioritize_rank=False, id_alias="d")
+        cte_sql = f"""
+            WITH chunk_matches AS (
+                SELECT d.id AS document_id, dc.text_content AS snippet_source, bm25(chunks_fts) AS rank, 0 AS source_priority
+                FROM chunks_fts
+                JOIN document_chunks dc ON dc.id = CAST(chunks_fts.chunk_id AS INTEGER)
+                JOIN documents d ON d.id = dc.document_id
+                WHERE chunks_fts MATCH ? AND {where_clause}
+            ),
+            metadata_matches AS (
+                SELECT d.id AS document_id, NULL AS snippet_source, bm25(documents_fts) AS rank, 1 AS source_priority
+                FROM documents_fts
+                JOIN documents d ON d.id = CAST(documents_fts.document_id AS INTEGER)
+                WHERE documents_fts MATCH ? AND {where_clause}
+            ),
+            all_matches AS (
+                SELECT * FROM chunk_matches
+                UNION ALL
+                SELECT * FROM metadata_matches
+            ),
+            ranked_matches AS (
+                SELECT
+                    document_id,
+                    snippet_source,
+                    rank,
+                    source_priority,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY document_id
+                        ORDER BY rank ASC, source_priority ASC, document_id ASC
+                    ) AS row_number
+                FROM all_matches
+            ),
+            best_matches AS (
+                SELECT document_id, snippet_source, rank
+                FROM ranked_matches
+                WHERE row_number = 1
+            ),
+            bates_matches AS (
+                SELECT d.id AS document_id, {range_begin_expr} AS bates_sort_value
+                FROM documents d
+                WHERE {where_clause}
+                  AND ({match_clause})
+            )
+        """
+
+        def combined_params(fts_query: str) -> list[object]:
+            return [fts_query, *params, fts_query, *params, *params, *match_params]
+
+        effective_query = keyword_query
+        count_sql = f"""
+            {cte_sql}
+            SELECT COUNT(*) AS total_hits
+            FROM best_matches bm
+            JOIN bates_matches bt ON bt.document_id = bm.document_id
+        """
+        try:
+            count_row = connection.execute(count_sql, combined_params(effective_query)).fetchone()
+        except sqlite3.OperationalError:
+            effective_query = f'"{keyword_query}"'
+            count_row = connection.execute(count_sql, combined_params(effective_query)).fetchone()
+        total_hits = int(count_row["total_hits"] or 0) if count_row is not None else 0
+        rows = connection.execute(
+            f"""
+            {cte_sql}
+            SELECT d.*, bm.rank AS rank, bm.snippet_source AS snippet_source, bt.bates_sort_value AS bates_sort_value
+            FROM best_matches bm
+            JOIN bates_matches bt ON bt.document_id = bm.document_id
+            JOIN documents d ON d.id = bm.document_id
+            ORDER BY {order_by_sql}
+            LIMIT ? OFFSET ?
+            """,
+            [*combined_params(effective_query), per_page, offset],
+        ).fetchall()
+        selection_page = {
+            "total_hits": total_hits,
+            "results": [
+                {
+                    "id": int(row["id"]),
+                    "rank": float(row["rank"]) if row["rank"] is not None else None,
+                    "snippet": make_snippet(
+                        row["snippet_source"] if row["snippet_source"] else metadata_snippet(row),
+                        keyword_query,
+                    ),
+                    "bates_sort_key": bates_sort_key(row["bates_sort_value"] or row["control_number"]),
+                    "row": row,
+                }
+                for row in rows
+            ],
+        }
+    elif bates_query:
         if sort_specs:
             selection_page = search_bates_page(
                 connection,
@@ -63805,26 +63548,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated file types to include, e.g. pdf,docx,eml",
     )
     ingest_parser.add_argument(
-        "--pipeline",
-        choices=(INGEST_PIPELINE_V2, INGEST_PIPELINE_LEGACY),
-        default=INGEST_PIPELINE_MODE,
-        help="Ingest implementation to use; v2 is bounded and resumable",
-    )
-    ingest_parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help="Compatibility alias for --pipeline legacy",
-    )
-    ingest_parser.add_argument(
         "--budget-seconds",
         type=int,
         default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
-        help="V2 per-call budget; values above the bounded-worker cap are rejected",
-    )
-    ingest_parser.add_argument(
-        "--run-to-completion",
-        action="store_true",
-        help="For local terminals only: keep invoking V2 steps until the run reaches a terminal state",
+        help="Per-call budget for the bounded resumable ingest facade",
     )
 
     ingest_start_parser = subparsers.add_parser("ingest-start", help="Start a resumable V2 ingest run")
@@ -63934,9 +63661,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     search_parser = subparsers.add_parser("search", help="Search indexed documents")
     add_search_arguments(search_parser)
-
-    search_docs_parser = subparsers.add_parser("search-docs", help="Search indexed documents at the document level")
-    add_search_arguments(search_docs_parser)
 
     slash_parser = subparsers.add_parser("slash", help="Execute a scope-aware slash command")
     slash_parser.add_argument("workspace", help="Workspace root path")
@@ -64668,13 +64392,6 @@ def build_parser() -> argparse.ArgumentParser:
     list_results_parser.add_argument("--run-id", type=int, help="Filter results to one run")
     list_results_parser.add_argument("--doc-id", dest="document_id", type=int, help="Filter results to one document")
 
-    execute_run_parser = subparsers.add_parser(
-        "execute-run",
-        help="Execute one planned processing run via the legacy direct executor",
-    )
-    execute_run_parser.add_argument("workspace", help="Workspace root path")
-    execute_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
-
     claim_run_items_parser = subparsers.add_parser("claim-run-items", help="Atomically claim pending run items for one worker")
     claim_run_items_parser.add_argument("workspace", help="Workspace root path")
     claim_run_items_parser.add_argument("--run-id", type=int, required=True, help="Run id")
@@ -65177,8 +64894,6 @@ def main() -> int:
         _auto_upgrade_and_maybe_reexec(root, args.command)
 
         if args.command == "ingest":
-            if args.legacy or args.pipeline == INGEST_PIPELINE_LEGACY:
-                return emit_cli_payload("ingest", ingest(root, args.recursive, args.file_types, raw_paths=args.paths))
             return emit_cli_payload(
                 "ingest",
                 ingest_v2_facade(
@@ -65187,7 +64902,6 @@ def main() -> int:
                     raw_file_types=args.file_types,
                     raw_paths=args.paths,
                     budget_seconds=args.budget_seconds,
-                    run_to_completion=args.run_to_completion,
                 ),
             )
 
@@ -65274,24 +64988,6 @@ def main() -> int:
             return emit_cli_payload(
                 "search",
                 search(
-                    root,
-                    args.query,
-                    args.filters,
-                    args.sort,
-                    args.order,
-                    args.page,
-                    args.per_page,
-                    args.columns,
-                    args.mode,
-                    compact_mode=(not args.verbose and args.mode == "compose"),
-                ),
-                verbose=args.verbose,
-            )
-
-        if args.command == "search-docs":
-            return emit_cli_payload(
-                "search-docs",
-                search_docs(
                     root,
                     args.query,
                     args.filters,
@@ -65899,10 +65595,6 @@ def main() -> int:
                     sort_keys=True,
                 )
             )
-            return 0
-
-        if args.command == "execute-run":
-            print(json.dumps(execute_run(root, run_id=args.run_id), indent=2, sort_keys=True))
             return 0
 
         if args.command == "claim-run-items":
