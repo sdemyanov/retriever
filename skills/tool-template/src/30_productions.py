@@ -4293,6 +4293,7 @@ def build_conversation_preview_head_html() -> str:
         ".retriever-calendar-invite-meta dd { margin: 0; }"
         ".retriever-calendar-invite-meta a { color: #174ea6; text-decoration: none; word-break: break-all; }"
         ".retriever-calendar-invite-meta a:hover { text-decoration: underline; }"
+        ".conversation-document-body img { display: block; max-width: 100%; height: auto; }"
         ".conversation-document-body pre { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; margin: 0; background: #f8fafc; border: 1px solid #d7e0ea; border-radius: 14px; padding: 0.9rem 1rem; font-family: inherit; font-size: 1rem; }"
         ".conversation-chat-transcript { display: grid; gap: 0.75rem; }"
         ".conversation-chat-message { display: flex; gap: 0.75rem; align-items: flex-start; min-width: 0; max-width: 100%; border: 1px solid #d0d7de; border-radius: 14px; padding: 0.85rem 0.95rem; background: #f6f8fa; }"

@@ -19245,6 +19245,7 @@ def build_email_preview_head_html() -> str:
         ".retriever-calendar-invite-meta dd { margin: 0; }"
         ".retriever-calendar-invite-meta a { color: #174ea6; text-decoration: none; word-break: break-all; }"
         ".retriever-calendar-invite-meta a:hover { text-decoration: underline; }"
+        ".conversation-document-body img { display: block; max-width: 100%; height: auto; }"
         ".retriever-attachments { margin-top: 1rem; padding-top: 0.8rem; border-top: 1px solid #eceff3; }"
         ".retriever-attachments h2 { margin: 0 0 0.5rem; font-size: 0.86rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #5f6368; }"
         ".retriever-attachments ul { margin: 0; padding-left: 1.1rem; }"
