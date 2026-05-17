@@ -454,6 +454,530 @@ def default_quality_score_for_text_status(text_status: object, text_content: str
     return None
 
 
+TEXT_QUALITY_POOR_THRESHOLD = 0.55
+TEXT_QUALITY_IMPROVEMENT_TOLERANCE = 0.02
+TRANSLATION_HEADER_LABELS = {
+    "attachments",
+    "bcc",
+    "cc",
+    "date",
+    "from",
+    "sent",
+    "subject",
+    "to",
+}
+TRANSLATION_HEADER_PATTERN = re.compile(
+    r"^\s*(Attachments?|Bcc|Cc|Date|From|Sent|Subject|To):\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+TRANSLATION_EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+TRANSLATION_URL_PATTERN = re.compile(r"\b(?:https?://|www\.)\S+\b", re.IGNORECASE)
+TRANSLATION_MONEY_PATTERN = re.compile(r"\$\d[\d,]*(?:\.\d+)?")
+TRANSLATION_BATES_PATTERN = re.compile(r"\b[A-Z]{1,6}\d{5,}\b")
+TRANSLATION_NUMBER_PATTERN = re.compile(r"\b\d[\d,]*(?:\.\d+)?\b")
+TRANSLATION_NUMERIC_DATE_PATTERN = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")
+TRANSLATION_TEXTUAL_DATE_PATTERN = re.compile(
+    r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+"
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+    r"\d{1,2},\s+\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM))?\b",
+    re.IGNORECASE,
+)
+TRANSLATION_PHONE_PATTERN = re.compile(r"\b(?:\(\d{3}\)\s*|\d{3}[-.])\d{3}[-.]\d{4}\b")
+TRANSLATION_FILE_NAME_PATTERN = re.compile(r"\b[^\s;,:()<>]+\.(?:pdf|docx?|xlsx?|pptx?|eml|txt)\b", re.IGNORECASE)
+COMMON_TEXT_PUNCTUATION = {
+    ".",
+    ",",
+    ";",
+    ":",
+    "!",
+    "?",
+    "(",
+    ")",
+    "[",
+    "]",
+    "{",
+    "}",
+    "<",
+    ">",
+    "/",
+    "\\",
+    "@",
+    "#",
+    "%",
+    "^",
+    "&",
+    "*",
+    "-",
+    "_",
+    "=",
+    "+",
+    "|",
+    "~",
+    "$",
+    "'",
+    '"',
+    "`",
+    "“",
+    "”",
+    "‘",
+    "’",
+    "…",
+    "–",
+    "—",
+    "•",
+}
+
+
+def ordered_unique_matches(
+    pattern: re.Pattern[str],
+    text: str,
+    *,
+    casefold: bool = False,
+) -> list[str]:
+    seen: set[str] = set()
+    matches: list[str] = []
+    for match in pattern.finditer(text):
+        value = match.group(0)
+        key = value.casefold() if casefold else value
+        if key in seen:
+            continue
+        seen.add(key)
+        matches.append(value)
+    return matches
+
+
+def normalize_translation_header_label(label: str) -> str:
+    normalized = normalize_whitespace(label).lower().rstrip(":")
+    if normalized == "attachment":
+        return "attachments"
+    return normalized
+
+
+def translation_header_rows(text: str) -> list[tuple[str, str]]:
+    return [
+        (normalize_translation_header_label(match.group(1)), normalize_whitespace(match.group(2)))
+        for match in TRANSLATION_HEADER_PATTERN.finditer(text)
+        if normalize_whitespace(match.group(2))
+    ]
+
+
+def translation_header_display_names(text: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for label, value in translation_header_rows(text):
+        if label not in {"from", "to", "cc", "bcc"}:
+            continue
+        candidate_values: list[str] = []
+        parsed_addresses = getaddresses([value])
+        candidate_values.extend(normalize_whitespace(name) for name, _ in parsed_addresses if normalize_whitespace(name))
+        for segment in re.split(r";", value):
+            cleaned = normalize_whitespace(re.sub(r"<[^>]+>", "", segment))
+            if not cleaned or "@" in cleaned or not any(ch.isalpha() for ch in cleaned):
+                continue
+            candidate_values.append(cleaned)
+        for candidate in candidate_values:
+            key = candidate.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(candidate)
+    return names
+
+
+def missing_literal_values(values: list[str], text: str, *, casefold: bool = False) -> list[str]:
+    haystack = text.casefold() if casefold else text
+    missing: list[str] = []
+    for value in values:
+        needle = value.casefold() if casefold else value
+        if needle not in haystack:
+            missing.append(value)
+    return missing
+
+
+def summarize_missing_literals(
+    source_text: str,
+    translated_text: str,
+    *,
+    label: str,
+    pattern: re.Pattern[str],
+    issues: list[str],
+    casefold: bool = False,
+) -> int:
+    source_values = ordered_unique_matches(pattern, source_text, casefold=casefold)
+    missing_values = missing_literal_values(source_values, translated_text, casefold=casefold)
+    if missing_values:
+        sample = ", ".join(missing_values[:3])
+        suffix = f" (+{len(missing_values) - 3} more)" if len(missing_values) > 3 else ""
+        issues.append(f"{label} changed or disappeared: {sample}{suffix}")
+    return len(source_values)
+
+
+def translation_validation_summary(
+    source_text: str,
+    translated_text: str,
+    *,
+    target_language: str | None,
+) -> dict[str, object]:
+    blocking_issues: list[str] = []
+    warnings: list[str] = []
+    source_headers = translation_header_rows(source_text)
+    translated_headers = translation_header_rows(translated_text)
+    source_header_labels = [label for label, _ in source_headers if label in TRANSLATION_HEADER_LABELS]
+    translated_header_labels = [label for label, _ in translated_headers if label in TRANSLATION_HEADER_LABELS]
+    if source_header_labels and source_header_labels != translated_header_labels:
+        blocking_issues.append(
+            "Email header labels/order changed: "
+            f"source={source_header_labels}, translated={translated_header_labels}"
+        )
+
+    for label, value in source_headers:
+        if label in {"date", "sent"} and value and value not in translated_text:
+            blocking_issues.append(f"Header value for {label!r} changed: {value}")
+
+    checked_literal_counts = {
+        "emails": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="Email addresses",
+            pattern=TRANSLATION_EMAIL_PATTERN,
+            issues=blocking_issues,
+            casefold=True,
+        ),
+        "urls": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="URLs",
+            pattern=TRANSLATION_URL_PATTERN,
+            issues=blocking_issues,
+            casefold=True,
+        ),
+        "money": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="Currency amounts",
+            pattern=TRANSLATION_MONEY_PATTERN,
+            issues=blocking_issues,
+        ),
+        "bates": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="Bates numbers",
+            pattern=TRANSLATION_BATES_PATTERN,
+            issues=blocking_issues,
+        ),
+        "numbers": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="Numbers",
+            pattern=TRANSLATION_NUMBER_PATTERN,
+            issues=blocking_issues,
+        ),
+        "numeric_dates": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="Numeric dates",
+            pattern=TRANSLATION_NUMERIC_DATE_PATTERN,
+            issues=blocking_issues,
+        ),
+        "textual_dates": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="Textual dates",
+            pattern=TRANSLATION_TEXTUAL_DATE_PATTERN,
+            issues=blocking_issues,
+            casefold=True,
+        ),
+        "phone_numbers": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="Phone numbers",
+            pattern=TRANSLATION_PHONE_PATTERN,
+            issues=blocking_issues,
+        ),
+        "file_names": summarize_missing_literals(
+            source_text,
+            translated_text,
+            label="File names",
+            pattern=TRANSLATION_FILE_NAME_PATTERN,
+            issues=blocking_issues,
+            casefold=True,
+        ),
+    }
+
+    source_names = translation_header_display_names(source_text)
+    missing_names = missing_literal_values(source_names, translated_text, casefold=False)
+    if missing_names:
+        sample = ", ".join(missing_names[:3])
+        suffix = f" (+{len(missing_names) - 3} more)" if len(missing_names) > 3 else ""
+        blocking_issues.append(f"Header names changed or disappeared: {sample}{suffix}")
+
+    normalized_source = normalize_whitespace(source_text)
+    normalized_translated = normalize_whitespace(translated_text)
+    if normalized_source and normalized_source == normalized_translated and target_language:
+        warnings.append(
+            f"Translated text is identical to the source despite target_language={target_language!r}."
+        )
+
+    score = max(0.0, min(1.0, 1.0 - (0.18 * len(blocking_issues)) - (0.04 * len(warnings))))
+    return {
+        "kind": "translation_literal_preservation",
+        "target_language": target_language,
+        "status": "failed" if blocking_issues else "ok",
+        "blocking_issues": blocking_issues,
+        "warnings": warnings,
+        "checked_literal_counts": checked_literal_counts,
+        "source_header_labels": source_header_labels,
+        "translated_header_labels": translated_header_labels,
+        "quality_score": score,
+    }
+
+
+def is_common_text_character(value: str) -> bool:
+    if value.isspace() or value.isalnum():
+        return True
+    category = unicodedata.category(value)
+    if category.startswith(("L", "N")):
+        return True
+    return value in COMMON_TEXT_PUNCTUATION
+
+
+def is_suspicious_text_token(token: str) -> bool:
+    stripped = token.strip()
+    if len(stripped) < 4:
+        return False
+    if "\ufffd" in stripped:
+        return True
+    alpha_count = sum(1 for char in stripped if char.isalpha())
+    digit_count = sum(1 for char in stripped if char.isdigit())
+    symbol_count = sum(1 for char in stripped if not is_common_text_character(char))
+    punctuation_count = sum(1 for char in stripped if not char.isalnum() and not char.isspace())
+    if symbol_count:
+        return True
+    if alpha_count == 0 and digit_count == 0:
+        return True
+    if alpha_count <= 1 and punctuation_count >= 2:
+        return True
+    if punctuation_count * 2 >= len(stripped):
+        return True
+    return False
+
+
+def text_quality_summary(
+    text_content: str,
+    *,
+    revision_kind: str,
+    source_text: str | None = None,
+    validation_summary: dict[str, object] | None = None,
+) -> dict[str, object]:
+    normalized = normalize_whitespace(text_content)
+    stripped = normalized.strip()
+    if not stripped:
+        return {
+            "quality_score": 0.0,
+            "blocking_issues": ["text is empty"],
+            "warnings": [],
+            "metrics": {"char_count": 0, "token_count": 0},
+        }
+
+    if revision_kind == "translation" and isinstance(validation_summary, dict):
+        return {
+            "quality_score": float(validation_summary.get("quality_score") or 0.0),
+            "blocking_issues": list(validation_summary.get("blocking_issues") or []),
+            "warnings": list(validation_summary.get("warnings") or []),
+            "metrics": {
+                "char_count": len(text_content),
+                "token_count": len(re.findall(r"\S+", stripped)),
+            },
+        }
+
+    tokens = re.findall(r"\S+", stripped)
+    suspicious_tokens = [token for token in tokens if is_suspicious_text_token(token)]
+    suspicious_ratio = len(suspicious_tokens) / max(len(tokens), 1)
+    uncommon_char_count = sum(1 for char in stripped if not is_common_text_character(char))
+    uncommon_char_ratio = uncommon_char_count / max(len(stripped), 1)
+    replacement_count = stripped.count("\ufffd")
+
+    blocking_issues: list[str] = []
+    warnings: list[str] = []
+    score = 1.0
+
+    if revision_kind == "image_description":
+        if len(stripped) < 40:
+            blocking_issues.append("image description is too short to be search-friendly")
+            score -= 0.35
+        elif len(tokens) < 8:
+            warnings.append("image description is very short")
+            score -= 0.1
+    else:
+        score -= min(0.45, uncommon_char_ratio * 4.0)
+        score -= min(0.35, suspicious_ratio * 1.8)
+        if replacement_count:
+            blocking_issues.append("text contains replacement characters")
+            score -= 0.2
+
+    if source_text:
+        normalized_source = normalize_whitespace(source_text).strip()
+        if normalized_source:
+            source_ratio = len(stripped) / max(len(normalized_source), 1)
+            if len(normalized_source) > 200 and source_ratio < 0.35:
+                warnings.append("text is substantially shorter than the source revision")
+                score -= 0.25
+            elif len(normalized_source) > 200 and source_ratio < 0.6:
+                warnings.append("text is noticeably shorter than the source revision")
+                score -= 0.1
+
+    score = max(0.0, min(1.0, score))
+    return {
+        "quality_score": score,
+        "blocking_issues": blocking_issues,
+        "warnings": warnings,
+        "metrics": {
+            "char_count": len(text_content),
+            "token_count": len(tokens),
+            "suspicious_token_count": len(suspicious_tokens),
+            "uncommon_char_count": uncommon_char_count,
+            "replacement_count": replacement_count,
+        },
+    }
+
+
+def text_revision_quality_summary(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    text_revision_row: sqlite3.Row,
+) -> dict[str, object]:
+    text_content = read_text_revision_body(paths, text_revision_row["storage_rel_path"]) or ""
+    provider_metadata = decode_json_text(text_revision_row["provider_metadata_json"], default={}) or {}
+    validation_summary = provider_metadata.get("validation") if isinstance(provider_metadata, dict) else None
+    source_text = None
+    if (
+        str(text_revision_row["revision_kind"] or "") in {"ocr", "translation"}
+        and text_revision_row["parent_revision_id"] is not None
+    ):
+        parent_row = require_text_revision_row_by_id(connection, int(text_revision_row["parent_revision_id"]))
+        source_text = read_text_revision_body(paths, parent_row["storage_rel_path"])
+    summary = text_quality_summary(
+        text_content,
+        revision_kind=str(text_revision_row["revision_kind"] or ""),
+        source_text=source_text,
+        validation_summary=validation_summary if isinstance(validation_summary, dict) else None,
+    )
+    stored_quality_score = (
+        float(text_revision_row["quality_score"])
+        if text_revision_row["quality_score"] is not None
+        else None
+    )
+    effective_quality_score = summary["quality_score"]
+    if stored_quality_score is not None:
+        if str(text_revision_row["revision_kind"] or "") == "source_extract":
+            effective_quality_score = min(stored_quality_score, float(summary["quality_score"]))
+        else:
+            effective_quality_score = stored_quality_score
+    return {
+        "revision_id": int(text_revision_row["id"]),
+        "revision_kind": str(text_revision_row["revision_kind"] or ""),
+        "quality_score": float(summary["quality_score"]),
+        "effective_quality_score": float(effective_quality_score),
+        "stored_quality_score": stored_quality_score,
+        "blocking_issues": list(summary["blocking_issues"]),
+        "warnings": list(summary["warnings"]),
+        "metrics": dict(summary["metrics"]),
+        "text_content": text_content,
+    }
+
+
+def text_revision_activation_comparison(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    document_row: sqlite3.Row,
+    candidate_revision_row: sqlite3.Row,
+) -> dict[str, object]:
+    candidate_summary = text_revision_quality_summary(connection, paths, candidate_revision_row)
+    current_summary = None
+    current_revision_row = None
+    if document_row["active_search_text_revision_id"] is not None:
+        current_revision_row = require_text_revision_row_by_id(
+            connection,
+            int(document_row["active_search_text_revision_id"]),
+        )
+        current_summary = text_revision_quality_summary(connection, paths, current_revision_row)
+    current_char_count = (
+        len(str(current_summary["text_content"]))
+        if current_summary is not None
+        else 0
+    )
+    candidate_char_count = len(str(candidate_summary["text_content"]))
+    return {
+        "candidate_revision_id": int(candidate_revision_row["id"]),
+        "candidate_revision_kind": str(candidate_revision_row["revision_kind"] or ""),
+        "candidate_char_count": candidate_char_count,
+        "candidate_quality_score": candidate_summary["effective_quality_score"],
+        "candidate_blocking_issues": candidate_summary["blocking_issues"],
+        "candidate_warnings": candidate_summary["warnings"],
+        "current_revision_id": (
+            int(current_revision_row["id"]) if current_revision_row is not None else None
+        ),
+        "current_revision_kind": (
+            str(current_revision_row["revision_kind"] or "")
+            if current_revision_row is not None
+            else None
+        ),
+        "current_char_count": current_char_count,
+        "current_quality_score": (
+            current_summary["effective_quality_score"]
+            if current_summary is not None
+            else None
+        ),
+        "current_blocking_issues": (
+            current_summary["blocking_issues"] if current_summary is not None else []
+        ),
+        "current_warnings": (
+            current_summary["warnings"] if current_summary is not None else []
+        ),
+        "candidate_to_current_char_ratio": (
+            candidate_char_count / current_char_count
+            if current_char_count > 0
+            else None
+        ),
+    }
+
+
+def activation_policy_decision(
+    comparison: dict[str, object],
+    *,
+    activation_policy: str,
+) -> tuple[bool, str | None]:
+    normalized_policy = normalize_text_revision_activation_policy(activation_policy)
+    if normalized_policy in {"always", "manual"}:
+        return True, None
+
+    candidate_char_count = int(comparison.get("candidate_char_count") or 0)
+    candidate_quality_score = float(comparison.get("candidate_quality_score") or 0.0)
+    current_char_count = int(comparison.get("current_char_count") or 0)
+    current_quality = comparison.get("current_quality_score")
+    current_quality_score = float(current_quality) if current_quality is not None else None
+
+    if normalized_policy == "if_empty":
+        if candidate_char_count < 1:
+            return False, "candidate_text_empty"
+        if current_char_count < 1:
+            return True, None
+        return False, "active_text_not_empty"
+
+    if candidate_char_count < 1:
+        return False, "candidate_text_empty"
+    if current_char_count < 1:
+        return True, None
+    if current_quality_score is None:
+        return True, None
+    if current_quality_score >= TEXT_QUALITY_POOR_THRESHOLD:
+        return False, "active_text_not_poor"
+    if candidate_quality_score + TEXT_QUALITY_IMPROVEMENT_TOLERANCE < current_quality_score:
+        return False, "candidate_quality_regression"
+    return True, None
+
+
 def text_revision_storage_rel_path(document_id: int, revision_kind: str, content_hash: str) -> str:
     revision_slug = sanitize_processing_identifier(revision_kind, label="Revision kind", prefix="revision")
     file_name = f"{revision_slug}-{content_hash}.txt"
@@ -824,7 +1348,7 @@ def activate_text_revision_for_document(
     normalized_policy = normalize_text_revision_activation_policy(activation_policy)
     document_row = connection.execute(
         """
-        SELECT id, source_text_revision_id
+        SELECT id, source_text_revision_id, active_search_text_revision_id
         FROM documents
         WHERE id = ?
         """,
@@ -843,6 +1367,27 @@ def activate_text_revision_for_document(
     text_content = read_text_revision_body(paths, text_revision_row["storage_rel_path"])
     if text_content is None:
         raise RetrieverError(f"Text revision {text_revision_id} has no readable body on disk.")
+
+    comparison = text_revision_activation_comparison(
+        connection,
+        paths,
+        document_row=document_row,
+        candidate_revision_row=text_revision_row,
+    )
+    should_activate, skip_reason = activation_policy_decision(
+        comparison,
+        activation_policy=normalized_policy,
+    )
+    if not should_activate:
+        return {
+            "status": "skipped",
+            "document_id": int(document_id),
+            "text_revision": text_revision_summary_by_id(connection, int(text_revision_id)),
+            "activation_policy": normalized_policy,
+            "skip_reason": skip_reason,
+            "comparison": comparison,
+            "preview_regen": None,
+        }
 
     replace_document_chunks(connection, document_id, chunk_text(text_content))
 
@@ -903,6 +1448,7 @@ def activate_text_revision_for_document(
         "text_revision": text_revision_summary_by_id(connection, int(text_revision_id)),
         "activation_event_id": activation_event_id,
         "activation_policy": normalized_policy,
+        "comparison": comparison,
         "preview_regen": preview_regen,
     }
 
@@ -1005,9 +1551,9 @@ def maybe_activate_created_text_revision(
     if text_revision_id is None:
         return None
     activation_policy = normalize_run_activation_policy(str(run_row["activation_policy"] or "manual"))
-    if activation_policy != "always":
+    if activation_policy == "manual":
         return None
-    return activate_text_revision_for_document(
+    activation_payload = activate_text_revision_for_document(
         connection,
         paths,
         document_id=document_id,
@@ -1016,6 +1562,9 @@ def maybe_activate_created_text_revision(
         activated_by_job_version_id=int(job_version_row["id"]),
         source_result_id=result_id,
     )
+    if str(activation_payload.get("status") or "") != "ok":
+        return None
+    return activation_payload
 
 
 def replace_run_snapshot_documents(
@@ -2043,6 +2592,29 @@ def list_image_description_page_output_payloads_for_document(
     return [image_description_page_output_row_to_payload(row) for row in rows]
 
 
+def claimed_run_item_rows_for_worker(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    claimed_by: str,
+) -> list[sqlite3.Row]:
+    normalized_claimed_by = normalize_whitespace(claimed_by)
+    if not normalized_claimed_by:
+        raise RetrieverError("claimed_by cannot be empty.")
+    return connection.execute(
+        """
+        SELECT *
+        FROM run_items
+        WHERE run_id = ?
+          AND status = 'running'
+          AND result_id IS NULL
+          AND claimed_by = ?
+        ORDER BY COALESCE(page_number, 0) ASC, id ASC
+        """,
+        (run_id, normalized_claimed_by),
+    ).fetchall()
+
+
 def claim_run_item_rows(
     connection: sqlite3.Connection,
     *,
@@ -2339,6 +2911,12 @@ def build_run_worker_payload(
         if normalized_claimed_by
         else None
     )
+    claimed_rows_for_worker = (
+        claimed_run_item_rows_for_worker(connection, run_id=run_id, claimed_by=normalized_claimed_by)
+        if normalized_claimed_by
+        else []
+    )
+    claimed_item_count = len(claimed_rows_for_worker)
     recommended_execution_mode = (
         "background"
         if max(total_items, planned_count) > DEFAULT_WORKER_INLINE_MAX_ITEMS
@@ -2367,6 +2945,13 @@ def build_run_worker_payload(
         and worker_batches_prepared >= effective_max_batches
         and pending_count > 0
     )
+    effective_launch_mode = (
+        normalize_run_worker_mode(str(worker_row["launch_mode"]))
+        if worker_row is not None and worker_row["launch_mode"] is not None
+        else recommended_execution_mode
+    )
+    claim_stale_after_seconds = default_run_item_claim_stale_seconds_for_launch_mode(effective_launch_mode)
+    recommended_heartbeat_interval_seconds = max(10, claim_stale_after_seconds // 2)
 
     next_action = "claim"
     stop_reason = None
@@ -2377,6 +2962,8 @@ def build_run_worker_payload(
     elif worker_cancel_requested:
         next_action = "stop"
         stop_reason = "canceled"
+    elif claimed_item_count > 0:
+        next_action = "process_batch"
     elif worker_should_handoff:
         next_action = "handoff"
         stop_reason = "max_batches_reached"
@@ -2407,6 +2994,9 @@ def build_run_worker_payload(
         "recommended_batch_size": recommended_batch_size,
         "recommended_max_batches_per_worker": recommended_max_batches,
         "max_batches_per_worker": effective_max_batches,
+        "claimed_item_count": claimed_item_count,
+        "claim_stale_after_seconds": claim_stale_after_seconds,
+        "recommended_heartbeat_interval_seconds": recommended_heartbeat_interval_seconds,
         "batches_prepared": worker_batches_prepared,
         "outstanding_items": outstanding_items,
         "needs_ocr_finalization": needs_ocr_finalization,
@@ -2978,7 +3568,12 @@ def refresh_run_progress(connection: sqlite3.Connection, run_id: int) -> None:
     )
 
 
-def run_status_by_id(connection: sqlite3.Connection, run_id: int) -> dict[str, object]:
+def run_status_by_id(
+    connection: sqlite3.Connection,
+    run_id: int,
+    *,
+    claimed_by: str | None = None,
+) -> dict[str, object]:
     refresh_run_progress(connection, run_id)
     payload = run_summary_by_id(connection, run_id)
     status_counts = run_item_status_counts(connection, run_id)
@@ -3027,7 +3622,12 @@ def run_status_by_id(connection: sqlite3.Connection, run_id: int) -> dict[str, o
     ]
     payload["claim_health"] = claim_health
     payload["workers"] = list_run_worker_payloads_for_run(connection, run_id)
-    payload["worker"] = build_run_worker_payload(connection, run_id, run_payload=payload)
+    payload["worker"] = build_run_worker_payload(
+        connection,
+        run_id,
+        run_payload=payload,
+        claimed_by=claimed_by,
+    )
     payload["supervision"] = build_run_supervision_payload(
         connection,
         run_id,
@@ -3134,6 +3734,20 @@ def finalize_ocr_results_for_run(
                 f"expected {len(page_rows)}, found {len(page_output_payloads)}."
             )
         merged_text = "\n\n".join(str(payload["text_content"]) for payload in page_output_payloads if str(payload["text_content"]).strip())
+        parent_revision_id = (
+            int(snapshot_row["pinned_input_revision_id"])
+            if snapshot_row["pinned_input_revision_id"] is not None
+            else None
+        )
+        parent_text = None
+        if parent_revision_id is not None:
+            parent_revision_row = require_text_revision_row_by_id(connection, parent_revision_id)
+            parent_text = read_text_revision_body(paths, parent_revision_row["storage_rel_path"])
+        quality_summary = text_quality_summary(
+            merged_text,
+            revision_kind="ocr",
+            source_text=parent_text,
+        )
         created_text_revision_id = create_text_revision_row(
             connection,
             paths,
@@ -3141,17 +3755,14 @@ def finalize_ocr_results_for_run(
             revision_kind="ocr",
             text_content=merged_text,
             language=None,
-            parent_revision_id=(
-                int(snapshot_row["pinned_input_revision_id"])
-                if snapshot_row["pinned_input_revision_id"] is not None
-                else None
-            ),
+            parent_revision_id=parent_revision_id,
             created_by_job_version_id=int(job_version_row["id"]),
-            quality_score=None,
+            quality_score=float(quality_summary["quality_score"]),
             provider_metadata={
                 "run_id": run_id,
                 "page_count": len(page_output_payloads),
                 "finalized_from": "ocr_page_outputs",
+                "quality": quality_summary,
             },
         )
         result_id, _ = create_result_row(
@@ -3177,6 +3788,7 @@ def finalize_ocr_results_for_run(
             provider_metadata={
                 "run_id": run_id,
                 "page_count": len(page_output_payloads),
+                "quality": quality_summary,
             },
         )
         connection.execute(
@@ -3320,6 +3932,10 @@ def finalize_image_description_results_for_run(
                 f"expected {len(page_rows)}, found {len(page_output_payloads)}."
             )
         merged_text = build_image_description_revision_text(page_output_payloads)
+        quality_summary = text_quality_summary(
+            merged_text,
+            revision_kind="image_description",
+        )
         created_text_revision_id = create_text_revision_row(
             connection,
             paths,
@@ -3333,11 +3949,12 @@ def finalize_image_description_results_for_run(
                 else None
             ),
             created_by_job_version_id=int(job_version_row["id"]),
-            quality_score=None,
+            quality_score=float(quality_summary["quality_score"]),
             provider_metadata={
                 "run_id": run_id,
                 "page_count": len(page_output_payloads),
                 "finalized_from": "image_description_page_outputs",
+                "quality": quality_summary,
             },
         )
         result_id, _ = create_result_row(
@@ -3363,6 +3980,7 @@ def finalize_image_description_results_for_run(
             provider_metadata={
                 "run_id": run_id,
                 "page_count": len(page_output_payloads),
+                "quality": quality_summary,
             },
         )
         connection.execute(

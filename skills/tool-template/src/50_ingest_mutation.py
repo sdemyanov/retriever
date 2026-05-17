@@ -16175,20 +16175,34 @@ def prepare_run_batch(
                 max_batches=max_batches,
             )
             reused_count = reuse_active_results_for_run(connection, run_id)
-            initial_run_payload = run_status_by_id(connection, run_id)
-            initial_worker_payload = build_run_worker_payload(
+            initial_run_payload = run_status_by_id(
                 connection,
                 run_id,
-                run_payload=initial_run_payload,
                 claimed_by=claimed_by,
             )
+            initial_worker_payload = dict(initial_run_payload.get("worker") or {})
             effective_limit = limit if limit is not None else int(initial_worker_payload["recommended_batch_size"])
-            if budget is not None and budget < RUN_JOB_MIN_SECONDS_TO_CLAIM:
+            if budget is not None and budget < RUN_JOB_MIN_SECONDS_TO_CLAIM and initial_worker_payload["next_action"] == "claim":
                 effective_limit = 0
             claimed_rows: list[sqlite3.Row] = []
             batch_payloads: list[dict[str, object]] = []
 
-            if initial_worker_payload["next_action"] == "claim" and effective_limit > 0:
+            if initial_worker_payload["next_action"] == "process_batch":
+                claimed_rows = claimed_run_item_rows_for_worker(
+                    connection,
+                    run_id=run_id,
+                    claimed_by=claimed_by,
+                )
+                if claimed_rows:
+                    heartbeat_claimed_run_items(connection, run_id=run_id, claimed_by=claimed_by)
+                batch_payloads = [
+                    {
+                        "run_item": run_item_row_to_payload(row),
+                        "context": build_run_item_context_payload(connection, paths, root, row),
+                    }
+                    for row in claimed_rows
+                ]
+            elif initial_worker_payload["next_action"] == "claim" and effective_limit > 0:
                 claimed_rows = claim_run_item_rows(
                     connection,
                     run_id=run_id,
@@ -16212,13 +16226,12 @@ def prepare_run_batch(
                         increment_batches_prepared=True,
                     )
 
-            current_run_payload = run_status_by_id(connection, run_id)
-            worker_payload = build_run_worker_payload(
+            current_run_payload = run_status_by_id(
                 connection,
                 run_id,
-                run_payload=current_run_payload,
                 claimed_by=claimed_by,
             )
+            worker_payload = dict(current_run_payload.get("worker") or {})
             if budget is not None:
                 worker_payload["budget_seconds"] = budget
                 worker_payload["minimum_seconds_to_claim"] = RUN_JOB_MIN_SECONDS_TO_CLAIM
@@ -16419,10 +16432,12 @@ def complete_run_item(
                 label="Output values",
                 default=output_values_default if isinstance(output_values_default, dict) else {},
             )
-            provider_metadata = parse_json_object_argument(
-                provider_metadata_json,
-                label="Provider metadata",
-                default={},
+            provider_metadata = dict(
+                parse_json_object_argument(
+                    provider_metadata_json,
+                    label="Provider metadata",
+                    default={},
+                )
             )
             created_text_revision_payload = (
                 parse_json_object_argument(
@@ -16433,6 +16448,22 @@ def complete_run_item(
                 if created_text_revision_json is not None
                 else None
             )
+            if job_kind == "structured_extraction":
+                schema_issues = validate_processing_response_output(
+                    job_version_row,
+                    job_output_rows,
+                    output_values,
+                )
+                provider_metadata["validation"] = {
+                    "kind": "response_schema",
+                    "status": "failed" if schema_issues else "ok",
+                    "issue_count": len(schema_issues),
+                    "issues": list(schema_issues),
+                }
+                if schema_issues:
+                    sample = "; ".join(schema_issues[:3])
+                    suffix = f" (+{len(schema_issues) - 3} more)" if len(schema_issues) > 3 else ""
+                    raise RetrieverError(f"Structured output did not match response_schema: {sample}{suffix}")
 
             created_text_revision_id = None
             if job_kind in {"ocr", "image_description"} and str(run_item_row["item_kind"] or "") == "page":
@@ -16525,17 +16556,74 @@ def complete_run_item(
                 text_content = str(created_text_revision_payload.get("text_content") or "")
                 if not text_content:
                     raise RetrieverError("Created text revision payload must include text_content.")
+                revision_kind = str(created_text_revision_payload.get("revision_kind") or job_kind)
+                revision_language = (
+                    normalize_whitespace(str(created_text_revision_payload.get("language") or "")).lower() or None
+                )
+                source_text = None
+                if snapshot_row is not None and snapshot_row["pinned_input_revision_id"] is not None:
+                    source_revision_row = require_text_revision_row_by_id(
+                        connection,
+                        int(snapshot_row["pinned_input_revision_id"]),
+                    )
+                    source_text = read_text_revision_body(paths, source_revision_row["storage_rel_path"]) or ""
+                quality_summary = None
+                if revision_kind == "translation" or job_kind == "translation":
+                    job_parameters = decode_json_text(job_version_row["parameters_json"], default={}) or {}
+                    if not isinstance(job_parameters, dict):
+                        job_parameters = {}
+                    target_language = revision_language
+                    if target_language is None:
+                        for raw_value in (
+                            (normalized_output.get("target_language") if isinstance(normalized_output, dict) else None),
+                            (raw_output.get("target_language") if isinstance(raw_output, dict) else None),
+                            job_parameters.get("target_language"),
+                            job_parameters.get("target_lang"),
+                            job_parameters.get("language"),
+                        ):
+                            normalized_value = normalize_whitespace(str(raw_value or "")).lower()
+                            if normalized_value:
+                                target_language = normalized_value
+                                break
+                    validation_summary = (
+                        translation_validation_summary(
+                            source_text or "",
+                            text_content,
+                            target_language=target_language,
+                        )
+                        if source_text is not None
+                        else None
+                    )
+                    if validation_summary is not None:
+                        provider_metadata["validation"] = validation_summary
+                        blocking_issues = list(validation_summary.get("blocking_issues") or [])
+                        if blocking_issues:
+                            sample = "; ".join(blocking_issues[:3])
+                            suffix = f" (+{len(blocking_issues) - 3} more)" if len(blocking_issues) > 3 else ""
+                            raise RetrieverError(
+                                f"Translation literal-preservation validation failed: {sample}{suffix}"
+                            )
+                    quality_summary = text_quality_summary(
+                        text_content,
+                        revision_kind="translation",
+                        source_text=source_text,
+                        validation_summary=validation_summary if isinstance(validation_summary, dict) else None,
+                    )
+                else:
+                    quality_summary = text_quality_summary(
+                        text_content,
+                        revision_kind=revision_kind,
+                        source_text=source_text,
+                    )
+                provider_metadata["quality"] = quality_summary
+                created_quality_score = created_text_revision_payload.get("quality_score")
                 created_text_revision_id = create_text_revision_row(
                     connection,
                     paths,
                     document_id=int(run_item_row["document_id"]),
-                    revision_kind=str(created_text_revision_payload.get("revision_kind") or job_kind),
+                    revision_kind=revision_kind,
                     text_content=text_content,
-                    language=(
-                        str(created_text_revision_payload["language"])
-                        if created_text_revision_payload.get("language")
-                        else None
-                    ),
+                    language=revision_language,
                     parent_revision_id=(
                         int(snapshot_row["pinned_input_revision_id"])
                         if snapshot_row is not None and snapshot_row["pinned_input_revision_id"] is not None
@@ -16543,9 +16631,9 @@ def complete_run_item(
                     ),
                     created_by_job_version_id=int(job_version_row["id"]),
                     quality_score=(
-                        float(created_text_revision_payload["quality_score"])
-                        if created_text_revision_payload.get("quality_score") is not None
-                        else None
+                        float(created_quality_score)
+                        if created_quality_score is not None
+                        else float(quality_summary["quality_score"])
                     ),
                     provider_metadata=provider_metadata,
                 )
@@ -16781,7 +16869,7 @@ def run_job_next_recommended_commands(
         commands.append(f"finalize-ocr-run {root_arg} --run-id {run_id_arg}")
     elif next_action == "finalize_image_description":
         commands.append(f"finalize-image-description-run {root_arg} --run-id {run_id_arg}")
-    elif next_action in {"claim", "stop"}:
+    elif next_action in {"claim", "process_batch", "stop"}:
         run_item_counts = dict(run_payload.get("run_item_counts") or {})
         if (
             int(worker_payload.get("outstanding_items", 0) or 0) > 0
@@ -16803,7 +16891,13 @@ def run_job_next_recommended_commands(
     return commands
 
 
-def run_status(root: Path, *, run_id: int, budget_seconds: int | None = None) -> dict[str, object]:
+def run_status(
+    root: Path,
+    *,
+    run_id: int,
+    budget_seconds: int | None = None,
+    claimed_by: str | None = None,
+) -> dict[str, object]:
     budget = (
         normalize_resumable_step_budget(budget_seconds)
         if budget_seconds is not None
@@ -16814,11 +16908,12 @@ def run_status(root: Path, *, run_id: int, budget_seconds: int | None = None) ->
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        run_payload = run_status_by_id(connection, run_id)
+        run_payload = run_status_by_id(connection, run_id, claimed_by=claimed_by)
         run_payload["next_recommended_commands"] = run_job_next_recommended_commands(
             root,
             run_payload=run_payload,
             budget_seconds=budget,
+            claimed_by=claimed_by,
         )
         return {
             "status": "ok",
@@ -16844,7 +16939,12 @@ def run_job_step(
     normalized_claimed_by = normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id))
     if not normalized_claimed_by:
         raise RetrieverError("claimed_by cannot be empty.")
-    status_payload = run_status(root, run_id=run_id, budget_seconds=budget)
+    status_payload = run_status(
+        root,
+        run_id=run_id,
+        budget_seconds=budget,
+        claimed_by=normalized_claimed_by,
+    )
     run_payload = dict(status_payload["run"])
     worker_payload = dict(run_payload.get("worker") or {})
     next_action = str(worker_payload.get("next_action") or "")
@@ -16895,7 +16995,7 @@ def run_job_step(
     elif next_action == "finalize_image_description":
         executed_step = "finalize_image_description"
         step_result = finalize_image_description_run(root, run_id=run_id)
-    elif next_action == "claim":
+    elif next_action in {"claim", "process_batch"}:
         executed_step = "prepare_run_batch"
         step_result = prepare_run_batch(
             root,
@@ -16937,7 +17037,12 @@ def run_job_step(
 
     updated_run_payload = dict(
         (step_result or {}).get("run")
-        or run_status(root, run_id=run_id, budget_seconds=budget)["run"]
+        or run_status(
+            root,
+            run_id=run_id,
+            budget_seconds=budget,
+            claimed_by=normalized_claimed_by,
+        )["run"]
     )
     updated_run_payload["next_recommended_commands"] = run_job_next_recommended_commands(
         root,
@@ -17324,16 +17429,23 @@ def create_job_version(
     try:
         apply_schema(connection, root)
         job_row = require_job_row_by_name(connection, job_name)
+        job_kind = normalize_job_kind(str(job_row["job_kind"]))
         normalized_capability = (
             normalize_job_capability(capability)
             if capability and capability.strip()
-            else default_job_capability_for_kind(str(job_row["job_kind"]))
+            else default_job_capability_for_kind(job_kind)
         )
         normalized_input_basis = (
             normalize_job_input_basis(input_basis)
             if input_basis and input_basis.strip()
-            else default_job_input_basis_for_kind(str(job_row["job_kind"]))
+            else default_job_input_basis_for_kind(job_kind)
         )
+        if job_kind == "translation" or normalized_capability == "text_translation":
+            target_language = normalize_whitespace(
+                str(parameters.get("target_language") or parameters.get("target_lang") or parameters.get("language") or "")
+            ).lower()
+            if not target_language:
+                raise RetrieverError("Translation job versions require parameters_json.target_language.")
         connection.execute("BEGIN")
         try:
             version_id = create_job_version_row(

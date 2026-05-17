@@ -4137,6 +4137,60 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_activate_text_revision_if_empty_skips_when_active_text_present(self) -> None:
+        note_path = self.root / "note-if-empty.txt"
+        note_path.write_text("already searchable active text", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("note-if-empty.txt")
+        source_revision_id = int(document_row["source_text_revision_id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("BEGIN")
+            try:
+                candidate_revision_id = retriever_tools.create_text_revision_row(
+                    connection,
+                    self.paths,
+                    document_id=int(document_row["id"]),
+                    revision_kind="ocr",
+                    text_content="candidate promoted text",
+                    language="en",
+                    parent_revision_id=source_revision_id,
+                    created_by_job_version_id=None,
+                    quality_score=0.9,
+                    provider_metadata={"provider": "test"},
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        finally:
+            connection.close()
+
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+            "--text-revision-id",
+            str(candidate_revision_id),
+            "--activation-policy",
+            "if_empty",
+        )
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        self.assertEqual(activate_payload["status"], "skipped")
+        self.assertEqual(activate_payload["activation_policy"], "if_empty")
+        self.assertEqual(activate_payload["skip_reason"], "active_text_not_empty")
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["active_search_text_revision_id"], source_revision_id)
+        self.assertEqual(updated_row["source_text_revision_id"], source_revision_id)
+
     def test_run_batch_completion_reuses_results_and_publishes_bound_outputs(self) -> None:
         note_path = self.root / "contract.txt"
         note_path.write_text("This contract mentions Delaware and an automatic renewal clause.", encoding="utf-8")
@@ -4449,6 +4503,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(translated_revision["revision_kind"], "translation")
         self.assertEqual(translated_revision["parent_revision_id"], source_revision_id)
         self.assertFalse(translated_revision["is_active_search_revision"])
+        self.assertIsNotNone(translated_revision["quality_score"])
+        self.assertEqual(translated_revision["provider_metadata"]["validation"]["status"], "ok")
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -4602,6 +4658,129 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertTrue(repeat_complete_payload["idempotent"])
         self.assertEqual(repeat_complete_payload["result"]["id"], result_payload["id"])
 
+    def test_translation_run_with_if_poor_activation_promotes_revision(self) -> None:
+        note_path = self.root / "memo-if-poor.txt"
+        note_path.write_text("Original English memo text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("memo-if-poor.txt")
+        source_revision_id = int(document_row["source_text_revision_id"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("BEGIN")
+            try:
+                connection.execute(
+                    "UPDATE text_revisions SET quality_score = ? WHERE id = ?",
+                    (0.1, source_revision_id),
+                )
+                connection.execute(
+                    "UPDATE documents SET active_text_quality_score = ? WHERE id = ?",
+                    (0.1, int(document_row["id"])),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        finally:
+            connection.close()
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Translate Poor",
+            "translation",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "translate_poor",
+            "--provider",
+            "static_text",
+            "--input-basis",
+            "active_search_text",
+            "--instruction",
+            "Translate to Spanish.",
+            "--parameters-json",
+            "{\"target_language\":\"es\",\"translated_text\":\"ES::{text}\"}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+            "--activation-policy",
+            "if_poor",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        self.assertEqual(create_run_payload["run"]["activation_policy"], "if_poor")
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "translator-poor",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        completion_template = context_payload["context"]["execution"]["completion_template"]
+        raw_output = dict(completion_template["raw_output_json"])
+        raw_output["translated_text"] = "ES::Original English memo text."
+        normalized_output = dict(completion_template["normalized_output_json"])
+        normalized_output["translated_text"] = "ES::Original English memo text."
+        created_text_revision = dict(completion_template["created_text_revision_json"])
+        created_text_revision["text_content"] = "ES::Original English memo text."
+
+        complete_exit, complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "translator-poor",
+            "--raw-output-json",
+            json.dumps(raw_output),
+            "--normalized-output-json",
+            json.dumps(normalized_output),
+            "--created-text-revision-json",
+            json.dumps(created_text_revision),
+        )
+        self.assertEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+        self.assertIn("activation", complete_payload)
+        self.assertEqual(complete_payload["activation"]["activation_policy"], "if_poor")
+
+        translated_revision_id = int(complete_payload["result"]["created_text_revision_id"])
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["active_search_text_revision_id"], translated_revision_id)
+        self.assertEqual(updated_row["active_text_source_kind"], "translation")
+
     def test_create_run_rejects_always_activation_for_structured_extraction(self) -> None:
         note_path = self.root / "contract-activation.txt"
         note_path.write_text("Contract text.", encoding="utf-8")
@@ -4643,6 +4822,133 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertNotEqual(create_run_exit, 0)
         self.assertIsNotNone(create_run_payload)
         self.assertIn("only supported", create_run_payload["error"])
+
+    def test_create_job_version_rejects_translation_without_target_language(self) -> None:
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Translate Missing Language",
+            "translation",
+        )
+        self.assertEqual(create_job_exit, 0)
+
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "translate_missing_language",
+            "--instruction",
+            "Translate to Spanish.",
+        )
+        self.assertNotEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        self.assertIn("target_language", create_version_payload["error"])
+
+    def test_translation_complete_run_item_rejects_literal_regressions(self) -> None:
+        note_path = self.root / "translation-regression.txt"
+        note_path.write_text(
+            (
+                "From: Alice Example <alice@example.com>\n"
+                "Sent: Wednesday, February 25, 2015 11:24 AM\n"
+                "To: Bob Example <bob@example.com>\n"
+                "Subject: Project update\n\n"
+                "Invoice submitted on 2/12/15 for $804,351.50.\n"
+                "See report.pdf at https://example.com/report.pdf.\n"
+            ),
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("translation-regression.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Translate Regression",
+            "translation",
+        )
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "translate_regression",
+            "--instruction",
+            "Translate to Spanish.",
+            "--parameters-json",
+            "{\"target_language\":\"es\"}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "translator-regression",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        context_exit, context_payload, _, _ = self.run_cli(
+            "get-run-item-context",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+        )
+        self.assertEqual(context_exit, 0)
+        self.assertIsNotNone(context_payload)
+        completion_template = context_payload["context"]["execution"]["completion_template"]
+        raw_output = dict(completion_template["raw_output_json"])
+        raw_output["translated_text"] = (
+            "De: Alice Example <alice@example.com>\n"
+            "Enviado: Wednesday, February 25, 2015 11:24 AM\n"
+            "Para: Bob Example <bob@example.com>\n"
+            "Asunto: Actualizacion del proyecto\n\n"
+            "Factura enviada el 12/2/15 por $804,351.50.\n"
+            "Ver report.pdf en https://example.com/report.pdf.\n"
+        )
+        normalized_output = dict(completion_template["normalized_output_json"])
+        normalized_output["translated_text"] = raw_output["translated_text"]
+        created_text_revision = dict(completion_template["created_text_revision_json"])
+        created_text_revision["text_content"] = raw_output["translated_text"]
+
+        complete_exit, complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "translator-regression",
+            "--raw-output-json",
+            json.dumps(raw_output),
+            "--normalized-output-json",
+            json.dumps(normalized_output),
+            "--created-text-revision-json",
+            json.dumps(created_text_revision),
+        )
+        self.assertNotEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+        self.assertIn("literal-preservation", complete_payload["error"])
 
     def test_translation_run_item_context_includes_execution_template(self) -> None:
         note_path = self.root / "translation.txt"
@@ -4883,6 +5189,87 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(status_payload["run"]["status"], "completed")
         self.assertEqual(status_payload["run"]["run_item_counts"]["completed"], 1)
 
+    def test_complete_run_item_rejects_structured_outputs_that_violate_response_schema(self) -> None:
+        note_path = self.root / "invalid-structured.txt"
+        note_path.write_text("Governing law is Delaware.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("invalid-structured.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Invalid Structured Metadata",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "invalid_structured_metadata",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "invalid_structured_metadata",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--filter",
+            f"id = {document_row['id']}",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-invalid",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        run_item_id = int(claim_payload["run_items"][0]["id"])
+
+        complete_exit, complete_payload, _, _ = self.run_cli(
+            "complete-run-item",
+            str(self.root),
+            "--run-item-id",
+            str(run_item_id),
+            "--claimed-by",
+            "worker-invalid",
+            "--raw-output-json",
+            json.dumps({"unexpected_field": "Delaware"}),
+            "--normalized-output-json",
+            json.dumps({"unexpected_field": "Delaware"}),
+            "--output-values-json",
+            json.dumps({"unexpected_field": "Delaware"}),
+        )
+        self.assertNotEqual(complete_exit, 0)
+        self.assertIsNotNone(complete_payload)
+        self.assertIn("response_schema", complete_payload["error"])
+
     def test_prepare_run_batch_returns_contexts_and_worker_hints(self) -> None:
         note_path = self.root / "batch-contract.txt"
         note_path.write_text("Governing law is New York.", encoding="utf-8")
@@ -5029,6 +5416,94 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(len(step_payload["batch"]), 1)
         self.assertEqual(step_payload["batch"][0]["run_item"]["status"], "running")
         self.assertIn("run-job-step", " ".join(step_payload["next_recommended_commands"]))
+
+    def test_run_job_step_reuses_same_worker_batch(self) -> None:
+        note_path = self.root / "step-contract-reuse.txt"
+        note_path.write_text("Governing law is Delaware.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("step-contract-reuse.txt")
+
+        create_job_exit, _, _, _ = self.run_cli(
+            "create-job",
+            str(self.root),
+            "Step Contract Reuse",
+            "structured_extraction",
+        )
+        self.assertEqual(create_job_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "step_contract_reuse",
+            "governing_law",
+            "--value-type",
+            "text",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "step_contract_reuse",
+            "--instruction",
+            "Extract the governing law field.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--filter",
+            f"id = {document_row['id']}",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        first_step_exit, first_step_payload, _, _ = self.run_cli(
+            "run-job-step",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-reuse",
+            "--budget-seconds",
+            "35",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(first_step_exit, 0)
+        self.assertIsNotNone(first_step_payload)
+        self.assertEqual(len(first_step_payload["batch"]), 1)
+        first_run_item_id = int(first_step_payload["batch"][0]["run_item"]["id"])
+
+        second_step_exit, second_step_payload, _, _ = self.run_cli(
+            "run-job-step",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "worker-reuse",
+            "--budget-seconds",
+            "35",
+            "--limit",
+            "1",
+        )
+        self.assertEqual(second_step_exit, 0)
+        self.assertIsNotNone(second_step_payload)
+        self.assertTrue(second_step_payload["executed"])
+        self.assertEqual(second_step_payload["executed_step"], "prepare_run_batch")
+        self.assertEqual(second_step_payload["reason"], "batch_ready")
+        self.assertEqual(second_step_payload["worker"]["next_action"], "process_batch")
+        self.assertEqual(second_step_payload["worker"]["claimed_item_count"], 1)
+        self.assertEqual(len(second_step_payload["batch"]), 1)
+        self.assertEqual(int(second_step_payload["batch"][0]["run_item"]["id"]), first_run_item_id)
 
     def test_run_job_step_respects_tiny_budget_before_claiming(self) -> None:
         note_path = self.root / "tiny-budget-contract.txt"
@@ -5916,6 +6391,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         ocr_revision = revisions_by_id[int(result_payload["created_text_revision_id"])]
         self.assertEqual(ocr_revision["revision_kind"], "ocr")
         self.assertFalse(ocr_revision["is_active_search_revision"])
+        self.assertIsNotNone(ocr_revision["quality_score"])
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -6227,6 +6703,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         description_revision = revisions_by_id[int(result_payload["created_text_revision_id"])]
         self.assertEqual(description_revision["revision_kind"], "image_description")
         self.assertFalse(description_revision["is_active_search_revision"])
+        self.assertIsNotNone(description_revision["quality_score"])
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
