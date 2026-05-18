@@ -654,6 +654,7 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
             cursor.setdefault("planned_slack_export_roots", [])
             cursor.setdefault("planned_slack_conversations", 0)
             cursor.setdefault("planned_slack_day_documents", 0)
+            cursor.setdefault("planned_slack_day_files_scanned", 0)
             cursor.setdefault("slack_failures", [])
             cursor.setdefault("current_mbox_source", None)
             cursor.setdefault("pending_gmail_mbox_sources", [])
@@ -733,6 +734,7 @@ def ingest_v2_load_or_create_loose_file_plan_cursor(
         "planned_slack_export_roots": [],
         "planned_slack_conversations": 0,
         "planned_slack_day_documents": 0,
+        "planned_slack_day_files_scanned": 0,
         "slack_failures": [],
         "current_mbox_source": None,
         "pending_gmail_mbox_sources": list(exclusions.get("gmail_mbox_source_payloads") or []),
@@ -978,6 +980,7 @@ def ingest_v2_plan_slack_export_root(
     commit_order = int(next_commit_order)
     planned_conversations = 0
     planned_day_documents = 0
+    planned_day_files_scanned = len(day_files)
     rel_paths: list[str] = []
     for conversation_plan in conversation_plans:
         conversation_inserted = False
@@ -1008,6 +1011,7 @@ def ingest_v2_plan_slack_export_root(
         "next_commit_order": commit_order,
         "planned_conversations": planned_conversations,
         "planned_day_documents": planned_day_documents,
+        "planned_day_files_scanned": planned_day_files_scanned,
         "seen_rel_paths": sorted(set(rel_paths)),
     }
 
@@ -7505,12 +7509,17 @@ def ingest_v2_plan_step(
                                 int(cursor.get("planned_slack_day_documents") or 0)
                                 + int(slack_plan["planned_day_documents"] or 0)
                             )
+                            cursor["planned_slack_day_files_scanned"] = (
+                                int(cursor.get("planned_slack_day_files_scanned") or 0)
+                                + int(slack_plan["planned_day_files_scanned"] or 0)
+                            )
                             slack_root_payloads = dict(cursor.get("slack_export_roots_by_rel_root") or {})
                             slack_root_payloads[slack_rel_root] = {
                                 **slack_payload,
                                 "seen_rel_paths": list(slack_plan["seen_rel_paths"]),
                                 "planned_conversations": int(slack_plan["planned_conversations"] or 0),
                                 "planned_day_documents": int(slack_plan["planned_day_documents"] or 0),
+                                "planned_day_files_scanned": int(slack_plan["planned_day_files_scanned"] or 0),
                             }
                             cursor["slack_export_roots_by_rel_root"] = slack_root_payloads
                             planned_roots = list(cursor.get("planned_slack_export_roots") or [])
@@ -7889,6 +7898,7 @@ def ingest_v2_plan_step(
                     "planned_slack_export_roots": list(cursor.get("planned_slack_export_roots") or []),
                     "planned_slack_conversations": int(cursor.get("planned_slack_conversations") or 0),
                     "planned_slack_day_documents": int(cursor.get("planned_slack_day_documents") or 0),
+                    "planned_slack_day_files_scanned": int(cursor.get("planned_slack_day_files_scanned") or 0),
                     "slack_failures": list(cursor.get("slack_failures") or []),
                     "current_mbox_source": (
                         str(dict(cursor.get("current_mbox_source") or {}).get("source_rel_path") or "")
@@ -10596,7 +10606,7 @@ def ingest_v2_compat_summary(
         + int(plan_cursor.get("skipped_unchanged_loose_files") or 0)
         + len(planned_mbox_sources)
         + len(planned_pst_sources)
-        + int(plan_cursor.get("planned_slack_day_documents") or 0)
+        + int(plan_cursor.get("planned_slack_day_files_scanned") or 0)
         + planned_gmail_mbox_sources
     )
 
@@ -10630,7 +10640,7 @@ def ingest_v2_compat_summary(
             "mbox_sources_missing": int(finalize_cursor.get("mbox_sources_missing") or 0),
             "mbox_documents_missing": int(finalize_cursor.get("mbox_documents_missing") or 0),
             "gmail_documents_scanned": planned_gmail_mbox_sources,
-            "slack_day_documents_scanned": int(plan_cursor.get("planned_slack_day_documents") or 0),
+            "slack_day_documents_scanned": int(plan_cursor.get("planned_slack_day_files_scanned") or 0),
             "slack_documents_created": int(slack_stats.get("slack_documents_created") or 0),
             "slack_documents_updated": int(slack_stats.get("slack_documents_updated") or 0),
             "slack_documents_missing": int(finalize_cursor.get("slack_documents_missing") or 0),

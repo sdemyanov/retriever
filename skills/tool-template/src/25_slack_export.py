@@ -639,6 +639,8 @@ def plan_slack_export_conversations(
                 day_record,
                 materialized_thread_roots=materialized_thread_roots,
             )
+            if not list(day_plan.get("messages") or []):
+                continue
             day_documents.append(
                 {
                     "kind": "day",

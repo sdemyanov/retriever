@@ -595,6 +595,19 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def maybe_fetch_document_row(self, rel_path: str) -> dict[str, object] | None:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            row = connection.execute(
+                "SELECT * FROM documents WHERE rel_path = ?",
+                (rel_path,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self.normalized_document_row(row)
+        finally:
+            connection.close()
+
     def fetch_document_by_id(self, document_id: int) -> dict[str, object]:
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -9862,10 +9875,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertEqual(plan_payload["cursor"]["planned_slack_export_roots"], ["data/slack"])
         self.assertEqual(plan_payload["cursor"]["planned_slack_conversations"], 1)
-        self.assertEqual(plan_payload["cursor"]["planned_slack_day_documents"], 2)
+        self.assertEqual(plan_payload["cursor"]["planned_slack_day_documents"], 1)
+        self.assertEqual(plan_payload["cursor"]["planned_slack_day_files_scanned"], 2)
         self.assertEqual(commit_payload["failed"], 0)
-        self.assertEqual(commit_payload["committed"], 3)
-        self.assertEqual(commit_payload["actions"], {"committed": 3})
+        self.assertEqual(commit_payload["committed"], 2)
+        self.assertEqual(commit_payload["actions"], {"committed": 2})
         self.assertEqual(
             commit_payload["batching"],
             {
@@ -9876,28 +9890,26 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 "pst_message_batch_items": 0,
                 "pst_message_batch_fallbacks": 0,
                 "slack_document_batches": 1,
-                "slack_document_batch_items": 3,
+                "slack_document_batch_items": 2,
                 "slack_document_batch_fallbacks": 0,
             },
         )
         self.assertEqual(finalize_payload["run"]["status"], "completed")
-        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["slack_document"]["committed"], 3)
+        self.assertEqual(finalize_payload["run"]["counts"]["by_unit_type"]["slack_document"]["committed"], 2)
 
         day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
-        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        self.assertIsNone(self.maybe_fetch_document_row("data/slack/general/2022-12-17.json"))
         child_rel_path = retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
         child_row = self.fetch_document_row(child_rel_path)
         dataset_row = self.fetch_dataset_row(int(day_one_row["dataset_id"]))
 
         self.assertEqual(day_one_row["source_kind"], retriever_tools.SLACK_EXPORT_SOURCE_KIND)
-        self.assertEqual(day_two_row["source_kind"], retriever_tools.SLACK_EXPORT_SOURCE_KIND)
         self.assertEqual(child_row["source_kind"], retriever_tools.SLACK_EXPORT_SOURCE_KIND)
         self.assertEqual(child_row["parent_document_id"], day_one_row["id"])
         self.assertEqual(child_row["child_document_kind"], retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD)
         self.assertEqual(child_row["source_rel_path"], "data/slack/general/2022-12-16.json")
         self.assertEqual(child_row["source_item_id"], thread_ts)
         self.assertEqual(child_row["root_message_key"], f"C04GENERAL1:{thread_ts}")
-        self.assertEqual(day_two_row["conversation_id"], day_one_row["conversation_id"])
         self.assertEqual(child_row["conversation_id"], day_one_row["conversation_id"])
         self.assertEqual(dataset_row["source_kind"], retriever_tools.SLACK_EXPORT_SOURCE_KIND)
         self.assertEqual(dataset_row["dataset_locator"], "data/slack")
@@ -9926,7 +9938,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(len(work_items), 3)
+        self.assertEqual(len(work_items), 2)
         self.assertTrue(all(len(json.loads(row["affected_document_ids_json"])) == 1 for row in work_items))
         self.assertTrue(
             all(
@@ -10054,23 +10066,22 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         second_finalize_payload = dict(second_payloads["finalize"])
 
         self.assertEqual(second_plan_payload["cursor"]["planned_slack_conversations"], 1)
-        self.assertEqual(second_plan_payload["cursor"]["planned_slack_day_documents"], 2)
+        self.assertEqual(second_plan_payload["cursor"]["planned_slack_day_documents"], 1)
+        self.assertEqual(second_plan_payload["cursor"]["planned_slack_day_files_scanned"], 2)
         self.assertEqual(second_commit_payload["failed"], 0)
-        self.assertEqual(second_commit_payload["committed"], 3)
-        self.assertEqual(second_commit_payload["actions"], {"committed": 3})
-        self.assertEqual(second_finalize_payload["run"]["counts"]["by_unit_type"]["slack_document"]["committed"], 3)
+        self.assertEqual(second_commit_payload["committed"], 2)
+        self.assertEqual(second_commit_payload["actions"], {"committed": 2})
+        self.assertEqual(second_finalize_payload["run"]["counts"]["by_unit_type"]["slack_document"]["committed"], 2)
 
         updated_day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
-        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        self.assertIsNone(self.maybe_fetch_document_row("data/slack/general/2022-12-17.json"))
         updated_child_row = self.fetch_document_row(child_rel_path)
 
         self.assertEqual(updated_day_one_row["conversation_id"], day_one_row["conversation_id"])
-        self.assertEqual(day_two_row["conversation_id"], day_one_row["conversation_id"])
         self.assertEqual(updated_child_row["conversation_id"], day_one_row["conversation_id"])
         self.assertEqual(updated_child_row["id"], first_child_id)
         self.assertEqual(updated_child_row["control_number"], first_child_control_number)
         self.assertEqual(updated_child_row["parent_document_id"], updated_day_one_row["id"])
-        self.assertEqual(day_two_row["text_status"], "empty")
 
         reply_search = retriever_tools.search(self.root, "Following up on kickoff", None, None, None, 1, 20)
         self.assertEqual(reply_search["total_hits"], 1)
@@ -10100,7 +10111,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(len(work_items), 3)
+        self.assertEqual(len(work_items), 2)
         self.assertEqual(
             json.loads(next(row for row in work_items if row["rel_path"] == child_rel_path)["artifact_manifest_json"])["updated"],
             1,
@@ -10368,8 +10379,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(commit_exit, 0)
         self.assertIsNotNone(commit_payload)
         self.assertEqual(commit_payload["failed"], 0)
-        self.assertEqual(commit_payload["committed"], 3)
-        self.assertEqual(commit_payload["actions"], {"committed": 3})
+        self.assertEqual(commit_payload["committed"], 2)
+        self.assertEqual(commit_payload["actions"], {"committed": 2})
         self.assertEqual(
             commit_payload["batching"],
             {
@@ -10379,8 +10390,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 "pst_message_batches": 0,
                 "pst_message_batch_items": 0,
                 "pst_message_batch_fallbacks": 0,
-                "slack_document_batches": 1,
-                "slack_document_batch_items": 2,
+                "slack_document_batches": 0,
+                "slack_document_batch_items": 0,
                 "slack_document_batch_fallbacks": 1,
             },
         )
@@ -10429,7 +10440,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(committed_count, 3)
+        self.assertEqual(committed_count, 2)
         self.assertEqual(prepared_count, 0)
 
     def test_ingest_v2_gmail_export_preserves_sidecar_enrichment(self) -> None:
@@ -13038,6 +13049,82 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             day_result["preview_rel_path"],
             self.preview_target_by_label(day_result["preview_targets"], "message")["rel_path"],
         )
+
+    def test_ingest_skips_empty_slack_day_export_files(self) -> None:
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Morning sync",
+                        "user": "U04SERGEY1",
+                        "ts": "1671235434.237949",
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (channel_dir / "2022-12-17.json").write_text("[]\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["failed"], 0)
+        self.assertEqual(ingest_result["slack_exports_detected"], 1)
+        self.assertEqual(ingest_result["slack_day_documents_scanned"], 2)
+        self.assertEqual(ingest_result["slack_documents_created"], 1)
+
+        self.assertIsNotNone(self.maybe_fetch_document_row("data/slack/general/2022-12-16.json"))
+        self.assertIsNone(self.maybe_fetch_document_row("data/slack/general/2022-12-17.json"))
+
+        dataset_payload = retriever_tools.list_datasets(self.root)
+        slack_dataset = next(
+            item for item in dataset_payload["datasets"] if item["source_kind"] == retriever_tools.SLACK_EXPORT_SOURCE_KIND
+        )
+        self.assertEqual(slack_dataset["document_count"], 1)
+        day_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(browse_result["total_hits"], 1)
+        day_result = next(item for item in browse_result["results"] if item["id"] == day_row["id"])
         day_preview_html = Path(str(day_result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
         self.assertIn('class="chat-message"', day_preview_html)
         self.assertIn("sync", day_preview_html)
@@ -13073,6 +13160,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                     {
                         "id": "C04GENERAL1",
                         "name": "general",
+                        "is_channel": True,
+                    },
+                    {
+                        "id": "C04RANDOM1",
+                        "name": "random",
                         "is_channel": True,
                     }
                 ],
@@ -13458,14 +13550,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         retriever_tools.bootstrap(self.root)
         ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
-        self.assertEqual(ingest_result["new"], 3)
+        self.assertEqual(ingest_result["new"], 2)
         self.assertEqual(ingest_result["failed"], 0)
         self.assertEqual(ingest_result["slack_exports_detected"], 1)
         self.assertEqual(ingest_result["slack_day_documents_scanned"], 2)
-        self.assertEqual(ingest_result["slack_documents_created"], 3)
+        self.assertEqual(ingest_result["slack_documents_created"], 2)
 
         day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
-        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        self.assertIsNone(self.maybe_fetch_document_row("data/slack/general/2022-12-17.json"))
         child_rel_path = retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
         child_row = self.fetch_document_row(child_rel_path)
 
@@ -13476,8 +13568,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(child_row["source_item_id"], thread_ts)
         self.assertEqual(child_row["root_message_key"], f"C04GENERAL1:{thread_ts}")
         self.assertEqual(child_row["conversation_id"], day_one_row["conversation_id"])
-        self.assertEqual(day_two_row["conversation_id"], day_one_row["conversation_id"])
-        self.assertEqual(day_two_row["text_status"], "empty")
 
         reply_search = retriever_tools.search(self.root, "Following up on kickoff", None, None, None, 1, 20)
         self.assertEqual(reply_search["total_hits"], 1)
@@ -13485,12 +13575,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
         day_one_result = next(item for item in browse_result["results"] if item["id"] == day_one_row["id"])
-        day_two_result = next(item for item in browse_result["results"] if item["id"] == day_two_row["id"])
         self.assertEqual(day_one_result["attachment_count"], 0)
         self.assertEqual(day_one_result["child_document_count"], 1)
         self.assertEqual(day_one_result["child_documents"][0]["id"], child_row["id"])
         self.assertEqual(day_one_result["child_documents"][0]["child_document_kind"], retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD)
-        self.assertEqual(day_two_result["child_document_count"], 0)
         self.assertEqual(
             [target.get("label") for target in day_one_result["preview_targets"]],
             ["message", "conversation"],
@@ -13541,7 +13629,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         slack_dataset = next(
             item for item in dataset_payload["datasets"] if item["source_kind"] == retriever_tools.SLACK_EXPORT_SOURCE_KIND
         )
-        self.assertEqual(slack_dataset["document_count"], 3)
+        self.assertEqual(slack_dataset["document_count"], 2)
 
         connection = retriever_tools.connect_db(self.paths["db_path"])
         try:
@@ -13668,25 +13756,23 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
 
         second_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
-        self.assertEqual(second_result["new"], 1)
+        self.assertEqual(second_result["new"], 0)
         self.assertEqual(second_result["updated"], 2)
         self.assertEqual(second_result["failed"], 0)
         self.assertEqual(second_result["slack_exports_detected"], 1)
         self.assertEqual(second_result["slack_day_documents_scanned"], 2)
-        self.assertEqual(second_result["slack_documents_created"], 1)
+        self.assertEqual(second_result["slack_documents_created"], 0)
         self.assertEqual(second_result["slack_documents_updated"], 2)
 
         updated_day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
-        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        self.assertIsNone(self.maybe_fetch_document_row("data/slack/general/2022-12-17.json"))
         updated_child_row = self.fetch_document_row(child_rel_path)
 
         self.assertEqual(updated_day_one_row["conversation_id"], day_one_row["conversation_id"])
-        self.assertEqual(day_two_row["conversation_id"], day_one_row["conversation_id"])
         self.assertEqual(updated_child_row["conversation_id"], day_one_row["conversation_id"])
         self.assertEqual(updated_child_row["id"], first_child_id)
         self.assertEqual(updated_child_row["control_number"], first_child_control_number)
         self.assertEqual(updated_child_row["parent_document_id"], updated_day_one_row["id"])
-        self.assertEqual(day_two_row["text_status"], "empty")
 
         reply_search = retriever_tools.search(self.root, "Following up on kickoff", None, None, None, 1, 20)
         self.assertEqual(reply_search["total_hits"], 1)
@@ -21883,13 +21969,32 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        random_dir = export_root / "random"
+        random_dir.mkdir()
+        (random_dir / "2022-12-18.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": "Later standalone channel update",
+                        "user": "U04SERGEY1",
+                        "ts": "1671408234.237949",
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
         retriever_tools.bootstrap(self.root)
         ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
         self.assertEqual(ingest_result["failed"], 0)
 
         day_one_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
-        day_two_row = self.fetch_document_row("data/slack/general/2022-12-17.json")
+        self.assertIsNone(self.maybe_fetch_document_row("data/slack/general/2022-12-17.json"))
+        day_three_row = self.fetch_document_row("data/slack/random/2022-12-18.json")
         child_row = self.fetch_document_row(
             retriever_tools.slack_reply_thread_rel_path("C04GENERAL1", thread_ts)
         )
@@ -21924,14 +22029,14 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Following up on kickoff", contiguous_html)
         self.assertIn(f'id="doc-{day_one_row["id"]}"', contiguous_html)
         self.assertIn(f'id="doc-{child_row["id"]}"', contiguous_html)
-        self.assertNotIn(f'id="doc-{day_two_row["id"]}"', contiguous_html)
+        self.assertNotIn(f'id="doc-{day_three_row["id"]}"', contiguous_html)
 
         split_exit, split_payload, _, _ = self.run_cli(
             "export-previews",
             str(self.root),
             "slack-split",
             "--doc-id",
-            str(day_two_row["id"]),
+            str(day_three_row["id"]),
             "--doc-id",
             str(child_row["id"]),
         )
@@ -21941,11 +22046,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(split_payload["unit_count"], 2)
         self.assertEqual(
             [unit["selected_document_ids"] for unit in split_payload["units"]],
-            [[day_two_row["id"]], [child_row["id"]]],
+            [[day_three_row["id"]], [child_row["id"]]],
         )
         self.assertEqual(
             [unit["document_ids"] for unit in split_payload["units"]],
-            [[day_two_row["id"]], [child_row["id"]]],
+            [[day_three_row["id"]], [child_row["id"]]],
         )
         self.assertEqual(
             len({target["output_rel_path"] for target in split_payload["document_targets"]}),
@@ -21953,7 +22058,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         first_split_html = Path(split_payload["units"][0]["output_path"]).read_text(encoding="utf-8")
         second_split_html = Path(split_payload["units"][1]["output_path"]).read_text(encoding="utf-8")
-        self.assertIn(f'id="doc-{day_two_row["id"]}"', first_split_html)
+        self.assertIn(f'id="doc-{day_three_row["id"]}"', first_split_html)
         self.assertNotIn(f'id="doc-{day_one_row["id"]}"', first_split_html)
         self.assertIn(f'id="doc-{child_row["id"]}"', second_split_html)
         self.assertNotIn(f'id="doc-{day_one_row["id"]}"', second_split_html)
