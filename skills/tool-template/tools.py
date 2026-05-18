@@ -19311,6 +19311,7 @@ def build_email_preview_head_html() -> str:
         ".gmail-message-body { color: #202124; line-height: 1.55; min-width: 0; }"
         ".gmail-message-rendered-html { min-width: 0; }"
         ".gmail-message-rendered-html img { max-width: 100%; height: auto; border-radius: 12px; }"
+        ".gmail-message-rendered-html pre { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }"
         ".gmail-message-rendered-html table { max-width: 100%; }"
         ".gmail-message-rendered-html a, .retriever-attachments a { color: #1a73e8; text-decoration: none; }"
         ".gmail-message-rendered-html a:hover, .retriever-attachments a:hover { text-decoration: underline; }"
