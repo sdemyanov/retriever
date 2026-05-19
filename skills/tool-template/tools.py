@@ -9076,12 +9076,15 @@ def document_native_target(paths: dict[str, Path], row: sqlite3.Row | None) -> d
 def document_prefers_native_primary_preview(row: sqlite3.Row | None) -> bool:
     if row is None:
         return False
-    if normalize_whitespace(str(row["content_type"] or "")) != "Chat":
-        return False
+    content_type = normalize_whitespace(str(row["content_type"] or ""))
     file_type = normalize_whitespace(str(row["file_type"] or "")).lower()
     if not file_type:
         file_type = normalize_extension(Path(str(row["file_name"] or row["rel_path"] or "")))
-    return file_type in {"pdf", "docx", "rtf"}
+    if content_type == "Chat":
+        return file_type in {"pdf", "docx", "rtf"}
+    if content_type == "Spreadsheet / Table":
+        return file_type in {"xls", "xlsx"}
+    return False
 
 
 def build_preview_target_payload(

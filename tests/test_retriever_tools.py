@@ -16169,13 +16169,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(row["page_count"], 2)
 
         search_result = retriever_tools.search(self.root, "Memo", None, None, None, 1, 20)
-        self.assertEqual(search_result["results"][0]["file_name"], "ledger.xls")
-        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "csv")
-        self.assertTrue(search_result["results"][0]["preview_rel_path"].endswith(".csv"))
+        xls_result = search_result["results"][0]
+        self.assertEqual(xls_result["file_name"], "ledger.xls")
+        self.assertEqual(xls_result["preview_targets"][0]["preview_type"], "native")
+        self.assertEqual(xls_result["preview_rel_path"], "ledger.xls")
         self.assertEqual(
-            [target["label"] for target in search_result["results"][0]["preview_targets"]],
+            [target["label"] for target in xls_result["preview_targets"][1:]],
             ["Sheet1", "Notes"],
         )
+        self.assertTrue(all(target["preview_type"] == "csv" for target in xls_result["preview_targets"][1:]))
         value_only_result = retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)
         self.assertEqual(value_only_result["total_hits"], 0)
 
@@ -16200,12 +16202,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Sergey", row["participants"])
 
         search_result = retriever_tools.search(self.root, "Budget Totals", None, None, None, 1, 20)
-        self.assertEqual(search_result["results"][0]["file_name"], "budget.xlsx")
-        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "csv")
+        xlsx_result = search_result["results"][0]
+        self.assertEqual(xlsx_result["file_name"], "budget.xlsx")
+        self.assertEqual(xlsx_result["preview_targets"][0]["preview_type"], "native")
+        self.assertEqual(xlsx_result["preview_rel_path"], "budget.xlsx")
         self.assertEqual(
-            [target["label"] for target in search_result["results"][0]["preview_targets"]],
+            [target["label"] for target in xlsx_result["preview_targets"][1:]],
             ["Budget", "Notes"],
         )
+        self.assertTrue(all(target["preview_type"] == "csv" for target in xlsx_result["preview_targets"][1:]))
 
         self.assertEqual(
             retriever_tools.search(self.root, "Needs review", None, None, None, 1, 20)["results"][0]["file_name"],
