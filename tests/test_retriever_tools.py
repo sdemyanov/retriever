@@ -23036,6 +23036,47 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(error_payload)
         self.assertIn("Expected ISO date value", error_payload["error"])
 
+    def test_set_field_batches_repeated_doc_ids_in_one_call(self) -> None:
+        (self.root / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("beta body\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        beta_row = self.fetch_document_row("beta.txt")
+
+        exit_code, payload, _, _ = self.run_cli(
+            "set-field",
+            str(self.root),
+            "--doc-id",
+            str(alpha_row["id"]),
+            "--doc-id",
+            str(beta_row["id"]),
+            "--field",
+            "title",
+            "--value",
+            "Batched Title",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["field_name"], "title")
+        self.assertEqual(payload["written"], 2)
+        self.assertEqual(payload["skipped"], 0)
+        self.assertEqual(payload["failed"], 0)
+        self.assertEqual(payload["document_ids"], [alpha_row["id"], beta_row["id"]])
+        self.assertEqual([item["document_id"] for item in payload["sample"]], [alpha_row["id"], beta_row["id"]])
+
+        updated_alpha = self.fetch_document_row("alpha.txt")
+        updated_beta = self.fetch_document_row("beta.txt")
+        self.assertEqual(updated_alpha["title"], "Batched Title")
+        self.assertEqual(updated_beta["title"], "Batched Title")
+        self.assertIn("title", retriever_tools.normalize_string_list(updated_alpha["manual_field_locks_json"]))
+        self.assertIn("title", retriever_tools.normalize_string_list(updated_beta["manual_field_locks_json"]))
+
     def test_promote_field_type_supports_week_aggregate_without_reingest(self) -> None:
         (self.root / "contract-a.txt").write_text("Contract A\n", encoding="utf-8")
         (self.root / "contract-b.txt").write_text("Contract B\n", encoding="utf-8")

@@ -384,6 +384,7 @@ Direct CLI equivalents (useful for scripts and non-interactive work):
 python3 skills/tool-template/tools.py add-field . privilege_status text --instruction "Privilege designation"
 python3 skills/tool-template/tools.py fill-field . --doc-id 42 --field privilege_status --value "privileged"
 python3 skills/tool-template/tools.py set-field . --doc-id 42 --field title --value "Board Minutes"
+python3 skills/tool-template/tools.py set-field . --doc-id 42 --doc-id 43 --field title --value "Board Minutes"
 ```
 
 Important details:
@@ -697,6 +698,7 @@ python3 skills/tool-template/tools.py change-field-type . issue_tag text
 python3 skills/tool-template/tools.py delete-field . old_tag --confirm
 python3 skills/tool-template/tools.py fill-field . --doc-id 42 --field privilege_status --value privileged
 python3 skills/tool-template/tools.py set-field . --doc-id 42 --field title --value "Board Minutes"
+python3 skills/tool-template/tools.py set-field . --doc-id 42 --doc-id 43 --field title --value "Board Minutes"
 python3 skills/tool-template/tools.py merge-into-conversation . --doc-id 42 --target-doc-id 17
 python3 skills/tool-template/tools.py split-from-conversation . --doc-id 42
 python3 skills/tool-template/tools.py clear-conversation-assignment . --doc-id 42

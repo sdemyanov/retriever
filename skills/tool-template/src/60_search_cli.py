@@ -13608,7 +13608,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     set_field_parser = subparsers.add_parser("set-field", help=argparse.SUPPRESS)
     set_field_parser.add_argument("workspace", help="Workspace root path")
-    set_field_parser.add_argument("--doc-id", type=int, required=True, help="Document id")
+    set_field_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        required=True,
+        help="Document id to update (repeatable)",
+    )
     set_field_parser.add_argument("--field", required=True, help="Field name")
     set_field_parser.add_argument("--value", help="Field value")
 
@@ -14772,7 +14779,7 @@ def main() -> int:
             )
 
         if args.command == "set-field":
-            return emit_cli_payload("set-field", set_field(root, args.doc_id, args.field, args.value))
+            return emit_cli_payload("set-field", set_field(root, args.document_ids, args.field, args.value))
 
         if args.command == "reconcile-duplicates":
             return emit_cli_payload(

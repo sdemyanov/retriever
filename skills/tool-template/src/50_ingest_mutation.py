@@ -19715,15 +19715,36 @@ def fill_field(
         connection.close()
 
 
-def set_field(root: Path, document_id: int, field_name: str, value: str | None) -> dict[str, object]:
+def set_field(root: Path, document_id_or_ids: int | list[int], field_name: str, value: str | None) -> dict[str, object]:
+    if isinstance(document_id_or_ids, int):
+        target_document_ids = [document_id_or_ids]
+    else:
+        target_document_ids = list(dict.fromkeys(int(document_id) for document_id in document_id_or_ids))
+    if not target_document_ids:
+        raise RetrieverError("set-field requires at least one document id.")
+
     payload = fill_field(
         root,
         field_name=field_name,
         value=value,
         clear=value is None,
-        document_ids=[document_id],
+        document_ids=target_document_ids,
         confirm=True,
     )
+    if len(target_document_ids) != 1:
+        return {
+            "status": str(payload.get("status") or "ok"),
+            "field_name": str(payload.get("field_name") or field_name),
+            "field_type": str(payload.get("field_type") or ""),
+            "value": payload.get("value"),
+            "written": int(payload.get("written") or 0),
+            "skipped": int(payload.get("skipped") or 0),
+            "failed": int(payload.get("failed") or 0),
+            "document_ids": [int(document_id) for document_id in payload.get("document_ids") or target_document_ids],
+            "sample": payload.get("sample") or [],
+        }
+
+    document_id = target_document_ids[0]
     paths = workspace_paths(root)
     connection = connect_db(paths["db_path"])
     try:

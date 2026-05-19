@@ -686,6 +686,8 @@ Expected JSON shape:
 }
 ```
 
+When `--doc-id` is repeated, Retriever applies all listed updates in one transaction and returns a batch summary with `written`, `skipped`, `failed`, `document_ids`, and `sample`.
+
 ### `search`
 
 Expected JSON shape:
