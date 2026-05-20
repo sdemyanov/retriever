@@ -1060,7 +1060,7 @@ def process_batch_entry(
             root,
             run_item_id=run_item_id,
             claimed_by=claimed_by,
-            error=str(exc),
+            error_summary=str(exc),
         )
         return {
             "status": "failed",
