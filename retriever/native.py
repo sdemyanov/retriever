@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import mimetypes
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -14,19 +18,30 @@ from typing import Any, Sequence
 from ._compat import load_tools_module
 
 
+CLAUDE_CODE_PROVIDER_NAMES = {"claude_code", "cowork_agent"}
 OPENAI_RESPONSES_PROVIDER_NAMES = {"openai", "openai_responses"}
 STATIC_JSON_PROVIDER_NAMES = {"builtin_static_json", "static_json"}
 STATIC_TEXT_PROVIDER_NAMES = {"builtin_static_text", "static_text"}
 NATIVE_COMMAND_NAMES = {"run", "translate", "extract", "ocr", "describe-images"}
 TEXT_MODEL_ENV_VARS = ("RETRIEVER_OPENAI_TEXT_MODEL", "RETRIEVER_OPENAI_MODEL", "OPENAI_MODEL")
 VISION_MODEL_ENV_VARS = ("RETRIEVER_OPENAI_VISION_MODEL", "RETRIEVER_OPENAI_MODEL", "OPENAI_MODEL")
+CLAUDE_TEXT_MODEL_ENV_VARS = ("RETRIEVER_CLAUDE_TEXT_MODEL", "RETRIEVER_CLAUDE_MODEL", "ANTHROPIC_MODEL")
+CLAUDE_VISION_MODEL_ENV_VARS = ("RETRIEVER_CLAUDE_VISION_MODEL", "RETRIEVER_CLAUDE_MODEL", "ANTHROPIC_MODEL")
 DEFAULT_NATIVE_STEP_BUDGET_SECONDS = 35
 DEFAULT_NATIVE_CLAIM_STALE_SECONDS = 300
+DEFAULT_CLAUDE_CODE_MAX_TURNS = 6
 SUPPORTED_OPENAI_IMAGE_MIME_TYPES = {
     "image/gif",
     "image/jpeg",
     "image/png",
     "image/webp",
+}
+SUPPORTED_CLAUDE_CODE_IMAGE_SUFFIXES = {
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
 }
 
 
@@ -297,7 +312,23 @@ def model_from_environment(job_kind: str) -> str | None:
     return None
 
 
+def claude_model_from_environment(job_kind: str) -> str | None:
+    env_names = CLAUDE_TEXT_MODEL_ENV_VARS if job_kind in {"structured_extraction", "translation"} else CLAUDE_VISION_MODEL_ENV_VARS
+    for env_name in env_names:
+        candidate = str(os.environ.get(env_name, "") or "").strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def claude_cli_path() -> str | None:
+    return shutil.which("claude")
+
+
 def default_provider(job_kind: str) -> str | None:
+    del job_kind
+    if claude_cli_path():
+        return "claude_code"
     api_key = str(os.environ.get("OPENAI_API_KEY", "") or "").strip()
     if api_key:
         return "openai_responses"
@@ -313,22 +344,24 @@ def choose_provider(tools: Any, job_kind: str, explicit_provider: str | None) ->
         return provider
     if job_kind == "structured_extraction":
         raise tools.RetrieverError(
-            "No extraction provider configured. Set OPENAI_API_KEY and --model, or pass "
-            "--provider static_json with --parameters-json."
+            "No extraction provider configured. Install Claude Code so `claude` is available, set OPENAI_API_KEY "
+            "and --model, or pass --provider static_json with --parameters-json."
         )
     if job_kind == "translation":
         raise tools.RetrieverError(
-            "No translation provider configured. Set OPENAI_API_KEY and --model, or pass "
-            "--provider static_text with --parameters-json."
+            "No translation provider configured. Install Claude Code so `claude` is available, set OPENAI_API_KEY "
+            "and --model, or pass --provider static_text with --parameters-json."
         )
     raise tools.RetrieverError(
-        "No vision provider configured. Set OPENAI_API_KEY and --model, or pass "
-        "--provider static_text with --parameters-json."
+        "No vision provider configured. Install Claude Code so `claude` is available, set OPENAI_API_KEY and "
+        "--model, or pass --provider static_text with --parameters-json."
     )
 
 
 def choose_model(tools: Any, job_kind: str, provider: str, explicit_model: str | None) -> str | None:
     normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider in CLAUDE_CODE_PROVIDER_NAMES:
+        return str(explicit_model or "").strip() or claude_model_from_environment(job_kind) or None
     if normalized_provider not in OPENAI_RESPONSES_PROVIDER_NAMES:
         return str(explicit_model or "").strip() or None
     model = str(explicit_model or "").strip() or model_from_environment(job_kind)
@@ -390,6 +423,158 @@ def prepare_openai_image_data_url(tools: Any, artifact_path: Path) -> str:
         buffer = io.BytesIO()
         converted.save(buffer, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def ensure_claude_code_image_path(tools: Any, root: Path, artifact_path: Path) -> Path:
+    if artifact_path.suffix.lower() in SUPPORTED_CLAUDE_CODE_IMAGE_SUFFIXES:
+        return artifact_path
+
+    pil_image = tools.load_dependency("PilImage", allow_auto_install=True)
+    if pil_image is None:
+        raise tools.RetrieverError(
+            f"Could not load Pillow to convert unsupported image artifact {artifact_path.name!r} for Claude Code vision."
+        )
+
+    paths = tools.workspace_paths(root)
+    output_dir = Path(paths["tmp_dir"]) / "claude-code-images"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stat_result = artifact_path.stat()
+    fingerprint = hashlib.sha256(
+        f"{artifact_path.resolve()}:{stat_result.st_size}:{stat_result.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:12]
+    target_path = output_dir / f"{artifact_path.stem}-{fingerprint}.png"
+    if target_path.exists():
+        return target_path
+
+    with pil_image.open(artifact_path) as source_image:
+        converted = source_image.convert("RGB")
+        converted.save(target_path, format="PNG")
+    return target_path
+
+
+def claude_code_runner_cwd(tools: Any, root: Path) -> Path:
+    paths = tools.workspace_paths(root)
+    runner_cwd = Path(paths["tmp_dir"]) / "claude-code-runner"
+    runner_cwd.mkdir(parents=True, exist_ok=True)
+    return runner_cwd
+
+
+def inline_text_reference_from_context(context: dict[str, object]) -> str | None:
+    input_payload = dict(context.get("input") or {})
+    inline_text = input_payload.get("inline_text")
+    if isinstance(inline_text, str):
+        return inline_text
+    return None
+
+
+def text_path_reference_from_context(context: dict[str, object]) -> Path | None:
+    input_payload = dict(context.get("input") or {})
+    text_path = str(input_payload.get("text_path") or "").strip()
+    if not text_path:
+        return None
+    return Path(text_path)
+
+
+def claude_code_prompt(context: dict[str, object], *, read_path: Path | None = None, inline_text: str | None = None) -> str:
+    execution = dict(context.get("execution") or {})
+    document = dict(context.get("document") or {})
+    input_payload = dict(context.get("input") or {})
+    lines = [
+        str(execution.get("task_prompt") or "").strip(),
+        "",
+        f"Document id: {document.get('id') or ''}",
+        f"File name: {document.get('file_name') or ''}",
+        f"Source path: {document.get('source_path') or document.get('source_rel_path') or ''}",
+    ]
+    page_number = input_payload.get("page_number")
+    if page_number:
+        lines.append(f"Page number: {page_number}")
+    if read_path is not None:
+        lines.extend(
+            [
+                "",
+                f"Use the Read tool on this file path and use its contents as the only primary input: {read_path}",
+            ]
+        )
+    if inline_text is not None:
+        lines.extend(
+            [
+                "",
+                "Use the following input exactly as the primary document text:",
+                "<document>",
+                inline_text,
+                "</document>",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Return only the final requested output. Do not include commentary, Markdown fences, or extra labels.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def run_claude_code(
+    tools: Any,
+    *,
+    root: Path,
+    prompt_text: str,
+    model: str | None,
+    json_schema: dict[str, object] | None = None,
+) -> str:
+    claude_path = claude_cli_path()
+    if not claude_path:
+        raise tools.RetrieverError("Claude Code CLI (`claude`) is not installed or not on PATH.")
+
+    command = [
+        claude_path,
+        "-p",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--permission-mode",
+        "bypassPermissions",
+        "--tools",
+        "Read",
+        "--add-dir",
+        str(root),
+        "--max-turns",
+        str(DEFAULT_CLAUDE_CODE_MAX_TURNS),
+    ]
+    if model:
+        command.extend(["--model", model])
+    if json_schema is not None:
+        command.extend(["--json-schema", compact_json(json_schema)])
+    command.append(prompt_text)
+
+    result = subprocess.run(
+        command,
+        cwd=claude_code_runner_cwd(tools, root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr_text = result.stderr.strip()
+        stdout_text = result.stdout.strip()
+        detail = stderr_text or stdout_text or f"claude exited with status {result.returncode}"
+        raise tools.RetrieverError(f"Claude Code provider failed: {detail}")
+    output_text = result.stdout.rstrip("\n")
+    if not output_text.strip():
+        raise tools.RetrieverError("Claude Code provider returned empty output.")
+    return output_text
+
+
+def claude_code_provider_metadata(job_version: dict[str, object], *, executed_by: str, extra: dict[str, object] | None = None) -> dict[str, object]:
+    metadata = {
+        "provider": str(job_version.get("provider") or ""),
+        "model": job_version.get("model"),
+        "executed_by": executed_by,
+        "transport": "claude_cli",
+    }
+    if extra:
+        metadata.update(extra)
+    return metadata
 
 
 def execute_static_structured_extraction(tools: Any, context: dict[str, object]) -> dict[str, object]:
@@ -480,6 +665,43 @@ def execute_openai_structured_extraction(tools: Any, context: dict[str, object])
     }
 
 
+def execute_claude_code_structured_extraction(tools: Any, root: Path, context: dict[str, object]) -> dict[str, object]:
+    job_version = dict(context.get("job_version") or {})
+    response_schema = context.get("response_schema")
+    if not isinstance(response_schema, dict) or not response_schema:
+        raise tools.RetrieverError("Structured extraction run context did not include a response schema.")
+    inline_text = inline_text_reference_from_context(context)
+    text_path = text_path_reference_from_context(context)
+    prompt_text = claude_code_prompt(context, read_path=text_path, inline_text=inline_text)
+    response_text = run_claude_code(
+        tools,
+        root=root,
+        prompt_text=prompt_text,
+        model=str(job_version.get("model") or "").strip() or None,
+        json_schema=response_schema,
+    )
+    try:
+        normalized_output = json.loads(response_text)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise tools.RetrieverError("Claude Code extraction response was not valid JSON.") from exc
+    validation_issues = tools.validate_processing_schema_value(normalized_output, response_schema)
+    if validation_issues:
+        raise tools.RetrieverError("; ".join(validation_issues))
+    return {
+        "raw_output": normalized_output,
+        "normalized_output": normalized_output,
+        "output_values": normalized_output if isinstance(normalized_output, dict) else {},
+        "provider_request_id": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "cost_cents": None,
+        "provider_metadata": claude_code_provider_metadata(
+            job_version,
+            executed_by="retriever_native_claude_code_extraction",
+        ),
+    }
+
+
 def execute_static_translation(tools: Any, context: dict[str, object]) -> dict[str, object]:
     job_version = dict(context.get("job_version") or {})
     parameters = dict(job_version.get("parameters") or {})
@@ -513,6 +735,42 @@ def execute_static_translation(tools: Any, context: dict[str, object]) -> dict[s
             "executed_by": "retriever_native_static_text_translation",
             "target_language": target_language,
         },
+    }
+
+
+def execute_claude_code_translation(tools: Any, root: Path, context: dict[str, object]) -> dict[str, object]:
+    job_version = dict(context.get("job_version") or {})
+    parameters = dict(job_version.get("parameters") or {})
+    target_language = str(
+        parameters.get("target_language") or parameters.get("target_lang") or parameters.get("language") or ""
+    ).strip().lower() or None
+    inline_text = inline_text_reference_from_context(context)
+    text_path = text_path_reference_from_context(context)
+    prompt_text = claude_code_prompt(context, read_path=text_path, inline_text=inline_text)
+    translated_text = run_claude_code(
+        tools,
+        root=root,
+        prompt_text=prompt_text,
+        model=str(job_version.get("model") or "").strip() or None,
+    )
+    return {
+        "raw_output": {"translated_text": translated_text},
+        "normalized_output": {"translated_text": translated_text},
+        "output_values": {},
+        "created_text_revision": {
+            "revision_kind": "translation",
+            "text_content": translated_text,
+            "language": target_language,
+        },
+        "provider_request_id": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "cost_cents": None,
+        "provider_metadata": claude_code_provider_metadata(
+            job_version,
+            executed_by="retriever_native_claude_code_translation",
+            extra={"target_language": target_language},
+        ),
     }
 
 
@@ -601,6 +859,41 @@ def execute_static_page_text(tools: Any, context: dict[str, object]) -> dict[str
     }
 
 
+def execute_claude_code_page_text(tools: Any, root: Path, context: dict[str, object]) -> dict[str, object]:
+    job_version = dict(context.get("job_version") or {})
+    input_payload = dict(context.get("input") or {})
+    artifact_path_text = str(input_payload.get("artifact_path") or "").strip()
+    if not artifact_path_text:
+        raise tools.RetrieverError("Run item context did not include an artifact path.")
+    artifact_path = Path(artifact_path_text)
+    if not artifact_path.exists():
+        raise tools.RetrieverError(f"Run item artifact is missing: {artifact_path}")
+    read_path = ensure_claude_code_image_path(tools, root, artifact_path)
+    page_text = run_claude_code(
+        tools,
+        root=root,
+        prompt_text=claude_code_prompt(context, read_path=read_path, inline_text=None),
+        model=str(job_version.get("model") or "").strip() or None,
+    )
+    job_kind = str(context.get("job", {}).get("job_kind") or "")
+    executed_by = "retriever_native_claude_code_ocr" if job_kind == "ocr" else "retriever_native_claude_code_image_description"
+    return {
+        "page_text": page_text,
+        "provider_request_id": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "cost_cents": None,
+        "provider_metadata": claude_code_provider_metadata(
+            job_version,
+            executed_by=executed_by,
+            extra={
+                "page_number": input_payload.get("page_number"),
+                "read_path": str(read_path),
+            },
+        ),
+    }
+
+
 def execute_openai_page_text(tools: Any, context: dict[str, object]) -> dict[str, object]:
     job_version = dict(context.get("job_version") or {})
     parameters = dict(job_version.get("parameters") or {})
@@ -655,7 +948,7 @@ def execute_openai_page_text(tools: Any, context: dict[str, object]) -> dict[str
     }
 
 
-def execute_run_item(tools: Any, context: dict[str, object]) -> dict[str, object]:
+def execute_run_item(tools: Any, root: Path, context: dict[str, object]) -> dict[str, object]:
     job = dict(context.get("job") or {})
     job_version = dict(context.get("job_version") or {})
     provider = str(job_version.get("provider") or "").strip().lower()
@@ -664,16 +957,22 @@ def execute_run_item(tools: Any, context: dict[str, object]) -> dict[str, object
     if job_kind == "structured_extraction":
         if provider in STATIC_JSON_PROVIDER_NAMES:
             return execute_static_structured_extraction(tools, context)
+        if provider in CLAUDE_CODE_PROVIDER_NAMES:
+            return execute_claude_code_structured_extraction(tools, root, context)
         if provider in OPENAI_RESPONSES_PROVIDER_NAMES:
             return execute_openai_structured_extraction(tools, context)
     elif job_kind == "translation":
         if provider in STATIC_TEXT_PROVIDER_NAMES:
             return execute_static_translation(tools, context)
+        if provider in CLAUDE_CODE_PROVIDER_NAMES:
+            return execute_claude_code_translation(tools, root, context)
         if provider in OPENAI_RESPONSES_PROVIDER_NAMES:
             return execute_openai_translation(tools, context)
     elif job_kind in {"ocr", "image_description"}:
         if provider in STATIC_TEXT_PROVIDER_NAMES:
             return execute_static_page_text(tools, context)
+        if provider in CLAUDE_CODE_PROVIDER_NAMES:
+            return execute_claude_code_page_text(tools, root, context)
         if provider in OPENAI_RESPONSES_PROVIDER_NAMES:
             return execute_openai_page_text(tools, context)
 
@@ -715,7 +1014,7 @@ def process_batch_entry(
     context = dict(batch_entry.get("context") or {})
     started = time.perf_counter()
     try:
-        execution_result = execute_run_item(tools, context)
+        execution_result = execute_run_item(tools, root, context)
         latency_ms = int((time.perf_counter() - started) * 1000.0)
         execution_result.setdefault("latency_ms", latency_ms)
         complete_payload = tools.complete_run_item(

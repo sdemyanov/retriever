@@ -157,6 +157,12 @@ def assert_version_metadata_current() -> None:
         raise AssertionError(
             "Missing root CLAUDE.md. Keep Claude Code project guidance in the repo root."
         )
+    root_claude_text = ROOT_CLAUDE_PATH.read_text(encoding="utf-8")
+    if "suggest the single most reasonable next Retriever command" not in root_claude_text:
+        raise AssertionError(
+            "CLAUDE.md is missing the next-command guidance for Claude Code. "
+            "Keep the repo prompt aligned with the installed Retriever guidance."
+        )
     if not RETRIEVER_PACKAGE_MAIN_PATH.exists():
         raise AssertionError(
             f"Missing Retriever package entrypoint at {RETRIEVER_PACKAGE_MAIN_PATH}."
@@ -24065,6 +24071,7 @@ class ClaudeGlobalInstallerTests(unittest.TestCase):
         self.assertIn("1. Use a `/retriever:*` slash command", claude_md_text)
         self.assertIn("2. If no slash command fits, call the Retriever CLI directly", claude_md_text)
         self.assertIn("3. Query `./.retriever/retriever.db` directly only", claude_md_text)
+        self.assertIn("suggest the single most reasonable next Retriever command", claude_md_text)
         self.assertIn("/retriever:search", claude_md_text)
         self.assertIn("/retriever:init", claude_md_text)
         self.assertIn("/retriever:status", claude_md_text)
@@ -24158,13 +24165,18 @@ class RetrieverPackageEntrypointTests(unittest.TestCase):
 
 
 class RetrieverPackageProcessingTests(RetrieverToolsRegressionTests):
-    def run_package_cli(self, *args: str) -> tuple[int, dict[str, object] | None, str, str]:
+    def run_package_cli(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object] | None, str, str]:
         result = subprocess.run(
             [sys.executable, "-m", "retriever", "--output", "json", *args],
             cwd=REPO_ROOT,
             check=False,
             capture_output=True,
             text=True,
+            env=env,
         )
         payload = None
         stdout_text = result.stdout.strip()
@@ -24172,6 +24184,32 @@ class RetrieverPackageProcessingTests(RetrieverToolsRegressionTests):
         if stdout_text:
             payload = json.loads(stdout_text)
         return result.returncode, payload, stdout_text, stderr_text
+
+    def make_fake_claude_env(self, output_text: str) -> tuple[dict[str, str], Path]:
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir(exist_ok=True)
+        log_path = self.root / "fake-claude-log.jsonl"
+        script_path = fake_bin / "claude"
+        script_path.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+log_path = os.environ.get("FAKE_CLAUDE_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sys.argv[1:]) + "\\n")
+sys.stdout.write(os.environ.get("FAKE_CLAUDE_OUTPUT", ""))
+""",
+            encoding="utf-8",
+        )
+        script_path.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["FAKE_CLAUDE_OUTPUT"] = output_text
+        env["FAKE_CLAUDE_LOG"] = str(log_path)
+        return env, log_path
 
     def test_python_m_retriever_run_executes_existing_structured_run(self) -> None:
         note_path = self.root / "run-contract.txt"
@@ -24295,6 +24333,40 @@ class RetrieverPackageProcessingTests(RetrieverToolsRegressionTests):
         updated_row = self.fetch_document_by_id(int(document_row["id"]))
         self.assertEqual(updated_row["counterparty"], "ACME Corp")
 
+    def test_python_m_retriever_extract_defaults_to_claude_code_when_available(self) -> None:
+        note_path = self.root / "extract-claude.txt"
+        note_path.write_text("Counterparty: ACME Corp\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        document_row = self.fetch_document_row("extract-claude.txt")
+        env, log_path = self.make_fake_claude_env("{\"counterparty\":\"ACME Corp\"}")
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "extract",
+            str(self.root),
+            "counterparty",
+            "--instruction",
+            "Extract the counterparty.",
+            "--doc-id",
+            str(document_row["id"]),
+            env=env,
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["command"], "extract")
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(payload["job_version"]["provider"], "claude_code")
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["counterparty"], "ACME Corp")
+
+        claude_invocation = log_path.read_text(encoding="utf-8")
+        self.assertIn("--json-schema", claude_invocation)
+        self.assertIn("--tools", claude_invocation)
+        self.assertIn("Read", claude_invocation)
+
     def test_python_m_retriever_ocr_runs_to_completion(self) -> None:
         production_root = self.write_production_fixture()
 
@@ -24322,6 +24394,38 @@ class RetrieverPackageProcessingTests(RetrieverToolsRegressionTests):
 
         updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
         self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+    def test_python_m_retriever_ocr_defaults_to_claude_code_when_available(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+        env, log_path = self.make_fake_claude_env("Claude OCR page text")
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "ocr",
+            str(self.root),
+            "--doc-id",
+            str(image_only_row["id"]),
+            env=env,
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["command"], "ocr")
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(payload["job_version"]["provider"], "claude_code")
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+        claude_invocation = log_path.read_text(encoding="utf-8")
+        self.assertIn("--tools", claude_invocation)
+        self.assertIn("Read", claude_invocation)
+        self.assertIn("--add-dir", claude_invocation)
 
     def test_python_m_retriever_describe_images_runs_to_completion(self) -> None:
         production_root = self.write_production_fixture()
