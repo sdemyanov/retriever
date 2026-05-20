@@ -19119,6 +19119,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         assert activate_payload is not None
         self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
         activated_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn('class="original-rich-email"', activated_preview_html)
         self.assertIn(translated_body, activated_preview_html)
         self.assertNotIn(source_body, activated_preview_html)
 
@@ -19140,6 +19141,104 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(refresh_payload["refreshed_conversations"], 1)
         refreshed_preview_html = preview_path.read_text(encoding="utf-8")
         self.assertNotIn("stale standalone email preview", refreshed_preview_html)
+        self.assertIn('class="original-rich-email"', refreshed_preview_html)
+        self.assertIn(translated_body, refreshed_preview_html)
+        self.assertNotIn(source_body, refreshed_preview_html)
+
+    def test_activate_text_revision_and_refresh_previews_preserve_inline_email_images(self) -> None:
+        email_path = self.root / "inline-activate.eml"
+        source_body = "Hello team."
+        translated_body = "Translated hello team."
+        png_pixel = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9mQAAAAASUVORK5CYII="
+        )
+        encoded_png = base64.b64encode(png_pixel).decode("ascii")
+        boundary = "boundary-inline-activate"
+        email_path.write_bytes(
+            (
+                "From: Alice Example <alice@example.com>\r\n"
+                "To: Bob Example <bob@example.com>\r\n"
+                "Subject: Inline activation test\r\n"
+                "Date: Tue, 14 Apr 2026 10:00:00 +0000\r\n"
+                "MIME-Version: 1.0\r\n"
+                f'Content-Type: multipart/related; boundary="{boundary}"\r\n'
+                "\r\n"
+                f"--{boundary}\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "\r\n"
+                '<html><body><div class="inline-rich-email"><p>Hello team.</p><img src="cid:logo-icon" alt="logo"/></div></body></html>\r\n'
+                f"--{boundary}\r\n"
+                "Content-Type: image/png\r\n"
+                "Content-Transfer-Encoding: base64\r\n"
+                "Content-ID: <logo-icon>\r\n"
+                'Content-Disposition: inline; filename="logo.png"\r\n'
+                "\r\n"
+                f"{encoded_png}\r\n"
+                f"--{boundary}--\r\n"
+            ).encode("ascii")
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        row = self.fetch_document_row("inline-activate.eml")
+        source_revision_id = int(row["source_text_revision_id"])
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        document_result = next(item for item in browse_result["results"] if item["id"] == row["id"])
+        preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(document_result["preview_targets"], "message")
+        )
+        source_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn('class="inline-rich-email"', source_preview_html)
+        self.assertIn("data:image/png;base64,", source_preview_html)
+        self.assertIn(source_body, source_preview_html)
+
+        translated_revision_id = self.create_text_revision(
+            document_id=int(row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=translated_body,
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--text-revision-id",
+            str(translated_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
+        activated_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn('class="inline-rich-email"', activated_preview_html)
+        self.assertIn("data:image/png;base64,", activated_preview_html)
+        self.assertIn(translated_body, activated_preview_html)
+        self.assertNotIn(source_body, activated_preview_html)
+        self.assertNotIn('src="cid:logo-icon"', activated_preview_html)
+
+        preview_path.write_text("stale inline activation preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "conversations",
+            "--doc-id",
+            str(row["id"]),
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "conversations")
+        self.assertEqual(refresh_payload["refreshed_conversations"], 1)
+        refreshed_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale inline activation preview", refreshed_preview_html)
+        self.assertIn('class="inline-rich-email"', refreshed_preview_html)
+        self.assertIn("data:image/png;base64,", refreshed_preview_html)
         self.assertIn(translated_body, refreshed_preview_html)
         self.assertNotIn(source_body, refreshed_preview_html)
 
@@ -19205,6 +19304,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(activate_payload["preview_regen"]["refreshed_conversations"], 1)
         activated_message_html = message_preview_path.read_text(encoding="utf-8")
         activated_segment_html = segment_preview_path.read_text(encoding="utf-8")
+        self.assertIn('class="reply-rich-email"', activated_message_html)
+        self.assertIn('class="reply-rich-email"', activated_segment_html)
         self.assertIn(source_root, activated_message_html)
         self.assertIn(source_root, activated_segment_html)
         self.assertIn(translated_reply, activated_message_html)
@@ -19233,6 +19334,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         refreshed_segment_html = segment_preview_path.read_text(encoding="utf-8")
         self.assertNotIn("stale threaded email message preview", refreshed_message_html)
         self.assertNotIn("stale threaded email conversation preview", refreshed_segment_html)
+        self.assertIn('class="reply-rich-email"', refreshed_message_html)
+        self.assertIn('class="reply-rich-email"', refreshed_segment_html)
         self.assertIn(source_root, refreshed_message_html)
         self.assertIn(source_root, refreshed_segment_html)
         self.assertIn(translated_reply, refreshed_message_html)

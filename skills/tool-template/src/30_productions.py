@@ -3024,6 +3024,9 @@ EMAIL_PREVIEW_BODY_SOURCE_PATTERN = re.compile(
     r"<template\b[^>]*data-retriever-email-body-source\b[^>]*>(.*?)</template>",
     flags=re.IGNORECASE | re.DOTALL,
 )
+EMAIL_PREVIEW_QUOTED_DETAILS_PATTERN = re.compile(
+    r'(?is)<details\b[^>]*class\s*=\s*(["\'])[^"\']*\bgmail-message-quoted\b[^"\']*\1[^>]*>.*?</details>'
+)
 EMAIL_QUOTED_REPLY_SEPARATOR_PATTERN = re.compile(
     r"^(?:On .+ wrote:|Begin forwarded message:|-{2,}\s*Original Message\s*-{2,}|-{2,}\s*Forwarded message\s*-{2,})$",
     flags=re.IGNORECASE,
@@ -3274,6 +3277,153 @@ def split_email_preview_text_content(text_content: str) -> tuple[str, str | None
     return normalized_text, None
 
 
+def render_email_preview_text_html(text: str) -> str:
+    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not normalized_text:
+        return ""
+    return "<br/>".join(html.escape(line) for line in normalized_text.split("\n"))
+
+
+def split_email_preview_visible_text_fragments(text: str, *, max_fragments: int) -> list[str]:
+    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized_text:
+        return []
+    if max_fragments <= 1:
+        return [normalized_text]
+    fragments = [
+        fragment.strip()
+        for fragment in re.split(r"\n\s*\n", normalized_text)
+        if fragment.strip()
+    ]
+    if not fragments:
+        return [normalized_text]
+    if len(fragments) <= max_fragments:
+        return fragments
+    return [*fragments[: max_fragments - 1], "\n\n".join(fragments[max_fragments - 1 :])]
+
+
+class EmailPreviewVisibleTextNodeCounter(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.visible_text_node_count = 0
+        self.literal_tag_stack: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.lower() in {"script", "style"}:
+            self.literal_tag_stack.append(tag.lower())
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.literal_tag_stack and self.literal_tag_stack[-1] == tag.lower():
+            self.literal_tag_stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self.literal_tag_stack:
+            return
+        if normalize_whitespace(data):
+            self.visible_text_node_count += 1
+
+
+def count_email_preview_visible_text_nodes(html_content: str | None) -> int:
+    normalized_html = str(html_content or "").strip()
+    if not normalized_html:
+        return 0
+    parser = EmailPreviewVisibleTextNodeCounter()
+    parser.feed(normalized_html)
+    parser.close()
+    return parser.visible_text_node_count
+
+
+class EmailPreviewActiveTextHTMLRewriter(HTMLParser):
+    def __init__(
+        self,
+        *,
+        fragments: list[str],
+        visible_text_node_count: int,
+    ) -> None:
+        super().__init__(convert_charrefs=True)
+        self.fragments = list(fragments)
+        self.visible_text_node_count = visible_text_node_count
+        self.processed_visible_text_nodes = 0
+        self.literal_tag_stack: list[str] = []
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        self.parts.append(self.get_starttag_text())
+        if tag.lower() in {"script", "style"}:
+            self.literal_tag_stack.append(tag.lower())
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del tag, attrs
+        self.parts.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag: str) -> None:
+        self.parts.append(f"</{tag}>")
+        if self.literal_tag_stack and self.literal_tag_stack[-1] == tag.lower():
+            self.literal_tag_stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self.literal_tag_stack:
+            self.parts.append(data)
+            return
+        if not normalize_whitespace(data):
+            self.parts.append(data)
+            return
+        self.processed_visible_text_nodes += 1
+        if not self.fragments:
+            return
+        fragment = self.fragments.pop(0)
+        if self.processed_visible_text_nodes == self.visible_text_node_count and self.fragments:
+            fragment = "\n\n".join([fragment, *self.fragments])
+            self.fragments.clear()
+        self.parts.append(render_email_preview_text_html(fragment))
+
+    def handle_comment(self, data: str) -> None:
+        self.parts.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl: str) -> None:
+        self.parts.append(f"<!{decl}>")
+
+    def handle_pi(self, data: str) -> None:
+        self.parts.append(f"<?{data}>")
+
+
+def rewrite_email_body_html_with_active_text(
+    html_content: str | None,
+    active_text: str,
+    *,
+    strip_quoted_history: bool = False,
+) -> str | None:
+    normalized_html = str(html_content or "").strip()
+    if not normalized_html:
+        return None
+    source_html = (
+        strip_email_reply_history_html(normalized_html)
+        if strip_quoted_history
+        else normalized_html
+    )
+    if not source_html:
+        return None
+    visible_text_node_count = count_email_preview_visible_text_nodes(source_html)
+    if visible_text_node_count <= 0:
+        return None
+    fragments = split_email_preview_visible_text_fragments(
+        active_text,
+        max_fragments=visible_text_node_count,
+    )
+    if not fragments:
+        return None
+    parser = EmailPreviewActiveTextHTMLRewriter(
+        fragments=fragments,
+        visible_text_node_count=visible_text_node_count,
+    )
+    parser.feed(source_html)
+    parser.close()
+    rewritten_html = "".join(parser.parts).strip()
+    return rewritten_html or None
+
+
 def email_html_has_visible_content(html_content: str | None) -> bool:
     return bool(normalize_whitespace(strip_html_tags(str(html_content or ""))))
 
@@ -3425,6 +3575,17 @@ def preview_body_html_for_output(
     )
 
 
+def email_preview_body_html_has_rendered_wrappers(html_body: str) -> bool:
+    return any(
+        token in html_body
+        for token in (
+            'class="gmail-message-rendered-html"',
+            'class="gmail-message-plain"',
+            'class="gmail-message-quoted"',
+        )
+    )
+
+
 def build_email_message_body_content_html(
     document: dict[str, object],
     *,
@@ -3450,6 +3611,53 @@ def build_email_message_body_content_html(
         preferred_body_html,
         target_preview_rel_path=target_preview_rel_path,
     )
+    if preferred_body_html and document_active_text_differs_from_source(document):
+        normalized_html = HTML_PREVIEW_CALENDAR_INVITES_PATTERN.sub("", preferred_body_html).strip()
+        normalized_html = EMAIL_PREVIEW_QUOTED_DETAILS_PATTERN.sub("", normalized_html).strip()
+        visible_text_node_count = count_email_preview_visible_text_nodes(
+            strip_email_reply_history_html(normalized_html)
+            if strip_quoted_history
+            else normalized_html
+        )
+        rewritten_html = rewrite_email_body_html_with_active_text(
+            normalized_html,
+            visible_text,
+            strip_quoted_history=strip_quoted_history,
+        )
+        body_parts: list[str] = []
+        if calendar_invites_html:
+            body_parts.append(calendar_invites_html)
+        if rewritten_html:
+            if email_preview_body_html_has_rendered_wrappers(rewritten_html):
+                body_parts.append(rewritten_html)
+            else:
+                body_parts.append(f'<div class="gmail-message-rendered-html">{rewritten_html}</div>')
+        elif visible_text:
+            body_parts.append(
+                f'<div class="gmail-message-plain">{render_email_preview_text_html(visible_text)}</div>'
+            )
+            if visible_text_node_count <= 0 and normalized_html:
+                if email_preview_body_html_has_rendered_wrappers(normalized_html):
+                    body_parts.append(normalized_html)
+                else:
+                    body_parts.append(f'<div class="gmail-message-rendered-html">{normalized_html}</div>')
+        elif visible_text_node_count <= 0 and normalized_html:
+            if email_preview_body_html_has_rendered_wrappers(normalized_html):
+                body_parts.append(normalized_html)
+            else:
+                body_parts.append(f'<div class="gmail-message-rendered-html">{normalized_html}</div>')
+        elif not body_parts:
+            body_parts.append(
+                '<div class="gmail-message-plain">No extracted text available.</div>'
+            )
+        if quoted_text and not strip_quoted_history:
+            body_parts.append(
+                "<details class=\"gmail-message-quoted\">"
+                "<summary>Quoted text</summary>"
+                f"<pre>{html.escape(quoted_text)}</pre>"
+                "</details>"
+            )
+        return "".join(body_parts)
     if preferred_body_html:
         normalized_html = preferred_body_html.strip()
         if strip_quoted_history:
@@ -3459,10 +3667,7 @@ def build_email_message_body_content_html(
             elif quoted_text and visible_text:
                 normalized_html = ""
         normalized_html = HTML_PREVIEW_CALENDAR_INVITES_PATTERN.sub("", normalized_html).strip()
-        if normalized_html and any(
-            token in normalized_html
-            for token in ('class="gmail-message-rendered-html"', 'class="gmail-message-plain"', 'class="gmail-message-quoted"')
-        ):
+        if normalized_html and email_preview_body_html_has_rendered_wrappers(normalized_html):
             return f"{calendar_invites_html}{normalized_html}" if calendar_invites_html else normalized_html
         normalized_html = re.sub(r"(?is)<!doctype[^>]*>\s*", "", normalized_html).strip()
         if normalized_html:
@@ -3474,7 +3679,7 @@ def build_email_message_body_content_html(
     plain_text = visible_text or ("No extracted text available." if not body_parts else "")
     if plain_text:
         body_parts.append(
-            f'<div class="gmail-message-plain">{html.escape(plain_text)}</div>'
+            f'<div class="gmail-message-plain">{render_email_preview_text_html(plain_text)}</div>'
         )
     elif not body_parts:
         body_parts.append(
@@ -3653,6 +3858,11 @@ def build_email_thread_preview_html(
         thread_link_href=thread_link_href,
         thread_position_label=thread_position_label,
     )
+    body_source_document_id = (
+        email_preview_document_id(body_source_document)
+        if body_source_document is not None
+        else None
+    )
     render_documents = list(reversed(documents)) if newest_first else list(documents)
     message_cards = []
     for document in render_documents:
@@ -3660,6 +3870,11 @@ def build_email_thread_preview_html(
         message_cards.append(
             build_email_message_card_html(
                 document,
+                body_html=(
+                    body_source_html
+                    if body_source_document_id is not None and document_id == body_source_document_id
+                    else None
+                ),
                 selected=(selected_document_id is not None and document_id == selected_document_id),
                 attachment_links=(
                     (attachment_links_by_document_id or {}).get(document_id, [])
@@ -3956,6 +4171,54 @@ def load_document_preview_body_payload(
                 "rel_preview_path": str(preview_row["rel_preview_path"]),
             }
     return None
+
+
+def load_source_backed_email_preview_body_payload(
+    paths: dict[str, Path],
+    document: dict[str, object],
+) -> dict[str, str] | None:
+    rel_path = normalize_whitespace(str(document.get("rel_path") or ""))
+    if not rel_path:
+        return None
+    source_kind = normalize_whitespace(str(document.get("source_kind") or FILESYSTEM_SOURCE_KIND)).lower()
+    if source_kind != FILESYSTEM_SOURCE_KIND:
+        return None
+    source_path = document_absolute_path(paths, rel_path)
+    if not source_path.exists():
+        return None
+    try:
+        extracted = extract_document(source_path, include_attachments=True)
+    except RetrieverError:
+        return None
+    preview_artifacts = [
+        artifact
+        for artifact in list(extracted.get("preview_artifacts") or [])
+        if isinstance(artifact, dict)
+        and normalize_whitespace(str(artifact.get("preview_type") or "")).lower() == "html"
+        and normalize_whitespace(str(artifact.get("content") or ""))
+    ]
+    if not preview_artifacts:
+        return None
+    preferred_artifact = sorted(
+        preview_artifacts,
+        key=lambda artifact: (
+            0 if normalize_whitespace(str(artifact.get("label") or "")).lower() == "message" else 1,
+            int(artifact.get("ordinal", 0) or 0),
+        ),
+    )[0]
+    body_html = extract_standalone_preview_body_html(str(preferred_artifact["content"]))
+    if not body_html:
+        return None
+    preview_file_name = normalize_whitespace(str(preferred_artifact.get("file_name") or ""))
+    preview_rel_path = (
+        (preview_base_path_for_rel_path(rel_path) / preview_file_name).as_posix()
+        if preview_file_name
+        else default_email_message_preview_rel_path(document)
+    )
+    return {
+        "body_html": body_html,
+        "rel_preview_path": preview_rel_path or default_email_message_preview_rel_path(document) or "",
+    }
 
 
 def load_document_preview_body_html(
@@ -4911,15 +5174,12 @@ def load_preview_documents(
     for document in documents:
         if normalize_whitespace(str(document.get("content_type") or "")).lower() == "chat":
             continue
-        if (
-            document_content_type_is_email(document.get("content_type"))
-            and document_active_text_differs_from_source(document)
-        ):
-            continue
         body_payload = load_document_preview_body_payload(
             paths,
             preserved_preview_rows_by_document_id.get(int(document["id"]), []),
         )
+        if body_payload is None and document_content_type_is_email(document.get("content_type")):
+            body_payload = load_source_backed_email_preview_body_payload(paths, document)
         if body_payload:
             document["standalone_preview_body_html"] = body_payload["body_html"]
             document["standalone_preview_rel_path"] = body_payload["rel_preview_path"]
