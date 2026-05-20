@@ -835,6 +835,8 @@ python3 skills/tool-template/tools.py merge-into-conversation . --doc-id 42 --ta
 python3 skills/tool-template/tools.py split-from-conversation . --doc-id 42
 python3 skills/tool-template/tools.py clear-conversation-assignment . --doc-id 42
 python3 skills/tool-template/tools.py reconcile-duplicates .
+python3 skills/tool-template/tools.py reconcile-duplicates . --doc-id 15 --doc-id 16 --apply
+python3 skills/tool-template/tools.py reconcile-duplicates . --dataset "Slack Export" --apply
 ```
 
 ## Important details to remember

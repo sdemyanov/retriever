@@ -14296,6 +14296,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile_duplicates_parser.add_argument("workspace", help="Workspace root path")
     reconcile_duplicates_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to consider for reconciliation (repeatable)",
+    )
+    add_scope_run_selector_arguments(reconcile_duplicates_parser)
+    reconcile_duplicates_parser.add_argument(
         "--basis",
         choices=("content_hash",),
         default="content_hash",
@@ -15488,6 +15496,13 @@ def main() -> int:
                     root,
                     basis=args.basis,
                     apply_changes=bool(args.apply),
+                    document_ids=args.document_ids,
+                    query=args.query,
+                    raw_bates=args.bates,
+                    raw_filters=args.filters,
+                    dataset_names=args.dataset_names,
+                    from_run_id=args.from_run_id,
+                    select_from_scope=args.select_from_scope,
                 ),
             )
 

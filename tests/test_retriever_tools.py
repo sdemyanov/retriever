@@ -17832,6 +17832,173 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIsNotNone(title_conflict_row)
         self.assertEqual(title_conflict_row["resolution"], "kept_survivor")
 
+    def test_reconcile_duplicates_apply_can_scope_by_doc_id_subset(self) -> None:
+        (self.root / "alpha.txt").write_text("shared clause alpha version\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("shared clause beta version\n", encoding="utf-8")
+        (self.root / "gamma.txt").write_text("shared clause gamma version\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 3)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        beta_row = self.fetch_document_row("beta.txt")
+        gamma_row = self.fetch_document_row("gamma.txt")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            for row in (beta_row, gamma_row):
+                connection.execute(
+                    """
+                    UPDATE documents
+                    SET content_hash = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (alpha_row["content_hash"], retriever_tools.utc_now(), int(row["id"])),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        exit_code, dry_run_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--doc-id",
+            str(alpha_row["id"]),
+            "--doc-id",
+            str(beta_row["id"]),
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(dry_run_payload)
+        self.assertEqual(dry_run_payload["selected_document_count"], 2)
+        self.assertEqual(dry_run_payload["selected_root_document_count"], 2)
+        self.assertEqual(
+            sorted(dry_run_payload["selected_document_ids"]),
+            sorted([int(alpha_row["id"]), int(beta_row["id"])]),
+        )
+        self.assertEqual(dry_run_payload["candidate_group_count"], 1)
+        candidate_group = dry_run_payload["candidate_groups"][0]
+        self.assertEqual(
+            sorted(candidate_group["document_ids"]),
+            sorted([int(alpha_row["id"]), int(beta_row["id"])]),
+        )
+
+        exit_code, apply_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--doc-id",
+            str(alpha_row["id"]),
+            "--doc-id",
+            str(beta_row["id"]),
+            "--apply",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["merged_group_count"], 1)
+        merged_group = apply_payload["applied_groups"][0]
+        survivor_document_id = int(merged_group["survivor_document_id"])
+
+        exit_code, unscoped_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(unscoped_payload)
+        self.assertEqual(unscoped_payload["candidate_group_count"], 1)
+        remaining_group = unscoped_payload["candidate_groups"][0]
+        self.assertEqual(
+            sorted(remaining_group["document_ids"]),
+            sorted([survivor_document_id, int(gamma_row["id"])]),
+        )
+
+    def test_reconcile_duplicates_apply_can_scope_by_dataset_subset(self) -> None:
+        (self.root / "alpha.txt").write_text("shared clause alpha version\n", encoding="utf-8")
+        (self.root / "beta.txt").write_text("shared clause beta version\n", encoding="utf-8")
+        (self.root / "gamma.txt").write_text("shared clause gamma version\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 3)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        alpha_row = self.fetch_document_row("alpha.txt")
+        beta_row = self.fetch_document_row("beta.txt")
+        gamma_row = self.fetch_document_row("gamma.txt")
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            slack_dataset_id = retriever_tools.create_dataset_row(connection, "Slack Export")
+            for row in (beta_row, gamma_row):
+                retriever_tools.ensure_dataset_document_membership(
+                    connection,
+                    dataset_id=slack_dataset_id,
+                    document_id=int(row["id"]),
+                    dataset_source_id=None,
+                )
+                retriever_tools.refresh_document_dataset_cache(connection, int(row["id"]))
+                connection.execute(
+                    """
+                    UPDATE documents
+                    SET content_hash = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (alpha_row["content_hash"], retriever_tools.utc_now(), int(row["id"])),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        exit_code, dry_run_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--dataset",
+            "Slack Export",
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(dry_run_payload)
+        self.assertEqual(dry_run_payload["selected_document_count"], 2)
+        self.assertEqual(dry_run_payload["selected_root_document_count"], 2)
+        self.assertEqual(dry_run_payload["candidate_group_count"], 1)
+        candidate_group = dry_run_payload["candidate_groups"][0]
+        self.assertEqual(
+            sorted(candidate_group["document_ids"]),
+            sorted([int(beta_row["id"]), int(gamma_row["id"])]),
+        )
+
+        exit_code, apply_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--dataset",
+            "Slack Export",
+            "--apply",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(apply_payload)
+        self.assertEqual(apply_payload["merged_group_count"], 1)
+        merged_group = apply_payload["applied_groups"][0]
+        survivor_document_id = int(merged_group["survivor_document_id"])
+
+        search_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        self.assertEqual(search_result["total_hits"], 2)
+
+        exit_code, unscoped_payload, _, _ = self.run_cli(
+            "reconcile-duplicates",
+            str(self.root),
+            "--dry-run",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(unscoped_payload)
+        self.assertEqual(unscoped_payload["candidate_group_count"], 1)
+        remaining_group = unscoped_payload["candidate_groups"][0]
+        self.assertEqual(
+            sorted(remaining_group["document_ids"]),
+            sorted([int(alpha_row["id"]), survivor_document_id]),
+        )
+
     def test_reconcile_duplicates_blocks_conflicting_custom_fields(self) -> None:
         (self.root / "alpha.txt").write_text("shared clause alpha version\n", encoding="utf-8")
         (self.root / "beta.txt").write_text("shared clause beta version\n", encoding="utf-8")
