@@ -13114,7 +13114,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             day_result["preview_rel_path"],
             self.preview_target_by_label(day_result["preview_targets"], "conversation")["rel_path"],
         )
-        self.assertEqual(day_result["preview_target_fragment"], f"doc-{day_row['id']}")
+        self.assertIsNone(day_result["preview_target_fragment"])
 
     def test_ingest_skips_empty_slack_day_export_files(self) -> None:
         export_root = self.root / "data" / "slack"
@@ -13661,8 +13661,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             reply_search["results"][0]["preview_rel_path"],
             self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "conversation")["rel_path"],
         )
-        self.assertEqual(day_one_result["preview_target_fragment"], f"doc-{day_one_row['id']}")
-        self.assertEqual(reply_search["results"][0]["preview_target_fragment"], f"doc-{child_row['id']}")
+        self.assertIsNone(day_one_result["preview_target_fragment"])
+        self.assertIsNone(reply_search["results"][0]["preview_target_fragment"])
         self.assertEqual(
             self.preview_target_file_path(
                 self.preview_target_by_label(day_one_result["preview_targets"], "conversation")
@@ -13951,13 +13951,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             reply_result["preview_rel_path"],
             self.preview_target_by_label(reply_result["preview_targets"], "segment")["rel_path"],
         )
-        self.assertEqual(reply_result["preview_target_fragment"], f"doc-{reply_row['id']}")
+        self.assertIsNone(reply_result["preview_target_fragment"])
         self.assertEqual(len(reply_result["preview_targets"]), 2)
         self.assertEqual(reply_result["preview_targets"][0]["label"], "segment")
         self.assertEqual(reply_result["preview_targets"][1]["label"], "message")
         self.assertFalse(any(target.get("label") == "entry" for target in reply_result["preview_targets"]))
         self.assertFalse(any(target.get("label") == "contents" for target in reply_result["preview_targets"]))
-        self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "segment")["target_fragment"], f"doc-{reply_row['id']}")
+        self.assertIsNone(self.preview_target_by_label(reply_result["preview_targets"], "segment")["target_fragment"])
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "message")["label"], "message")
         self.assertEqual(
             self.preview_target_file_path(self.preview_target_by_label(root_result["preview_targets"], "segment")),
@@ -14202,7 +14202,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             self.preview_target_by_label(refreshed_result["preview_targets"], "segment")["rel_path"],
         )
         self.assertEqual(refreshed_result["preview_targets"][0]["label"], "segment")
-        self.assertEqual(refreshed_result["preview_target_fragment"], f"doc-{root_row['id']}")
+        self.assertIsNone(refreshed_result["preview_target_fragment"])
         refreshed_message_preview_path = self.preview_target_file_path(
             self.preview_target_by_label(refreshed_result["preview_targets"], "message")
         )
@@ -19627,7 +19627,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             result["preview_rel_path"],
             self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
         )
-        self.assertEqual(result["preview_target_fragment"], f"doc-{row['id']}")
+        self.assertIsNone(result["preview_target_fragment"])
         preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
         self.assertIn('class="chat-message"', preview_html)
         self.assertIn("Alice Example", preview_html)
@@ -19742,7 +19742,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             result["preview_rel_path"],
             self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
         )
-        self.assertEqual(result["preview_target_fragment"], f"doc-{second_row['id']}")
+        self.assertIsNone(result["preview_target_fragment"])
         self.assertEqual(
             self.preview_target_file_path(
                 self.preview_target_by_label(result["preview_targets"], "conversation")
@@ -20182,7 +20182,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             result["preview_rel_path"],
             self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
         )
-        self.assertEqual(result["preview_target_fragment"], f"doc-{chat_row['id']}")
+        self.assertIsNone(result["preview_target_fragment"])
         preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
         self.assertIn('class="chat-message"', preview_html)
         self.assertIn("Sergey Demyanov", preview_html)
@@ -22692,7 +22692,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("text", verbose_result)
         self.assertIn("preview_targets", verbose_result)
 
-    def test_get_doc_for_conversation_document_uses_anchored_conversation_preview(self) -> None:
+    def test_get_doc_for_conversation_document_uses_conversation_preview_without_anchor(self) -> None:
         self.write_email_message(
             self.root / "root.eml",
             subject="Anchored Preview",
@@ -22719,8 +22719,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(get_exit, 0)
         self.assertIsNotNone(get_payload)
         document_payload = get_payload["document"]
-        self.assertTrue(document_payload["preview_rel_path"].endswith(f"/conversation.html#doc-{reply_row['id']}"))
-        self.assertIn(f"#doc-{reply_row['id']}", document_payload["preview_abs_path"])
+        self.assertTrue(document_payload["preview_rel_path"].endswith("/conversation.html"))
+        self.assertNotIn("#doc-", document_payload["preview_abs_path"])
 
     def test_cli_human_output_for_workspace_ingest_get_doc_and_export(self) -> None:
         document_path = self.root / "sample.txt"
