@@ -76,8 +76,6 @@ def document_prefers_native_primary_preview(row: sqlite3.Row | None) -> bool:
         file_type = normalize_extension(Path(str(row["file_name"] or row["rel_path"] or "")))
     if content_type == "Chat":
         return file_type in {"pdf", "docx", "rtf"}
-    if content_type == "Spreadsheet / Table":
-        return file_type in {"xls", "xlsx"}
     return False
 
 
@@ -324,6 +322,8 @@ SPREADSHEET_MAX_NAMED_RANGES = 500
 SPREADSHEET_MAX_ENUM_VALUES = 64
 SPREADSHEET_MAX_PARTICIPANTS = 32
 SPREADSHEET_MAX_SUMMARY_CHARS = 64 * 1024
+SPREADSHEET_HTML_PREVIEW_MAX_SOURCE_BYTES = 10 * 1024 * 1024
+SPREADSHEET_HTML_PREVIEW_SHEETJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"
 SPREADSHEET_XLSX_READ_ONLY_FALLBACK_BYTES = 50 * 1024 * 1024
 
 
@@ -1177,6 +1177,296 @@ def build_structural_summary_from_sections(sections: list[str]) -> tuple[str, li
     return text_content, chunks
 
 
+def format_spreadsheet_preview_size(byte_count: int) -> str:
+    size = float(max(0, int(byte_count)))
+    units = ("bytes", "KB", "MB", "GB", "TB")
+    unit_index = 0
+    while size >= 1024.0 and unit_index < len(units) - 1:
+        size /= 1024.0
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} bytes"
+    return f"{size:.1f} {units[unit_index]}"
+
+
+def build_spreadsheet_embedded_preview_html(
+    *,
+    document_title: str,
+    file_name: str,
+    file_type: str,
+    source_base64: str | None,
+    skip_reason: str | None = None,
+) -> str:
+    resolved_title = normalize_generated_document_title(document_title) or file_name or "Spreadsheet Preview"
+    resolved_file_name = normalize_whitespace(file_name) or resolved_title
+    resolved_file_type = normalize_whitespace(file_type).lower()
+    resolved_skip_reason = normalize_whitespace(str(skip_reason or "")) or None
+    return "".join(
+        [
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/>"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>",
+            f"<title>{html.escape(resolved_title)}</title>",
+            "<style>"
+            "html { box-sizing: border-box; height: 100%; }"
+            "*, *::before, *::after { box-sizing: inherit; }"
+            "body { margin: 0; min-height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #172030; background: radial-gradient(circle at top, #f8f0d8 0%, #f3efe4 38%, #ece8dc 100%); }"
+            ".spreadsheet-preview { padding: clamp(12px, 3vw, 24px); }"
+            ".preview-shell { max-width: 100%; }"
+            ".preview-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }"
+            ".preview-kicker { margin: 0 0 4px; font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: #7a5c1a; font-weight: 700; }"
+            ".preview-title { margin: 0; font-size: clamp(1.3rem, 3vw, 2rem); line-height: 1.1; }"
+            ".preview-file-name { margin: 0; color: #4d5a72; font-size: 0.95rem; overflow-wrap: anywhere; }"
+            ".sheet-tabs { display: flex; gap: 8px; overflow: auto; padding-bottom: 6px; margin-bottom: 12px; }"
+            ".sheet-tab { border: 1px solid #d8cfbb; background: rgba(255,255,255,0.78); color: #27364f; border-radius: 999px; padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; box-shadow: 0 1px 0 rgba(255,255,255,0.55) inset; }"
+            ".sheet-tab.is-active { background: #27364f; color: #fff; border-color: #27364f; }"
+            ".preview-status { margin: 0 0 12px; color: #5e6a7d; font-size: 0.92rem; }"
+            ".sheet-frame { border: 1px solid #d7d2c2; border-radius: 18px; overflow: hidden; background: rgba(255,255,255,0.92); box-shadow: 0 18px 40px rgba(26, 37, 54, 0.08); }"
+            ".sheet-scroll { overflow: auto; max-height: calc(100vh - 220px); }"
+            ".sheet-table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; background: #fff; }"
+            ".sheet-table th, .sheet-table td { border-right: 1px solid #e6e1d3; border-bottom: 1px solid #e6e1d3; min-width: 112px; max-width: 280px; vertical-align: top; }"
+            ".sheet-table thead th { position: sticky; top: 0; z-index: 3; background: #f7f3e7; color: #48556c; font-weight: 700; text-align: center; padding: 10px 12px; }"
+            ".sheet-table .corner-cell { position: sticky; left: 0; z-index: 4; min-width: 56px; width: 56px; background: #efe7d1; }"
+            ".sheet-table .row-header { position: sticky; left: 0; z-index: 2; min-width: 56px; width: 56px; background: #f7f3e7; color: #5e6a7d; font-weight: 700; text-align: right; padding: 10px 12px; }"
+            ".sheet-cell { background: #fff; }"
+            ".sheet-cell.is-empty { background: #fcfbf7; }"
+            ".cell-body { min-height: 2.6rem; padding: 10px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.35; }"
+            ".sheet-cell:hover .cell-body, .sheet-cell:focus-within .cell-body { white-space: pre-wrap; overflow: visible; position: relative; z-index: 1; background: #fffef9; box-shadow: inset 0 0 0 1px #d2b671; }"
+            ".empty-state, .error-box { padding: 22px; }"
+            ".empty-state { color: #5e6a7d; font-style: italic; }"
+            ".error-box { color: #6d2b1f; background: #fff4ef; border-top: 1px solid #f0d2c5; }"
+            ".error-box strong { display: block; margin-bottom: 6px; }"
+            ".error-detail { color: #8e4334; overflow-wrap: anywhere; }"
+            "@media (max-width: 720px) {"
+            ".spreadsheet-preview { padding: 12px; }"
+            ".sheet-scroll { max-height: calc(100vh - 190px); }"
+            ".sheet-table th, .sheet-table td { min-width: 92px; max-width: 220px; }"
+            ".sheet-tab { padding: 7px 12px; }"
+            "}"
+            "</style>",
+            f'<script src="{html.escape(SPREADSHEET_HTML_PREVIEW_SHEETJS_URL, quote=True)}"></script>',
+            "</head><body>",
+            "<main class=\"spreadsheet-preview\">"
+            "<section class=\"preview-shell\">"
+            "<header class=\"preview-header\">"
+            "<div>"
+            "<p class=\"preview-kicker\" id=\"spreadsheet-preview-kicker\">Spreadsheet preview</p>"
+            "<h1 class=\"preview-title\" id=\"spreadsheet-preview-title\"></h1>"
+            "</div>"
+            "<p class=\"preview-file-name\" id=\"spreadsheet-preview-file-name\"></p>"
+            "</header>"
+            "<div class=\"sheet-tabs\" id=\"spreadsheet-preview-tabs\" aria-label=\"Workbook sheets\"></div>"
+            "<p class=\"preview-status\" id=\"spreadsheet-preview-status\">Preparing preview...</p>"
+            "<section class=\"sheet-frame\">"
+            "<div id=\"spreadsheet-preview-content\"></div>"
+            "<div class=\"error-box\" id=\"spreadsheet-preview-error\" hidden></div>"
+            "</section>"
+            "</section>"
+            "</main><script>",
+            "const PREVIEW_TITLE = ",
+            json.dumps(resolved_title),
+            ";",
+            "const PREVIEW_FILE_NAME = ",
+            json.dumps(resolved_file_name),
+            ";",
+            "const PREVIEW_FILE_TYPE = ",
+            json.dumps(resolved_file_type),
+            ";",
+            "const PREVIEW_BASE64 = ",
+            json.dumps(source_base64),
+            ";",
+            "const PREVIEW_SKIP_REASON = ",
+            json.dumps(resolved_skip_reason),
+            ";",
+            """
+(function() {
+  const tabsRoot = document.getElementById("spreadsheet-preview-tabs");
+  const statusNode = document.getElementById("spreadsheet-preview-status");
+  const contentNode = document.getElementById("spreadsheet-preview-content");
+  const errorNode = document.getElementById("spreadsheet-preview-error");
+  const titleNode = document.getElementById("spreadsheet-preview-title");
+  const kickerNode = document.getElementById("spreadsheet-preview-kicker");
+  const fileNameNode = document.getElementById("spreadsheet-preview-file-name");
+
+  const escapeMap = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  const sheetHtmlCache = [];
+  const tabButtons = [];
+  let workbook = null;
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, function(character) {
+      return escapeMap[character] || character;
+    });
+  }
+
+  function setStatus(message) {
+    statusNode.textContent = message;
+  }
+
+  function showError(message, detail) {
+    errorNode.hidden = false;
+    errorNode.innerHTML =
+      "<strong>" + escapeHtml(message) + "</strong>" +
+      (detail ? '<div class="error-detail">' + escapeHtml(detail) + "</div>" : "");
+    tabsRoot.innerHTML = "";
+    contentNode.innerHTML = "";
+    setStatus("Preview unavailable");
+  }
+
+  function decodeBase64ToArrayBuffer(encoded) {
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer;
+  }
+
+  function cellDisplayValue(cell) {
+    if (!cell) return "";
+    if (cell.w !== undefined && cell.w !== null && cell.w !== "") return String(cell.w);
+    if (cell.v !== undefined && cell.v !== null && cell.v !== "") return String(cell.v);
+    if (cell.f) return "=" + String(cell.f);
+    return "";
+  }
+
+  function buildSheetHtml(sheet) {
+    if (!sheet || !sheet["!ref"]) {
+      return '<div class="empty-state">This sheet has no populated cells.</div>';
+    }
+
+    let range;
+    try {
+      range = XLSX.utils.decode_range(sheet["!ref"]);
+    } catch (error) {
+      return '<div class="empty-state">Retriever could not decode the used range for this sheet.</div>';
+    }
+
+    const fragments = [];
+    fragments.push('<div class="sheet-scroll"><table class="sheet-table"><thead><tr><th class="corner-cell"></th>');
+    for (let columnIndex = range.s.c; columnIndex <= range.e.c; columnIndex += 1) {
+      fragments.push('<th class="col-header">' + escapeHtml(XLSX.utils.encode_col(columnIndex)) + "</th>");
+    }
+    fragments.push("</tr></thead><tbody>");
+
+    for (let rowIndex = range.s.r; rowIndex <= range.e.r; rowIndex += 1) {
+      fragments.push("<tr>");
+      fragments.push('<th class="row-header">' + String(rowIndex + 1) + "</th>");
+      for (let columnIndex = range.s.c; columnIndex <= range.e.c; columnIndex += 1) {
+        const cellRef = XLSX.utils.encode_cell({ r: rowIndex, c: columnIndex });
+        const cellText = cellDisplayValue(sheet[cellRef]);
+        const hasValue = cellText.trim().length > 0;
+        const safeText = escapeHtml(cellText).replace(/\\n/g, "<br/>");
+        const titleAttr = hasValue ? ' title="' + escapeHtml(cellText) + '"' : "";
+        fragments.push(
+          '<td class="sheet-cell' + (hasValue ? "" : " is-empty") + '"' + titleAttr + ">" +
+            '<div class="cell-body">' + (hasValue ? safeText : "&nbsp;") + "</div>" +
+          "</td>"
+        );
+      }
+      fragments.push("</tr>");
+    }
+
+    fragments.push("</tbody></table></div>");
+    return fragments.join("");
+  }
+
+  function renderSheet(sheetIndex) {
+    const sheetName = workbook.SheetNames[sheetIndex];
+    if (sheetHtmlCache[sheetIndex] === undefined) {
+      sheetHtmlCache[sheetIndex] = buildSheetHtml(workbook.Sheets[sheetName]);
+    }
+    contentNode.innerHTML = sheetHtmlCache[sheetIndex];
+    setStatus("Showing " + sheetName + " (" + String(sheetIndex + 1) + " of " + String(workbook.SheetNames.length) + ")");
+  }
+
+  function activateSheet(sheetIndex) {
+    tabButtons.forEach(function(button, index) {
+      const isActive = index === sheetIndex;
+      button.classList.toggle("is-active", isActive);
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+    renderSheet(sheetIndex);
+  }
+
+  function buildTabs(sheetNames) {
+    tabsRoot.innerHTML = "";
+    tabButtons.length = 0;
+    sheetNames.forEach(function(sheetName, sheetIndex) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "sheet-tab";
+      button.textContent = sheetName;
+      button.setAttribute("aria-pressed", "false");
+      button.addEventListener("click", function() {
+        activateSheet(sheetIndex);
+      });
+      tabButtons.push(button);
+      tabsRoot.appendChild(button);
+    });
+  }
+
+  titleNode.textContent = PREVIEW_TITLE || PREVIEW_FILE_NAME || "Spreadsheet Preview";
+  fileNameNode.textContent = PREVIEW_FILE_NAME || "";
+  if (PREVIEW_FILE_TYPE) {
+    kickerNode.textContent = PREVIEW_FILE_TYPE.toUpperCase() + " spreadsheet preview";
+  }
+
+  if (PREVIEW_SKIP_REASON) {
+    showError("Preview skipped for this spreadsheet.", PREVIEW_SKIP_REASON);
+    return;
+  }
+
+  try {
+    if (!window.XLSX || typeof window.XLSX.read !== "function") {
+      throw new Error("SheetJS did not load from the configured CDN.");
+    }
+    workbook = XLSX.read(decodeBase64ToArrayBuffer(PREVIEW_BASE64), {
+      raw: false,
+      cellText: true,
+      dense: false,
+    });
+    if (!workbook || !Array.isArray(workbook.SheetNames) || workbook.SheetNames.length === 0) {
+      throw new Error("This file did not produce any readable sheets.");
+    }
+    buildTabs(workbook.SheetNames);
+    activateSheet(0);
+  } catch (error) {
+    const detail = error && error.message ? error.message : String(error);
+    showError("Retriever couldn't render this spreadsheet preview.", detail);
+  }
+})();
+""",
+            "</script></body></html>",
+        ]
+    )
+
+
+def build_spreadsheet_html_preview_artifact(path: Path, *, ordinal: int = 0) -> dict[str, object]:
+    file_size = path.stat().st_size
+    source_base64: str | None = None
+    skip_reason: str | None = None
+    if file_size > SPREADSHEET_HTML_PREVIEW_MAX_SOURCE_BYTES:
+        skip_reason = (
+            f"{path.name} is {format_spreadsheet_preview_size(file_size)}, which exceeds the "
+            f"{format_spreadsheet_preview_size(SPREADSHEET_HTML_PREVIEW_MAX_SOURCE_BYTES)} embedded preview cap."
+        )
+    else:
+        source_base64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {
+        "file_name": f"{path.name}.html",
+        "preview_type": "html",
+        "label": "spreadsheet",
+        "ordinal": ordinal,
+        "content": build_spreadsheet_embedded_preview_html(
+            document_title=path.stem or path.name,
+            file_name=path.name,
+            file_type=normalize_extension(path) or "",
+            source_base64=source_base64,
+            skip_reason=skip_reason,
+        ),
+    }
+
+
 def parse_spreadsheet_literal_list(formula: str) -> list[str]:
     inner = formula[1:-1]
     try:
@@ -1586,7 +1876,7 @@ def extract_xlsx_file(path: Path) -> dict[str, object]:
     openpyxl_module = dependency_guard("openpyxl", "openpyxl", "xlsx")
     read_only = path.stat().st_size > SPREADSHEET_XLSX_READ_ONLY_FALLBACK_BYTES
     workbook = openpyxl_module.load_workbook(path, read_only=read_only, data_only=True)  # type: ignore[union-attr]
-    preview_artifacts: list[dict[str, object]] = []
+    preview_artifacts: list[dict[str, object]] = [build_spreadsheet_html_preview_artifact(path, ordinal=0)]
     sections: list[str] = []
     workbook_hyperlinks_seen: set[str] = set()
     participants: list[str] = []
@@ -1600,6 +1890,7 @@ def extract_xlsx_file(path: Path) -> dict[str, object]:
         append_spreadsheet_participants(participants, participant_seen, [author, last_modified_by])
 
         sheet_names = [str(sheet.title) for sheet in workbook.worksheets]
+        sheet_count = len(sheet_names)
         sections.append(
             build_spreadsheet_header_section(
                 title=title,
@@ -1616,7 +1907,7 @@ def extract_xlsx_file(path: Path) -> dict[str, object]:
             )
         )
 
-        for ordinal, sheet in enumerate(workbook.worksheets):
+        for ordinal, sheet in enumerate(workbook.worksheets, start=1):
             surface = scan_openpyxl_sheet_surface(
                 workbook,
                 sheet,
@@ -1674,7 +1965,7 @@ def extract_xlsx_file(path: Path) -> dict[str, object]:
         )
     text_content, chunks = build_structural_summary_from_sections(sections)
     return {
-        "page_count": len(preview_artifacts),
+        "page_count": sheet_count,
         "author": author,
         "content_type": "Spreadsheet / Table",
         "date_created": normalize_datetime(getattr(props, "created", None)),
@@ -1693,7 +1984,7 @@ def extract_xlsx_file(path: Path) -> dict[str, object]:
 def extract_xls_file(path: Path) -> dict[str, object]:
     xlrd_module = dependency_guard("xlrd", "xlrd", "xls")
     workbook = xlrd_module.open_workbook(path, formatting_info=True)  # type: ignore[union-attr]
-    preview_artifacts: list[dict[str, object]] = []
+    preview_artifacts: list[dict[str, object]] = [build_spreadsheet_html_preview_artifact(path, ordinal=0)]
     sections: list[str] = []
     workbook_hyperlinks_seen: set[str] = set()
     participants: list[str] = []
@@ -1702,6 +1993,7 @@ def extract_xls_file(path: Path) -> dict[str, object]:
     author = spreadsheet_text_value(getattr(workbook, "user_name", None)) or None
     append_spreadsheet_participants(participants, participant_seen, [author])
     sheet_names = [str(sheet.name) for sheet in workbook.sheets()]
+    sheet_count = len(sheet_names)
     sections.append(
         build_spreadsheet_header_section(
             title=path.stem,
@@ -1712,7 +2004,7 @@ def extract_xls_file(path: Path) -> dict[str, object]:
         )
     )
 
-    for ordinal, sheet in enumerate(workbook.sheets()):
+    for ordinal, sheet in enumerate(workbook.sheets(), start=1):
         surface = scan_xls_sheet_surface(
             workbook,
             sheet,
@@ -1762,7 +2054,7 @@ def extract_xls_file(path: Path) -> dict[str, object]:
 
     text_content, chunks = build_structural_summary_from_sections(sections)
     return {
-        "page_count": len(preview_artifacts),
+        "page_count": sheet_count,
         "author": author,
         "content_type": "Spreadsheet / Table",
         "date_created": None,
@@ -1778,11 +2070,11 @@ def extract_xls_file(path: Path) -> dict[str, object]:
     }
 
 
-def parse_csv_rows_for_summary(path: Path) -> tuple[list[list[str]], str]:
+def parse_delimited_rows_for_summary(path: Path) -> tuple[list[list[str]], str]:
     decoded, text_status, _ = decode_bytes(path.read_bytes())
     normalized_text = decoded.lstrip("\ufeff")
     rows_source = normalized_text
-    delimiter: str | None = None
+    delimiter: str | None = "\t" if normalize_extension(path) == "tsv" else None
     first_line, _, remainder = normalized_text.partition("\n")
     directive_match = re.fullmatch(r"\s*sep=(.)\s*", first_line)
     if directive_match is not None:
@@ -1816,8 +2108,9 @@ def csv_first_row_looks_like_header(row: list[str]) -> bool:
 
 
 def extract_csv_file(path: Path) -> dict[str, object]:
-    rows, text_status = parse_csv_rows_for_summary(path)
+    rows, text_status = parse_delimited_rows_for_summary(path)
     title = path.stem
+    preview_artifacts = [build_spreadsheet_html_preview_artifact(path, ordinal=0)]
     if not rows:
         sections = [
             build_spreadsheet_header_section(
@@ -1843,7 +2136,7 @@ def extract_csv_file(path: Path) -> dict[str, object]:
             "text_content": text_content,
             "text_status": "empty" if not text_content else text_status,
             "chunks": chunks,
-            "preview_artifacts": [],
+            "preview_artifacts": preview_artifacts,
         }
 
     has_headers = csv_first_row_looks_like_header(rows[0])
@@ -1896,7 +2189,7 @@ def extract_csv_file(path: Path) -> dict[str, object]:
         "text_content": text_content,
         "text_status": "empty" if not text_content else text_status,
         "chunks": chunks,
-        "preview_artifacts": [],
+        "preview_artifacts": preview_artifacts,
     }
 
 
@@ -4081,7 +4374,7 @@ def extract_document(path: Path, include_attachments: bool = True) -> dict[str, 
     file_type = normalize_extension(path)
     if file_type not in SUPPORTED_FILE_TYPES:
         raise RetrieverError(f"Unsupported file type: .{file_type or '(none)'}")
-    if file_type == "csv":
+    if file_type in {"csv", "tsv"}:
         return extract_csv_file(path)
     if file_type in TEXT_FILE_TYPES:
         return extract_plain_text_file(path)

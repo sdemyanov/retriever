@@ -3424,6 +3424,8 @@ ATTACHMENT_FILE_TYPE_BY_MIME_TYPE = {
     "text/markdown": "md",
     "text/plain": "txt",
     "text/rtf": "rtf",
+    "text/tab-separated-values": "tsv",
+    "text/tsv": "tsv",
     "text/xml": "xml",
 }
 OLE_COMPOUND_FILE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
@@ -3497,7 +3499,7 @@ def canonical_kind_from_metadata(
     if normalized_content_type in {"chat", "e-doc", "web"}:
         return "document"
 
-    if normalized_file_type in {"csv", "json", "xml", "yaml", "yml"}:
+    if normalized_file_type in {"csv", "json", "tsv", "xml", "yaml", "yml"}:
         return "data"
     if normalized_file_type in {"xls", "xlsx", "xlsm", "xlsb", "ods", "numbers"}:
         return "spreadsheet"
