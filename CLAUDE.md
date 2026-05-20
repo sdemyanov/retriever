@@ -40,6 +40,8 @@ Use the highest-level Retriever surface that can answer the request:
 - Treat `skills/tool-template/src/` as the authored backend source of truth.
 - Treat `skills/tool-template/tools.py` as a generated compatibility artifact until the bundle is retired.
 - Treat `retriever/` as the Claude-first package surface. Native processing orchestration belongs there, even when it still reuses backend storage/runtime helpers.
+- Keep repository-map and doc-boundary details in `ARCHITECTURE.md`.
+- Keep test-suite structure and migration guidance in `TESTING.md`.
 - When source fragments change, keep generated artifacts, installer output, and tests in sync.
 
 ## Common Commands
