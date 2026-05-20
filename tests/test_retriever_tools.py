@@ -430,6 +430,40 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 return target
         raise AssertionError(f"Missing preview target with label {label!r}.")
 
+    def create_text_revision(
+        self,
+        *,
+        document_id: int,
+        parent_revision_id: int,
+        text_content: str,
+        revision_kind: str = "translation",
+        language: str = "en",
+        quality_score: float = 1.0,
+    ) -> int:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("BEGIN")
+            try:
+                revision_id = retriever_tools.create_text_revision_row(
+                    connection,
+                    self.paths,
+                    document_id=document_id,
+                    revision_kind=revision_kind,
+                    text_content=text_content,
+                    language=language,
+                    parent_revision_id=parent_revision_id,
+                    created_by_job_version_id=None,
+                    quality_score=quality_score,
+                    provider_metadata={"provider": "test"},
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        finally:
+            connection.close()
+        return int(revision_id)
+
     def create_legacy_documents_table(self, *, with_row: bool) -> None:
         connection = sqlite3.connect(self.paths["db_path"])
         try:
@@ -18578,6 +18612,501 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(refresh_all_result["refreshed_documents"], 1)
         self.assertEqual(refresh_all_result["refreshed_conversations"], 0)
         self.assertNotIn("stale rtf preview again", preview_path.read_text(encoding="utf-8"))
+
+    def test_activate_text_revision_and_refresh_previews_regenerate_standalone_email_preview_from_active_text(self) -> None:
+        source_body = "\u0418\u0441\u0445\u043e\u0434\u043d\u043e\u0435 \u043f\u0438\u0441\u044c\u043c\u043e."
+        translated_body = "Translated standalone email body."
+        self.write_email_message(
+            self.root / "translated.eml",
+            subject="Translation Check",
+            body_text=source_body,
+            body_html=f'<div class="original-rich-email"><p>{source_body}</p></div>',
+            message_id="<translated-standalone@example.com>",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        row = self.fetch_document_row("translated.eml")
+        source_revision_id = int(row["source_text_revision_id"])
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        document_result = next(item for item in browse_result["results"] if item["id"] == row["id"])
+        preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(document_result["preview_targets"], "message")
+        )
+        source_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn(source_body, source_preview_html)
+
+        translated_revision_id = self.create_text_revision(
+            document_id=int(row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=translated_body,
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--text-revision-id",
+            str(translated_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
+        activated_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn(translated_body, activated_preview_html)
+        self.assertNotIn(source_body, activated_preview_html)
+
+        preview_path.write_text("stale standalone email preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "conversations",
+            "--doc-id",
+            str(row["id"]),
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "conversations")
+        self.assertEqual(refresh_payload["refreshed_conversations"], 1)
+        refreshed_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale standalone email preview", refreshed_preview_html)
+        self.assertIn(translated_body, refreshed_preview_html)
+        self.assertNotIn(source_body, refreshed_preview_html)
+
+    def test_activate_text_revision_and_refresh_previews_use_active_email_text_for_threaded_eml(self) -> None:
+        source_root = "\u041a\u043e\u0440\u043d\u0435\u0432\u043e\u0435 \u043f\u0438\u0441\u044c\u043c\u043e."
+        source_reply = "\u041e\u0442\u0432\u0435\u0442 \u043d\u0430 \u0440\u0443\u0441\u0441\u043a\u043e\u043c."
+        translated_reply = "Translated thread reply."
+        self.write_email_message(
+            self.root / "root.eml",
+            subject="Translation Thread",
+            body_text=source_root,
+            message_id="<thread-root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            self.root / "reply.eml",
+            subject="Re: Translation Thread",
+            body_text=source_reply,
+            body_html=f'<div class="reply-rich-email"><p>{source_reply}</p></div>',
+            message_id="<thread-reply@example.com>",
+            in_reply_to="<thread-root@example.com>",
+            references="<thread-root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 2)
+        reply_row = self.fetch_document_row("reply.eml")
+        source_revision_id = int(reply_row["source_text_revision_id"])
+        search_result = retriever_tools.search(self.root, source_reply, None, None, None, 1, 20)
+        reply_result = next(item for item in search_result["results"] if item["id"] == reply_row["id"])
+        message_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(reply_result["preview_targets"], "message")
+        )
+        segment_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(reply_result["preview_targets"], "segment")
+        )
+        source_message_html = message_preview_path.read_text(encoding="utf-8")
+        source_segment_html = segment_preview_path.read_text(encoding="utf-8")
+        self.assertIn(source_reply, source_message_html)
+        self.assertIn(source_reply, source_segment_html)
+
+        translated_revision_id = self.create_text_revision(
+            document_id=int(reply_row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=translated_reply,
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(reply_row["id"]),
+            "--text-revision-id",
+            str(translated_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
+        self.assertEqual(activate_payload["preview_regen"]["refreshed_conversations"], 1)
+        activated_message_html = message_preview_path.read_text(encoding="utf-8")
+        activated_segment_html = segment_preview_path.read_text(encoding="utf-8")
+        self.assertIn(source_root, activated_message_html)
+        self.assertIn(source_root, activated_segment_html)
+        self.assertIn(translated_reply, activated_message_html)
+        self.assertIn(translated_reply, activated_segment_html)
+        self.assertNotIn(source_reply, activated_message_html)
+        self.assertNotIn(source_reply, activated_segment_html)
+
+        message_preview_path.write_text("stale threaded email message preview", encoding="utf-8")
+        segment_preview_path.write_text("stale threaded email conversation preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "conversations",
+            "--doc-id",
+            str(reply_row["id"]),
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "conversations")
+        self.assertEqual(refresh_payload["refreshed_conversations"], 1)
+        refreshed_message_html = message_preview_path.read_text(encoding="utf-8")
+        refreshed_segment_html = segment_preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale threaded email message preview", refreshed_message_html)
+        self.assertNotIn("stale threaded email conversation preview", refreshed_segment_html)
+        self.assertIn(source_root, refreshed_message_html)
+        self.assertIn(source_root, refreshed_segment_html)
+        self.assertIn(translated_reply, refreshed_message_html)
+        self.assertIn(translated_reply, refreshed_segment_html)
+        self.assertNotIn(source_reply, refreshed_message_html)
+        self.assertNotIn(source_reply, refreshed_segment_html)
+
+    def test_activate_text_revision_and_refresh_previews_regenerate_standalone_chat_preview_from_active_text(self) -> None:
+        source_message = "\u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u043e\u0436\u0435\u043c \u0441\u043e\u0437\u0432\u043e\u043d\u0438\u0442\u044c\u0441\u044f?"
+        source_reply = "\u0414\u0430, \u0434\u0430\u0432\u0430\u0439 \u0432 10:05."
+        translated_reply_html = "Yes, let&#x27;s sync at 10:05."
+        translated_text = (
+            "[2022-12-17T00:03:54Z] Sergey Demyanov: Hello, can we sync?\n"
+            "[2022-12-17T00:08:54Z] Maksim Faleev: Yes, let's sync at 10:05."
+        )
+
+        (self.root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = self.root / "general"
+        channel_dir.mkdir()
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": source_message,
+                        "user": "U04SERGEY1",
+                        "ts": "1671235434.237949",
+                    },
+                    {
+                        "type": "message",
+                        "text": source_reply,
+                        "user": "U04MAX0001",
+                        "ts": "1671235734.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 2)
+        row = self.fetch_document_row("general/2022-12-16.json")
+        source_revision_id = int(row["source_text_revision_id"])
+        search_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        document_result = next(item for item in search_result["results"] if item["id"] == row["id"])
+        preview_path = self.preview_target_file_path(document_result["preview_targets"][0])
+        source_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn(source_message, source_preview_html)
+        self.assertIn(source_reply, source_preview_html)
+
+        translated_revision_id = self.create_text_revision(
+            document_id=int(row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=translated_text,
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--text-revision-id",
+            str(translated_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
+        activated_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn("Hello, can we sync?", activated_preview_html)
+        self.assertIn(translated_reply_html, activated_preview_html)
+        self.assertNotIn(source_message, activated_preview_html)
+        self.assertNotIn(source_reply, activated_preview_html)
+
+        preview_path.write_text("stale translated preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "documents",
+            "--doc-id",
+            str(row["id"]),
+            "--from-source",
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "documents")
+        self.assertEqual(refresh_payload["refreshed_documents"], 1)
+        refreshed_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale translated preview", refreshed_preview_html)
+        self.assertIn("Hello, can we sync?", refreshed_preview_html)
+        self.assertIn(translated_reply_html, refreshed_preview_html)
+        self.assertNotIn(source_message, refreshed_preview_html)
+        self.assertNotIn(source_reply, refreshed_preview_html)
+
+    def test_refresh_previews_conversation_scope_uses_active_chat_text_for_slack_export(self) -> None:
+        source_message = "\u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u043e\u0436\u0435\u043c \u0441\u043e\u0437\u0432\u043e\u043d\u0438\u0442\u044c\u0441\u044f?"
+        source_reply = "\u0414\u0430, \u0434\u0430\u0432\u0430\u0439 \u0432 10:05."
+        translated_reply_html = "Yes, let&#x27;s sync at 10:05."
+        translated_text = (
+            "[2022-12-17T00:03:54Z] Sergey Demyanov: Hello, can we sync?\n"
+            "[2022-12-17T00:08:54Z] Maksim Faleev: Yes, let's sync at 10:05."
+        )
+
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": source_message,
+                        "user": "U04SERGEY1",
+                        "ts": "1671235434.237949",
+                    },
+                    {
+                        "type": "message",
+                        "text": source_reply,
+                        "user": "U04MAX0001",
+                        "ts": "1671235734.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["slack_documents_created"], 1)
+        day_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        source_revision_id = int(day_row["source_text_revision_id"])
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        day_result = next(item for item in browse_result["results"] if item["id"] == day_row["id"])
+        conversation_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(day_result["preview_targets"], "conversation")
+        )
+        source_conversation_html = conversation_preview_path.read_text(encoding="utf-8")
+        self.assertIn(source_message, source_conversation_html)
+        self.assertIn(source_reply, source_conversation_html)
+
+        translated_revision_id = self.create_text_revision(
+            document_id=int(day_row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=translated_text,
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(day_row["id"]),
+            "--text-revision-id",
+            str(translated_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "skipped")
+        self.assertEqual(activate_payload["preview_regen"]["reason"], "conversation_scope")
+
+        conversation_preview_path.write_text("stale conversation preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "conversations",
+            "--doc-id",
+            str(day_row["id"]),
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "conversations")
+        self.assertEqual(refresh_payload["refreshed_conversations"], 1)
+        refreshed_conversation_html = conversation_preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale conversation preview", refreshed_conversation_html)
+        self.assertIn("Hello, can we sync?", refreshed_conversation_html)
+        self.assertIn(translated_reply_html, refreshed_conversation_html)
+        self.assertNotIn(source_message, refreshed_conversation_html)
+        self.assertNotIn(source_reply, refreshed_conversation_html)
+
+    def test_refresh_previews_document_scope_uses_active_text_for_production_preview(self) -> None:
+        translated_text = "Translated production memo body.\nReview translated attachments."
+        self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["production_documents_created"], 4)
+        row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000001.logical"
+        )
+        source_revision_id = int(row["source_text_revision_id"])
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            preview_row = connection.execute(
+                """
+                SELECT rel_preview_path
+                FROM document_previews
+                WHERE document_id = ? AND preview_type = 'html'
+                ORDER BY ordinal ASC, id ASC
+                LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            self.assertIsNotNone(preview_row)
+            assert preview_row is not None
+            preview_path = self.paths["state_dir"] / str(preview_row["rel_preview_path"])
+        finally:
+            connection.close()
+
+        translated_revision_id = self.create_text_revision(
+            document_id=int(row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=translated_text,
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--text-revision-id",
+            str(translated_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
+        activated_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn("Translated production memo body.", activated_preview_html)
+        self.assertNotIn("Parent production memo", activated_preview_html)
+
+        preview_path.write_text("stale translated production preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "documents",
+            "--doc-id",
+            str(row["id"]),
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "documents")
+        self.assertEqual(refresh_payload["refreshed_documents"], 1)
+        self.assertEqual(refresh_payload["skipped_documents"], 0)
+        refreshed_html = preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale translated production preview", refreshed_html)
+        self.assertIn("Translated production memo body.", refreshed_html)
+        self.assertNotIn("Parent production memo", refreshed_html)
 
     def test_refresh_previews_document_scope_refreshes_production_email_in_conversation(self) -> None:
         self.write_production_fixture()
