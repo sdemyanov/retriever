@@ -5126,7 +5126,7 @@ def refresh_conversation_previews(
                             {
                                 "rel_preview_path": segment_rel_path,
                                 "preview_type": "html",
-                                "target_fragment": conversation_preview_anchor(int(document["id"])),
+                                "target_fragment": None,
                                 "label": "segment",
                                 "ordinal": len(preview_rows),
                                 "created_at": created_at,

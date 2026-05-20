@@ -9168,16 +9168,7 @@ def conversation_primary_preview_target(
         conversation_rows[0],
     )
     selected_target = preview_target_payload_from_preview_row(paths, selected_row)
-    if selected_target["target_fragment"]:
-        return selected_target
-    return build_preview_target_payload(
-        rel_path=str(selected_target["file_rel_path"]),
-        abs_path=str(selected_target["file_abs_path"]),
-        preview_type=str(selected_target["preview_type"]),
-        label=(str(selected_target["label"]) if selected_target["label"] is not None else None),
-        ordinal=int(selected_target["ordinal"]),
-        target_fragment=conversation_preview_anchor(int(document_row["id"])),
-    )
+    return selected_target
 
 
 def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection: sqlite3.Connection) -> dict[str, object]:
@@ -21636,7 +21627,7 @@ def refresh_conversation_previews(
                             {
                                 "rel_preview_path": segment_rel_path,
                                 "preview_type": "html",
-                                "target_fragment": conversation_preview_anchor(int(document["id"])),
+                                "target_fragment": None,
                                 "label": "segment",
                                 "ordinal": len(preview_rows),
                                 "created_at": created_at,
