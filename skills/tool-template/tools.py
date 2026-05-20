@@ -19714,6 +19714,7 @@ def build_email_preview_head_html() -> str:
         ".gmail-message-rendered-html a:hover, .retriever-attachments a:hover { text-decoration: underline; }"
         ".gmail-message-rendered-html .gmail_quote, .gmail-message-rendered-html blockquote[type='cite'], .gmail-message-rendered-html blockquote { margin: 1rem 0 0; padding-left: 0.9rem; border-left: 3px solid #d8dde3; color: #5f6368; }"
         ".gmail-message-plain { white-space: pre-wrap; word-break: break-word; font: inherit; }"
+        ".gmail-message-plain--active-text { margin-bottom: 1rem; }"
         ".gmail-message-quoted { margin-top: 1rem; }"
         ".gmail-message-quoted summary { cursor: pointer; color: #5f6368; font-weight: 500; }"
         ".gmail-message-quoted pre { white-space: pre-wrap; word-break: break-word; margin: 0.72rem 0 0; padding: 0.85rem 1rem; background: #f8fafc; border: 1px solid #e4e7eb; border-radius: 14px; font: inherit; color: #5f6368; }"
@@ -20152,6 +20153,31 @@ def build_email_message_body_content_html(
         preferred_body_html,
         target_preview_rel_path=target_preview_rel_path,
     )
+    if (
+        preferred_body_html
+        and text_content
+        and document_active_text_should_render_above_preserved_email_body(document)
+    ):
+        normalized_html = HTML_PREVIEW_CALENDAR_INVITES_PATTERN.sub("", preferred_body_html).strip()
+        normalized_html = EMAIL_PREVIEW_QUOTED_DETAILS_PATTERN.sub("", normalized_html).strip()
+        if strip_quoted_history:
+            stripped_html = strip_email_reply_history_html(normalized_html)
+            if stripped_html is not None:
+                normalized_html = stripped_html
+        body_parts: list[str] = []
+        if calendar_invites_html:
+            body_parts.append(calendar_invites_html)
+        body_parts.append(
+            '<div class="gmail-message-plain gmail-message-plain--active-text">'
+            f"{render_email_preview_text_html(text_content)}"
+            "</div>"
+        )
+        if normalized_html:
+            if email_preview_body_html_has_rendered_wrappers(normalized_html):
+                body_parts.append(normalized_html)
+            else:
+                body_parts.append(f'<div class="gmail-message-rendered-html">{normalized_html}</div>')
+        return "".join(body_parts)
     if preferred_body_html and document_active_text_differs_from_source(document):
         normalized_html = HTML_PREVIEW_CALENDAR_INVITES_PATTERN.sub("", preferred_body_html).strip()
         normalized_html = EMAIL_PREVIEW_QUOTED_DETAILS_PATTERN.sub("", normalized_html).strip()
@@ -21579,6 +21605,19 @@ def document_active_text_differs_from_source(document: dict[str, object]) -> boo
     )
 
 
+def document_active_text_source_kind(document: dict[str, object]) -> str:
+    return normalize_whitespace(str(document.get("active_text_source_kind") or "")).lower()
+
+
+def document_active_text_should_render_above_preserved_email_body(
+    document: dict[str, object],
+) -> bool:
+    return (
+        document_active_text_differs_from_source(document)
+        and document_active_text_source_kind(document) == "ocr"
+    )
+
+
 def load_document_preview_text(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
@@ -21675,6 +21714,7 @@ def load_preview_documents(
           d.conversation_id,
           d.source_text_revision_id,
           d.active_search_text_revision_id,
+          d.active_text_source_kind,
           parent.control_number AS parent_control_number,
           parent.title AS parent_title,
           source_tr.storage_rel_path AS source_text_storage_rel_path,
@@ -29042,7 +29082,15 @@ def activate_text_revision_for_document(
     try:
         if document_content_type_is_chat(document_row["content_type"]):
             if document_row["conversation_id"] is not None:
-                preview_regen = {"status": "skipped", "reason": "conversation_scope"}
+                preview_regen = {
+                    "status": "ok",
+                    "conversation_id": int(document_row["conversation_id"]),
+                    "refreshed_conversations": refresh_conversation_previews(
+                        connection,
+                        paths,
+                        [int(document_row["conversation_id"])],
+                    ),
+                }
             else:
                 preview_regen = regenerate_chat_preview_for_document(
                     connection,

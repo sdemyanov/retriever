@@ -1435,7 +1435,15 @@ def activate_text_revision_for_document(
     try:
         if document_content_type_is_chat(document_row["content_type"]):
             if document_row["conversation_id"] is not None:
-                preview_regen = {"status": "skipped", "reason": "conversation_scope"}
+                preview_regen = {
+                    "status": "ok",
+                    "conversation_id": int(document_row["conversation_id"]),
+                    "refreshed_conversations": refresh_conversation_previews(
+                        connection,
+                        paths,
+                        [int(document_row["conversation_id"])],
+                    ),
+                }
             else:
                 preview_regen = regenerate_chat_preview_for_document(
                     connection,

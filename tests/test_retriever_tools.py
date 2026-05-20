@@ -19242,6 +19242,125 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn(translated_body, refreshed_preview_html)
         self.assertNotIn(source_body, refreshed_preview_html)
 
+    def test_activate_text_revision_and_refresh_previews_render_full_ocr_text_above_preserved_email_images(self) -> None:
+        email_path = self.root / "inline-ocr-activate.eml"
+        ocr_body = (
+            "Harry Montoro\n\n"
+            "From: Alice Example <alice@example.com>\n"
+            "Sent: Tuesday, April 14, 2026 10:00 AM\n"
+            "To: Bob Example <bob@example.com>\n"
+            "Subject: Inline OCR activation test\n\n"
+            "OCR body line one.\n"
+            "OCR body line two."
+        )
+        png_pixel = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9mQAAAAASUVORK5CYII="
+        )
+        encoded_png = base64.b64encode(png_pixel).decode("ascii")
+        boundary = "boundary-inline-ocr-activate"
+        email_path.write_bytes(
+            (
+                "From: Alice Example <alice@example.com>\r\n"
+                "To: Bob Example <bob@example.com>\r\n"
+                "Subject: Inline OCR activation test\r\n"
+                "Date: Tue, 14 Apr 2026 10:00:00 +0000\r\n"
+                "MIME-Version: 1.0\r\n"
+                f'Content-Type: multipart/related; boundary="{boundary}"\r\n'
+                "\r\n"
+                f"--{boundary}\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "\r\n"
+                '<html><body><div class="inline-rich-email"><img src="cid:logo-icon" alt="scan"/></div></body></html>\r\n'
+                f"--{boundary}\r\n"
+                "Content-Type: image/png\r\n"
+                "Content-Transfer-Encoding: base64\r\n"
+                "Content-ID: <logo-icon>\r\n"
+                'Content-Disposition: inline; filename="logo.png"\r\n'
+                "\r\n"
+                f"{encoded_png}\r\n"
+                f"--{boundary}--\r\n"
+            ).encode("ascii")
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 1)
+        row = self.fetch_document_row("inline-ocr-activate.eml")
+        source_revision_id = int(row["source_text_revision_id"])
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        document_result = next(item for item in browse_result["results"] if item["id"] == row["id"])
+        preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(document_result["preview_targets"], "message")
+        )
+        source_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn('class="inline-rich-email"', source_preview_html)
+        self.assertIn("data:image/png;base64,", source_preview_html)
+        self.assertNotIn("OCR body line one.", source_preview_html)
+
+        ocr_revision_id = self.create_text_revision(
+            document_id=int(row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=ocr_body,
+            revision_kind="ocr",
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--text-revision-id",
+            str(ocr_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
+        activated_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn('class="inline-rich-email"', activated_preview_html)
+        self.assertIn("data:image/png;base64,", activated_preview_html)
+        self.assertIn('class="gmail-message-plain gmail-message-plain--active-text"', activated_preview_html)
+        self.assertIn("Harry Montoro", activated_preview_html)
+        self.assertIn("From: Alice Example", activated_preview_html)
+        self.assertIn("OCR body line two.", activated_preview_html)
+        self.assertNotIn("<summary>Quoted text</summary>", activated_preview_html)
+        self.assertNotIn('src="cid:logo-icon"', activated_preview_html)
+        self.assertLess(
+            activated_preview_html.index("From: Alice Example"),
+            activated_preview_html.index("data:image/png;base64,"),
+        )
+
+        preview_path.write_text("stale inline ocr activation preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "conversations",
+            "--doc-id",
+            str(row["id"]),
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "conversations")
+        self.assertEqual(refresh_payload["refreshed_conversations"], 1)
+        refreshed_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale inline ocr activation preview", refreshed_preview_html)
+        self.assertIn('class="inline-rich-email"', refreshed_preview_html)
+        self.assertIn("data:image/png;base64,", refreshed_preview_html)
+        self.assertIn('class="gmail-message-plain gmail-message-plain--active-text"', refreshed_preview_html)
+        self.assertIn("Harry Montoro", refreshed_preview_html)
+        self.assertIn("From: Alice Example", refreshed_preview_html)
+        self.assertIn("OCR body line two.", refreshed_preview_html)
+        self.assertNotIn("<summary>Quoted text</summary>", refreshed_preview_html)
+        self.assertLess(
+            refreshed_preview_html.index("From: Alice Example"),
+            refreshed_preview_html.index("data:image/png;base64,"),
+        )
+
     def test_activate_text_revision_and_refresh_previews_use_active_email_text_for_threaded_eml(self) -> None:
         source_root = "\u041a\u043e\u0440\u043d\u0435\u0432\u043e\u0435 \u043f\u0438\u0441\u044c\u043c\u043e."
         source_reply = "\u041e\u0442\u0432\u0435\u0442 \u043d\u0430 \u0440\u0443\u0441\u0441\u043a\u043e\u043c."
@@ -19573,8 +19692,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(activate_exit, 0)
         self.assertIsNotNone(activate_payload)
         assert activate_payload is not None
-        self.assertEqual(activate_payload["preview_regen"]["status"], "skipped")
-        self.assertEqual(activate_payload["preview_regen"]["reason"], "conversation_scope")
+        self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
+        self.assertEqual(activate_payload["preview_regen"]["refreshed_conversations"], 1)
+        activated_conversation_html = conversation_preview_path.read_text(encoding="utf-8")
+        self.assertIn("Hello, can we sync?", activated_conversation_html)
+        self.assertIn(translated_reply_html, activated_conversation_html)
+        self.assertNotIn(source_message, activated_conversation_html)
+        self.assertNotIn(source_reply, activated_conversation_html)
 
         conversation_preview_path.write_text("stale conversation preview", encoding="utf-8")
         refresh_exit, refresh_payload, _, _ = self.run_cli(
