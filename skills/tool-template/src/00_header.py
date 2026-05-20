@@ -281,6 +281,7 @@ SUPPORTED_FILE_TYPES = {
     "tif",
     "tiff",
     "toml",
+    "tsv",
     "txt",
     "ts",
     "tsx",
@@ -335,6 +336,7 @@ NATIVE_PREVIEW_FILE_TYPES = {
     "tif",
     "tiff",
     "toml",
+    "tsv",
     "txt",
     "ts",
     "tsx",
@@ -344,7 +346,7 @@ NATIVE_PREVIEW_FILE_TYPES = {
     "yml",
     "zsh",
 }
-TEXT_FILE_TYPES = {"csv", "htm", "html", "ics", "json", "md", "txt", *CURATED_TEXT_SOURCE_FILE_TYPES}
+TEXT_FILE_TYPES = {"csv", "htm", "html", "ics", "json", "md", "tsv", "txt", *CURATED_TEXT_SOURCE_FILE_TYPES}
 EDITABLE_BUILTIN_FIELDS = {
     "author",
     "content_type",

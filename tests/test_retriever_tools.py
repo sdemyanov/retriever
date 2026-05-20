@@ -16258,13 +16258,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         search_result = retriever_tools.search(self.root, "Memo", None, None, None, 1, 20)
         xls_result = search_result["results"][0]
         self.assertEqual(xls_result["file_name"], "ledger.xls")
-        self.assertEqual(xls_result["preview_targets"][0]["preview_type"], "native")
-        self.assertEqual(xls_result["preview_rel_path"], "ledger.xls")
+        self.assertTrue(xls_result["preview_rel_path"].endswith(".html"))
+        self.assertEqual(xls_result["preview_targets"][0]["preview_type"], "html")
         self.assertEqual(
             [target["label"] for target in xls_result["preview_targets"][1:]],
             ["Sheet1", "Notes"],
         )
         self.assertTrue(all(target["preview_type"] == "csv" for target in xls_result["preview_targets"][1:]))
+        preview_html = Path(xls_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("xlsx.full.min.js", preview_html)
+        self.assertIn("spreadsheet-preview-tabs", preview_html)
         value_only_result = retriever_tools.search(self.root, "Budget approved", None, None, None, 1, 20)
         self.assertEqual(value_only_result["total_hits"], 0)
 
@@ -16291,13 +16294,16 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         search_result = retriever_tools.search(self.root, "Budget Totals", None, None, None, 1, 20)
         xlsx_result = search_result["results"][0]
         self.assertEqual(xlsx_result["file_name"], "budget.xlsx")
-        self.assertEqual(xlsx_result["preview_targets"][0]["preview_type"], "native")
-        self.assertEqual(xlsx_result["preview_rel_path"], "budget.xlsx")
+        self.assertTrue(xlsx_result["preview_rel_path"].endswith(".html"))
+        self.assertEqual(xlsx_result["preview_targets"][0]["preview_type"], "html")
         self.assertEqual(
             [target["label"] for target in xlsx_result["preview_targets"][1:]],
             ["Budget", "Notes"],
         )
         self.assertTrue(all(target["preview_type"] == "csv" for target in xlsx_result["preview_targets"][1:]))
+        preview_html = Path(xlsx_result["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("xlsx.full.min.js", preview_html)
+        self.assertIn("spreadsheet-preview-tabs", preview_html)
 
         self.assertEqual(
             retriever_tools.search(self.root, "Needs review", None, None, None, 1, 20)["results"][0]["file_name"],
@@ -16344,7 +16350,36 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         search_result = retriever_tools.search(self.root, "Status", None, None, None, 1, 20)
         self.assertEqual(search_result["results"][0]["file_name"], "pipeline.csv")
-        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "native")
+        self.assertTrue(search_result["results"][0]["preview_rel_path"].endswith(".html"))
+        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "html")
+        preview_html = Path(search_result["results"][0]["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("xlsx.full.min.js", preview_html)
+        self.assertIn("pipeline.csv", preview_html)
+        self.assertEqual(retriever_tools.search(self.root, "Acme Corp", None, None, None, 1, 20)["total_hits"], 0)
+
+    def test_ingest_supports_tsv_structural_summary_without_indexing_values(self) -> None:
+        tsv_path = self.root / "pipeline.tsv"
+        tsv_path.write_text(
+            "Customer\tAmount\tStatus\nAcme Corp\t100\tPaid\nBeta LLC\t250\tHold\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        self.assertEqual(ingest_result["failed"], 0)
+
+        row = self.fetch_document_row("pipeline.tsv")
+        self.assertEqual(row["content_type"], "Spreadsheet / Table")
+        self.assertEqual(row["page_count"], 1)
+
+        search_result = retriever_tools.search(self.root, "Status", None, None, None, 1, 20)
+        self.assertEqual(search_result["results"][0]["file_name"], "pipeline.tsv")
+        self.assertTrue(search_result["results"][0]["preview_rel_path"].endswith(".html"))
+        self.assertEqual(search_result["results"][0]["preview_targets"][0]["preview_type"], "html")
+        preview_html = Path(search_result["results"][0]["preview_targets"][0]["abs_path"]).read_text(encoding="utf-8")
+        self.assertIn("xlsx.full.min.js", preview_html)
+        self.assertIn("pipeline.tsv", preview_html)
         self.assertEqual(retriever_tools.search(self.root, "Acme Corp", None, None, None, 1, 20)["total_hits"], 0)
 
     def test_ingest_supports_pptx_deck_preview_images_and_notes(self) -> None:
