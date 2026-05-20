@@ -24910,16 +24910,21 @@ class ClaudeGlobalInstallerTests(unittest.TestCase):
         translate_text = translate_path.read_text(encoding="utf-8")
         self.assertIn("python3 -m retriever translate", translate_text)
         self.assertIn("--target-language", translate_text)
+        self.assertIn("--control-number", translate_text)
 
         extract_text = extract_path.read_text(encoding="utf-8")
         self.assertIn("python3 -m retriever extract", extract_text)
         self.assertIn("<field_name>", extract_text)
+        self.assertIn("--control-number", extract_text)
 
         ocr_text = ocr_path.read_text(encoding="utf-8")
         self.assertIn("python3 -m retriever ocr", ocr_text)
+        self.assertIn("--control-number", ocr_text)
+        self.assertIn("Use `--control-number` for visible `SR...`", ocr_text)
 
         describe_images_text = describe_images_path.read_text(encoding="utf-8")
         self.assertIn("python3 -m retriever describe-images", describe_images_text)
+        self.assertIn("--control-number", describe_images_text)
 
         export_text = export_path.read_text(encoding="utf-8")
         self.assertIn('slash_command="$slash_command --run-to-completion"', export_text)
@@ -25415,6 +25420,7 @@ sys.stdout.write(os.environ.get("FAKE_CLAUDE_OUTPUT", ""))
             str(self.root),
             "--doc-id",
             str(image_only_row["id"]),
+            "--no-cascade-metadata",
             "--provider",
             "static_text",
             "--parameters-json",
@@ -25424,9 +25430,107 @@ sys.stdout.write(os.environ.get("FAKE_CLAUDE_OUTPUT", ""))
         self.assertIsNotNone(payload)
         self.assertEqual(payload["command"], "ocr")
         self.assertEqual(payload["run"]["status"], "completed")
+        self.assertFalse(payload["metadata_cascade_requested"])
+        self.assertIsNone(payload["metadata_refresh"])
 
         updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
         self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+    def test_python_m_retriever_ocr_accepts_control_number_selector(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "ocr",
+            str(self.root),
+            "--control-number",
+            str(image_only_row["control_number"]),
+            "--no-cascade-metadata",
+            "--provider",
+            "static_text",
+            "--parameters-json",
+            "{\"page_text\":\"OCR page {page_number}\"}",
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["command"], "ocr")
+        self.assertEqual(payload["run"]["status"], "completed")
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+    def test_python_m_retriever_doc_id_rejects_control_number_with_hint(self) -> None:
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "ocr",
+            str(self.root),
+            "--doc-id",
+            "SR000542",
+            "--provider",
+            "static_text",
+            "--parameters-json",
+            "{\"page_text\":\"OCR page {page_number}\"}",
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertIsNone(payload)
+        self.assertIn("looks like a control number or Bates label", stderr_text)
+        self.assertIn("--control-number SR000542", stderr_text)
+
+    def test_python_m_retriever_ocr_defaults_to_metadata_cascade(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+        parameters_json = json.dumps(
+            {
+                "page_text": (
+                    "From: Alice Example <alice@example.com>\n"
+                    "Sent: Wednesday, February 25, 2015 11:24 AM\n"
+                    "To: Bob Example <bob@example.com>\n"
+                    "Cc: Carol Example <carol@example.com>\n"
+                    "Subject: Project Update\n\n"
+                    "Body page {page_number}"
+                )
+            }
+        )
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "ocr",
+            str(self.root),
+            "--doc-id",
+            str(image_only_row["id"]),
+            "--provider",
+            "static_text",
+            "--parameters-json",
+            parameters_json,
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["command"], "ocr")
+        self.assertTrue(payload["metadata_cascade_requested"])
+        metadata_refresh = payload["metadata_refresh"]
+        self.assertEqual(metadata_refresh["updated_documents"], 1)
+        self.assertGreaterEqual(metadata_refresh["updated_fields"], 3)
+        self.assertIn("[progress]", stderr_text)
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+        self.assertEqual(updated_row["author"], "Alice Example <alice@example.com>")
+        self.assertEqual(updated_row["date_created"], "2015-02-25T11:24:00Z")
+        self.assertIn("Alice Example <alice@example.com>", updated_row["participants"] or "")
+        self.assertIn("Bob Example <bob@example.com>", updated_row["participants"] or "")
+        self.assertIn("Carol Example <carol@example.com>", updated_row["participants"] or "")
 
     def test_python_m_retriever_run_as_worker_executes_existing_ocr_run(self) -> None:
         production_root = self.write_production_fixture()
@@ -25487,10 +25591,92 @@ sys.stdout.write(os.environ.get("FAKE_CLAUDE_OUTPUT", ""))
         self.assertTrue(payload["worker_mode"])
         self.assertEqual(payload["session_reason"], "terminal")
         self.assertEqual(payload["run"]["status"], "completed")
+        self.assertFalse(payload["metadata_cascade_requested"])
+        self.assertIsNone(payload["metadata_refresh"])
         self.assertIn("[progress]", stderr_text)
 
         updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
         self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+    def test_python_m_retriever_run_defaults_to_metadata_cascade_for_ocr_runs(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Run OCR Cascade", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "run_ocr_cascade",
+            "--instruction",
+            "Transcribe the page.",
+            "--provider",
+            "static_text",
+            "--capability",
+            "vision_ocr",
+            "--input-basis",
+            "source_parts",
+            "--parameters-json",
+            json.dumps(
+                {
+                    "page_text": (
+                        "From: Alice Example <alice@example.com>\n"
+                        "Sent: Wednesday, February 25, 2015 11:24 AM\n"
+                        "To: Bob Example <bob@example.com>\n"
+                        "Cc: Carol Example <carol@example.com>\n"
+                        "Subject: Project Update\n\n"
+                        "Body page {page_number}"
+                    )
+                }
+            ),
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        assert create_version_payload is not None
+
+        run_create_exit, run_create_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(create_version_payload["job_version"]["id"]),
+            "--activation-policy",
+            "always",
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(run_create_exit, 0)
+        self.assertIsNotNone(run_create_payload)
+        assert run_create_payload is not None
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "run",
+            str(self.root),
+            "--run-id",
+            str(run_create_payload["run"]["id"]),
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["command"], "run")
+        self.assertTrue(payload["metadata_cascade_requested"])
+        metadata_refresh = payload["metadata_refresh"]
+        self.assertEqual(metadata_refresh["updated_documents"], 1)
+        self.assertGreaterEqual(metadata_refresh["updated_fields"], 3)
+        self.assertIn("[progress]", stderr_text)
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+        self.assertEqual(updated_row["author"], "Alice Example <alice@example.com>")
+        self.assertEqual(updated_row["date_created"], "2015-02-25T11:24:00Z")
+        self.assertIn("Alice Example <alice@example.com>", updated_row["participants"] or "")
+        self.assertIn("Bob Example <bob@example.com>", updated_row["participants"] or "")
+        self.assertIn("Carol Example <carol@example.com>", updated_row["participants"] or "")
 
     def test_python_m_retriever_ocr_rotates_workers_for_long_runs(self) -> None:
         doc_ids: list[int] = []

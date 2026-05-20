@@ -81,8 +81,48 @@ def render_native_help_section() -> str:
     )
 
 
+def parse_document_id(value: str) -> int:
+    normalized = str(value or "").strip()
+    try:
+        return int(normalized)
+    except (TypeError, ValueError) as exc:
+        looks_like_control_number = any(character.isalpha() for character in normalized) and any(
+            character.isdigit() for character in normalized
+        )
+        if looks_like_control_number:
+            raise argparse.ArgumentTypeError(
+                f"{normalized!r} looks like a control number or Bates label, not a numeric document id. "
+                f"Use --control-number {normalized} or --bates {normalized}."
+            ) from exc
+        raise argparse.ArgumentTypeError(f"Document ids must be integers; got {normalized!r}.") from exc
+
+
+def sql_string_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def build_control_number_filter(control_numbers: Sequence[str] | None) -> list[str] | None:
+    normalized_control_numbers = [str(value or "").strip() for value in list(control_numbers or []) if str(value or "").strip()]
+    if not normalized_control_numbers:
+        return None
+    literals = ", ".join(sql_string_literal(value) for value in normalized_control_numbers)
+    return [f"control_number IN ({literals})"]
+
+
 def add_selector_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--doc-id", dest="document_ids", action="append", type=int, help="Document id (repeatable)")
+    parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=parse_document_id,
+        help="Internal numeric document id (repeatable)",
+    )
+    parser.add_argument(
+        "--control-number",
+        dest="control_numbers",
+        action="append",
+        help="Visible control number / production label (repeatable)",
+    )
     parser.add_argument(
         "--filter",
         dest="filters",
@@ -166,6 +206,11 @@ def build_parser(tools: Any) -> argparse.ArgumentParser:
         "--no-publish",
         action="store_true",
         help="Do not auto-publish bound structured extraction outputs after completion",
+    )
+    run_parser.add_argument(
+        "--no-cascade-metadata",
+        action="store_true",
+        help="Do not auto-refresh text-derived metadata when a high-level OCR run finalizes",
     )
 
     translate_parser = subparsers.add_parser("translate", help="Create a translation run and execute it to completion")
@@ -265,6 +310,11 @@ def build_parser(tools: Any) -> argparse.ArgumentParser:
         type=int,
         help="Optional maximum number of backend step calls before stopping with an error",
     )
+    ocr_parser.add_argument(
+        "--no-cascade-metadata",
+        action="store_true",
+        help="Do not auto-refresh text-derived metadata after OCR finalization",
+    )
     add_selector_arguments(ocr_parser)
 
     describe_parser = subparsers.add_parser(
@@ -320,6 +370,7 @@ def parse_json_object(value: str | None, *, label: str) -> dict[str, object]:
 def has_explicit_selectors(args: argparse.Namespace) -> bool:
     return bool(
         getattr(args, "document_ids", None)
+        or getattr(args, "control_numbers", None)
         or getattr(args, "filters", None)
         or getattr(args, "bates", None)
         or getattr(args, "dataset_names", None)
@@ -1110,6 +1161,10 @@ def create_processing_run(
     select_from_scope = bool(getattr(args, "select_from_scope", False))
     if not has_explicit_selectors(args):
         select_from_scope = True
+    raw_filters = list(getattr(args, "filters", None) or [])
+    control_number_filter = build_control_number_filter(getattr(args, "control_numbers", None))
+    if control_number_filter is not None:
+        raw_filters.append(control_number_filter)
     return tools.create_run(
         root,
         job_version_id=job_version_id,
@@ -1117,7 +1172,7 @@ def create_processing_run(
         document_ids=list(getattr(args, "document_ids", None) or []),
         query=str(getattr(args, "query", "") or ""),
         raw_bates=getattr(args, "bates", None),
-        raw_filters=list(getattr(args, "filters", None) or []),
+        raw_filters=raw_filters,
         from_run_id=getattr(args, "from_run_id", None),
         select_from_scope=select_from_scope,
         activation_policy=activation_policy,
@@ -1316,6 +1371,7 @@ def run_worker_session(
     limit: int | None,
     max_steps: int | None,
     publish_bound_outputs: bool,
+    cascade_ocr_metadata: bool,
     progress: NativeProgressPrinter | None = None,
 ) -> dict[str, object]:
     normalized_claimed_by = str(claimed_by or "").strip()
@@ -1334,6 +1390,10 @@ def run_worker_session(
     final_run_payload: dict[str, object] | None = None
     session_reason = "idle"
     handoff_claimed_by_hint: str | None = None
+    metadata_refresh: dict[str, object] | None = None
+    metadata_cascade_requested = False
+    stale_text_derived_metadata_document_ids: list[int] = []
+    next_recommended_commands: list[str] = []
     progress_printer = progress or NativeProgressPrinter(command_name)
 
     try:
@@ -1392,7 +1452,11 @@ def run_worker_session(
                     raise tools.RetrieverError(
                         f"Reached --max-steps={max_steps} before run {run_id} reached a terminal state."
                     )
-                finalize_payload = tools.finalize_ocr_run(root, run_id=run_id)
+                finalize_payload = tools.finalize_ocr_run(
+                    root,
+                    run_id=run_id,
+                    cascade_metadata=cascade_ocr_metadata,
+                )
                 step_calls += 1
                 step_payloads.append(
                     {
@@ -1406,6 +1470,15 @@ def run_worker_session(
                     }
                 )
                 final_run_payload = dict(finalize_payload.get("run") or final_run_payload)
+                metadata_cascade_requested = bool(finalize_payload.get("metadata_cascade_requested"))
+                metadata_refresh_payload = finalize_payload.get("metadata_refresh")
+                if isinstance(metadata_refresh_payload, dict):
+                    metadata_refresh = metadata_refresh_payload
+                stale_text_derived_metadata_document_ids = [
+                    int(document_id)
+                    for document_id in list(finalize_payload.get("stale_text_derived_metadata_document_ids") or [])
+                ]
+                next_recommended_commands = list(finalize_payload.get("next_recommended_commands") or [])
             elif finalization_action == "finalize_image_description":
                 if max_steps is not None and step_calls >= max_steps:
                     raise tools.RetrieverError(
@@ -1521,6 +1594,10 @@ def run_worker_session(
             "worker_finish": worker_finish_payload,
             "session_reason": session_reason,
             "handoff_claimed_by_hint": handoff_claimed_by_hint,
+            "metadata_refresh": metadata_refresh,
+            "metadata_cascade_requested": metadata_cascade_requested,
+            "stale_text_derived_metadata_document_ids": stale_text_derived_metadata_document_ids,
+            "next_recommended_commands": next_recommended_commands,
         }
     except Exception as exc:
         finish_worker_best_effort(
@@ -1552,6 +1629,7 @@ def run_to_completion(
     limit: int | None,
     max_steps: int | None,
     publish_bound_outputs: bool,
+    cascade_ocr_metadata: bool,
 ) -> dict[str, object]:
     base_claimed_by = str(claimed_by or f"retriever-run-{run_id}").strip()
     if not base_claimed_by:
@@ -1568,6 +1646,10 @@ def run_to_completion(
     publish_error = None
     final_run_payload: dict[str, object] | None = None
     results: list[dict[str, object]] = []
+    metadata_refresh: dict[str, object] | None = None
+    metadata_cascade_requested = False
+    stale_text_derived_metadata_document_ids: list[int] = []
+    next_recommended_commands: list[str] = []
     progress = NativeProgressPrinter(command_name)
     while True:
         remaining_steps = None if max_steps is None else max_steps - step_calls
@@ -1586,6 +1668,7 @@ def run_to_completion(
             limit=limit,
             max_steps=remaining_steps,
             publish_bound_outputs=publish_bound_outputs,
+            cascade_ocr_metadata=cascade_ocr_metadata,
             progress=progress,
         )
         step_calls += int(session_payload.get("step_calls") or 0)
@@ -1601,6 +1684,18 @@ def run_to_completion(
             publish_error = str(session_payload["publish_error"])
         if session_payload.get("results"):
             results = list(session_payload.get("results") or [])
+        metadata_refresh_payload = session_payload.get("metadata_refresh")
+        if isinstance(metadata_refresh_payload, dict):
+            metadata_refresh = metadata_refresh_payload
+        if session_payload.get("metadata_cascade_requested"):
+            metadata_cascade_requested = True
+        if session_payload.get("stale_text_derived_metadata_document_ids"):
+            stale_text_derived_metadata_document_ids = [
+                int(document_id)
+                for document_id in list(session_payload.get("stale_text_derived_metadata_document_ids") or [])
+            ]
+        if session_payload.get("next_recommended_commands"):
+            next_recommended_commands = list(session_payload.get("next_recommended_commands") or [])
         worker_finish_payload = session_payload.get("worker_finish")
         if isinstance(worker_finish_payload, dict):
             worker_finishes.append(worker_finish_payload)
@@ -1628,6 +1723,10 @@ def run_to_completion(
         "publish_error": publish_error,
         "worker_finish": worker_finishes[-1] if worker_finishes else None,
         "worker_finishes": worker_finishes,
+        "metadata_refresh": metadata_refresh,
+        "metadata_cascade_requested": metadata_cascade_requested,
+        "stale_text_derived_metadata_document_ids": stale_text_derived_metadata_document_ids,
+        "next_recommended_commands": next_recommended_commands,
     }
 
 
@@ -1663,6 +1762,7 @@ def handle_run(tools: Any, args: argparse.Namespace) -> dict[str, object]:
                 limit=args.limit,
                 max_steps=args.max_steps,
                 publish_bound_outputs=(not args.no_publish),
+                cascade_ocr_metadata=False,
             ),
         }
     return {
@@ -1678,6 +1778,7 @@ def handle_run(tools: Any, args: argparse.Namespace) -> dict[str, object]:
             limit=args.limit,
             max_steps=args.max_steps,
             publish_bound_outputs=(not args.no_publish),
+            cascade_ocr_metadata=(not args.no_cascade_metadata),
         ),
     }
 
@@ -1723,6 +1824,7 @@ def handle_translate(tools: Any, args: argparse.Namespace) -> dict[str, object]:
         limit=None,
         max_steps=args.max_steps,
         publish_bound_outputs=False,
+        cascade_ocr_metadata=False,
     )
     return {
         "status": "ok",
@@ -1795,6 +1897,7 @@ def handle_extract(tools: Any, args: argparse.Namespace) -> dict[str, object]:
         limit=None,
         max_steps=args.max_steps,
         publish_bound_outputs=True,
+        cascade_ocr_metadata=False,
     )
     return {
         "status": "ok",
@@ -1848,6 +1951,7 @@ def handle_ocr(tools: Any, args: argparse.Namespace) -> dict[str, object]:
         limit=None,
         max_steps=args.max_steps,
         publish_bound_outputs=False,
+        cascade_ocr_metadata=(not args.no_cascade_metadata),
     )
     return {
         "status": "ok",
@@ -1905,6 +2009,7 @@ def handle_describe_images(tools: Any, args: argparse.Namespace) -> dict[str, ob
         limit=None,
         max_steps=args.max_steps,
         publish_bound_outputs=False,
+        cascade_ocr_metadata=False,
     )
     return {
         "status": "ok",
@@ -1973,6 +2078,14 @@ def render_human_summary(payload: dict[str, object]) -> str:
     handoff_claimed_by_hint = str(payload.get("handoff_claimed_by_hint") or "").strip()
     if handoff_claimed_by_hint:
         notes.append(f"next worker `{handoff_claimed_by_hint}`")
+    metadata_refresh_payload = payload.get("metadata_refresh")
+    if isinstance(metadata_refresh_payload, dict):
+        refreshed_documents = int(metadata_refresh_payload.get("updated_documents") or 0)
+        refreshed_fields = int(metadata_refresh_payload.get("updated_fields") or 0)
+        if refreshed_documents or refreshed_fields:
+            notes.append(f"metadata refreshed for {refreshed_documents} docs / {refreshed_fields} fields")
+    elif payload.get("metadata_cascade_requested"):
+        notes.append("metadata cascade requested")
     if command == "translate":
         target_language = payload.get("target_language")
         if target_language:

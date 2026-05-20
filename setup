@@ -123,7 +123,7 @@ WORKSPACE_ARGS_COMMANDS: tuple[WorkspaceArgsCommandSpec, ...] = (
         "Create a translation run for the current scope or explicit selectors and execute it to completion",
         "translate",
         "first",
-        "Pass `--target-language <language>` and optional selectors like `--doc-id`, `--filter`, `--dataset`, or `--keyword`.",
+        "Pass `--target-language <language>` and optional selectors like `--doc-id`, `--control-number`, `--filter`, `--dataset`, or `--keyword`.",
         extra_guidance=(
             "If you do not pass any selectors, Retriever automatically uses the current persisted browse scope.",
             "Use `--provider` and `--model` when you want to override the default processing provider configuration.",
@@ -134,7 +134,7 @@ WORKSPACE_ARGS_COMMANDS: tuple[WorkspaceArgsCommandSpec, ...] = (
         "Create a structured extraction run for one field and execute it to completion",
         "extract",
         "first",
-        "Pass `<field_name> --instruction \"...\"` and optional selectors like `--doc-id`, `--filter`, `--dataset`, or `--keyword`.",
+        "Pass `<field_name> --instruction \"...\"` and optional selectors like `--doc-id`, `--control-number`, `--filter`, `--dataset`, or `--keyword`.",
         extra_guidance=(
             "If you do not pass any selectors, Retriever automatically uses the current persisted browse scope.",
             "Completed extraction runs auto-publish bound outputs into the target custom field.",
@@ -145,7 +145,7 @@ WORKSPACE_ARGS_COMMANDS: tuple[WorkspaceArgsCommandSpec, ...] = (
         "Create an OCR run and execute it to completion",
         "ocr",
         "first",
-        "Optional selectors: `--doc-id`, `--filter`, `--dataset`, or `--keyword`. Optional provider overrides: `--provider`, `--model`, `--parameters-json`.",
+        "Optional selectors: `--doc-id`, `--control-number`, `--filter`, `--dataset`, or `--keyword`. Use `--control-number` for visible `SR...` / production labels instead of `--doc-id`. Optional provider overrides: `--provider`, `--model`, `--parameters-json`.",
         extra_guidance=(
             "If you do not pass any selectors, Retriever automatically uses the current persisted browse scope.",
         ),
@@ -155,7 +155,7 @@ WORKSPACE_ARGS_COMMANDS: tuple[WorkspaceArgsCommandSpec, ...] = (
         "Create an image-description run and execute it to completion",
         "describe-images",
         "first",
-        "Optional selectors: `--doc-id`, `--filter`, `--dataset`, or `--keyword`. Optional provider overrides: `--provider`, `--model`, `--parameters-json`.",
+        "Optional selectors: `--doc-id`, `--control-number`, `--filter`, `--dataset`, or `--keyword`. Optional provider overrides: `--provider`, `--model`, `--parameters-json`.",
         extra_guidance=(
             "If you do not pass any selectors, Retriever automatically uses the current persisted browse scope.",
         ),
