@@ -343,6 +343,17 @@ def ingest_v2_sorted_pending_paths(paths: list[str]) -> list[str]:
     return sorted(dict.fromkeys(str(path).replace("\\", "/").strip("/") for path in paths))
 
 
+INGEST_V2_IGNORED_WORKSPACE_PARTS = {".retriever", ".claude"}
+
+
+def ingest_v2_path_is_workspace_internal(root: Path, path: Path) -> bool:
+    try:
+        rel_parts = path.resolve().relative_to(root.resolve()).parts
+    except ValueError:
+        return False
+    return any(part in INGEST_V2_IGNORED_WORKSPACE_PARTS for part in rel_parts)
+
+
 def ingest_v2_initial_pending_paths(root: Path, scan_scope: dict[str, object]) -> list[str]:
     pending: list[str] = []
     for scan_path in list(scan_scope.get("paths") or [root]):
@@ -2363,7 +2374,7 @@ def ingest_v2_planning_child_paths(root: Path, directory: Path, *, recursive: bo
         if not path_is_at_or_under(child, root):
             continue
         rel_path = ingest_v2_cursor_rel_path(root, child)
-        if ".retriever" in child.resolve().relative_to(root.resolve()).parts:
+        if ingest_v2_path_is_workspace_internal(root, child):
             continue
         if child.is_dir() and not recursive:
             continue
@@ -7698,7 +7709,7 @@ def ingest_v2_plan_step(
                     )
                     cursor["listed_directories"] = int(cursor.get("listed_directories") or 0) + 1
                 elif candidate_path.is_file():
-                    if ".retriever" in candidate_path.resolve().relative_to(root.resolve()).parts:
+                    if ingest_v2_path_is_workspace_internal(root, candidate_path):
                         cursor["skipped_excluded_paths"] = int(cursor.get("skipped_excluded_paths") or 0) + 1
                     elif not ingest_scan_scope_contains_rel_path(scan_scope, rel_path):
                         cursor["skipped_excluded_paths"] = int(cursor.get("skipped_excluded_paths") or 0) + 1

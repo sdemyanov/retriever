@@ -473,7 +473,11 @@ def extract_subcommands() -> list[str]:
         text=True,
         check=True,
     )
-    match = re.search(r"\{([^}]+)\}", result.stdout)
+    match = re.search(
+        r"positional arguments:\s*\n\s+\{([^}]+)\}",
+        result.stdout,
+        re.DOTALL,
+    )
     if not match:
         raise SystemExit("Could not parse subcommand list from tools.py --help")
     raw = match.group(1)

@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Install Retriever Claude Code commands globally under ~/.claude/commands/retriever.
+
+This is the Claude-first installer. It keeps Retriever's current backend in this
+checkout, but installs personal namespaced commands so Claude Code can use
+Retriever in any workspace opened at the desired workspace root.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import site
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "tools.py"
+PACKAGE_MAIN_PATH = REPO_ROOT / "retriever" / "__main__.py"
+COMMAND_NAMESPACE = "retriever"
+COMMANDS_SUBDIR = Path("commands") / COMMAND_NAMESPACE
+MANIFEST_PATH = Path("retriever-manifest.json")
+MANAGED_MARKER = "<!-- Managed by Retriever setup. Re-run the installer to update. -->"
+CLAUDE_MD_PATH = Path("CLAUDE.md")
+CLAUDE_SECTION_START = "<!-- BEGIN RETRIEVER CLAUDE SECTION -->"
+CLAUDE_SECTION_END = "<!-- END RETRIEVER CLAUDE SECTION -->"
+PTH_FILENAME = "retriever.pth"
+
+
+@dataclass(frozen=True)
+class SlashCommandSpec:
+    name: str
+    description: str
+
+
+@dataclass(frozen=True)
+class FixedCommandSpec:
+    name: str
+    description: str
+    argv_after_tool: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkspaceArgsCommandSpec:
+    name: str
+    description: str
+    subcommand: str
+    workspace_position: str
+    arguments_hint: str
+    always_args: tuple[str, ...] = ()
+    default_args_if_empty: tuple[str, ...] = ()
+    extra_guidance: tuple[str, ...] = ()
+
+
+SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
+    SlashCommandSpec("search", "Search the active Retriever workspace using the persistent browse session"),
+    SlashCommandSpec("filter", "Add or clear SQL-like filters on the active Retriever browse session"),
+    SlashCommandSpec("dataset", "Inspect, set, rename, or clear the active dataset scope"),
+    SlashCommandSpec("sort", "Inspect or change the sort order for the active Retriever results"),
+    SlashCommandSpec("columns", "Inspect or change the visible columns for Retriever result tables"),
+    SlashCommandSpec("page", "Jump to a specific results page in the active Retriever browse session"),
+    SlashCommandSpec("page-size", "Inspect or change the Retriever results page size"),
+    SlashCommandSpec("next", "Advance to the next page of Retriever results"),
+    SlashCommandSpec("previous", "Go back to the previous page of Retriever results"),
+    SlashCommandSpec("scope", "Inspect, save, load, list, or clear the current Retriever browse scope"),
+    SlashCommandSpec("bates", "Scope Retriever browsing to a Bates or production-number range"),
+    SlashCommandSpec("from-run", "Scope Retriever browsing to documents from a processing run"),
+    SlashCommandSpec("documents", "Switch Retriever browsing back to document mode"),
+    SlashCommandSpec("conversations", "Switch Retriever browsing to conversation mode"),
+    SlashCommandSpec("entities", "Switch Retriever browsing to entity mode"),
+    SlashCommandSpec("export", "Start, inspect, or resume Retriever table and archive exports"),
+)
+
+FIXED_COMMANDS: tuple[FixedCommandSpec, ...] = (
+    FixedCommandSpec(
+        "status",
+        "Check Retriever workspace readiness and runtime state",
+        ("workspace", "status"),
+    ),
+    FixedCommandSpec(
+        "init",
+        "Initialize or repair Retriever workspace state",
+        ("workspace", "init"),
+    ),
+)
+
+WORKSPACE_ARGS_COMMANDS: tuple[WorkspaceArgsCommandSpec, ...] = (
+    WorkspaceArgsCommandSpec(
+        "open",
+        "Open one Retriever document preview and include a short extracted-text summary",
+        "get-doc",
+        "first",
+        "Pass at least `--doc-id <id>`. Use `/retriever:search` first if you need to discover the document id.",
+        always_args=("--include-text", "summary"),
+    ),
+    WorkspaceArgsCommandSpec(
+        "ingest",
+        "Start or resume Retriever ingest for the current workspace",
+        "ingest",
+        "last",
+        "Examples: `--recursive`, `--path raw`, `--file-types pdf,docx`.",
+        always_args=("--run-to-completion",),
+        default_args_if_empty=("--recursive",),
+        extra_guidance=(
+            "This command already includes `--run-to-completion`, so let it keep stepping until Retriever reaches a terminal ingest state.",
+            "Do not stop early or ask the user to continue manually unless the Bash command was interrupted or Claude explicitly backgrounded it.",
+        ),
+    ),
+)
+
+
+def yaml_quote(value: str) -> str:
+    return json.dumps(value)
+
+
+def shell_quote(path: Path | str) -> str:
+    return shlex.quote(str(path))
+
+
+def retriever_command_prefix() -> str:
+    return "python3 -m retriever"
+
+
+def render_frontmatter(description: str) -> str:
+    allowed_tools = "Bash(python3 -m retriever:*)"
+    return "\n".join(
+        (
+            "---",
+            f"description: {yaml_quote(description)}",
+            f"allowed-tools: {yaml_quote(allowed_tools)}",
+            "---",
+            "",
+        )
+    )
+
+
+def render_slash_command(spec: SlashCommandSpec, *, tool_path: Path, repo_root: Path) -> str:
+    base_command = f"/{COMMAND_NAMESPACE}:{spec.name}"
+    del tool_path
+    example = f"{retriever_command_prefix()} slash \"$PWD\" '<slash command text>'"
+    if spec.name == "export":
+        execution_block = (
+            "```bash\n"
+            + "slash_args=\"$ARGUMENTS\"\n"
+            + "if [ -z \"$slash_args\" ]; then\n"
+            + "  slash_command=\"/export\"\n"
+            + "else\n"
+            + "  slash_command=\"/export $slash_args\"\n"
+            + "fi\n"
+            + "case \"$slash_args\" in\n"
+            + "  table*|csv*|archive*)\n"
+            + "    case \" $slash_command \" in\n"
+            + "      *\" --run-to-completion \"*) ;;\n"
+            + "      *) slash_command=\"$slash_command --run-to-completion\" ;;\n"
+            + "    esac\n"
+            + "    ;;\n"
+            + "esac\n"
+            + f"{retriever_command_prefix()} slash \"$PWD\" \"$slash_command\"\n"
+            + "```\n\n"
+        )
+        slash_guidance = (
+            "Build the slash command from the user arguments, then run the shell script above exactly once.\n"
+            "- `/export table ...` and `/export archive ...` should always keep the hidden `--run-to-completion` suffix.\n"
+            "- `/export status ...` should pass through unchanged.\n\n"
+        )
+    else:
+        execution_block = "```bash\n" + example + "\n```\n\n"
+        slash_guidance = (
+            "Build `<slash command text>` as:\n"
+            + f"- `/{spec.name}` if no user arguments were provided\n"
+            + f"- otherwise `/{spec.name} ` followed by the exact user arguments\n\n"
+            + "Quote the full slash command as one shell argument safely.\n\n"
+        )
+
+    return (
+        render_frontmatter(spec.description)
+        + MANAGED_MARKER
+        + "\n\n"
+        + f"# Retriever {base_command}\n\n"
+        + "Use Retriever's existing persistent browse/session surface for the current workspace.\n\n"
+        + "- Workspace root: current Claude working directory (`$PWD`)\n"
+        + f"- Retriever repo: `{repo_root}`\n"
+        + "- User arguments: `$ARGUMENTS`\n\n"
+        + "Use the Bash tool to run exactly one Retriever command:\n\n"
+        + execution_block
+        + slash_guidance
+        + "Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.\n"
+    )
+
+
+def render_fixed_command(spec: FixedCommandSpec, *, tool_path: Path, repo_root: Path) -> str:
+    del tool_path
+    argv = [*retriever_command_prefix().split(), *spec.argv_after_tool, "$PWD"]
+    display_command = " ".join(shell_quote(part) if part != "$PWD" else '"$PWD"' for part in argv)
+    return (
+        render_frontmatter(spec.description)
+        + MANAGED_MARKER
+        + "\n\n"
+        + f"# Retriever /{COMMAND_NAMESPACE}:{spec.name}\n\n"
+        + "- Workspace root: current Claude working directory (`$PWD`)\n"
+        + f"- Retriever repo: `{repo_root}`\n\n"
+        + "Use the Bash tool to run exactly one Retriever command:\n\n"
+        + "```bash\n"
+        + display_command
+        + "\n```\n\n"
+        + "Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.\n"
+    )
+
+
+def render_workspace_args_command(spec: WorkspaceArgsCommandSpec, *, tool_path: Path, repo_root: Path) -> str:
+    always_args_display = " ".join(shell_quote(arg) for arg in spec.always_args)
+    default_args_display = " ".join(shell_quote(arg) for arg in spec.default_args_if_empty)
+    if spec.workspace_position == "first":
+        if default_args_display:
+            display_command = (
+                f"{retriever_command_prefix()} {spec.subcommand} "
+                + (f"{always_args_display} " if always_args_display else "")
+                + "\"$PWD\" [user arguments or default arguments]"
+            )
+        else:
+            display_command = (
+                f"{retriever_command_prefix()} {spec.subcommand} "
+                + (f"{always_args_display} " if always_args_display else "")
+                + "\"$PWD\" [user arguments]"
+            )
+        placement_rule = "Place the workspace path before the user arguments."
+    elif spec.workspace_position == "last":
+        if default_args_display:
+            display_command = (
+                f"{retriever_command_prefix()} {spec.subcommand} "
+                + (f"{always_args_display} " if always_args_display else "")
+                + "[user arguments or default arguments] \"$PWD\""
+            )
+        else:
+            display_command = (
+                f"{retriever_command_prefix()} {spec.subcommand} "
+                + (f"{always_args_display} " if always_args_display else "")
+                + "[user arguments] \"$PWD\""
+            )
+        placement_rule = "Place all user arguments before the workspace path."
+    else:
+        raise ValueError(f"Unknown workspace_position: {spec.workspace_position}")
+
+    if spec.default_args_if_empty:
+        empty_args_rule = (
+            "If the user did not provide any arguments, use these default arguments instead: "
+            f"`{default_args_display}`."
+        )
+    else:
+        empty_args_rule = "If no arguments are needed, omit `[user arguments]` entirely."
+
+    if spec.always_args:
+        always_args_rule = f"Always include these arguments: `{always_args_display}`."
+    else:
+        always_args_rule = None
+
+    return (
+        render_frontmatter(spec.description)
+        + MANAGED_MARKER
+        + "\n\n"
+        + f"# Retriever /{COMMAND_NAMESPACE}:{spec.name}\n\n"
+        + "- Workspace root: current Claude working directory (`$PWD`)\n"
+        + f"- Retriever repo: `{repo_root}`\n"
+        + "- User arguments: `$ARGUMENTS`\n\n"
+        + "Use the Bash tool to run exactly one Retriever command:\n\n"
+        + "```bash\n"
+        + display_command
+        + "\n```\n\n"
+        + placement_rule
+        + "\n"
+        + spec.arguments_hint
+        + "\n\n"
+        + (always_args_rule + "\n\n" if always_args_rule else "")
+        + empty_args_rule
+        + "\n\n"
+        + ("\n".join(spec.extra_guidance) + "\n\n" if spec.extra_guidance else "")
+        + "Return stdout exactly as the entire response. No preamble. No commentary. No reformatting.\n"
+    )
+
+
+def load_manifest(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def managed_paths_from_manifest(manifest: dict[str, object] | None, claude_home: Path) -> set[Path]:
+    if not manifest:
+        return set()
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return set()
+    return {claude_home / relpath for relpath in files if isinstance(relpath, str)}
+
+
+def remove_previous_managed_files(paths: set[Path], commands_dir: Path) -> None:
+    for path in sorted(paths, reverse=True):
+        if not path.exists():
+            continue
+        if commands_dir not in path.parents:
+            continue
+        path.unlink()
+
+
+def render_claude_md_section() -> str:
+    commands = [
+        "/retriever:init",
+        "/retriever:status",
+        "/retriever:ingest",
+        "/retriever:search",
+        "/retriever:filter",
+        "/retriever:dataset",
+        "/retriever:sort",
+        "/retriever:columns",
+        "/retriever:page",
+        "/retriever:page-size",
+        "/retriever:next",
+        "/retriever:previous",
+        "/retriever:documents",
+        "/retriever:conversations",
+        "/retriever:entities",
+        "/retriever:open",
+        "/retriever:export",
+    ]
+    command_lines = "\n".join(f"- `{command}`" for command in commands)
+    return (
+        f"{CLAUDE_SECTION_START}\n"
+        + "## Retriever\n\n"
+        + "When a workspace contains a Retriever state directory at `./.retriever/`, prefer Retriever's installed slash commands over ad hoc Bash, Python, or SQL.\n\n"
+        + "Selection order:\n"
+        + "1. Use a `/retriever:*` slash command when it can satisfy the user's request.\n"
+        + "2. If no slash command fits, call the Retriever CLI directly with `python3 -m retriever ...`.\n"
+        + "3. Query `./.retriever/retriever.db` directly only for debugging or verification that Retriever cannot already answer.\n\n"
+        + "Behavior rules:\n"
+        + "- Preserve Retriever's stateful browse model. Prefer `/retriever:search`, `/retriever:documents`, `/retriever:conversations`, `/retriever:entities`, `/retriever:filter`, `/retriever:dataset`, `/retriever:sort`, `/retriever:columns`, `/retriever:page`, `/retriever:page-size`, `/retriever:next`, `/retriever:previous`, `/retriever:scope`, `/retriever:bates`, and `/retriever:from-run` over stateless one-off queries when the user is browsing.\n"
+        + "- For long-running ingest and export work, prefer the one-shot commands that already run to completion. Only fall back to direct backend recovery commands like `python3 -m retriever ingest-status ...` or `python3 -m retriever ingest-run-step ...` if the original command was interrupted.\n"
+        + "- Prefer `/retriever:open` for document previews. Do not rely on HTML anchors in preview URLs unless Claude Code preview handling is known to respect them.\n"
+        + "- Return Retriever's human summaries directly when they are sufficient. Avoid reprinting raw JSON unless the user asks for it.\n\n"
+        + "Available Retriever commands:\n"
+        + f"{command_lines}\n"
+        + f"{CLAUDE_SECTION_END}\n"
+    )
+
+
+def update_claude_md(claude_md_path: Path) -> None:
+    rendered_section = render_claude_md_section().rstrip() + "\n"
+    if claude_md_path.exists():
+        current = claude_md_path.read_text(encoding="utf-8")
+    else:
+        current = ""
+
+    start = current.find(CLAUDE_SECTION_START)
+    end = current.find(CLAUDE_SECTION_END)
+    if start != -1 and end != -1 and end > start:
+        end += len(CLAUDE_SECTION_END)
+        updated = current[:start].rstrip()
+        if updated:
+            updated += "\n\n"
+        updated += rendered_section
+        tail = current[end:].lstrip("\n")
+        if tail:
+            updated += "\n" + tail
+    else:
+        updated = current.rstrip()
+        if updated:
+            updated += "\n\n"
+        updated += rendered_section
+
+    claude_md_path.parent.mkdir(parents=True, exist_ok=True)
+    claude_md_path.write_text(updated, encoding="utf-8")
+
+
+def install_python_package_entrypoint(repo_root: Path, python_site_packages: Path) -> Path:
+    python_site_packages.mkdir(parents=True, exist_ok=True)
+    pth_path = python_site_packages / PTH_FILENAME
+    pth_path.write_text(str(repo_root) + "\n", encoding="utf-8")
+    return pth_path
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Install Retriever Claude Code commands globally under ~/.claude/commands/retriever."
+    )
+    parser.add_argument(
+        "--claude-home",
+        default=str(Path.home() / ".claude"),
+        help="Claude home directory. Defaults to ~/.claude.",
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=str(REPO_ROOT),
+        help="Retriever checkout to call from installed commands. Defaults to this repository.",
+    )
+    parser.add_argument(
+        "--python-site-packages",
+        default=str(Path(site.getusersitepackages()).expanduser()),
+        help="User site-packages directory that should receive the Retriever .pth registration.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing Retriever-managed files inside the retriever command namespace.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    claude_home = Path(args.claude_home).expanduser().resolve()
+    repo_root = Path(args.repo_root).expanduser().resolve()
+    python_site_packages = Path(args.python_site_packages).expanduser().resolve()
+    tool_path = repo_root / "skills" / "tool-template" / "tools.py"
+    package_main_path = repo_root / "retriever" / "__main__.py"
+    commands_dir = claude_home / COMMANDS_SUBDIR
+    manifest_path = claude_home / MANIFEST_PATH
+    claude_md_path = claude_home / CLAUDE_MD_PATH
+
+    if not tool_path.exists():
+        raise SystemExit(f"Could not find Retriever tools.py at: {tool_path}")
+    if not package_main_path.exists():
+        raise SystemExit(f"Could not find Retriever package entrypoint at: {package_main_path}")
+
+    previous_manifest = load_manifest(manifest_path)
+    previous_managed_files = managed_paths_from_manifest(previous_manifest, claude_home)
+    rendered_files = {
+        **{
+            f"{spec.name}.md": render_slash_command(spec, tool_path=tool_path, repo_root=repo_root)
+            for spec in SLASH_COMMANDS
+        },
+        **{
+            f"{spec.name}.md": render_fixed_command(spec, tool_path=tool_path, repo_root=repo_root)
+            for spec in FIXED_COMMANDS
+        },
+        **{
+            f"{spec.name}.md": render_workspace_args_command(spec, tool_path=tool_path, repo_root=repo_root)
+            for spec in WORKSPACE_ARGS_COMMANDS
+        },
+    }
+    target_paths = {commands_dir / filename for filename in rendered_files}
+
+    if commands_dir.exists():
+        unmanaged_paths = sorted(
+            path
+            for path in commands_dir.glob("*.md")
+            if path not in previous_managed_files and path not in target_paths
+        )
+        if unmanaged_paths and not args.force:
+            collision_list = "\n".join(f"- {path}" for path in unmanaged_paths)
+            raise SystemExit(
+                "Refusing to install because the Retriever namespace already contains unmanaged command files:\n"
+                + collision_list
+                + "\nRe-run with --force if you want to overwrite the namespace."
+            )
+
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    remove_previous_managed_files(previous_managed_files - target_paths, commands_dir)
+
+    for filename, content in sorted(rendered_files.items()):
+        (commands_dir / filename).write_text(content, encoding="utf-8")
+
+    pth_path = install_python_package_entrypoint(repo_root, python_site_packages)
+
+    manifest = {
+        "schema_version": 1,
+        "repo_root": str(repo_root),
+        "command_namespace": COMMAND_NAMESPACE,
+        "command_subdir": str(COMMANDS_SUBDIR),
+        "python_site_packages": str(python_site_packages),
+        "python_path_file": str(pth_path),
+        "files": [str(path.relative_to(claude_home)) for path in sorted(target_paths)],
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    update_claude_md(claude_md_path)
+
+    print(f"Installed {len(rendered_files)} Retriever Claude commands into {commands_dir}")
+    print(f"Registered `python3 -m retriever` via {pth_path}")
+    print(f"Updated Retriever guidance in {claude_md_path}")
+    print("Open Claude Code in a Retriever workspace root and run `/help` to see the new namespaced commands.")
+    print("Primary commands: /retriever:init, /retriever:status, /retriever:ingest, /retriever:search, /retriever:open, /retriever:export")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

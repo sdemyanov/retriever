@@ -192,16 +192,121 @@ Consequences:
 
 ## Loading Retriever
 
-The exact install flow depends on the host environment, but for local Claude CLI testing the fastest load is:
+For Claude Code, the primary install flow is a one-time global command install:
+
+```bash
+git clone --single-branch --depth 1 https://github.com/sdemyanov/retriever.git ~/.claude/skills/retriever
+cd ~/.claude/skills/retriever
+./setup
+```
+
+That writes namespaced personal commands under:
+
+```text
+~/.claude/commands/retriever/
+```
+
+It also updates your user-level Claude memory at:
+
+```text
+~/.claude/CLAUDE.md
+```
+
+The installed Retriever section tells Claude to prefer `/retriever:*` commands
+first, then call the Retriever backend directly if needed, and only inspect
+`./.retriever/retriever.db` as a last resort for debugging or verification.
+
+After running `./setup`:
+
+- open Claude Code in the Retriever workspace root you want to work in
+- run `/help` to confirm the new namespaced commands are present
+- `python3 -m retriever --help` now works from any directory that uses the same
+  Python interpreter as the installer
+- use `/retriever:init`, `/retriever:status`, `/retriever:ingest`,
+  `/retriever:search`, `/retriever:open`, and `/retriever:export` as the main
+  Claude-facing flow
+- use `/retriever:filter`, `/retriever:dataset`, `/retriever:sort`,
+  `/retriever:columns`, `/retriever:page`, `/retriever:page-size`,
+  `/retriever:next`, `/retriever:previous`, `/retriever:scope`,
+  `/retriever:bates`, `/retriever:from-run`, `/retriever:documents`,
+  `/retriever:conversations`, and `/retriever:entities` to keep the existing
+  persistent browse/session UX
+- `/retriever:ingest` automatically includes `--run-to-completion`, so it
+  keeps stepping the resumable ingest backend until the run reaches a terminal
+  state
+- `/retriever:export table ...` and `/retriever:export archive ...` also append
+  hidden `--run-to-completion`, so exports default to a one-shot user flow
+- `python3 -m retriever` now defaults to human-readable output, so installed
+  commands come back as short summaries instead of raw JSON where Retriever
+  supports it
+- if a long-running command is interrupted, use `python3 -m retriever ...`
+  recovery commands like `ingest-status`, `ingest-run-step`, or `cancel-run`
+  directly instead of expecting those lower-level verbs in the normal slash
+  surface
+
+`skills/tool-template/tools.py` still works as a compatibility path and keeps
+JSON as its default output mode, but `python3 -m retriever ...` is now the
+primary CLI entrypoint and defaults to human-readable output.
+
+### Legacy plugin / workspace-local paths
+
+For local plugin compatibility testing, you can still load the bundled plugin:
 
 ```bash
 claude --plugin-dir /path/to/retriever-plugin
 ```
 
-Once loaded:
+For project-local Claude Code testing without the global install, you can still
+use the workspace bridge below.
 
-- use natural-language requests such as "index this workspace" or "run retriever workspace status" for setup, ingest, exports, and job operations
-- use Retriever's persistent slash commands for day-to-day browsing and narrowing once a workspace is active
+### Claude Code v0 command bridge
+
+If you want to test Retriever in Claude Code without changing the plugin-first
+packaging model yet, install a small project-local command bridge into the
+target workspace:
+
+```bash
+./setup-claude-v0 /path/to/workspace
+```
+
+That writes Claude Code command files under:
+
+```text
+/path/to/workspace/.claude/commands/
+```
+
+The generated commands call this checkout's canonical bundled backend:
+`skills/tool-template/tools.py`.
+
+After running the installer:
+
+- open Claude Code in the target workspace, not in the Retriever repo
+- run `/help` to confirm the Retriever commands are present
+- use the existing Retriever browse vocabulary directly: `/search`, `/filter`,
+  `/dataset`, `/sort`, `/columns`, `/page`, `/page-size`, `/next`,
+  `/previous`, `/scope`, `/bates`, `/from-run`, and `/export`
+- use `/show-doc --doc-id <id>` to open one preview with a short extracted-text
+  summary
+- use the longer admin commands for generic maintenance verbs:
+  `/workspace-status`, `/init-workspace`, `/update-workspace`, `/ingest`,
+  `/ingest-status`, `/ingest-run-step`, `/ingest-cancel`,
+  `/ingest-production`, `/run-status`, `/run-job-step`, and `/cancel-run`
+- if you run `/ingest` with no arguments, the v0 bridge defaults to
+  `--recursive`
+- the v0 `/ingest` command always includes `--run-to-completion`, so it keeps
+  advancing the resumable ingest backend until the run reaches a terminal state
+- the v0 `/export table ...` and `/export archive ...` commands append hidden
+  `--run-to-completion`, so exports also default to one-shot completion
+- the generated commands call Retriever with `--human`, so workspace, ingest,
+  export, and `show-doc` return concise human output directly from Retriever
+
+The installer defaults to unprefixed command names so Retriever can be tested
+with its natural vocabulary. If the target workspace already has colliding
+Claude command names, re-run with a prefix:
+
+```bash
+./setup-claude-v0 /path/to/workspace --prefix retriever-
+```
 
 ## Typical workflows
 
@@ -218,9 +323,9 @@ In conversation:
 Direct CLI equivalents:
 
 ```bash
-python3 skills/tool-template/tools.py workspace status .
-python3 skills/tool-template/tools.py workspace init .
-python3 skills/tool-template/tools.py ingest . --recursive
+python3 -m retriever workspace status .
+python3 -m retriever workspace init .
+python3 -m retriever ingest . --recursive
 ```
 
 The `workspace` command groups runtime and schema maintenance into subcommands:
@@ -232,7 +337,7 @@ The `workspace` command groups runtime and schema maintenance into subcommands:
 Use `ingest-production` when you want to target a processed production root explicitly:
 
 ```bash
-python3 skills/tool-template/tools.py ingest-production . productions/VOL001
+python3 -m retriever ingest-production . productions/VOL001
 ```
 
 ### 2. Browse and narrow a collection
@@ -662,21 +767,21 @@ Examples:
 ### Health and setup
 
 ```bash
-python3 skills/tool-template/tools.py workspace status .
-python3 skills/tool-template/tools.py workspace status . --quick
-python3 skills/tool-template/tools.py workspace init .
-python3 skills/tool-template/tools.py workspace update .
-python3 skills/tool-template/tools.py schema-version
+python3 -m retriever workspace status .
+python3 -m retriever workspace status . --quick
+python3 -m retriever workspace init .
+python3 -m retriever workspace update .
+python3 -m retriever schema-version
 ```
 
 ### Search and retrieval
 
 ```bash
-python3 skills/tool-template/tools.py search . "merger" --filter "content_type = 'Email'" --mode view
-python3 skills/tool-template/tools.py get-doc . --doc-id 42 --include-text summary
-python3 skills/tool-template/tools.py list-chunks . --doc-id 42 --page 1 --per-page 20
-python3 skills/tool-template/tools.py search-chunks . "indemnification" --top-k 20
-python3 skills/tool-template/tools.py aggregate . --group-by dataset_name --metric count
+python3 -m retriever search . "merger" --filter "content_type = 'Email'" --mode view
+python3 -m retriever get-doc . --doc-id 42 --include-text summary
+python3 -m retriever list-chunks . --doc-id 42 --page 1 --per-page 20
+python3 -m retriever search-chunks . "indemnification" --top-k 20
+python3 -m retriever aggregate . --group-by dataset_name --metric count
 ```
 
 ### Export

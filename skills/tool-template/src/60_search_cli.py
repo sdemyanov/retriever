@@ -1860,10 +1860,299 @@ def prepare_cli_payload(command: str, payload: dict[str, object], *, verbose: bo
     return payload
 
 
+CLI_OUTPUT_MODE = "json"
+
+
+def set_cli_output_mode(mode: str) -> None:
+    global CLI_OUTPUT_MODE
+    CLI_OUTPUT_MODE = "human" if normalize_inline_whitespace(mode).lower() == "human" else "json"
+
+
+def cli_run_payload(payload: dict[str, object]) -> dict[str, object]:
+    run = payload.get("run")
+    if isinstance(run, dict):
+        return run
+    return payload
+
+
+def cli_work_item_counts(payload: dict[str, object]) -> dict[str, object]:
+    counts = payload.get("counts")
+    if not isinstance(counts, dict):
+        counts = cli_run_payload(payload).get("counts")
+    if not isinstance(counts, dict):
+        return {}
+    work_items = counts.get("work_items")
+    return dict(work_items) if isinstance(work_items, dict) else {}
+
+
+def cli_counts_by_unit_type(payload: dict[str, object]) -> dict[str, dict[str, object]]:
+    counts = payload.get("counts")
+    if not isinstance(counts, dict):
+        counts = cli_run_payload(payload).get("counts")
+    if not isinstance(counts, dict):
+        return {}
+    by_unit_type = counts.get("by_unit_type")
+    if not isinstance(by_unit_type, dict):
+        return {}
+    normalized: dict[str, dict[str, object]] = {}
+    for unit_type, unit_counts in by_unit_type.items():
+        if isinstance(unit_counts, dict):
+            normalized[str(unit_type)] = dict(unit_counts)
+    return normalized
+
+
+def human_count_label(value: object, singular: str, plural: str | None = None) -> str:
+    count = int(value or 0)
+    noun = singular if count == 1 else (plural or singular + "s")
+    return f"{count} {noun}"
+
+
+def humanize_unit_type(unit_type: str) -> str:
+    return unit_type.replace("_", " ")
+
+
+def first_status_detail(status_report: dict[str, object]) -> str | None:
+    for value in status_report.values():
+        if not isinstance(value, dict):
+            continue
+        if str(value.get("status") or "").lower() != "fail":
+            continue
+        detail = normalize_inline_whitespace(str(value.get("detail") or value.get("error") or ""))
+        if detail:
+            return detail
+    return None
+
+
+def render_workspace_human_output(payload: dict[str, object]) -> str:
+    action = normalize_inline_whitespace(str(payload.get("action") or "status")) or "status"
+    status_report = payload.get("status_report") if isinstance(payload.get("status_report"), dict) else {}
+    workspace_root = normalize_inline_whitespace(
+        str(
+            payload.get("workspace_root")
+            or status_report.get("workspace_root")
+            or (status_report.get("workspace") or {}).get("root")
+            or ""
+        )
+    )
+    overall = normalize_inline_whitespace(str(status_report.get("overall") or payload.get("status") or ""))
+    tool_version = normalize_inline_whitespace(
+        str(
+            status_report.get("tool_version")
+            or (payload.get("initialization") or {}).get("tool_version")
+            or (payload.get("tool_update") or {}).get("new_tool_version")
+            or TOOL_VERSION
+        )
+    )
+    schema_version = normalize_inline_whitespace(
+        str(
+            status_report.get("schema_version")
+            or status_report.get("workspace_schema_version")
+            or (payload.get("initialization") or {}).get("schema_version")
+            or SCHEMA_VERSION
+        )
+    )
+    runtime_status = normalize_inline_whitespace(
+        str(
+            (payload.get("runtime_init") or {}).get("status")
+            or (status_report.get("plugin_runtime") or {}).get("status")
+            or ""
+        )
+    ) or "unknown"
+    workspace_inventory = (
+        status_report.get("workspace_inventory")
+        if isinstance(status_report.get("workspace_inventory"), dict)
+        else {}
+    )
+    documents_total = int(workspace_inventory.get("documents_total") or 0)
+    ready = overall.lower() in {"pass", "ready", "ok"}
+    action_phrase = {
+        "init": "Done. Workspace initialized and ready",
+        "status": "Workspace ready",
+        "update": "Done. Workspace updated and ready",
+    }.get(action, "Workspace ready")
+    if ready:
+        return (
+            f"{action_phrase} at {workspace_root} "
+            f"(tool v{tool_version}, schema {schema_version}, runtime {runtime_status}, "
+            f"{human_count_label(documents_total, 'document')})."
+        )
+    detail = first_status_detail(status_report) or normalize_inline_whitespace(str(payload.get("status") or overall))
+    root_suffix = f" at {workspace_root}" if workspace_root else ""
+    return f"Workspace {action} failed{root_suffix}: {detail or 'unknown error'}."
+
+
+def render_ingest_human_output(payload: dict[str, object]) -> str:
+    run = cli_run_payload(payload)
+    counts = cli_work_item_counts(payload)
+    by_unit_type = cli_counts_by_unit_type(payload)
+    status = normalize_inline_whitespace(str(payload.get("status") or run.get("status") or ""))
+    phase = normalize_inline_whitespace(str(payload.get("phase") or run.get("phase") or status))
+    run_id = normalize_inline_whitespace(str(payload.get("run_id") or run.get("run_id") or ""))
+    committed = int(counts.get("committed") or 0)
+    pending = int(counts.get("pending") or 0)
+    prepared = int(counts.get("prepared") or 0)
+    leased = int(counts.get("leased") or 0)
+    failed = int(counts.get("failed") or 0)
+    canceled = int(counts.get("cancelled") or 0)
+    more_work_remaining = bool(payload.get("more_work_remaining"))
+    line: str
+    if status == "completed":
+        line = f"Done. Ingest completed — {committed} committed, {failed} failed"
+        if canceled:
+            line += f", {canceled} cancelled"
+    elif status == "canceled":
+        line = f"Ingest canceled — {committed} committed, {failed} failed"
+    elif status == "none":
+        line = "No ingest run found."
+    else:
+        line = (
+            f"Ingest {phase or 'in progress'} — {committed} committed, {pending} pending, "
+            f"{prepared} prepared, {leased} leased, {failed} failed"
+        )
+    if run_id:
+        line += f" (run_id {run_id})"
+
+    lines = [line + "."]
+    unit_notes: list[str] = []
+    for unit_type, unit_counts in sorted(by_unit_type.items()):
+        unit_committed = int(unit_counts.get("committed") or 0)
+        unit_pending = int(unit_counts.get("pending") or 0)
+        unit_failed = int(unit_counts.get("failed") or 0)
+        if unit_committed == 0 and unit_pending == 0 and unit_failed == 0:
+            continue
+        fragments = []
+        if unit_committed:
+            fragments.append(f"{unit_committed} committed")
+        if unit_pending:
+            fragments.append(f"{unit_pending} pending")
+        if unit_failed:
+            fragments.append(f"{unit_failed} failed")
+        if fragments:
+            unit_notes.append(f"{humanize_unit_type(unit_type)} {', '.join(fragments)}")
+    if unit_notes:
+        lines.append("By type: " + "; ".join(unit_notes[:4]) + ("." if len(unit_notes) <= 4 else "; ..."))
+    if more_work_remaining:
+        next_commands = payload.get("next_recommended_commands")
+        if isinstance(next_commands, list) and next_commands:
+            lines.append(f"Next: {next_commands[0]}")
+    return "\n".join(lines)
+
+
+def render_export_human_output(payload: dict[str, object]) -> str:
+    if str(payload.get("slash_command") or "") == "/export status" and isinstance(payload.get("exports"), dict):
+        active_exports = payload.get("active_exports") if isinstance(payload.get("active_exports"), list) else []
+        if not active_exports:
+            run_id = normalize_inline_whitespace(str(payload.get("run_id") or ""))
+            if run_id:
+                return f"No export run found for run_id {run_id}."
+            return "No active exports."
+        lines = ["Active exports:"]
+        for item in active_exports:
+            if not isinstance(item, dict):
+                continue
+            label = normalize_inline_whitespace(str(item.get("export_label") or "export"))
+            status = normalize_inline_whitespace(str(item.get("status") or item.get("phase") or "active"))
+            run_id = normalize_inline_whitespace(str(item.get("run_id") or ""))
+            suffix = f" (run_id {run_id})" if run_id else ""
+            lines.append(f"- {label}: {status}{suffix}")
+        return "\n".join(lines)
+
+    run = cli_run_payload(payload)
+    counts = cli_work_item_counts(payload)
+    export_kind = normalize_inline_whitespace(
+        str(payload.get("export_label") or run.get("export_kind") or payload.get("export_kind") or "export")
+    )
+    if export_kind == "csv":
+        export_kind = "table"
+    status = normalize_inline_whitespace(str(payload.get("status") or run.get("status") or ""))
+    phase = normalize_inline_whitespace(str(payload.get("phase") or run.get("phase") or status))
+    run_id = normalize_inline_whitespace(str(payload.get("run_id") or run.get("run_id") or ""))
+    completed = int(counts.get("completed") or 0)
+    pending = int(counts.get("pending") or 0)
+    running = int(counts.get("running") or 0)
+    failed = int(counts.get("failed") or 0)
+    output_rel_path = normalize_inline_whitespace(str(run.get("output_rel_path") or ""))
+    output_path = normalize_inline_whitespace(str(run.get("output_path") or ""))
+    more_work_remaining = bool(payload.get("more_work_remaining")) or status not in EXPORT_RUN_TERMINAL_STATUSES
+
+    if status == "completed":
+        line = f"Done. {export_kind.title()} export completed — {completed} completed, {failed} failed"
+    elif status == "failed":
+        line = f"{export_kind.title()} export failed — {completed} completed, {failed} failed"
+    elif status == "none":
+        return f"No {export_kind} export run found."
+    else:
+        line = (
+            f"{export_kind.title()} export {phase or 'in progress'} — {completed} completed, "
+            f"{pending} pending, {running} running, {failed} failed"
+        )
+    if run_id:
+        line += f" (run_id {run_id})"
+    lines = [line + "."]
+    if output_rel_path or output_path:
+        lines.append(f"Output: {output_rel_path or output_path}")
+    if more_work_remaining:
+        next_commands = payload.get("next_recommended_commands") or run.get("next_recommended_commands")
+        if isinstance(next_commands, list) and next_commands:
+            lines.append(f"Next: {next_commands[0]}")
+    return "\n".join(lines)
+
+
+def render_get_doc_human_output(payload: dict[str, object]) -> str:
+    document = payload.get("document") if isinstance(payload.get("document"), dict) else {}
+    document_id = int(document.get("document_id") or 0)
+    title = normalize_inline_whitespace(
+        str(document.get("control_number") or document.get("file_name") or f"Document {document_id}")
+    )
+    preview_abs_path = normalize_inline_whitespace(str(document.get("preview_abs_path") or ""))
+    preview_target = preview_abs_path
+    if preview_target and not preview_target.startswith("file://"):
+        preview_target = "file://" + preview_target
+    lines = [f"Document {document_id}: {title}."]
+    if preview_target:
+        lines.append(f"Preview: {preview_target}")
+    text_summary = normalize_inline_whitespace(str(payload.get("text_summary") or ""))
+    if text_summary:
+        lines.append(f"Text: {text_summary}")
+    return "\n".join(lines)
+
+
+def render_cli_human_output(command: str, payload: dict[str, object]) -> str | None:
+    if command == "workspace":
+        return render_workspace_human_output(payload)
+    if command in {
+        "ingest",
+        "ingest-start",
+        "ingest-status",
+        "ingest-cancel",
+        "ingest-run-step",
+        "ingest-plan-step",
+        "ingest-prepare-step",
+        "ingest-commit-step",
+        "ingest-finalize-step",
+    }:
+        return render_ingest_human_output(payload)
+    if command in {"export-csv-start", "export-csv-status", "export-csv-run-step", "export-archive-start", "export-archive-status", "export-archive-run-step"}:
+        return render_export_human_output(payload)
+    if command == "slash" and str(payload.get("slash_command") or "").startswith("/export"):
+        return render_export_human_output(payload)
+    if command == "get-doc":
+        return render_get_doc_human_output(payload)
+    return None
+
+
 def emit_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> int:
     benchmark_mark("prepare_payload_begin", command=command, verbose=verbose)
     prepared_payload = prepare_cli_payload(command, payload, verbose=verbose)
     benchmark_mark("prepare_payload_done")
+    if CLI_OUTPUT_MODE == "human":
+        rendered_human = render_cli_human_output(command, prepared_payload)
+        if rendered_human is not None:
+            sys.stdout.write(rendered_human + "\n")
+            sys.stdout.flush()
+            benchmark_mark("stdout_written")
+            benchmark_emit(command=command, verbose=verbose)
+            return 0
     serialized = json.dumps(prepared_payload, indent=2, sort_keys=True)
     benchmark_mark("json_serialized", bytes=len(serialized.encode("utf-8")))
     sys.stdout.write(serialized + "\n")
@@ -6795,7 +7084,13 @@ EXPORT_TABLE_ALIASES = {
     "conversations": "conversations",
 }
 SLASH_EXPORT_KNOWN_TABLES = set(EXPORT_TABLE_ALIASES) | {"dataset", "datasets"}
-SLASH_EXPORT_BOOLEAN_OPTIONS = {"--include-ignored", "--no-scope", "--portable", "--portable-workspace"}
+SLASH_EXPORT_BOOLEAN_OPTIONS = {
+    "--include-ignored",
+    "--no-scope",
+    "--portable",
+    "--portable-workspace",
+    "--run-to-completion",
+}
 SLASH_EXPORT_VALUE_OPTIONS = {
     "--bates",
     "--budget-seconds",
@@ -6949,6 +7244,7 @@ def run_export_table_slash_command(
         include_ignored_entities=bool(options.get("--include-ignored")),
         limit=limit,
         budget_seconds=budget_seconds,
+        run_to_completion=bool(options.get("--run-to-completion")),
     )
     payload["slash_command"] = "/export table"
     payload["table"] = table_name
@@ -6983,6 +7279,7 @@ def run_export_archive_slash_command(root: Path, tokens: list[str]) -> dict[str,
         seed_limit=seed_limit,
         portable_workspace=bool(options.get("--portable-workspace") or options.get("--portable")),
         budget_seconds=budget_seconds,
+        run_to_completion=bool(options.get("--run-to-completion")),
     )
     payload["slash_command"] = "/export archive"
     payload["export_label"] = "archive"
@@ -9984,6 +10281,93 @@ def export_status(
         connection.close()
 
 
+def export_run_facade_payload(
+    *,
+    root: Path,
+    export_kind: str,
+    budget_seconds: int,
+    created: bool,
+    run_payload: dict[str, object],
+    step_payloads: list[dict[str, object]],
+    reason: str,
+    mode: str,
+) -> dict[str, object]:
+    more_work_remaining = str(run_payload.get("status")) not in EXPORT_RUN_TERMINAL_STATUSES
+    executed_steps: list[str] = []
+    for step_payload in step_payloads:
+        executed_steps.extend(str(step) for step in list(step_payload.get("executed_steps") or []))
+    next_commands: list[str] = []
+    if more_work_remaining:
+        prefix = "export-csv-start" if export_kind == "csv" else "export-archive-start"
+        run_id = run_payload.get("run_id")
+        if run_id:
+            next_commands.append(
+                f"{prefix} {shlex.quote(str(root))} ... --run-to-completion --budget-seconds {int(budget_seconds)}"
+            )
+    next_commands.extend(str(command) for command in list(run_payload.get("next_recommended_commands") or []))
+    return {
+        "ok": True,
+        "export_kind": export_kind,
+        "mode": mode,
+        "created": created,
+        "run_id": run_payload.get("run_id"),
+        "status": run_payload.get("status"),
+        "phase": run_payload.get("phase"),
+        "reason": reason,
+        "executed": bool(executed_steps),
+        "executed_steps": executed_steps,
+        "step_calls": len(step_payloads),
+        "step_results": step_payloads,
+        "more_work_remaining": more_work_remaining,
+        "run": run_payload,
+        "counts": run_payload.get("counts"),
+        "next_recommended_commands": next_commands,
+    }
+
+
+def export_run_to_completion(
+    root: Path,
+    *,
+    export_kind: str,
+    run_id: str,
+    budget_seconds: int,
+    created: bool,
+    start_payload: dict[str, object],
+) -> dict[str, object]:
+    run_payload = {
+        key: value
+        for key, value in start_payload.items()
+        if key not in {"ok", "created"}
+    }
+    step_payloads: list[dict[str, object]] = []
+    reason = "run_terminal" if str(run_payload.get("status")) in EXPORT_RUN_TERMINAL_STATUSES else "budget_exhausted"
+    while str(run_payload.get("status")) not in EXPORT_RUN_TERMINAL_STATUSES:
+        step_payload = export_run_step(
+            root,
+            export_kind=export_kind,
+            run_id=run_id,
+            budget_seconds=budget_seconds,
+        )
+        step_payloads.append(step_payload)
+        if isinstance(step_payload.get("run"), dict):
+            run_payload = dict(step_payload["run"])
+        reason = str(step_payload.get("reason") or reason)
+        if not bool(step_payload.get("executed")):
+            break
+        if reason == "no_runnable_step" and bool(step_payload.get("more_work_remaining")):
+            break
+    return export_run_facade_payload(
+        root=root,
+        export_kind=export_kind,
+        budget_seconds=budget_seconds,
+        created=created,
+        run_payload=run_payload,
+        step_payloads=step_payloads,
+        reason=reason,
+        mode="run_to_completion",
+    )
+
+
 def export_csv_start(
     root: Path,
     raw_output_path: str,
@@ -9995,11 +10379,14 @@ def export_csv_start(
     order: str | None,
     select_from_scope: bool = False,
     budget_seconds: int | None = None,
+    run_to_completion: bool = False,
 ) -> dict[str, object]:
     budget = normalize_resumable_step_budget(budget_seconds)
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
+    start_payload: dict[str, object] | None = None
+    run_id: str | None = None
     try:
         apply_schema(connection, root)
         active_row = active_export_run_row(connection, export_kind="csv")
@@ -10080,9 +10467,21 @@ def export_csv_start(
             connection.rollback()
             raise
         row = require_export_run_row(connection, export_kind="csv", run_id=run_id)
-        return {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
+        start_payload = {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
     finally:
         connection.close()
+    if start_payload is None or run_id is None:
+        raise RetrieverError("CSV export start did not produce a resumable run.")
+    if run_to_completion:
+        return export_run_to_completion(
+            root,
+            export_kind="csv",
+            run_id=run_id,
+            budget_seconds=budget,
+            created=True,
+            start_payload=start_payload,
+        )
+    return start_payload
 
 
 def export_table_csv_start(
@@ -10100,12 +10499,15 @@ def export_table_csv_start(
     include_ignored_entities: bool = False,
     limit: int | None = None,
     budget_seconds: int | None = None,
+    run_to_completion: bool = False,
 ) -> dict[str, object]:
     normalized_table_name = normalize_export_table_name(table_name)
     budget = normalize_resumable_step_budget(budget_seconds)
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
+    start_payload: dict[str, object] | None = None
+    run_id: str | None = None
     try:
         apply_schema(connection, root)
         active_row = active_export_run_row(connection, export_kind="csv")
@@ -10243,9 +10645,21 @@ def export_table_csv_start(
             connection.rollback()
             raise
         row = require_export_run_row(connection, export_kind="csv", run_id=run_id)
-        return {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
+        start_payload = {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
     finally:
         connection.close()
+    if start_payload is None or run_id is None:
+        raise RetrieverError("Table CSV export start did not produce a resumable run.")
+    if run_to_completion:
+        return export_run_to_completion(
+            root,
+            export_kind="csv",
+            run_id=run_id,
+            budget_seconds=budget,
+            created=True,
+            start_payload=start_payload,
+        )
+    return start_payload
 
 
 def export_archive_start(
@@ -10262,11 +10676,14 @@ def export_archive_start(
     seed_limit: int | None = None,
     portable_workspace: bool = False,
     budget_seconds: int | None = None,
+    run_to_completion: bool = False,
 ) -> dict[str, object]:
     budget = normalize_resumable_step_budget(budget_seconds)
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
+    start_payload: dict[str, object] | None = None
+    run_id: str | None = None
     try:
         apply_schema(connection, root)
         active_row = active_export_run_row(connection, export_kind="archive")
@@ -10358,9 +10775,21 @@ def export_archive_start(
             connection.rollback()
             raise
         row = require_export_run_row(connection, export_kind="archive", run_id=run_id)
-        return {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
+        start_payload = {"ok": True, "created": True, **export_run_status_payload(connection, root, row, budget_seconds=budget)}
     finally:
         connection.close()
+    if start_payload is None or run_id is None:
+        raise RetrieverError("Archive export start did not produce a resumable run.")
+    if run_to_completion:
+        return export_run_to_completion(
+            root,
+            export_kind="archive",
+            run_id=run_id,
+            budget_seconds=budget,
+            created=True,
+            start_payload=start_payload,
+        )
+    return start_payload
 
 
 def export_table_csv_seed_page(
@@ -12383,6 +12812,17 @@ def add_scope_run_selector_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retriever workspace tool")
+    parser.add_argument(
+        "--output",
+        choices=("json", "human"),
+        default="json",
+        help="Output mode. Use `human` for concise terminal-friendly summaries when supported.",
+    )
+    parser.add_argument(
+        "--human",
+        action="store_true",
+        help="Shortcut for `--output human`.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     workspace_parser = subparsers.add_parser(
@@ -12448,6 +12888,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_RESUMABLE_STEP_BUDGET_SECONDS,
         help="Per-call budget for the bounded resumable ingest facade",
+    )
+    ingest_parser.add_argument(
+        "--run-to-completion",
+        action="store_true",
+        help="Keep advancing resumable ingest steps until the run reaches a terminal state",
     )
 
     ingest_start_parser = subparsers.add_parser("ingest-start", help="Start a resumable V2 ingest run")
@@ -12634,6 +13079,11 @@ def build_parser() -> argparse.ArgumentParser:
     export_csv_start_parser.add_argument("--sort", "--sort-by", dest="sort", help="Sort field for search-based export or 'relevance'")
     export_csv_start_parser.add_argument("--order", "--sort-order", dest="order", choices=("asc", "desc"), help="Sort order")
     export_csv_start_parser.add_argument("--budget-seconds", type=int, default=None, help="Cowork-safe status budget hint")
+    export_csv_start_parser.add_argument(
+        "--run-to-completion",
+        action="store_true",
+        help="Keep advancing the resumable CSV export until it reaches a terminal state",
+    )
 
     export_csv_run_step_parser = subparsers.add_parser(
         "export-csv-run-step",
@@ -12694,6 +13144,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include a curated subset .retriever/retriever.db for the exported documents",
     )
     export_archive_start_parser.add_argument("--budget-seconds", type=int, default=None, help="Cowork-safe status budget hint")
+    export_archive_start_parser.add_argument(
+        "--run-to-completion",
+        action="store_true",
+        help="Keep advancing the resumable archive export until it reaches a terminal state",
+    )
 
     export_archive_run_step_parser = subparsers.add_parser(
         "export-archive-run-step",
@@ -13750,6 +14205,9 @@ def main() -> int:
     benchmark_mark("main_entered")
     parser = build_parser()
     args = parser.parse_args()
+    if bool(getattr(args, "human", False)):
+        args.output = "human"
+    set_cli_output_mode(str(getattr(args, "output", "json")))
     benchmark_mark("argparse_done", command=getattr(args, "command", None))
 
     try:
@@ -13805,6 +14263,7 @@ def main() -> int:
                     raw_file_types=args.file_types,
                     raw_paths=args.paths,
                     budget_seconds=args.budget_seconds,
+                    run_to_completion=args.run_to_completion,
                 ),
             )
 
@@ -13940,55 +14399,44 @@ def main() -> int:
             return 0
 
         if args.command == "export-csv-start":
-            print(
-                json.dumps(
-                    export_csv_start(
-                        root,
-                        args.output_path,
-                        args.fields,
-                        args.document_ids,
-                        args.query,
-                        args.filters,
-                        args.sort,
-                        args.order,
-                        args.select_from_scope,
-                        budget_seconds=args.budget_seconds,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "export-csv-start",
+                export_csv_start(
+                    root,
+                    args.output_path,
+                    args.fields,
+                    args.document_ids,
+                    args.query,
+                    args.filters,
+                    args.sort,
+                    args.order,
+                    args.select_from_scope,
+                    budget_seconds=args.budget_seconds,
+                    run_to_completion=args.run_to_completion,
+                ),
             )
-            return 0
 
         if args.command == "export-csv-run-step":
-            print(
-                json.dumps(
-                    export_run_step(
-                        root,
-                        export_kind="csv",
-                        run_id=args.run_id,
-                        budget_seconds=args.budget_seconds,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "export-csv-run-step",
+                export_run_step(
+                    root,
+                    export_kind="csv",
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                ),
             )
-            return 0
 
         if args.command == "export-csv-status":
-            print(
-                json.dumps(
-                    export_status(
-                        root,
-                        export_kind="csv",
-                        run_id=args.run_id,
-                        budget_seconds=args.budget_seconds,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "export-csv-status",
+                export_status(
+                    root,
+                    export_kind="csv",
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                ),
             )
-            return 0
 
         if args.command == "export-archive":
             print(
@@ -14013,57 +14461,46 @@ def main() -> int:
             return 0
 
         if args.command == "export-archive-start":
-            print(
-                json.dumps(
-                    export_archive_start(
-                        root,
-                        args.output_path,
-                        dataset_names=args.dataset_names,
-                        query=args.query,
-                        raw_bates=args.bates,
-                        raw_filters=args.filters,
-                        from_run_id=args.from_run_id,
-                        select_from_scope=args.select_from_scope,
-                        family_mode=args.family_mode,
-                        seed_limit=args.seed_limit,
-                        portable_workspace=args.portable_workspace,
-                        budget_seconds=args.budget_seconds,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "export-archive-start",
+                export_archive_start(
+                    root,
+                    args.output_path,
+                    dataset_names=args.dataset_names,
+                    query=args.query,
+                    raw_bates=args.bates,
+                    raw_filters=args.filters,
+                    from_run_id=args.from_run_id,
+                    select_from_scope=args.select_from_scope,
+                    family_mode=args.family_mode,
+                    seed_limit=args.seed_limit,
+                    portable_workspace=args.portable_workspace,
+                    budget_seconds=args.budget_seconds,
+                    run_to_completion=args.run_to_completion,
+                ),
             )
-            return 0
 
         if args.command == "export-archive-run-step":
-            print(
-                json.dumps(
-                    export_run_step(
-                        root,
-                        export_kind="archive",
-                        run_id=args.run_id,
-                        budget_seconds=args.budget_seconds,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "export-archive-run-step",
+                export_run_step(
+                    root,
+                    export_kind="archive",
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                ),
             )
-            return 0
 
         if args.command == "export-archive-status":
-            print(
-                json.dumps(
-                    export_status(
-                        root,
-                        export_kind="archive",
-                        run_id=args.run_id,
-                        budget_seconds=args.budget_seconds,
-                    ),
-                    indent=2,
-                    sort_keys=True,
-                )
+            return emit_cli_payload(
+                "export-archive-status",
+                export_status(
+                    root,
+                    export_kind="archive",
+                    run_id=args.run_id,
+                    budget_seconds=args.budget_seconds,
+                ),
             )
-            return 0
 
         if args.command == "export-previews":
             print(
@@ -14840,16 +15277,31 @@ def main() -> int:
         parser.error(f"Unknown command: {args.command}")
         return 2
     except RetrieverStructuredError as exc:
-        print(json.dumps({"tool_version": TOOL_VERSION, **exc.payload}, indent=2, sort_keys=True), file=sys.stderr)
+        if CLI_OUTPUT_MODE == "human":
+            message = normalize_inline_whitespace(str(exc.payload.get("error") or exc.payload.get("message") or "Retriever error"))
+            print(message, file=sys.stderr)
+        else:
+            print(json.dumps({"tool_version": TOOL_VERSION, **exc.payload}, indent=2, sort_keys=True), file=sys.stderr)
         return 2
     except RetrieverError as exc:
-        print(json.dumps({"error": str(exc), "tool_version": TOOL_VERSION}), file=sys.stderr)
+        if CLI_OUTPUT_MODE == "human":
+            print(str(exc), file=sys.stderr)
+        else:
+            print(json.dumps({"error": str(exc), "tool_version": TOOL_VERSION}), file=sys.stderr)
         return 2
     except sqlite3.Error as exc:
-        print(json.dumps({"error": f"SQLite error: {exc}", "tool_version": TOOL_VERSION}), file=sys.stderr)
+        message = f"SQLite error: {exc}"
+        if CLI_OUTPUT_MODE == "human":
+            print(message, file=sys.stderr)
+        else:
+            print(json.dumps({"error": message, "tool_version": TOOL_VERSION}), file=sys.stderr)
         return 2
     except Exception as exc:
-        print(json.dumps({"error": f"{type(exc).__name__}: {exc}", "tool_version": TOOL_VERSION}), file=sys.stderr)
+        message = f"{type(exc).__name__}: {exc}"
+        if CLI_OUTPUT_MODE == "human":
+            print(message, file=sys.stderr)
+        else:
+            print(json.dumps({"error": message, "tool_version": TOOL_VERSION}), file=sys.stderr)
         return 1
 
 

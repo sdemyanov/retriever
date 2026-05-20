@@ -1,10 +1,8 @@
 # Contributing
 
-Retriever's shared plugin-level operating rules live in
-`skills/routing/SKILL.md`, not in a root `CLAUDE.md`. Claude Code ignores a
-plugin-root `CLAUDE.md`, so putting load-bearing routing or safety logic there
-causes validation warnings and leaves published plugins without the intended
-context.
+Retriever's shared Claude Code operating rules now live in the repo-root
+`CLAUDE.md`. Keep user-facing Claude guidance there, and keep Retriever's
+backend routing/reference material in `skills/routing/SKILL.md`.
 
 ## Build And Validate
 

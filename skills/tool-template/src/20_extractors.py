@@ -136,6 +136,42 @@ def ordered_preview_rows_for_document(
     return list(preview_rows)
 
 
+def conversation_primary_preview_target(
+    paths: dict[str, Path],
+    document_row: sqlite3.Row | None,
+    preview_rows: list[sqlite3.Row],
+) -> dict[str, object] | None:
+    if document_row is None or document_row["conversation_id"] is None:
+        return None
+    conversation_rows = [
+        preview_row
+        for preview_row in preview_rows
+        if is_conversation_preview_rel_path(str(preview_row["rel_preview_path"] or ""))
+        and normalize_whitespace(str(preview_row["label"] or "")).lower() != "contents"
+    ]
+    if not conversation_rows:
+        return None
+    selected_row = next(
+        (
+            preview_row
+            for preview_row in conversation_rows
+            if normalize_whitespace(str(preview_row["target_fragment"] or ""))
+        ),
+        conversation_rows[0],
+    )
+    selected_target = preview_target_payload_from_preview_row(paths, selected_row)
+    if selected_target["target_fragment"]:
+        return selected_target
+    return build_preview_target_payload(
+        rel_path=str(selected_target["file_rel_path"]),
+        abs_path=str(selected_target["file_abs_path"]),
+        preview_type=str(selected_target["preview_type"]),
+        label=(str(selected_target["label"]) if selected_target["label"] is not None else None),
+        ordinal=int(selected_target["ordinal"]),
+        target_fragment=conversation_preview_anchor(int(document_row["id"])),
+    )
+
+
 def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection: sqlite3.Connection) -> dict[str, object]:
     preview_rows = connection.execute(
         """
@@ -161,6 +197,9 @@ def default_preview_target(paths: dict[str, Path], row: sqlite3.Row, connection:
             label=(str(native_target["label"]) if native_target["label"] is not None else None),
             ordinal=int(native_target["ordinal"]),
         )
+    conversation_target = conversation_primary_preview_target(paths, row, ordered_preview_rows)
+    if conversation_target is not None:
+        return conversation_target
     if ordered_preview_rows:
         return preview_target_payload_from_preview_row(paths, ordered_preview_rows[0])
     source_targets = production_source_part_targets(paths, connection, row)
@@ -219,6 +258,18 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
 
     ordered_preview_rows = ordered_preview_rows_for_document(document_row, preview_rows)
     targets: list[dict[str, object]] = []
+    seen_targets: set[tuple[str, str | None]] = set()
+
+    def append_target(target: dict[str, object]) -> None:
+        key = (
+            str(target["file_rel_path"]),
+            normalize_whitespace(str(target.get("target_fragment") or "")) or None,
+        )
+        if key in seen_targets:
+            return
+        seen_targets.add(key)
+        targets.append(target)
+
     if (
         ordered_preview_rows
         and not preview_rows_use_conversation_navigation(ordered_preview_rows)
@@ -226,7 +277,7 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
     ):
         native_target = document_native_target(paths, document_row)
         if native_target is not None:
-            targets.append(
+            append_target(
                 build_preview_target_payload(
                     rel_path=str(native_target["rel_path"]),
                     abs_path=str(native_target["abs_path"]),
@@ -235,12 +286,22 @@ def collect_preview_targets(paths: dict[str, Path], document_id: int, rel_path: 
                     ordinal=int(native_target["ordinal"]),
                 )
             )
+    conversation_target = conversation_primary_preview_target(paths, document_row, ordered_preview_rows)
+    if conversation_target is not None:
+        append_target(conversation_target)
     for preview_row in ordered_preview_rows:
-        targets.append(preview_target_payload_from_preview_row(paths, preview_row))
+        preview_target = preview_target_payload_from_preview_row(paths, preview_row)
+        if (
+            conversation_target is not None
+            and str(preview_target["file_rel_path"]) == str(conversation_target["file_rel_path"])
+            and normalize_whitespace(str(preview_target.get("label") or "")).lower() in {"conversation", "segment"}
+        ):
+            continue
+        append_target(preview_target)
     source_targets = production_source_part_targets(paths, connection, document_row)
     for target in source_targets:
         if target["rel_path"] not in {existing["rel_path"] for existing in targets}:
-            targets.append(
+            append_target(
                 build_preview_target_payload(
                     rel_path=str(target["rel_path"]),
                     abs_path=str(target["abs_path"]),

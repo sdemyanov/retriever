@@ -12,6 +12,8 @@ import random
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -29,9 +31,12 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "skills" / "tool-template" / "tools.py"
+RETRIEVER_PACKAGE_MAIN_PATH = REPO_ROOT / "retriever" / "__main__.py"
 BUNDLER_PATH = REPO_ROOT / "skills" / "tool-template" / "bundle_retriever_tools.py"
 TOOL_TEMPLATE_PATH = REPO_ROOT / "skills" / "tool-template" / "tool-template.md"
 SOURCE_HEADER_PATH = REPO_ROOT / "skills" / "tool-template" / "src" / "00_header.py"
+SETUP_PATH = REPO_ROOT / "setup"
+CLAUDE_V0_SETUP_PATH = REPO_ROOT / "setup-claude-v0"
 PLUGIN_MANIFEST_PATH = REPO_ROOT / ".claude-plugin" / "plugin.json"
 PING_SKILL_PATH = REPO_ROOT / "skills" / "ping" / "SKILL.md"
 SKILL_ROOT = REPO_ROOT / "skills"
@@ -148,11 +153,19 @@ def assert_version_metadata_current() -> None:
         raise AssertionError(f"Could not determine SCHEMA_VERSION from {SOURCE_HEADER_PATH}.")
     expected_schema_version = schema_match.group(1)
 
-    if ROOT_CLAUDE_PATH.exists():
+    if not ROOT_CLAUDE_PATH.exists():
         raise AssertionError(
-            "Root CLAUDE.md is ignored by the plugin loader and causes validation warnings. "
-            "Keep shared plugin instructions in skills/ instead."
+            "Missing root CLAUDE.md. Keep Claude Code project guidance in the repo root."
         )
+    if not RETRIEVER_PACKAGE_MAIN_PATH.exists():
+        raise AssertionError(
+            f"Missing Retriever package entrypoint at {RETRIEVER_PACKAGE_MAIN_PATH}."
+        )
+
+    if not CLAUDE_V0_SETUP_PATH.exists():
+        raise AssertionError(f"Missing Claude v0 installer at {CLAUDE_V0_SETUP_PATH}.")
+    if not SETUP_PATH.exists():
+        raise AssertionError(f"Missing Claude installer at {SETUP_PATH}.")
 
     plugin_version = json.loads(PLUGIN_MANIFEST_PATH.read_text(encoding="utf-8")).get("version")
     if plugin_version != expected_version:
@@ -11438,6 +11451,52 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(after_schema_row["document_id"], document_row["id"])
         self.assertEqual(after_schema_row["updated_at"], key_row["updated_at"])
 
+    def test_recursive_ingest_ignores_claude_workspace_internals(self) -> None:
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "alpha.txt").write_text("alpha body\n", encoding="utf-8")
+
+        commands_dir = self.root / ".claude" / "commands"
+        commands_dir.mkdir(parents=True)
+        (commands_dir / "search.md").write_text("---\ndescription: test\n---\n", encoding="utf-8")
+
+        mirrored_worktree = self.root / ".claude" / "worktrees" / "shadow-repo" / "skills" / "tool-template"
+        mirrored_worktree.mkdir(parents=True)
+        (mirrored_worktree / "tools.py").write_text("print('should stay out of ingest')\n", encoding="utf-8")
+        (mirrored_worktree / "tool-template.md").write_text("# not source data\n", encoding="utf-8")
+
+        payloads = self.run_v2_loose_ingest()
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            document_rel_paths = [
+                row["rel_path"]
+                for row in connection.execute(
+                    """
+                    SELECT rel_path
+                    FROM documents
+                    ORDER BY rel_path ASC
+                    """
+                ).fetchall()
+            ]
+            work_item_rel_paths = [
+                row["rel_path"]
+                for row in connection.execute(
+                    """
+                    SELECT rel_path
+                    FROM ingest_work_items
+                    WHERE run_id = ?
+                    ORDER BY rel_path ASC
+                    """,
+                    (payloads["run_id"],),
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+        self.assertEqual(document_rel_paths, ["raw/alpha.txt"])
+        self.assertEqual(work_item_rel_paths, ["raw/alpha.txt"])
+
     def test_ingest_v2_interleaves_prepare_and_commit_batches(self) -> None:
         raw_dir = self.root / "raw"
         raw_dir.mkdir()
@@ -13043,12 +13102,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(day_result["conversation_id"], day_row["conversation_id"])
         self.assertEqual(
             [target.get("label") for target in day_result["preview_targets"]],
-            ["message", "conversation"],
+            ["conversation", "message"],
         )
         self.assertEqual(
             day_result["preview_rel_path"],
-            self.preview_target_by_label(day_result["preview_targets"], "message")["rel_path"],
+            self.preview_target_by_label(day_result["preview_targets"], "conversation")["rel_path"],
         )
+        self.assertEqual(day_result["preview_target_fragment"], f"doc-{day_row['id']}")
 
     def test_ingest_skips_empty_slack_day_export_files(self) -> None:
         export_root = self.root / "data" / "slack"
@@ -13581,20 +13641,22 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(day_one_result["child_documents"][0]["child_document_kind"], retriever_tools.CHILD_DOCUMENT_KIND_REPLY_THREAD)
         self.assertEqual(
             [target.get("label") for target in day_one_result["preview_targets"]],
-            ["message", "conversation"],
+            ["conversation", "message"],
         )
         self.assertEqual(
             [target.get("label") for target in reply_search["results"][0]["preview_targets"]],
-            ["message", "conversation"],
+            ["conversation", "message"],
         )
         self.assertEqual(
             day_one_result["preview_rel_path"],
-            self.preview_target_by_label(day_one_result["preview_targets"], "message")["rel_path"],
+            self.preview_target_by_label(day_one_result["preview_targets"], "conversation")["rel_path"],
         )
         self.assertEqual(
             reply_search["results"][0]["preview_rel_path"],
-            self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "message")["rel_path"],
+            self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "conversation")["rel_path"],
         )
+        self.assertEqual(day_one_result["preview_target_fragment"], f"doc-{day_one_row['id']}")
+        self.assertEqual(reply_search["results"][0]["preview_target_fragment"], f"doc-{child_row['id']}")
         self.assertEqual(
             self.preview_target_file_path(
                 self.preview_target_by_label(day_one_result["preview_targets"], "conversation")
@@ -13609,7 +13671,9 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         reply_conversation_preview = self.preview_target_file_path(
             self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "conversation")
         )
-        slack_entry_path = self.preview_target_file_path(day_one_result["preview_targets"][0])
+        slack_entry_path = self.preview_target_file_path(
+            self.preview_target_by_label(day_one_result["preview_targets"], "message")
+        )
         slack_entry_html = slack_entry_path.read_text(encoding="utf-8")
         self.assertIn('class="chat-message"', slack_entry_html)
         self.assertIn("Kickoff thread", slack_entry_html)
@@ -13879,12 +13943,12 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         reply_result = next(item for item in search_result["results"] if item["id"] == reply_row["id"])
         self.assertEqual(
             reply_result["preview_rel_path"],
-            self.preview_target_by_label(reply_result["preview_targets"], "message")["rel_path"],
+            self.preview_target_by_label(reply_result["preview_targets"], "segment")["rel_path"],
         )
-        self.assertIsNone(reply_result["preview_target_fragment"])
+        self.assertEqual(reply_result["preview_target_fragment"], f"doc-{reply_row['id']}")
         self.assertEqual(len(reply_result["preview_targets"]), 2)
-        self.assertEqual(reply_result["preview_targets"][0]["label"], "message")
-        self.assertEqual(reply_result["preview_targets"][1]["label"], "segment")
+        self.assertEqual(reply_result["preview_targets"][0]["label"], "segment")
+        self.assertEqual(reply_result["preview_targets"][1]["label"], "message")
         self.assertFalse(any(target.get("label") == "entry" for target in reply_result["preview_targets"]))
         self.assertFalse(any(target.get("label") == "contents" for target in reply_result["preview_targets"]))
         self.assertEqual(self.preview_target_by_label(reply_result["preview_targets"], "segment")["target_fragment"], f"doc-{reply_row['id']}")
@@ -14129,9 +14193,10 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         refreshed_result = next(item for item in refreshed_search["results"] if item["id"] == root_row["id"])
         self.assertEqual(
             refreshed_result["preview_rel_path"],
-            self.preview_target_by_label(refreshed_result["preview_targets"], "message")["rel_path"],
+            self.preview_target_by_label(refreshed_result["preview_targets"], "segment")["rel_path"],
         )
-        self.assertEqual(refreshed_result["preview_targets"][0]["label"], "message")
+        self.assertEqual(refreshed_result["preview_targets"][0]["label"], "segment")
+        self.assertEqual(refreshed_result["preview_target_fragment"], f"doc-{root_row['id']}")
         refreshed_message_preview_path = self.preview_target_file_path(
             self.preview_target_by_label(refreshed_result["preview_targets"], "message")
         )
@@ -14670,6 +14735,21 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(args.sort, "created_date")
         self.assertEqual(args.order, "desc")
 
+    def test_ingest_parser_accepts_run_to_completion_flag(self) -> None:
+        parser = retriever_tools.build_parser()
+        args = parser.parse_args(
+            [
+                "ingest",
+                str(self.root),
+                "--recursive",
+                "--run-to-completion",
+            ]
+        )
+
+        self.assertEqual(args.command, "ingest")
+        self.assertTrue(args.recursive)
+        self.assertTrue(args.run_to_completion)
+
     def test_search_accepts_created_date_sort_alias(self) -> None:
         first_path = self.root / "chat-older.txt"
         first_path.write_text(
@@ -14753,7 +14833,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(next_exit, 0)
         self.assertEqual(next_stderr, "")
         self.assertIn("Page: 2 of 2  (docs 3-3 of 3)", next_stdout)
-        self.assertIn("older.eml", next_stdout)
+        self.assertIn("Beagle Feature -- Auto Tagging", next_stdout)
+        self.assertIn("2026-04-14 10:00", next_stdout)
 
     def test_search_cli_view_mode_keeps_relevance_for_plain_content_queries(self) -> None:
         (self.root / "alpha.txt").write_text("needle\n", encoding="utf-8")
@@ -19534,12 +19615,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         result = search_result["results"][0]
         self.assertEqual(
             [target.get("label") for target in result["preview_targets"]],
-            ["message", "conversation"],
+            ["conversation", "message"],
         )
         self.assertEqual(
             result["preview_rel_path"],
-            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
         )
+        self.assertEqual(result["preview_target_fragment"], f"doc-{row['id']}")
         preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
         self.assertIn('class="chat-message"', preview_html)
         self.assertIn("Alice Example", preview_html)
@@ -19648,12 +19730,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         result = search_result["results"][0]
         self.assertEqual(
             [target.get("label") for target in result["preview_targets"]],
-            ["message", "conversation"],
+            ["conversation", "message"],
         )
         self.assertEqual(
             result["preview_rel_path"],
-            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
         )
+        self.assertEqual(result["preview_target_fragment"], f"doc-{second_row['id']}")
         self.assertEqual(
             self.preview_target_file_path(
                 self.preview_target_by_label(result["preview_targets"], "conversation")
@@ -20087,12 +20170,13 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         result = next(item for item in search_result["results"] if item["id"] == chat_row["id"])
         self.assertEqual(
             [target.get("label") for target in result["preview_targets"]],
-            ["message", "conversation"],
+            ["conversation", "message"],
         )
         self.assertEqual(
             result["preview_rel_path"],
-            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
         )
+        self.assertEqual(result["preview_target_fragment"], f"doc-{chat_row['id']}")
         preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
         self.assertIn('class="chat-message"', preview_html)
         self.assertIn("Sergey Demyanov", preview_html)
@@ -22602,6 +22686,90 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("text", verbose_result)
         self.assertIn("preview_targets", verbose_result)
 
+    def test_get_doc_for_conversation_document_uses_anchored_conversation_preview(self) -> None:
+        self.write_email_message(
+            self.root / "root.eml",
+            subject="Anchored Preview",
+            body_text="Root body",
+            message_id="<anchor-root@example.com>",
+            date_created="Tue, 14 Apr 2026 10:00:00 +0000",
+        )
+        self.write_email_message(
+            self.root / "reply.eml",
+            subject="Re: Anchored Preview",
+            body_text="Reply body",
+            message_id="<anchor-reply@example.com>",
+            in_reply_to="<anchor-root@example.com>",
+            references="<anchor-root@example.com>",
+            date_created="Tue, 14 Apr 2026 11:00:00 +0000",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        reply_row = self.fetch_document_row("reply.eml")
+        get_exit, get_payload, _, _ = self.run_cli("get-doc", str(self.root), "--doc-id", str(reply_row["id"]))
+        self.assertEqual(get_exit, 0)
+        self.assertIsNotNone(get_payload)
+        document_payload = get_payload["document"]
+        self.assertTrue(document_payload["preview_rel_path"].endswith(f"/conversation.html#doc-{reply_row['id']}"))
+        self.assertIn(f"#doc-{reply_row['id']}", document_payload["preview_abs_path"])
+
+    def test_cli_human_output_for_workspace_ingest_get_doc_and_export(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("Termination notice appears here.\nSupporting detail follows.\n", encoding="utf-8")
+
+        workspace_exit, workspace_stdout, workspace_stderr = self.run_cli_raw(
+            "--human",
+            "workspace",
+            "init",
+            str(self.root),
+        )
+        self.assertEqual(workspace_exit, 0, workspace_stderr)
+        self.assertIn("Workspace initialized and ready", workspace_stdout)
+        self.assertNotIn("{", workspace_stdout)
+
+        ingest_exit, ingest_stdout, ingest_stderr = self.run_cli_raw(
+            "--human",
+            "ingest",
+            str(self.root),
+            "--recursive",
+            "--run-to-completion",
+        )
+        self.assertEqual(ingest_exit, 0, ingest_stderr)
+        self.assertIn("Ingest completed", ingest_stdout)
+        self.assertNotIn("{", ingest_stdout)
+
+        row = self.fetch_document_row("sample.txt")
+        get_doc_exit, get_doc_stdout, get_doc_stderr = self.run_cli_raw(
+            "--human",
+            "get-doc",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--include-text",
+            "summary",
+        )
+        self.assertEqual(get_doc_exit, 0, get_doc_stderr)
+        self.assertIn(f"Document {row['id']}", get_doc_stdout)
+        self.assertIn("Preview: file://", get_doc_stdout)
+        self.assertNotIn("{", get_doc_stdout)
+
+        export_exit, export_stdout, export_stderr = self.run_cli_raw(
+            "--human",
+            "export-csv-start",
+            str(self.root),
+            "review.csv",
+            "--field",
+            "file_name",
+            "--run-to-completion",
+        )
+        self.assertEqual(export_exit, 0, export_stderr)
+        self.assertIn("Table export completed", export_stdout)
+        self.assertIn(".retriever/exports/review.csv", export_stdout)
+        self.assertNotIn("{", export_stdout)
+
     def test_search_chunks_supports_citations_and_distinct_doc_count_mode(self) -> None:
         (self.root / "nda-one.txt").write_text("Termination notice must be delivered within thirty days.\n", encoding="utf-8")
         (self.root / "nda-two.txt").write_text("The agreement has a termination notice period of sixty days.\n", encoding="utf-8")
@@ -23708,6 +23876,245 @@ class AttachmentResolutionTests(unittest.TestCase):
             "Mcneill, Walter.pdf",
         )
         self.assertEqual(retriever_tools.pst_attachment_content_type(attachment), "application/pdf")
+
+
+class ClaudeV0InstallerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory(prefix="retriever-claude-v0-")
+        self.addCleanup(self.tempdir.cleanup)
+        self.workspace = Path(self.tempdir.name) / "workspace"
+        self.workspace.mkdir()
+
+    def run_installer(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(CLAUDE_V0_SETUP_PATH), str(self.workspace), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_installer_writes_expected_commands_and_manifest(self) -> None:
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        resolved_workspace = self.workspace.resolve()
+
+        commands_dir = self.workspace / ".claude" / "commands"
+        self.assertTrue(commands_dir.is_dir())
+
+        search_path = commands_dir / "search.md"
+        workspace_status_path = commands_dir / "workspace-status.md"
+        ingest_path = commands_dir / "ingest.md"
+        show_doc_path = commands_dir / "show-doc.md"
+        run_status_path = commands_dir / "run-status.md"
+        self.assertTrue(search_path.exists())
+        self.assertTrue(workspace_status_path.exists())
+        self.assertTrue(ingest_path.exists())
+        self.assertTrue(show_doc_path.exists())
+        self.assertTrue(run_status_path.exists())
+
+        search_text = search_path.read_text(encoding="utf-8")
+        self.assertIn("Managed by Retriever setup-claude-v0", search_text)
+        self.assertIn("tools.py --human slash", search_text)
+        self.assertIn(str(self.workspace), search_text)
+        self.assertIn(str(REPO_ROOT), search_text)
+
+        workspace_status_text = workspace_status_path.read_text(encoding="utf-8")
+        self.assertIn("workspace status", workspace_status_text)
+        self.assertIn(str(self.workspace), workspace_status_text)
+        self.assertIn("tools.py --human workspace status", workspace_status_text)
+        self.assertIn("Return stdout exactly as the entire response.", workspace_status_text)
+
+        ingest_text = ingest_path.read_text(encoding="utf-8")
+        self.assertIn("tools.py --human ingest", ingest_text)
+        self.assertIn("Always include these arguments: `--run-to-completion`", ingest_text)
+        self.assertIn("default arguments instead: `--recursive`", ingest_text)
+        self.assertIn("Return stdout exactly as the entire response.", ingest_text)
+
+        show_doc_text = show_doc_path.read_text(encoding="utf-8")
+        self.assertIn("tools.py --human get-doc", show_doc_text)
+        self.assertIn("Always include these arguments: `--include-text summary`", show_doc_text)
+
+        manifest = json.loads((self.workspace / ".claude" / "retriever-v0-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["workspace_root"], str(resolved_workspace))
+        self.assertEqual(manifest["repo_root"], str(REPO_ROOT))
+        self.assertIn(".claude/commands/search.md", manifest["files"])
+
+    def test_installer_refuses_unprefixed_name_collisions(self) -> None:
+        commands_dir = self.workspace / ".claude" / "commands"
+        commands_dir.mkdir(parents=True)
+        (commands_dir / "search.md").write_text("---\ndescription: existing\n---\n", encoding="utf-8")
+
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already exist", result.stderr)
+        self.assertIn("--prefix retriever-", result.stderr)
+
+
+class ClaudeGlobalInstallerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory(prefix="retriever-claude-global-")
+        self.addCleanup(self.tempdir.cleanup)
+        self.claude_home = Path(self.tempdir.name) / ".claude"
+        self.python_site_packages = Path(self.tempdir.name) / "python-site-packages"
+
+    def run_installer(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SETUP_PATH),
+                "--claude-home",
+                str(self.claude_home),
+                "--python-site-packages",
+                str(self.python_site_packages),
+                *args,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_global_installer_writes_namespaced_commands(self) -> None:
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        commands_dir = self.claude_home / "commands" / "retriever"
+        claude_md_path = self.claude_home / "CLAUDE.md"
+        pth_path = self.python_site_packages / "retriever.pth"
+        self.assertTrue(commands_dir.is_dir())
+        self.assertTrue(claude_md_path.exists())
+        self.assertTrue(pth_path.exists())
+
+        init_path = commands_dir / "init.md"
+        status_path = commands_dir / "status.md"
+        search_path = commands_dir / "search.md"
+        ingest_path = commands_dir / "ingest.md"
+        export_path = commands_dir / "export.md"
+        open_path = commands_dir / "open.md"
+        workspace_status_path = commands_dir / "workspace-status.md"
+        init_workspace_path = commands_dir / "init-workspace.md"
+        show_doc_path = commands_dir / "show-doc.md"
+        ingest_status_path = commands_dir / "ingest-status.md"
+        ingest_run_step_path = commands_dir / "ingest-run-step.md"
+        ingest_cancel_path = commands_dir / "ingest-cancel.md"
+        self.assertTrue(init_path.exists())
+        self.assertTrue(status_path.exists())
+        self.assertTrue(search_path.exists())
+        self.assertTrue(ingest_path.exists())
+        self.assertTrue(export_path.exists())
+        self.assertTrue(open_path.exists())
+        self.assertFalse(workspace_status_path.exists())
+        self.assertFalse(init_workspace_path.exists())
+        self.assertFalse(show_doc_path.exists())
+        self.assertFalse(ingest_status_path.exists())
+        self.assertFalse(ingest_run_step_path.exists())
+        self.assertFalse(ingest_cancel_path.exists())
+
+        init_text = init_path.read_text(encoding="utf-8")
+        self.assertIn("/retriever:init", init_text)
+
+        status_text = status_path.read_text(encoding="utf-8")
+        self.assertIn("/retriever:status", status_text)
+
+        search_text = search_path.read_text(encoding="utf-8")
+        self.assertIn("Managed by Retriever setup.", search_text)
+        self.assertIn('python3 -m retriever slash "$PWD"', search_text)
+        self.assertIn("/retriever:search", search_text)
+
+        ingest_text = ingest_path.read_text(encoding="utf-8")
+        self.assertIn("python3 -m retriever ingest --run-to-completion", ingest_text)
+        self.assertIn('"$PWD"', ingest_text)
+
+        export_text = export_path.read_text(encoding="utf-8")
+        self.assertIn('slash_command="$slash_command --run-to-completion"', export_text)
+        self.assertIn("/retriever:export", export_text)
+
+        open_text = open_path.read_text(encoding="utf-8")
+        self.assertIn('python3 -m retriever get-doc --include-text summary "$PWD"', open_text)
+        self.assertIn("/retriever:open", open_text)
+
+        claude_md_text = claude_md_path.read_text(encoding="utf-8")
+        self.assertIn("## Retriever", claude_md_text)
+        self.assertIn("1. Use a `/retriever:*` slash command", claude_md_text)
+        self.assertIn("2. If no slash command fits, call the Retriever CLI directly", claude_md_text)
+        self.assertIn("3. Query `./.retriever/retriever.db` directly only", claude_md_text)
+        self.assertIn("/retriever:search", claude_md_text)
+        self.assertIn("/retriever:init", claude_md_text)
+        self.assertIn("/retriever:status", claude_md_text)
+        self.assertIn("/retriever:open", claude_md_text)
+        self.assertNotIn("/retriever:init-workspace", claude_md_text)
+        self.assertNotIn("/retriever:workspace-status", claude_md_text)
+        self.assertNotIn("/retriever:show-doc", claude_md_text)
+        self.assertNotIn("/retriever:ingest-status", claude_md_text)
+        self.assertEqual(pth_path.read_text(encoding="utf-8").strip(), str(REPO_ROOT))
+
+        manifest = json.loads((self.claude_home / "retriever-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["repo_root"], str(REPO_ROOT))
+        self.assertEqual(manifest["command_namespace"], "retriever")
+        self.assertEqual(Path(manifest["python_site_packages"]).resolve(), self.python_site_packages.resolve())
+        self.assertEqual(Path(manifest["python_path_file"]).resolve(), pth_path.resolve())
+        self.assertIn("commands/retriever/search.md", manifest["files"])
+        self.assertIn("/retriever:search", result.stdout)
+        self.assertIn("Updated Retriever guidance", result.stdout)
+        self.assertIn("Registered `python3 -m retriever`", result.stdout)
+        self.assertIn("/retriever:init", result.stdout)
+        self.assertIn("/retriever:status", result.stdout)
+        self.assertIn("/retriever:open", result.stdout)
+
+    def test_global_installer_preserves_non_retriever_claude_content(self) -> None:
+        self.claude_home.mkdir(parents=True)
+        claude_md_path = self.claude_home / "CLAUDE.md"
+        claude_md_path.write_text("# Personal Notes\n\nAlways prefer concise answers.\n", encoding="utf-8")
+
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        claude_md_text = claude_md_path.read_text(encoding="utf-8")
+        self.assertIn("# Personal Notes", claude_md_text)
+        self.assertIn("Always prefer concise answers.", claude_md_text)
+        self.assertIn("## Retriever", claude_md_text)
+        self.assertEqual(claude_md_text.count("## Retriever"), 1)
+
+
+class RetrieverPackageEntrypointTests(unittest.TestCase):
+    def test_python_m_retriever_help_works_from_repo_root(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "retriever", "--help"],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Retriever workspace tool", result.stdout)
+        self.assertIn("schema-version", result.stdout)
+
+    def test_python_m_retriever_defaults_to_human_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="retriever-human-default-") as tempdir:
+            root = Path(tempdir)
+            document_path = root / "sample.txt"
+            document_path.write_text("hello retriever\n", encoding="utf-8")
+
+            init_result = subprocess.run(
+                [sys.executable, "-m", "retriever", "workspace", "init", str(root)],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(init_result.returncode, 0, init_result.stderr)
+            self.assertIn("Workspace initialized and ready", init_result.stdout)
+            self.assertNotIn("{", init_result.stdout)
+
+            json_result = subprocess.run(
+                [sys.executable, "-m", "retriever", "--output", "json", "workspace", "status", str(root)],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(json_result.returncode, 0, json_result.stderr)
+            self.assertIn('"status"', json_result.stdout)
 
 
 if __name__ == "__main__":
