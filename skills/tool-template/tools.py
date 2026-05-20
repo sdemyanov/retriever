@@ -21037,6 +21037,7 @@ def chat_message_preview_rows(
     entry_rel_path: str,
     created_at: str,
 ) -> list[dict[str, object]]:
+    preview_html = build_chat_document_preview_html(document)
     preferred_rows = sorted(
         preserved_preview_rows,
         key=lambda row: (
@@ -21044,8 +21045,30 @@ def chat_message_preview_rows(
             int(row.get("ordinal", 0)),
         ),
     )
-    if preferred_rows and normalize_whitespace(str(preferred_rows[0].get("preview_type") or "")).lower() == "html":
-        target_row = dict(preferred_rows[0])
+    preferred_html_rows = [
+        row
+        for row in preferred_rows
+        if normalize_whitespace(str(row.get("preview_type") or "")).lower() == "html"
+    ]
+    if preferred_html_rows:
+        target_row = dict(
+            next(
+                (
+                    row
+                    for row in preferred_html_rows
+                    if normalize_whitespace(str(row.get("label") or "")).lower() == "message"
+                ),
+                preferred_html_rows[0],
+            )
+        )
+        target_rel_path = normalize_whitespace(str(target_row.get("rel_preview_path") or "")) or entry_rel_path
+        entry_abs_path = paths["state_dir"] / target_rel_path
+        entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        entry_abs_path.write_text(
+            preview_html,
+            encoding="utf-8",
+        )
+        target_row["rel_preview_path"] = target_rel_path
         target_row["target_fragment"] = None
         target_row["label"] = "message"
         target_row["ordinal"] = 0
@@ -21055,7 +21078,7 @@ def chat_message_preview_rows(
     entry_abs_path = paths["state_dir"] / entry_rel_path
     entry_abs_path.parent.mkdir(parents=True, exist_ok=True)
     entry_abs_path.write_text(
-        build_chat_document_preview_html(document),
+        preview_html,
         encoding="utf-8",
     )
     return [

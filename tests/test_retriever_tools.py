@@ -19671,9 +19671,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         conversation_preview_path = self.preview_target_file_path(
             self.preview_target_by_label(day_result["preview_targets"], "conversation")
         )
+        message_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(day_result["preview_targets"], "message")
+        )
         source_conversation_html = conversation_preview_path.read_text(encoding="utf-8")
+        source_message_html = message_preview_path.read_text(encoding="utf-8")
         self.assertIn(source_message, source_conversation_html)
         self.assertIn(source_reply, source_conversation_html)
+        self.assertIn(source_message, source_message_html)
+        self.assertIn(source_reply, source_message_html)
 
         translated_revision_id = self.create_text_revision(
             document_id=int(day_row["id"]),
@@ -19695,12 +19701,18 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
         self.assertEqual(activate_payload["preview_regen"]["refreshed_conversations"], 1)
         activated_conversation_html = conversation_preview_path.read_text(encoding="utf-8")
+        activated_message_html = message_preview_path.read_text(encoding="utf-8")
         self.assertIn("Hello, can we sync?", activated_conversation_html)
         self.assertIn(translated_reply_html, activated_conversation_html)
         self.assertNotIn(source_message, activated_conversation_html)
         self.assertNotIn(source_reply, activated_conversation_html)
+        self.assertIn("Hello, can we sync?", activated_message_html)
+        self.assertIn(translated_reply_html, activated_message_html)
+        self.assertNotIn(source_message, activated_message_html)
+        self.assertNotIn(source_reply, activated_message_html)
 
         conversation_preview_path.write_text("stale conversation preview", encoding="utf-8")
+        message_preview_path.write_text("stale message preview", encoding="utf-8")
         refresh_exit, refresh_payload, _, _ = self.run_cli(
             "refresh-previews",
             str(self.root),
@@ -19717,11 +19729,17 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(refresh_payload["scope"], "conversations")
         self.assertEqual(refresh_payload["refreshed_conversations"], 1)
         refreshed_conversation_html = conversation_preview_path.read_text(encoding="utf-8")
+        refreshed_message_html = message_preview_path.read_text(encoding="utf-8")
         self.assertNotIn("stale conversation preview", refreshed_conversation_html)
         self.assertIn("Hello, can we sync?", refreshed_conversation_html)
         self.assertIn(translated_reply_html, refreshed_conversation_html)
         self.assertNotIn(source_message, refreshed_conversation_html)
         self.assertNotIn(source_reply, refreshed_conversation_html)
+        self.assertNotIn("stale message preview", refreshed_message_html)
+        self.assertIn("Hello, can we sync?", refreshed_message_html)
+        self.assertIn(translated_reply_html, refreshed_message_html)
+        self.assertNotIn(source_message, refreshed_message_html)
+        self.assertNotIn(source_reply, refreshed_message_html)
 
     def test_refresh_previews_document_scope_uses_active_text_for_production_preview(self) -> None:
         translated_text = "Translated production memo body.\nReview translated attachments."
