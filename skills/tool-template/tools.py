@@ -44414,16 +44414,59 @@ def evaluate_reconcile_candidate_group(
     return root_group
 
 
+def resolve_reconcile_root_document_rows(
+    connection: sqlite3.Connection,
+    document_ids: list[int] | None,
+) -> list[sqlite3.Row]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+    if not normalized_document_ids:
+        return []
+
+    root_rows_by_id: dict[int, sqlite3.Row] = {}
+    ordered_root_ids: list[int] = []
+    for document_id in normalized_document_ids:
+        root_row = get_document_family_root_row_for_assignment(connection, document_id)
+        root_id = int(root_row["id"])
+        full_root_row = connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (root_id,),
+        ).fetchone()
+        if full_root_row is None:
+            raise RetrieverError(f"Unknown document id: {document_id}")
+        if full_root_row["canonical_status"] != CANONICAL_STATUS_ACTIVE:
+            raise RetrieverError(
+                f"Document {document_id} cannot be reconciled because family root document {root_id} is not active."
+            )
+        if root_id not in root_rows_by_id:
+            root_rows_by_id[root_id] = full_root_row
+            ordered_root_ids.append(root_id)
+    return [root_rows_by_id[root_id] for root_id in ordered_root_ids]
+
+
 def find_reconcile_candidate_groups(
     connection: sqlite3.Connection,
     *,
     basis: str,
+    candidate_root_document_ids: list[int] | None = None,
 ) -> list[dict[str, object]]:
     if basis != "content_hash":
         raise RetrieverError(f"Unsupported reconciliation basis: {basis}")
 
+    normalized_candidate_root_ids = None
+    if candidate_root_document_ids is not None:
+        normalized_candidate_root_ids = list(dict.fromkeys(int(document_id) for document_id in candidate_root_document_ids))
+        if not normalized_candidate_root_ids:
+            return []
+
+    candidate_id_clause = ""
+    candidate_params: list[object] = [CANONICAL_STATUS_ACTIVE]
+    if normalized_candidate_root_ids is not None:
+        placeholders = ", ".join("?" for _ in normalized_candidate_root_ids)
+        candidate_id_clause = f"\n          AND id IN ({placeholders})"
+        candidate_params.extend(normalized_candidate_root_ids)
+
     candidate_rows = connection.execute(
-        """
+        f"""
         SELECT *
         FROM documents
         WHERE canonical_status = ?
@@ -44431,9 +44474,10 @@ def find_reconcile_candidate_groups(
           AND parent_document_id IS NULL
           AND content_hash IS NOT NULL
           AND text_status IN ('ok', 'partial')
+          {candidate_id_clause}
         ORDER BY content_hash ASC, id ASC
         """,
-        (CANONICAL_STATUS_ACTIVE,),
+        tuple(candidate_params),
     ).fetchall()
 
     groups_by_hash: dict[str, list[sqlite3.Row]] = defaultdict(list)
@@ -44713,19 +44757,92 @@ def reconcile_duplicates(
     *,
     basis: str,
     apply_changes: bool,
+    document_ids: list[int] | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    dataset_names: list[str] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
 ) -> dict[str, object]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+    selector_inputs_present = bool(query.strip() or raw_bates or raw_filters or dataset_names or from_run_id is not None)
+    if normalized_document_ids and (selector_inputs_present or select_from_scope):
+        raise RetrieverError(
+            "reconcile-duplicates accepts either --doc-id selectors or query/filter/scope selectors, not both."
+        )
+
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
         reconcile_custom_fields_registry(connection, repair=True)
-        candidate_groups = find_reconcile_candidate_groups(connection, basis=basis)
+        selector_payload: dict[str, object] = {"mode": "all_documents"}
+        selected_from_scope = False
+        selected_document_ids: list[int] = []
+        selected_root_document_rows: list[sqlite3.Row] | None = None
+
+        if normalized_document_ids:
+            selected_document_ids = normalized_document_ids
+            selected_root_document_rows = resolve_reconcile_root_document_rows(connection, normalized_document_ids)
+            selector_payload = {
+                "mode": "document_ids",
+                "document_ids": selected_document_ids,
+                "root_document_ids": [int(row["id"]) for row in selected_root_document_rows],
+            }
+        elif selector_inputs_present or select_from_scope:
+            selector = build_effective_scope_selector(
+                connection,
+                paths,
+                query=query,
+                raw_bates=raw_bates,
+                raw_filters=raw_filters,
+                dataset_names=dataset_names,
+                from_run_id=from_run_id,
+                select_from_scope=select_from_scope,
+            )
+            if not scope_run_selector_has_inputs(selector):
+                raise RetrieverError(
+                    "No document selection active. Provide --doc-id or at least one of "
+                    "--keyword, --filter, --bates, --dataset, --from-run-id, or --select-from-scope."
+                )
+            selected_document_ids, _, _ = resolve_seed_documents_for_scope_selector(connection, selector)
+            selected_root_document_rows = resolve_reconcile_root_document_rows(connection, selected_document_ids)
+            selector_payload = {
+                "mode": "scope_search",
+                "scope": selector,
+                "document_ids": selected_document_ids,
+                "root_document_ids": [int(row["id"]) for row in selected_root_document_rows],
+            }
+            selected_from_scope = bool(select_from_scope)
+
+        selected_root_document_ids = (
+            None
+            if selected_root_document_rows is None
+            else [int(row["id"]) for row in selected_root_document_rows]
+        )
+        selection_payload: dict[str, object] = {
+            "selector": selector_payload,
+            "selected_from_scope": selected_from_scope,
+        }
+        if selected_root_document_ids is not None:
+            selection_payload["selected_document_ids"] = selected_document_ids
+            selection_payload["selected_document_count"] = len(selected_document_ids)
+            selection_payload["selected_root_document_ids"] = selected_root_document_ids
+            selection_payload["selected_root_document_count"] = len(selected_root_document_ids)
+
+        candidate_groups = find_reconcile_candidate_groups(
+            connection,
+            basis=basis,
+            candidate_root_document_ids=selected_root_document_ids,
+        )
         if not apply_changes:
             return {
                 "status": "ok",
                 "basis": basis,
                 "mode": "dry-run",
+                **selection_payload,
                 "candidate_group_count": len(candidate_groups),
                 "mergeable_group_count": sum(1 for group in candidate_groups if group["status"] == "ready"),
                 "blocked_group_count": sum(1 for group in candidate_groups if group["status"] == "blocked"),
@@ -44769,6 +44886,7 @@ def reconcile_duplicates(
             "status": "ok",
             "basis": basis,
             "mode": "apply",
+            **selection_payload,
             "candidate_group_count": len(candidate_groups),
             "merged_group_count": len(applied_groups),
             "blocked_group_count": len(blocked_groups),
@@ -67595,6 +67713,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile_duplicates_parser.add_argument("workspace", help="Workspace root path")
     reconcile_duplicates_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to consider for reconciliation (repeatable)",
+    )
+    add_scope_run_selector_arguments(reconcile_duplicates_parser)
+    reconcile_duplicates_parser.add_argument(
         "--basis",
         choices=("content_hash",),
         default="content_hash",
@@ -68787,6 +68913,13 @@ def main() -> int:
                     root,
                     basis=args.basis,
                     apply_changes=bool(args.apply),
+                    document_ids=args.document_ids,
+                    query=args.query,
+                    raw_bates=args.bates,
+                    raw_filters=args.filters,
+                    dataset_names=args.dataset_names,
+                    from_run_id=args.from_run_id,
+                    select_from_scope=args.select_from_scope,
                 ),
             )
 
