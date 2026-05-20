@@ -19,7 +19,7 @@ Use the highest-level Retriever surface that can answer the request:
 ## Long-Running Work
 
 - Keep the resumable backend for ingest, export, entity rebuild, and processing jobs.
-- Prefer one-shot Claude-facing commands that run to a terminal state.
+- Prefer one-shot Claude-facing commands that run to a terminal state: `/retriever:ingest`, `/retriever:run`, `/retriever:translate`, `/retriever:extract`, `/retriever:ocr`, `/retriever:describe-images`, and `/retriever:export`.
 - Only surface `...-status`, `...-run-step`, or lower-level recovery commands when the original command was interrupted or the user explicitly wants stepwise control.
 
 ## Preview Behavior
@@ -32,6 +32,7 @@ Use the highest-level Retriever surface that can answer the request:
 
 - Treat `skills/tool-template/src/` as the authored backend source of truth.
 - Treat `skills/tool-template/tools.py` as a generated compatibility artifact until the bundle is retired.
+- Treat `retriever/` as the Claude-first package surface. Native processing orchestration belongs there, even when it still reuses backend storage/runtime helpers.
 - When source fragments change, keep generated artifacts, installer output, and tests in sync.
 
 ## Common Commands

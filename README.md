@@ -80,6 +80,7 @@ Common use cases:
 - Dataset-aware workflows. Documents can belong to one or more datasets, and datasets can be source-backed or manually curated.
 - Exports. Retriever can export selected rows to CSV, generate HTML preview bundles, or build zip archives containing source files, previews, and an optional portable workspace subset.
 - Metadata enrichment. You can add custom fields, set values manually, and run structured processing jobs that operate on frozen run snapshots.
+- Long-running processing. Translation, structured extraction, OCR, and image-description runs now have first-class Claude Code commands and native `python3 -m retriever` entrypoints that drive the resumable backend to a terminal state.
 
 ## How Retriever works
 
@@ -103,8 +104,8 @@ Important consequences:
 - your original documents stay in place and are not rewritten
 - document paths in the database are workspace-relative
 - the workspace carries its own Retriever state, so browsing, datasets, and exports stay tied to that folder
-- the workspace records which canonical Retriever bundle last touched it, and commands run directly through the plugin's canonical tool
-- heavy parser dependencies live in the shared plugin runtime (`<plugin-root>/.retriever-plugin-runtime/...`), not under `.retriever/`; see *Runtime and dependencies* for details
+- the workspace records which canonical Retriever tool build last touched it, so the native package surface and compatibility bundle stay aligned
+- heavy parser dependencies live in the shared Retriever runtime (`<repo-root>/.retriever-plugin-runtime/...`), not under `.retriever/`; see *Runtime and dependencies* for details
 
 ### Document model
 
@@ -174,10 +175,10 @@ Ingest-path behaviors worth knowing:
 
 ## Runtime and dependencies
 
-Retriever maintains a **shared plugin runtime** under the plugin directory:
+Retriever maintains a **shared Retriever runtime** under the repo directory:
 
 ```text
-<plugin-root>/.retriever-plugin-runtime/<system>-<machine>-pyX.Y/venv/
+<repo-root>/.retriever-plugin-runtime/<system>-<machine>-pyX.Y/venv/
 ```
 
 Heavy parser dependencies (`pdfplumber`, `python-docx`, `openpyxl`, `xlrd`, `extract-msg`, `libpff-python`, `striprtf`, `Pillow`, `charset-normalizer`) are **lazy-installed** into that shared venv the first time a command actually needs them. Non-parsing commands do not pay that cost.
@@ -189,6 +190,8 @@ Consequences:
 - parser installs are keyed by platform and Python version, so swapping Python versions triggers a fresh install
 - first use of a new parser type (for example, the first PST ingest) can briefly block while the dependency installs; `workspace status` will report the runtime state and warn if something needed is missing
 - the runtime is advisory — if you prefer to manage Python yourself, the tool still falls back to whatever is importable in the active interpreter
+
+The on-disk directory name still uses `.retriever-plugin-runtime/` for compatibility with older workspaces and generated tooling, but Claude Code is now the primary surface.
 
 ## Loading Retriever
 
@@ -223,8 +226,9 @@ After running `./setup`:
 - `python3 -m retriever --help` now works from any directory that uses the same
   Python interpreter as the installer
 - use `/retriever:init`, `/retriever:status`, `/retriever:ingest`,
-  `/retriever:search`, `/retriever:open`, and `/retriever:export` as the main
-  Claude-facing flow
+  `/retriever:run`, `/retriever:translate`, `/retriever:extract`,
+  `/retriever:ocr`, `/retriever:describe-images`, `/retriever:search`,
+  `/retriever:open`, and `/retriever:export` as the main Claude-facing flow
 - use `/retriever:filter`, `/retriever:dataset`, `/retriever:sort`,
   `/retriever:columns`, `/retriever:page`, `/retriever:page-size`,
   `/retriever:next`, `/retriever:previous`, `/retriever:scope`,
@@ -234,6 +238,10 @@ After running `./setup`:
 - `/retriever:ingest` automatically includes `--run-to-completion`, so it
   keeps stepping the resumable ingest backend until the run reaches a terminal
   state
+- `/retriever:run`, `/retriever:translate`, `/retriever:extract`,
+  `/retriever:ocr`, and `/retriever:describe-images` are native package
+  commands that keep stepping the resumable processing backend until the run
+  reaches a terminal state
 - `/retriever:export table ...` and `/retriever:export archive ...` also append
   hidden `--run-to-completion`, so exports default to a one-shot user flow
 - `python3 -m retriever` now defaults to human-readable output, so installed
@@ -248,9 +256,9 @@ After running `./setup`:
 JSON as its default output mode, but `python3 -m retriever ...` is now the
 primary CLI entrypoint and defaults to human-readable output.
 
-### Legacy plugin / workspace-local paths
+### Legacy compatibility paths
 
-For local plugin compatibility testing, you can still load the bundled plugin:
+For legacy compatibility testing, you can still load the bundled plugin:
 
 ```bash
 claude --plugin-dir /path/to/retriever-plugin
@@ -261,9 +269,8 @@ use the workspace bridge below.
 
 ### Claude Code v0 command bridge
 
-If you want to test Retriever in Claude Code without changing the plugin-first
-packaging model yet, install a small project-local command bridge into the
-target workspace:
+If you want to test Retriever in Claude Code without using the global install,
+install a small project-local command bridge into the target workspace:
 
 ```bash
 ./setup-claude-v0 /path/to/workspace
@@ -332,7 +339,7 @@ The `workspace` command groups runtime and schema maintenance into subcommands:
 
 - `workspace init` prepares or repairs `.retriever/` state and runtime metadata for a folder.
 - `workspace status` reports runtime readiness and schema state without rewriting anything.
-- `workspace update` refreshes runtime metadata from the canonical `tools.py` bundle after a plugin upgrade.
+- `workspace update` refreshes runtime metadata from the canonical `tools.py` compatibility bundle after a tool update.
 
 Use `ingest-production` when you want to target a processed production root explicitly:
 
@@ -378,6 +385,26 @@ You can also set Bates scope through `/search` because it auto-detects Bates-sha
 
 ```text
 /search ABC000123-ABC000150
+```
+
+### 4. Run long processing jobs
+
+Once the scope is right, use the first-class processing commands instead of
+manually stepping `run-job-step`.
+
+Examples:
+
+```bash
+python3 -m retriever translate . --target-language Spanish --select-from-scope --model gpt-4.1-mini
+python3 -m retriever extract . counterparty --instruction "Extract the named counterparty." --select-from-scope --model gpt-4.1-mini
+python3 -m retriever ocr . --filter "text_status = 'empty'" --model gpt-4.1-mini
+python3 -m retriever describe-images . --filter "content_type = 'Image'" --model gpt-4.1-mini
+```
+
+If a processing command is interrupted, resume it with:
+
+```bash
+python3 -m retriever run . --run-id <id>
 ```
 
 If you need plain full-text search for something that looks like a Bates value, force FTS:

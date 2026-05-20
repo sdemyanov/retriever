@@ -108,6 +108,58 @@ WORKSPACE_ARGS_COMMANDS: tuple[WorkspaceArgsCommandSpec, ...] = (
             "Do not stop early or ask the user to continue manually unless the Bash command was interrupted or Claude explicitly backgrounded it.",
         ),
     ),
+    WorkspaceArgsCommandSpec(
+        "run",
+        "Resume or finish an existing Retriever processing run to a terminal state",
+        "run",
+        "first",
+        "Pass `--run-id <id>`. Use this when a translation, extraction, OCR, or image-description run was interrupted and needs to be resumed.",
+        extra_guidance=(
+            "This is the native one-shot processing runner. Let it continue until the run reaches a terminal state.",
+        ),
+    ),
+    WorkspaceArgsCommandSpec(
+        "translate",
+        "Create a translation run for the current scope or explicit selectors and execute it to completion",
+        "translate",
+        "first",
+        "Pass `--target-language <language>` and optional selectors like `--doc-id`, `--filter`, `--dataset`, or `--keyword`.",
+        extra_guidance=(
+            "If you do not pass any selectors, Retriever automatically uses the current persisted browse scope.",
+            "Use `--provider` and `--model` when you want to override the default processing provider configuration.",
+        ),
+    ),
+    WorkspaceArgsCommandSpec(
+        "extract",
+        "Create a structured extraction run for one field and execute it to completion",
+        "extract",
+        "first",
+        "Pass `<field_name> --instruction \"...\"` and optional selectors like `--doc-id`, `--filter`, `--dataset`, or `--keyword`.",
+        extra_guidance=(
+            "If you do not pass any selectors, Retriever automatically uses the current persisted browse scope.",
+            "Completed extraction runs auto-publish bound outputs into the target custom field.",
+        ),
+    ),
+    WorkspaceArgsCommandSpec(
+        "ocr",
+        "Create an OCR run and execute it to completion",
+        "ocr",
+        "first",
+        "Optional selectors: `--doc-id`, `--filter`, `--dataset`, or `--keyword`. Optional provider overrides: `--provider`, `--model`, `--parameters-json`.",
+        extra_guidance=(
+            "If you do not pass any selectors, Retriever automatically uses the current persisted browse scope.",
+        ),
+    ),
+    WorkspaceArgsCommandSpec(
+        "describe-images",
+        "Create an image-description run and execute it to completion",
+        "describe-images",
+        "first",
+        "Optional selectors: `--doc-id`, `--filter`, `--dataset`, or `--keyword`. Optional provider overrides: `--provider`, `--model`, `--parameters-json`.",
+        extra_guidance=(
+            "If you do not pass any selectors, Retriever automatically uses the current persisted browse scope.",
+        ),
+    ),
 )
 
 
@@ -309,6 +361,11 @@ def render_claude_md_section() -> str:
         "/retriever:init",
         "/retriever:status",
         "/retriever:ingest",
+        "/retriever:run",
+        "/retriever:translate",
+        "/retriever:extract",
+        "/retriever:ocr",
+        "/retriever:describe-images",
         "/retriever:search",
         "/retriever:filter",
         "/retriever:dataset",
@@ -335,7 +392,7 @@ def render_claude_md_section() -> str:
         + "3. Query `./.retriever/retriever.db` directly only for debugging or verification that Retriever cannot already answer.\n\n"
         + "Behavior rules:\n"
         + "- Preserve Retriever's stateful browse model. Prefer `/retriever:search`, `/retriever:documents`, `/retriever:conversations`, `/retriever:entities`, `/retriever:filter`, `/retriever:dataset`, `/retriever:sort`, `/retriever:columns`, `/retriever:page`, `/retriever:page-size`, `/retriever:next`, `/retriever:previous`, `/retriever:scope`, `/retriever:bates`, and `/retriever:from-run` over stateless one-off queries when the user is browsing.\n"
-        + "- For long-running ingest and export work, prefer the one-shot commands that already run to completion. Only fall back to direct backend recovery commands like `python3 -m retriever ingest-status ...` or `python3 -m retriever ingest-run-step ...` if the original command was interrupted.\n"
+        + "- For long-running ingest, export, and processing work, prefer the one-shot commands that already run to completion: `/retriever:ingest`, `/retriever:run`, `/retriever:translate`, `/retriever:extract`, `/retriever:ocr`, `/retriever:describe-images`, and `/retriever:export`. Only fall back to direct backend recovery commands like `python3 -m retriever ingest-status ...` or `python3 -m retriever run-status ...` if the original command was interrupted.\n"
         + "- Prefer `/retriever:open` for document previews. Do not rely on HTML anchors in preview URLs unless Claude Code preview handling is known to respect them.\n"
         + "- Return Retriever's human summaries directly when they are sufficient. Avoid reprinting raw JSON unless the user asks for it.\n\n"
         + "Available Retriever commands:\n"
@@ -480,7 +537,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Registered `python3 -m retriever` via {pth_path}")
     print(f"Updated Retriever guidance in {claude_md_path}")
     print("Open Claude Code in a Retriever workspace root and run `/help` to see the new namespaced commands.")
-    print("Primary commands: /retriever:init, /retriever:status, /retriever:ingest, /retriever:search, /retriever:open, /retriever:export")
+    print(
+        "Primary commands: /retriever:init, /retriever:status, /retriever:ingest, /retriever:run, "
+        "/retriever:translate, /retriever:extract, /retriever:ocr, /retriever:describe-images, "
+        "/retriever:search, /retriever:open, /retriever:export"
+    )
     return 0
 
 

@@ -23988,6 +23988,11 @@ class ClaudeGlobalInstallerTests(unittest.TestCase):
         status_path = commands_dir / "status.md"
         search_path = commands_dir / "search.md"
         ingest_path = commands_dir / "ingest.md"
+        run_path = commands_dir / "run.md"
+        translate_path = commands_dir / "translate.md"
+        extract_path = commands_dir / "extract.md"
+        ocr_path = commands_dir / "ocr.md"
+        describe_images_path = commands_dir / "describe-images.md"
         export_path = commands_dir / "export.md"
         open_path = commands_dir / "open.md"
         workspace_status_path = commands_dir / "workspace-status.md"
@@ -24000,6 +24005,11 @@ class ClaudeGlobalInstallerTests(unittest.TestCase):
         self.assertTrue(status_path.exists())
         self.assertTrue(search_path.exists())
         self.assertTrue(ingest_path.exists())
+        self.assertTrue(run_path.exists())
+        self.assertTrue(translate_path.exists())
+        self.assertTrue(extract_path.exists())
+        self.assertTrue(ocr_path.exists())
+        self.assertTrue(describe_images_path.exists())
         self.assertTrue(export_path.exists())
         self.assertTrue(open_path.exists())
         self.assertFalse(workspace_status_path.exists())
@@ -24024,6 +24034,24 @@ class ClaudeGlobalInstallerTests(unittest.TestCase):
         self.assertIn("python3 -m retriever ingest --run-to-completion", ingest_text)
         self.assertIn('"$PWD"', ingest_text)
 
+        run_text = run_path.read_text(encoding="utf-8")
+        self.assertIn("python3 -m retriever run", run_text)
+        self.assertIn("--run-id", run_text)
+
+        translate_text = translate_path.read_text(encoding="utf-8")
+        self.assertIn("python3 -m retriever translate", translate_text)
+        self.assertIn("--target-language", translate_text)
+
+        extract_text = extract_path.read_text(encoding="utf-8")
+        self.assertIn("python3 -m retriever extract", extract_text)
+        self.assertIn("<field_name>", extract_text)
+
+        ocr_text = ocr_path.read_text(encoding="utf-8")
+        self.assertIn("python3 -m retriever ocr", ocr_text)
+
+        describe_images_text = describe_images_path.read_text(encoding="utf-8")
+        self.assertIn("python3 -m retriever describe-images", describe_images_text)
+
         export_text = export_path.read_text(encoding="utf-8")
         self.assertIn('slash_command="$slash_command --run-to-completion"', export_text)
         self.assertIn("/retriever:export", export_text)
@@ -24040,6 +24068,11 @@ class ClaudeGlobalInstallerTests(unittest.TestCase):
         self.assertIn("/retriever:search", claude_md_text)
         self.assertIn("/retriever:init", claude_md_text)
         self.assertIn("/retriever:status", claude_md_text)
+        self.assertIn("/retriever:run", claude_md_text)
+        self.assertIn("/retriever:translate", claude_md_text)
+        self.assertIn("/retriever:extract", claude_md_text)
+        self.assertIn("/retriever:ocr", claude_md_text)
+        self.assertIn("/retriever:describe-images", claude_md_text)
         self.assertIn("/retriever:open", claude_md_text)
         self.assertNotIn("/retriever:init-workspace", claude_md_text)
         self.assertNotIn("/retriever:workspace-status", claude_md_text)
@@ -24053,11 +24086,15 @@ class ClaudeGlobalInstallerTests(unittest.TestCase):
         self.assertEqual(Path(manifest["python_site_packages"]).resolve(), self.python_site_packages.resolve())
         self.assertEqual(Path(manifest["python_path_file"]).resolve(), pth_path.resolve())
         self.assertIn("commands/retriever/search.md", manifest["files"])
+        self.assertIn("commands/retriever/run.md", manifest["files"])
+        self.assertIn("commands/retriever/translate.md", manifest["files"])
         self.assertIn("/retriever:search", result.stdout)
         self.assertIn("Updated Retriever guidance", result.stdout)
         self.assertIn("Registered `python3 -m retriever`", result.stdout)
         self.assertIn("/retriever:init", result.stdout)
         self.assertIn("/retriever:status", result.stdout)
+        self.assertIn("/retriever:run", result.stdout)
+        self.assertIn("/retriever:translate", result.stdout)
         self.assertIn("/retriever:open", result.stdout)
 
     def test_global_installer_preserves_non_retriever_claude_content(self) -> None:
@@ -24088,6 +24125,9 @@ class RetrieverPackageEntrypointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Retriever workspace tool", result.stdout)
         self.assertIn("schema-version", result.stdout)
+        self.assertIn("Native Claude-first processing commands:", result.stdout)
+        self.assertIn("translate", result.stdout)
+        self.assertIn("describe-images", result.stdout)
 
     def test_python_m_retriever_defaults_to_human_output(self) -> None:
         with tempfile.TemporaryDirectory(prefix="retriever-human-default-") as tempdir:
@@ -24115,6 +24155,201 @@ class RetrieverPackageEntrypointTests(unittest.TestCase):
             )
             self.assertEqual(json_result.returncode, 0, json_result.stderr)
             self.assertIn('"status"', json_result.stdout)
+
+
+class RetrieverPackageProcessingTests(RetrieverToolsRegressionTests):
+    def run_package_cli(self, *args: str) -> tuple[int, dict[str, object] | None, str, str]:
+        result = subprocess.run(
+            [sys.executable, "-m", "retriever", "--output", "json", *args],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        payload = None
+        stdout_text = result.stdout.strip()
+        stderr_text = result.stderr.strip()
+        if stdout_text:
+            payload = json.loads(stdout_text)
+        return result.returncode, payload, stdout_text, stderr_text
+
+    def test_python_m_retriever_run_executes_existing_structured_run(self) -> None:
+        note_path = self.root / "run-contract.txt"
+        note_path.write_text("Counterparty: ACME Corp\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        document_row = self.fetch_document_row("run-contract.txt")
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Run Counterparty", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        add_field_exit, _, _, _ = self.run_cli("add-field", str(self.root), "counterparty", "text")
+        self.assertEqual(add_field_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "run_counterparty",
+            "counterparty",
+            "--value-type",
+            "text",
+            "--bind-custom-field",
+            "counterparty",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "run_counterparty",
+            "--instruction",
+            "Extract the counterparty.",
+            "--provider",
+            "static_json",
+            "--parameters-json",
+            "{\"output_values\":{\"counterparty\":\"ACME Corp\"}}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        run_create_exit, run_create_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(create_version_payload["job_version"]["id"]),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(run_create_exit, 0)
+        self.assertIsNotNone(run_create_payload)
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "run",
+            str(self.root),
+            "--run-id",
+            str(run_create_payload["run"]["id"]),
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["command"], "run")
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertIsInstance(payload["publish"], dict)
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["counterparty"], "ACME Corp")
+
+    def test_python_m_retriever_translate_runs_to_completion(self) -> None:
+        note_path = self.root / "translate.txt"
+        note_path.write_text("Original memo text.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        document_row = self.fetch_document_row("translate.txt")
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "translate",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+            "--target-language",
+            "es",
+            "--provider",
+            "static_text",
+            "--parameters-json",
+            "{\"translated_text\":\"ES::{text}\"}",
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["command"], "translate")
+        self.assertEqual(payload["run"]["status"], "completed")
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["active_text_source_kind"], "translation")
+
+    def test_python_m_retriever_extract_runs_to_completion_and_publishes(self) -> None:
+        note_path = self.root / "extract.txt"
+        note_path.write_text("Counterparty: ACME Corp\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+        document_row = self.fetch_document_row("extract.txt")
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "extract",
+            str(self.root),
+            "counterparty",
+            "--instruction",
+            "Extract the counterparty.",
+            "--doc-id",
+            str(document_row["id"]),
+            "--provider",
+            "static_json",
+            "--parameters-json",
+            "{\"output_values\":{\"counterparty\":\"ACME Corp\"}}",
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["command"], "extract")
+        self.assertEqual(payload["run"]["status"], "completed")
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["counterparty"], "ACME Corp")
+
+    def test_python_m_retriever_ocr_runs_to_completion(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "ocr",
+            str(self.root),
+            "--doc-id",
+            str(image_only_row["id"]),
+            "--provider",
+            "static_text",
+            "--parameters-json",
+            "{\"page_text\":\"OCR page {page_number}\"}",
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["command"], "ocr")
+        self.assertEqual(payload["run"]["status"], "completed")
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+    def test_python_m_retriever_describe_images_runs_to_completion(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "describe-images",
+            str(self.root),
+            "--doc-id",
+            str(image_only_row["id"]),
+            "--provider",
+            "static_text",
+            "--parameters-json",
+            "{\"page_text\":\"Description page {page_number}\"}",
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["command"], "describe-images")
+        self.assertEqual(payload["run"]["status"], "completed")
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_text_source_kind"], "image_description")
 
 
 if __name__ == "__main__":
