@@ -26950,6 +26950,34 @@ def write_workspace_meta(connection: sqlite3.Connection, tool_sha256: str | None
     connection.commit()
 
 
+def workspace_runtime_metadata_needs_materialization(
+    paths: dict[str, Path],
+    connection: sqlite3.Connection,
+) -> bool:
+    if not paths["runtime_path"].exists():
+        return True
+    workspace_meta = read_workspace_meta(connection)
+    if workspace_meta is None:
+        return True
+    try:
+        return int(workspace_meta.get("schema_version")) != SCHEMA_VERSION
+    except (TypeError, ValueError):
+        return True
+
+
+def ensure_workspace_runtime_metadata(root: Path, connection: sqlite3.Connection) -> None:
+    paths = workspace_paths(root)
+    if not workspace_runtime_metadata_needs_materialization(paths, connection):
+        return
+    canonical_tool_path = locate_canonical_plugin_tool_or_self()
+    tool_path = canonical_tool_path or Path(__file__).resolve()
+    tool_sha = sha256_file(tool_path)
+    if tool_sha is None:
+        raise RetrieverError(f"Canonical tool not readable at {tool_path}")
+    write_workspace_meta(connection, tool_sha)
+    write_runtime(paths, tool_sha)
+
+
 def resolve_production_root_argument(workspace_root: Path, raw_production_root: str | Path) -> Path:
     candidate = Path(raw_production_root).expanduser()
     if not candidate.is_absolute():
@@ -40003,6 +40031,7 @@ def ingest_v2_start(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            ensure_workspace_runtime_metadata(root, connection)
             active_row = active_ingest_v2_run_row(connection)
             if active_row is not None:
                 raise RetrieverStructuredError(
@@ -42296,6 +42325,7 @@ def ingest_v2_facade(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        ensure_workspace_runtime_metadata(root, connection)
         active_row = active_ingest_v2_run_row(connection)
         if active_row is not None:
             active_scope = decode_json_text(active_row["scope_json"], default={}) or {}

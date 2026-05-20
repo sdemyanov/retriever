@@ -3901,6 +3901,34 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             reason="init",
         )
 
+    def test_ingest_command_bootstraps_fresh_workspace_runtime_metadata(self) -> None:
+        document_path = self.root / "sample.txt"
+        document_path.write_text("fresh workspace body\n", encoding="utf-8")
+        self.assertFalse(self.paths["runtime_path"].exists())
+
+        exit_code, payload, _, _ = self.run_cli("ingest", str(self.root), "--recursive", "--run-to-completion")
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["status"], "completed")
+        self.assertTrue(self.paths["runtime_path"].exists())
+
+        status_report = retriever_tools.workspace_status(self.root, quick=False)
+        self.assertEqual(status_report["overall"], "pass")
+        self.assertEqual(status_report["workspace"]["state"], "initialized")
+        self.assertTrue(status_report["workspace"]["runtime_present"])
+        self.assertEqual(status_report["workspace_schema_version"], retriever_tools.SCHEMA_VERSION)
+        self.assertFalse(status_report["schema_needs_migration"])
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            workspace_meta = retriever_tools.read_workspace_meta(connection)
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(workspace_meta)
+        self.assertEqual(workspace_meta["schema_version"], retriever_tools.SCHEMA_VERSION)
+
     def test_plugin_runtime_paths_live_under_plugin_root_not_workspace(self) -> None:
         runtime_paths = retriever_tools.plugin_runtime_paths(root=self.root)
         self.assertIsNotNone(runtime_paths)
