@@ -2125,13 +2125,14 @@ def ingest_v2_conversation_previews_need_refresh(
         SELECT
           d.conversation_id,
           d.id AS document_id,
-          COALESCE(tr.created_at, d.updated_at) AS preview_freshness_at,
+          COALESCE(active_tr.created_at, d.updated_at) AS preview_freshness_at,
           d.content_type,
           dp.rel_preview_path,
           dp.preview_type,
           dp.created_at AS preview_created_at
         FROM documents d
-        LEFT JOIN text_revisions tr ON tr.id = d.source_text_revision_id
+        LEFT JOIN text_revisions active_tr
+          ON active_tr.id = COALESCE(d.active_search_text_revision_id, d.source_text_revision_id)
         LEFT JOIN document_previews dp ON dp.document_id = d.id
         WHERE d.conversation_id IN ({placeholders})
           AND d.lifecycle_status NOT IN ('missing', 'deleted')
@@ -18870,9 +18871,12 @@ def load_preview_refresh_document_rows(
           d.source_kind,
           d.conversation_id,
           d.production_id,
-          tr.storage_rel_path AS source_text_storage_rel_path
+          d.source_text_revision_id,
+          d.active_search_text_revision_id,
+          active_tr.storage_rel_path AS preview_text_storage_rel_path
         FROM documents d
-        LEFT JOIN text_revisions tr ON tr.id = d.source_text_revision_id
+        LEFT JOIN text_revisions active_tr
+          ON active_tr.id = COALESCE(d.active_search_text_revision_id, d.source_text_revision_id)
         WHERE d.id IN ({", ".join("?" for _ in normalized_document_ids)})
           AND d.lifecycle_status NOT IN ('missing', 'deleted')
         ORDER BY d.id ASC
@@ -18892,6 +18896,20 @@ def refresh_source_backed_document_preview(
         return {"status": "skipped", "reason": "internal_document"}
     if document_content_type_is_chat(row["content_type"]):
         return regenerate_chat_preview_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+        )
+    if (
+        document_content_type_is_email(row["content_type"])
+        and row["conversation_id"] is None
+        and row["production_id"] is None
+        and text_revision_pointers_differ(
+            row["source_text_revision_id"],
+            row["active_search_text_revision_id"],
+        )
+    ):
+        return regenerate_email_preview_for_document(
             connection,
             paths,
             document_id=document_id,
@@ -18935,12 +18953,22 @@ def refresh_stored_state_document_preview(
             paths,
             document_id=document_id,
         )
+    if (
+        document_content_type_is_email(row["content_type"])
+        and row["conversation_id"] is None
+        and row["production_id"] is None
+    ):
+        return regenerate_email_preview_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+        )
     if row["production_id"] is not None:
         text_content = load_document_preview_text(
             connection,
             paths,
             document_id=document_id,
-            storage_rel_path=row["source_text_storage_rel_path"],
+            storage_rel_path=row["preview_text_storage_rel_path"],
         )
         return regenerate_production_preview_for_document(
             connection,

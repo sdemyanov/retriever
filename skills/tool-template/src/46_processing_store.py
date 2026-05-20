@@ -1348,7 +1348,7 @@ def activate_text_revision_for_document(
     normalized_policy = normalize_text_revision_activation_policy(activation_policy)
     document_row = connection.execute(
         """
-        SELECT id, source_text_revision_id, active_search_text_revision_id, content_type, conversation_id
+        SELECT id, source_text_revision_id, active_search_text_revision_id, content_type, conversation_id, production_id
         FROM documents
         WHERE id = ?
         """,
@@ -1441,6 +1441,30 @@ def activate_text_revision_for_document(
                     connection,
                     paths,
                     document_id=document_id,
+                )
+        elif document_content_type_is_email(document_row["content_type"]):
+            if document_row["conversation_id"] is not None:
+                preview_regen = {
+                    "status": "ok",
+                    "conversation_id": int(document_row["conversation_id"]),
+                    "refreshed_conversations": refresh_conversation_previews(
+                        connection,
+                        paths,
+                        [int(document_row["conversation_id"])],
+                    ),
+                }
+            elif document_row["production_id"] is None:
+                preview_regen = regenerate_email_preview_for_document(
+                    connection,
+                    paths,
+                    document_id=document_id,
+                )
+            else:
+                preview_regen = regenerate_production_preview_for_document(
+                    connection,
+                    paths,
+                    document_id=document_id,
+                    text_content=text_content,
                 )
         else:
             preview_regen = regenerate_production_preview_for_document(
