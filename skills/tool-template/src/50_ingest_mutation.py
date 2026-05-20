@@ -7046,6 +7046,7 @@ def ingest_v2_start(
         connection = connect_db(paths["db_path"])
         try:
             apply_schema(connection, root)
+            ensure_workspace_runtime_metadata(root, connection)
             active_row = active_ingest_v2_run_row(connection)
             if active_row is not None:
                 raise RetrieverStructuredError(
@@ -9339,6 +9340,7 @@ def ingest_v2_facade(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        ensure_workspace_runtime_metadata(root, connection)
         active_row = active_ingest_v2_run_row(connection)
         if active_row is not None:
             active_scope = decode_json_text(active_row["scope_json"], default={}) or {}
