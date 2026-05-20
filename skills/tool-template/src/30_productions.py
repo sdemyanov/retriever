@@ -4031,6 +4031,94 @@ def build_chat_document_preview_html(document: dict[str, object]) -> str:
     )
 
 
+def default_chat_document_preview_file_name(document: dict[str, object]) -> str:
+    rel_path = normalize_whitespace(str(document.get("rel_path") or ""))
+    source_kind = normalize_whitespace(str(document.get("source_kind") or "")).lower()
+    source_item_id = normalize_whitespace(str(document.get("source_item_id") or ""))
+    if source_kind in CONTAINER_SOURCE_FILE_TYPES and source_item_id:
+        return container_preview_file_name(source_item_id)
+    if rel_path:
+        return f"{Path(rel_path).name}.html"
+    return "preview.html"
+
+
+def regenerate_chat_preview_for_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    document_id: int,
+) -> dict[str, object]:
+    documents = load_preview_documents(connection, paths, document_ids=[document_id])
+    if not documents:
+        return {"status": "skipped", "reason": "unknown_document"}
+    document = dict(documents[0])
+    if not document_content_type_is_chat(document.get("content_type")):
+        return {"status": "skipped", "reason": "not_chat"}
+    if document.get("conversation_id") is not None:
+        return {"status": "skipped", "reason": "conversation_scope"}
+
+    rel_path = normalize_whitespace(str(document.get("rel_path") or ""))
+    if not rel_path:
+        return {"status": "skipped", "reason": "missing_rel_path"}
+
+    preserved_preview_rows = load_preserved_preview_rows_by_document_id(
+        connection,
+        paths,
+        [document_id],
+    ).get(document_id, [])
+    preferred_html_row = next(
+        (
+            row
+            for row in sorted(
+                preserved_preview_rows,
+                key=lambda item: int(item.get("ordinal", 0)),
+            )
+            if normalize_whitespace(str(row.get("preview_type") or "")).lower() == "html"
+        ),
+        None,
+    )
+    preview_file_name = (
+        Path(str(preferred_html_row["rel_preview_path"])).name
+        if preferred_html_row is not None and preferred_html_row.get("rel_preview_path")
+        else default_chat_document_preview_file_name(document)
+    )
+    preview_label = (
+        normalize_whitespace(str(preferred_html_row.get("label") or ""))
+        if preferred_html_row is not None
+        else ""
+    )
+    preview_artifacts = [
+        {
+            "file_name": preview_file_name,
+            "preview_type": "html",
+            "label": preview_label or "conversation",
+            "ordinal": 0,
+            "content": build_chat_document_preview_html(document),
+        }
+    ]
+    previous_preview_paths = [
+        str(preview_row["rel_preview_path"])
+        for preview_row in connection.execute(
+            "SELECT rel_preview_path FROM document_previews WHERE document_id = ?",
+            (document_id,),
+        ).fetchall()
+    ]
+    preview_rows = write_preview_artifacts(paths, rel_path, preview_artifacts)
+    preserved_non_html_rows = rebase_preserved_preview_rows(
+        [
+            row
+            for row in preserved_preview_rows
+            if normalize_whitespace(str(row.get("preview_type") or "")).lower() != "html"
+        ],
+        start_ordinal=len(preview_rows),
+        created_at=utc_now(),
+    )
+    replace_document_preview_rows(connection, document_id, [*preview_rows, *preserved_non_html_rows])
+    cleanup_unreferenced_preview_files(paths, connection, previous_preview_paths)
+    sync_document_attachment_preview_links(connection, paths, document_id)
+    return {"status": "ok", "preview_rows": len(preview_rows) + len(preserved_non_html_rows)}
+
+
 def build_chat_conversation_preview_html(
     conversation_row: sqlite3.Row,
     documents: list[dict[str, object]],
@@ -4620,25 +4708,44 @@ def conversation_document_uses_entry_preview(document: dict[str, object]) -> boo
     return normalize_whitespace(str(document.get("content_type") or "")).lower() == "chat"
 
 
+def document_content_type_is_chat(content_type: object) -> bool:
+    return normalize_whitespace(str(content_type or "")).lower() == "chat"
+
+
 def load_document_preview_text(
     connection: sqlite3.Connection,
     paths: dict[str, Path],
     *,
     document_id: int,
     storage_rel_path: object,
+    prefer_search_chunks: bool = False,
 ) -> str:
+    chunk_rows: list[sqlite3.Row] | None = None
+    if prefer_search_chunks:
+        chunk_rows = connection.execute(
+            """
+            SELECT text_content
+            FROM document_chunks
+            WHERE document_id = ?
+            ORDER BY chunk_index ASC
+            """,
+            (document_id,),
+        ).fetchall()
+        if chunk_rows:
+            return "\n".join(str(row["text_content"] or "") for row in chunk_rows)
     text_content = read_text_revision_body(paths, str(storage_rel_path or "") or None)
     if text_content is not None:
         return text_content
-    chunk_rows = connection.execute(
-        """
-        SELECT text_content
-        FROM document_chunks
-        WHERE document_id = ?
-        ORDER BY chunk_index ASC
-        """,
-        (document_id,),
-    ).fetchall()
+    if chunk_rows is None:
+        chunk_rows = connection.execute(
+            """
+            SELECT text_content
+            FROM document_chunks
+            WHERE document_id = ?
+            ORDER BY chunk_index ASC
+            """,
+            (document_id,),
+        ).fetchall()
     return "\n".join(str(row["text_content"] or "") for row in chunk_rows)
 
 
@@ -4724,6 +4831,7 @@ def load_preview_documents(
                     paths,
                     document_id=int(row["id"]),
                     storage_rel_path=row["source_text_storage_rel_path"],
+                    prefer_search_chunks=document_content_type_is_chat(row["content_type"]),
                 )
             }
         )

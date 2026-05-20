@@ -430,6 +430,40 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
                 return target
         raise AssertionError(f"Missing preview target with label {label!r}.")
 
+    def create_text_revision(
+        self,
+        *,
+        document_id: int,
+        parent_revision_id: int,
+        text_content: str,
+        revision_kind: str = "translation",
+        language: str = "en",
+        quality_score: float = 1.0,
+    ) -> int:
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("BEGIN")
+            try:
+                revision_id = retriever_tools.create_text_revision_row(
+                    connection,
+                    self.paths,
+                    document_id=document_id,
+                    revision_kind=revision_kind,
+                    text_content=text_content,
+                    language=language,
+                    parent_revision_id=parent_revision_id,
+                    created_by_job_version_id=None,
+                    quality_score=quality_score,
+                    provider_metadata={"provider": "test"},
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        finally:
+            connection.close()
+        return int(revision_id)
+
     def create_legacy_documents_table(self, *, with_row: bool) -> None:
         connection = sqlite3.connect(self.paths["db_path"])
         try:
@@ -18543,6 +18577,262 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(refresh_all_result["refreshed_documents"], 1)
         self.assertEqual(refresh_all_result["refreshed_conversations"], 0)
         self.assertNotIn("stale rtf preview again", preview_path.read_text(encoding="utf-8"))
+
+    def test_activate_text_revision_and_refresh_previews_regenerate_standalone_chat_preview_from_active_text(self) -> None:
+        source_message = "\u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u043e\u0436\u0435\u043c \u0441\u043e\u0437\u0432\u043e\u043d\u0438\u0442\u044c\u0441\u044f?"
+        source_reply = "\u0414\u0430, \u0434\u0430\u0432\u0430\u0439 \u0432 10:05."
+        translated_reply_html = "Yes, let&#x27;s sync at 10:05."
+        translated_text = (
+            "[2022-12-17T00:03:54Z] Sergey Demyanov: Hello, can we sync?\n"
+            "[2022-12-17T00:08:54Z] Maksim Faleev: Yes, let's sync at 10:05."
+        )
+
+        (self.root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = self.root / "general"
+        channel_dir.mkdir()
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": source_message,
+                        "user": "U04SERGEY1",
+                        "ts": "1671235434.237949",
+                    },
+                    {
+                        "type": "message",
+                        "text": source_reply,
+                        "user": "U04MAX0001",
+                        "ts": "1671235734.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["new"], 2)
+        row = self.fetch_document_row("general/2022-12-16.json")
+        source_revision_id = int(row["source_text_revision_id"])
+        search_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        document_result = next(item for item in search_result["results"] if item["id"] == row["id"])
+        preview_path = self.preview_target_file_path(document_result["preview_targets"][0])
+        source_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn(source_message, source_preview_html)
+        self.assertIn(source_reply, source_preview_html)
+
+        translated_revision_id = self.create_text_revision(
+            document_id=int(row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=translated_text,
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(row["id"]),
+            "--text-revision-id",
+            str(translated_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "ok")
+        activated_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertIn("Hello, can we sync?", activated_preview_html)
+        self.assertIn(translated_reply_html, activated_preview_html)
+        self.assertNotIn(source_message, activated_preview_html)
+        self.assertNotIn(source_reply, activated_preview_html)
+
+        preview_path.write_text("stale translated preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "documents",
+            "--doc-id",
+            str(row["id"]),
+            "--from-source",
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "documents")
+        self.assertEqual(refresh_payload["refreshed_documents"], 1)
+        refreshed_preview_html = preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale translated preview", refreshed_preview_html)
+        self.assertIn("Hello, can we sync?", refreshed_preview_html)
+        self.assertIn(translated_reply_html, refreshed_preview_html)
+        self.assertNotIn(source_message, refreshed_preview_html)
+        self.assertNotIn(source_reply, refreshed_preview_html)
+
+    def test_refresh_previews_conversation_scope_uses_active_chat_text_for_slack_export(self) -> None:
+        source_message = "\u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u043e\u0436\u0435\u043c \u0441\u043e\u0437\u0432\u043e\u043d\u0438\u0442\u044c\u0441\u044f?"
+        source_reply = "\u0414\u0430, \u0434\u0430\u0432\u0430\u0439 \u0432 10:05."
+        translated_reply_html = "Yes, let&#x27;s sync at 10:05."
+        translated_text = (
+            "[2022-12-17T00:03:54Z] Sergey Demyanov: Hello, can we sync?\n"
+            "[2022-12-17T00:08:54Z] Maksim Faleev: Yes, let's sync at 10:05."
+        )
+
+        export_root = self.root / "data" / "slack"
+        export_root.mkdir(parents=True)
+        (export_root / "users.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "U04SERGEY1",
+                        "name": "sergey",
+                        "profile": {
+                            "real_name": "Sergey Demyanov",
+                            "display_name": "Sergey",
+                        },
+                    },
+                    {
+                        "id": "U04MAX0001",
+                        "name": "maksim",
+                        "profile": {
+                            "real_name": "Maksim Faleev",
+                            "display_name": "Maksim",
+                        },
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (export_root / "channels.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "C04GENERAL1",
+                        "name": "general",
+                        "is_channel": True,
+                    }
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        channel_dir = export_root / "general"
+        channel_dir.mkdir()
+        (channel_dir / "2022-12-16.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "type": "message",
+                        "text": source_message,
+                        "user": "U04SERGEY1",
+                        "ts": "1671235434.237949",
+                    },
+                    {
+                        "type": "message",
+                        "text": source_reply,
+                        "user": "U04MAX0001",
+                        "ts": "1671235734.237949",
+                    },
+                ],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+
+        self.assertEqual(ingest_result["slack_documents_created"], 1)
+        day_row = self.fetch_document_row("data/slack/general/2022-12-16.json")
+        source_revision_id = int(day_row["source_text_revision_id"])
+        browse_result = retriever_tools.search(self.root, "", None, None, None, 1, 20)
+        day_result = next(item for item in browse_result["results"] if item["id"] == day_row["id"])
+        conversation_preview_path = self.preview_target_file_path(
+            self.preview_target_by_label(day_result["preview_targets"], "conversation")
+        )
+        source_conversation_html = conversation_preview_path.read_text(encoding="utf-8")
+        self.assertIn(source_message, source_conversation_html)
+        self.assertIn(source_reply, source_conversation_html)
+
+        translated_revision_id = self.create_text_revision(
+            document_id=int(day_row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=translated_text,
+        )
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(day_row["id"]),
+            "--text-revision-id",
+            str(translated_revision_id),
+        )
+
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+        assert activate_payload is not None
+        self.assertEqual(activate_payload["preview_regen"]["status"], "skipped")
+        self.assertEqual(activate_payload["preview_regen"]["reason"], "conversation_scope")
+
+        conversation_preview_path.write_text("stale conversation preview", encoding="utf-8")
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-previews",
+            str(self.root),
+            "--scope",
+            "conversations",
+            "--doc-id",
+            str(day_row["id"]),
+        )
+
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        assert refresh_payload is not None
+        self.assertEqual(refresh_payload["status"], "ok")
+        self.assertEqual(refresh_payload["scope"], "conversations")
+        self.assertEqual(refresh_payload["refreshed_conversations"], 1)
+        refreshed_conversation_html = conversation_preview_path.read_text(encoding="utf-8")
+        self.assertNotIn("stale conversation preview", refreshed_conversation_html)
+        self.assertIn("Hello, can we sync?", refreshed_conversation_html)
+        self.assertIn(translated_reply_html, refreshed_conversation_html)
+        self.assertNotIn(source_message, refreshed_conversation_html)
+        self.assertNotIn(source_reply, refreshed_conversation_html)
 
     def test_refresh_previews_document_scope_refreshes_production_email_in_conversation(self) -> None:
         self.write_production_fixture()

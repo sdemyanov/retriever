@@ -18866,6 +18866,7 @@ def load_preview_refresh_document_rows(
         SELECT
           d.id,
           d.rel_path,
+          d.content_type,
           d.source_kind,
           d.conversation_id,
           d.production_id,
@@ -18889,6 +18890,12 @@ def refresh_source_backed_document_preview(
     rel_path = str(row["rel_path"] or "")
     if is_internal_rel_path(rel_path):
         return {"status": "skipped", "reason": "internal_document"}
+    if document_content_type_is_chat(row["content_type"]):
+        return regenerate_chat_preview_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+        )
     source_kind = normalize_whitespace(str(row["source_kind"] or FILESYSTEM_SOURCE_KIND)).lower()
     if source_kind != FILESYSTEM_SOURCE_KIND:
         return {"status": "skipped", "reason": "source_kind_requires_ingest"}
@@ -18922,6 +18929,12 @@ def refresh_stored_state_document_preview(
     row: sqlite3.Row,
 ) -> dict[str, object]:
     document_id = int(row["id"])
+    if document_content_type_is_chat(row["content_type"]):
+        return regenerate_chat_preview_for_document(
+            connection,
+            paths,
+            document_id=document_id,
+        )
     if row["production_id"] is not None:
         text_content = load_document_preview_text(
             connection,
