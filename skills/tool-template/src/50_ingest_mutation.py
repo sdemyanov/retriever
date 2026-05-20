@@ -9320,6 +9320,7 @@ def ingest_v2_facade(
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
     skip_unchanged_loose_files: bool = True,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -9378,6 +9379,8 @@ def ingest_v2_facade(
             for key, value in start_payload.items()
             if key not in {"ok", "created"}
         }
+    if progress_callback is not None and run_to_completion:
+        progress_callback((start_payload if not resumed else run_payload), True)
 
     step_payloads: list[dict[str, object]] = []
     reason = "run_terminal" if str(run_payload.get("status")) in INGEST_V2_TERMINAL_STATUSES else "budget_exhausted"
@@ -9390,10 +9393,12 @@ def ingest_v2_facade(
         step_payloads.append(step_payload)
         run_payload = dict(step_payload["run"])
         reason = str(step_payload.get("reason") or reason)
+        if progress_callback is not None and run_to_completion:
+            progress_callback(step_payload, False)
         if not run_to_completion:
             break
 
-    return ingest_v2_facade_payload(
+    payload = ingest_v2_facade_payload(
         root=root,
         recursive=recursive,
         raw_file_types=raw_file_types,
@@ -9406,6 +9411,9 @@ def ingest_v2_facade(
         reason=reason,
         mode="run_to_completion" if run_to_completion else "bounded",
     )
+    if progress_callback is not None and run_to_completion:
+        progress_callback(payload, True)
+    return payload
 
 
 def ingest_v2_step_not_implemented(
@@ -12878,6 +12886,7 @@ def rebuild_entities(
     *,
     document_ids: list[int] | None = None,
     batch_size: int = 500,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     normalized_batch_size = max(1, min(int(batch_size or 500), 5000))
     paths = workspace_paths(root)
@@ -12888,14 +12897,33 @@ def rebuild_entities(
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="rebuild-entities")
             raise_if_entity_rebuild_active(connection, root, command_name="rebuild-entities")
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "running",
+                        "phase": "preparing",
+                        "detail": "selecting documents",
+                    },
+                    True,
+                )
             ids_to_rebuild = entity_rebuild_document_ids(connection, document_ids)
             full_rebuild = not document_ids
+            total_documents = len(ids_to_rebuild)
             reset_counts = {
                 "auto_document_links_deleted": 0,
                 "auto_resolution_keys_deleted": 0,
                 "auto_identifiers_deleted": 0,
                 "auto_entities_deleted": 0,
             }
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "running" if total_documents or full_rebuild else "completed",
+                        "phase": "resetting" if full_rebuild else ("syncing" if total_documents else "completed"),
+                        "detail": f"0/{total_documents} documents",
+                    },
+                    True,
+                )
             if full_rebuild:
                 connection.execute("BEGIN")
                 try:
@@ -12907,6 +12935,16 @@ def rebuild_entities(
 
             documents_synced = 0
             auto_links_created = 0
+            processed_documents = 0
+            if progress_callback is not None and full_rebuild and total_documents:
+                progress_callback(
+                    {
+                        "status": "running",
+                        "phase": "syncing",
+                        "detail": f"0/{total_documents} documents",
+                    },
+                    False,
+                )
             for offset in range(0, len(ids_to_rebuild), normalized_batch_size):
                 batch_document_ids = ids_to_rebuild[offset : offset + normalized_batch_size]
                 connection.execute("BEGIN")
@@ -12925,22 +12963,42 @@ def rebuild_entities(
                                 (document_id,),
                             ).fetchone()
                             auto_links_created += int(row[0] or 0) if row is not None else 0
+                        processed_documents += 1
+                        if progress_callback is not None:
+                            progress_callback(
+                                {
+                                    "status": "running",
+                                    "phase": "syncing",
+                                    "detail": f"{processed_documents}/{total_documents} documents",
+                                },
+                                False,
+                            )
                     connection.commit()
                 except Exception:
                     connection.rollback()
                     raise
 
-            return {
+            payload = {
                 "status": "ok",
                 "session_id": rebuild_session["id"],
                 "mode": "full" if full_rebuild else "selected",
-                "documents_scanned": len(ids_to_rebuild),
+                "documents_scanned": total_documents,
                 "documents_synced": documents_synced,
                 "auto_links_created": auto_links_created,
                 "batch_size": normalized_batch_size,
                 **reset_counts,
                 **entity_graph_counts(connection),
             }
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "completed",
+                        "phase": "completed",
+                        "detail": f"{processed_documents}/{total_documents} documents",
+                    },
+                    True,
+                )
+            return payload
         finally:
             connection.close()
 
@@ -16869,6 +16927,10 @@ def run_job_default_claimed_by(run_id: int) -> str:
     return f"cowork-run-{int(run_id)}"
 
 
+def run_job_effective_claimed_by(run_id: int, claimed_by: str | None = None) -> str:
+    return normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id))
+
+
 def run_job_next_recommended_commands(
     root: Path,
     *,
@@ -16880,17 +16942,33 @@ def run_job_next_recommended_commands(
     root_arg = shlex.quote(str(root))
     run_id_arg = str(run_id)
     budget_arg = str(int(budget_seconds))
-    claimed_by_arg = shlex.quote(normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id)))
+    effective_claimed_by = run_job_effective_claimed_by(run_id, claimed_by)
+    claimed_by_arg = shlex.quote(effective_claimed_by)
     if str(run_payload.get("status") or "") in {"completed", "failed", "canceled"}:
         return [f"run-status {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}"]
 
     worker_payload = dict(run_payload.get("worker") or {})
     next_action = str(worker_payload.get("next_action") or "")
+    handoff_claimed_by_hint = (
+        normalize_whitespace(str(worker_payload.get("handoff_claimed_by_hint") or "")) or None
+    )
     commands: list[str] = []
     if next_action == "finalize_ocr":
         commands.append(f"finalize-ocr-run {root_arg} --run-id {run_id_arg}")
     elif next_action == "finalize_image_description":
         commands.append(f"finalize-image-description-run {root_arg} --run-id {run_id_arg}")
+    elif next_action == "handoff":
+        continuation_claimed_by = handoff_claimed_by_hint or f"{effective_claimed_by}-handoff"
+        continuation_arg = shlex.quote(continuation_claimed_by)
+        commands.extend(
+            [
+                "run-job-step "
+                f"{root_arg} --run-id {run_id_arg} --claimed-by {continuation_arg} --budget-seconds {budget_arg}",
+                "prepare-run-batch "
+                f"{root_arg} --run-id {run_id_arg} --claimed-by {continuation_arg} "
+                f"--budget-seconds {budget_arg} --stale-seconds {DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS}",
+            ]
+        )
     elif next_action in {"claim", "process_batch", "stop"}:
         run_item_counts = dict(run_payload.get("run_item_counts") or {})
         if (
@@ -16903,11 +16981,11 @@ def run_job_next_recommended_commands(
                 f"{root_arg} --run-id {run_id_arg} --claimed-by {claimed_by_arg} "
                 f"--budget-seconds {budget_arg} --stale-seconds {DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS}"
             )
-    if commands:
+    if commands and next_action != "handoff":
         commands.insert(
             0,
             "run-job-step "
-            f"{root_arg} --run-id {run_id_arg} --claimed-by {claimed_by_arg} --budget-seconds {budget_arg}",
+                f"{root_arg} --run-id {run_id_arg} --claimed-by {claimed_by_arg} --budget-seconds {budget_arg}",
         )
     commands.append(f"run-status {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
     return commands
@@ -16958,7 +17036,7 @@ def run_job_step(
     stale_after_seconds: int | None = None,
 ) -> dict[str, object]:
     budget = normalize_resumable_step_budget(budget_seconds)
-    normalized_claimed_by = normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id))
+    normalized_claimed_by = run_job_effective_claimed_by(run_id, claimed_by)
     if not normalized_claimed_by:
         raise RetrieverError("claimed_by cannot be empty.")
     status_payload = run_status(
@@ -17041,6 +17119,9 @@ def run_job_step(
             budget_seconds=budget,
             claimed_by=normalized_claimed_by,
         )
+        handoff_claimed_by_hint = (
+            normalize_whitespace(str(worker_payload.get("handoff_claimed_by_hint") or "")) or None
+        )
         return {
             "status": "ok",
             "step": "run-job",
@@ -17049,10 +17130,11 @@ def run_job_step(
             "budget_seconds": budget,
             "executed": False,
             "executed_step": None,
-            "reason": next_action or "stop",
+            "reason": "handoff_required" if next_action == "handoff" else (next_action or "stop"),
             "batch": [],
             "step_result": None,
             "run": run_payload,
+            "handoff_claimed_by_hint": handoff_claimed_by_hint,
             "more_work_remaining": bool(run_payload.get("status") not in {"completed", "failed", "canceled"}),
             "next_recommended_commands": run_payload["next_recommended_commands"],
         }
@@ -17214,7 +17296,14 @@ def finish_run_worker(
         connection.close()
 
 
-def finalize_ocr_run(root: Path, *, run_id: int) -> dict[str, object]:
+def finalize_ocr_run(
+    root: Path,
+    *,
+    run_id: int,
+    cascade_metadata: bool = False,
+    metadata_fields: list[str] | None = None,
+) -> dict[str, object]:
+    normalized_metadata_fields = normalize_text_derived_metadata_fields(metadata_fields)
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -17224,6 +17313,35 @@ def finalize_ocr_run(root: Path, *, run_id: int) -> dict[str, object]:
         try:
             materialize_run_items_for_run(connection, paths, root, run_id)
             payload = finalize_ocr_results_for_run(connection, paths, run_id=run_id)
+            stale_document_ids = sorted(
+                dict.fromkeys(int(document_id) for document_id in payload.get("stale_text_derived_metadata_document_ids") or [])
+            )
+            payload["metadata_cascade_requested"] = bool(cascade_metadata)
+            payload["next_recommended_commands"] = build_refresh_text_derived_metadata_followup_commands(
+                root,
+                stale_document_ids,
+                field_names=normalized_metadata_fields,
+            )
+            if cascade_metadata and stale_document_ids:
+                document_rows = fetch_visible_document_rows_by_ids(connection, stale_document_ids)
+                metadata_payload = refresh_text_derived_metadata_for_document_rows(
+                    connection,
+                    paths,
+                    document_rows=document_rows,
+                    field_names=normalized_metadata_fields,
+                )
+                metadata_payload["selector"] = {
+                    "mode": "document_ids",
+                    "document_ids": [int(row["id"]) for row in document_rows],
+                }
+                metadata_payload["selected_from_scope"] = False
+                metadata_payload["document_ids"] = [int(row["id"]) for row in document_rows]
+                metadata_payload["next_recommended_commands"] = build_rebuild_entities_followup_commands(
+                    root,
+                    list(metadata_payload.get("entity_rebuild_candidate_document_ids") or []),
+                )
+                payload["metadata_refresh"] = metadata_payload
+                payload["next_recommended_commands"] = list(metadata_payload.get("next_recommended_commands") or [])
             connection.commit()
         except Exception:
             connection.rollback()
@@ -19820,5 +19938,375 @@ def set_field(root: Path, document_id_or_ids: int | list[int], field_name: str, 
             "value": row["field_value"] if row is not None else None,
             "manual_field_locks": locks,
         }
+    finally:
+        connection.close()
+
+
+TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN = {
+    "author": "extracted_author",
+    "participants": "extracted_participants",
+    "recipients": "extracted_recipients",
+    "date_created": "extracted_doc_authored_at",
+    "subject": "extracted_subject",
+    "title": "extracted_title",
+}
+DEFAULT_TEXT_DERIVED_METADATA_FIELDS = ("author", "participants", "date_created")
+ENTITY_REBUILD_TEXT_METADATA_FIELDS = frozenset({"author", "participants", "recipients"})
+
+
+def normalize_text_derived_metadata_fields(raw_fields: list[str] | None = None) -> list[str]:
+    normalized_fields: list[str] = []
+    for raw_field in list(raw_fields or DEFAULT_TEXT_DERIVED_METADATA_FIELDS):
+        normalized_field = normalize_whitespace(str(raw_field or "")).lower()
+        if not normalized_field:
+            continue
+        if normalized_field not in TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN:
+            supported = ", ".join(sorted(TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN))
+            raise RetrieverError(
+                f"Unsupported text-derived metadata field {raw_field!r}. Supported values: {supported}."
+            )
+        if normalized_field not in normalized_fields:
+            normalized_fields.append(normalized_field)
+    if not normalized_fields:
+        raise RetrieverError("At least one metadata field must be selected.")
+    return normalized_fields
+
+
+def load_active_text_for_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_row: sqlite3.Row,
+) -> tuple[str | None, int | None]:
+    revision_id = (
+        int(document_row["active_search_text_revision_id"])
+        if document_row["active_search_text_revision_id"] is not None
+        else (
+            int(document_row["source_text_revision_id"])
+            if document_row["source_text_revision_id"] is not None
+            else None
+        )
+    )
+    if revision_id is not None:
+        revision_row = require_text_revision_row_by_id(connection, revision_id)
+        text_content = read_text_revision_body(paths, revision_row["storage_rel_path"])
+        if text_content is not None:
+            return text_content, revision_id
+    chunk_rows = document_chunk_rows(connection, int(document_row["id"]))
+    if not chunk_rows:
+        return None, revision_id
+    return "\n\n".join(str(chunk_row["text_content"] or "") for chunk_row in chunk_rows), revision_id
+
+
+def derive_text_metadata_from_active_text(text_content: str) -> dict[str, str | None]:
+    metadata = extract_email_like_headers(text_content)
+    if not metadata:
+        return {}
+    chain_participants = extract_email_chain_participants(
+        text_content,
+        [
+            metadata.get("author"),
+            metadata.get("participants"),
+            metadata.get("recipients"),
+        ],
+    )
+    if chain_participants:
+        metadata["participants"] = chain_participants
+    return metadata
+
+
+def build_rebuild_entities_followup_commands(root: Path, document_ids: list[int]) -> list[str]:
+    normalized_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+    if not normalized_document_ids:
+        return []
+    root_arg = shlex.quote(str(root))
+    doc_args = " ".join(f"--doc-id {document_id}" for document_id in normalized_document_ids)
+    return [f"rebuild-entities {root_arg} {doc_args}"]
+
+
+def build_refresh_text_derived_metadata_followup_commands(
+    root: Path,
+    document_ids: list[int],
+    *,
+    field_names: list[str] | None = None,
+) -> list[str]:
+    normalized_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+    if not normalized_document_ids:
+        return []
+    normalized_fields = normalize_text_derived_metadata_fields(field_names)
+    root_arg = shlex.quote(str(root))
+    doc_args = " ".join(f"--doc-id {document_id}" for document_id in normalized_document_ids)
+    field_args = (
+        " ".join(f"--field {field_name}" for field_name in normalized_fields)
+        if tuple(normalized_fields) != DEFAULT_TEXT_DERIVED_METADATA_FIELDS
+        else ""
+    )
+    args = " ".join(part for part in [field_args, doc_args] if part)
+    return [f"refresh-text-derived-metadata {root_arg} {args}".strip()]
+
+
+def refresh_text_derived_metadata_for_document_rows(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    document_rows: list[sqlite3.Row],
+    field_names: list[str],
+) -> dict[str, object]:
+    normalized_field_names = normalize_text_derived_metadata_fields(field_names)
+    updated_documents = 0
+    updated_fields = 0
+    skipped_reasons: dict[str, int] = defaultdict(int)
+    results: list[dict[str, object]] = []
+    entity_rebuild_candidate_document_ids: list[int] = []
+    now = utc_now()
+
+    for document_row in document_rows:
+        document_id = int(document_row["id"])
+        before = {
+            field_name: document_row[field_name]
+            for field_name in TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN
+        }
+        manual_locks = set(normalize_string_list(document_row[MANUAL_FIELD_LOCKS_COLUMN]))
+        text_content, revision_id = load_active_text_for_document(connection, paths, document_row)
+        if not normalize_whitespace(text_content or ""):
+            skipped_reasons["no_active_text"] = skipped_reasons.get("no_active_text", 0) + 1
+            results.append(
+                {
+                    "document_id": document_id,
+                    "status": "skipped",
+                    "reason": "no_active_text",
+                    "active_text_revision_id": revision_id,
+                    "field_names": normalized_field_names,
+                    "before": before,
+                    "after": dict(before),
+                    "updated_fields": [],
+                    "locked_fields": [],
+                    "derived": {},
+                }
+            )
+            continue
+
+        derived = derive_text_metadata_from_active_text(str(text_content or ""))
+        if not derived:
+            skipped_reasons["no_email_headers"] = skipped_reasons.get("no_email_headers", 0) + 1
+            results.append(
+                {
+                    "document_id": document_id,
+                    "status": "skipped",
+                    "reason": "no_email_headers",
+                    "active_text_revision_id": revision_id,
+                    "field_names": normalized_field_names,
+                    "before": before,
+                    "after": dict(before),
+                    "updated_fields": [],
+                    "locked_fields": [],
+                    "derived": {},
+                }
+            )
+            continue
+
+        occurrence_rows = active_occurrence_rows_for_document(connection, document_id)
+        if not occurrence_rows:
+            skipped_reasons["no_active_occurrences"] = skipped_reasons.get("no_active_occurrences", 0) + 1
+            results.append(
+                {
+                    "document_id": document_id,
+                    "status": "skipped",
+                    "reason": "no_active_occurrences",
+                    "active_text_revision_id": revision_id,
+                    "field_names": normalized_field_names,
+                    "before": before,
+                    "after": dict(before),
+                    "updated_fields": [],
+                    "locked_fields": [],
+                    "derived": {
+                        field_name: derived.get(field_name)
+                        for field_name in normalized_field_names
+                        if derived.get(field_name) is not None
+                    },
+                }
+            )
+            continue
+
+        selected_derived_values = {
+            field_name: derived.get(field_name)
+            for field_name in normalized_field_names
+            if derived.get(field_name) is not None
+        }
+        if not selected_derived_values:
+            skipped_reasons["no_selected_fields"] = skipped_reasons.get("no_selected_fields", 0) + 1
+            results.append(
+                {
+                    "document_id": document_id,
+                    "status": "skipped",
+                    "reason": "no_selected_fields",
+                    "active_text_revision_id": revision_id,
+                    "field_names": normalized_field_names,
+                    "before": before,
+                    "after": dict(before),
+                    "updated_fields": [],
+                    "locked_fields": [],
+                    "derived": {},
+                }
+            )
+            continue
+
+        for occurrence_row in occurrence_rows:
+            assignments: list[str] = []
+            params: list[object] = []
+            for field_name, derived_value in selected_derived_values.items():
+                column_name = TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN[field_name]
+                if occurrence_row[column_name] == derived_value:
+                    continue
+                assignments.append(f"{quote_identifier(column_name)} = ?")
+                params.append(derived_value)
+            if not assignments:
+                continue
+            assignments.append("updated_at = ?")
+            params.append(now)
+            params.append(int(occurrence_row["id"]))
+            connection.execute(
+                f"""
+                UPDATE document_occurrences
+                SET {', '.join(assignments)}
+                WHERE id = ?
+                """,
+                params,
+            )
+
+        refresh_document_from_occurrences(connection, document_id)
+        updated_row = connection.execute(
+            f"""
+            SELECT
+              id,
+              {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} AS locks_json,
+              {", ".join(quote_identifier(field_name) for field_name in TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN)}
+            FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+        assert updated_row is not None
+        after = {
+            field_name: updated_row[field_name]
+            for field_name in TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN
+        }
+        changed_field_names = [
+            field_name
+            for field_name in normalized_field_names
+            if before.get(field_name) != after.get(field_name)
+        ]
+        locked_fields = [
+            field_name
+            for field_name in normalized_field_names
+            if field_name in manual_locks
+            and selected_derived_values.get(field_name) is not None
+            and before.get(field_name) != selected_derived_values.get(field_name)
+        ]
+        if changed_field_names:
+            updated_documents += 1
+            updated_fields += len(changed_field_names)
+            if set(changed_field_names) & ENTITY_REBUILD_TEXT_METADATA_FIELDS:
+                entity_rebuild_candidate_document_ids.append(document_id)
+        results.append(
+            {
+                "document_id": document_id,
+                "status": "updated" if changed_field_names else "unchanged",
+                "reason": None,
+                "active_text_revision_id": revision_id,
+                "field_names": normalized_field_names,
+                "before": before,
+                "after": after,
+                "updated_fields": changed_field_names,
+                "locked_fields": locked_fields,
+                "derived": selected_derived_values,
+            }
+        )
+
+    return {
+        "status": "ok",
+        "field_names": normalized_field_names,
+        "processed_documents": len(document_rows),
+        "updated_documents": updated_documents,
+        "updated_fields": updated_fields,
+        "skipped_documents": sum(1 for item in results if item["status"] == "skipped"),
+        "skipped_reasons": dict(sorted(skipped_reasons.items())),
+        "results": results,
+        "entity_rebuild_candidate_document_ids": sorted(dict.fromkeys(entity_rebuild_candidate_document_ids)),
+    }
+
+
+def refresh_text_derived_metadata(
+    root: Path,
+    *,
+    document_ids: list[int] | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    dataset_names: list[str] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
+    field_names: list[str] | None = None,
+) -> dict[str, object]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+    normalized_field_names = normalize_text_derived_metadata_fields(field_names)
+    selector_inputs_present = bool(query.strip() or raw_bates or raw_filters or dataset_names or from_run_id is not None)
+    if normalized_document_ids and (selector_inputs_present or select_from_scope):
+        raise RetrieverError(
+            "refresh-text-derived-metadata accepts either --doc-id selectors or query/filter/scope selectors, not both."
+        )
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        if normalized_document_ids:
+            target_rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
+            selector_payload: dict[str, object] = {
+                "mode": "document_ids",
+                "document_ids": [int(row["id"]) for row in target_rows],
+            }
+            selected_from_scope = False
+        else:
+            selector = build_effective_scope_selector(
+                connection,
+                paths,
+                query=query,
+                raw_bates=raw_bates,
+                raw_filters=raw_filters,
+                dataset_names=dataset_names,
+                from_run_id=from_run_id,
+                select_from_scope=select_from_scope,
+            )
+            if not scope_run_selector_has_inputs(selector):
+                raise RetrieverError(build_no_document_selection_error())
+            target_document_ids, _, _ = resolve_seed_documents_for_scope_selector(connection, selector)
+            target_rows = fetch_visible_document_rows_by_ids(connection, target_document_ids)
+            selector_payload = {
+                "mode": "scope_search",
+                "scope": selector,
+            }
+            selected_from_scope = bool(select_from_scope)
+
+        connection.execute("BEGIN")
+        try:
+            payload = refresh_text_derived_metadata_for_document_rows(
+                connection,
+                paths,
+                document_rows=target_rows,
+                field_names=normalized_field_names,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        payload["selector"] = selector_payload
+        payload["selected_from_scope"] = selected_from_scope
+        payload["document_ids"] = [int(row["id"]) for row in target_rows]
+        payload["next_recommended_commands"] = build_rebuild_entities_followup_commands(
+            root,
+            list(payload.get("entity_rebuild_candidate_document_ids") or []),
+        )
+        return payload
     finally:
         connection.close()

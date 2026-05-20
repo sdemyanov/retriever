@@ -2060,7 +2060,7 @@ def workspace_status(root: Path, quick: bool) -> dict[str, object]:
     return result
 
 
-def doctor(root: Path, quick: bool) -> dict[str, object]:
+def doctor(root: Path, quick: bool, *, repair_stale_sidecars: bool = False) -> dict[str, object]:
     set_active_workspace_root(root)
     paths = workspace_paths(root)
     runtime_paths = plugin_runtime_paths(root=root)
@@ -2091,16 +2091,35 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
     processing_providers = probe_processing_providers(None)
     journal_mode = None
     db_error = None
+    integrity_check: dict[str, object] | None = None
+    stale_artifacts_before = [str(path) for path in stale_sqlite_artifact_paths(paths["db_path"])]
+    removed_stale_artifacts: list[str] = []
+
+    if repair_stale_sidecars and stale_artifacts_before:
+        removed_stale_artifacts = remove_stale_sqlite_artifacts(paths["db_path"])
 
     if paths["db_path"].exists():
         try:
             connection = connect_db(paths["db_path"])
             try:
                 journal_mode = current_journal_mode(connection)
-                schema_status = apply_schema(connection, root)
-                registry_status = reconcile_custom_fields_registry(connection, repair=True)
-                workspace_inventory = document_inventory_counts(connection)
-                processing_providers = probe_processing_providers(connection)
+                try:
+                    integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+                    integrity_messages = [str(row[0]) for row in integrity_rows]
+                    integrity_check = {
+                        "status": "ok" if integrity_messages == ["ok"] else "error",
+                        "messages": integrity_messages,
+                    }
+                except Exception as exc:
+                    integrity_check = {
+                        "status": "failed",
+                        "messages": [f"{type(exc).__name__}: {exc}"],
+                    }
+                if integrity_check is None or str(integrity_check.get("status")) == "ok":
+                    schema_status = apply_schema(connection, root)
+                    registry_status = reconcile_custom_fields_registry(connection, repair=True)
+                    workspace_inventory = document_inventory_counts(connection)
+                    processing_providers = probe_processing_providers(connection)
             finally:
                 connection.close()
         except Exception as exc:
@@ -2111,7 +2130,11 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
         overall = "fail"
     elif db_error is not None:
         overall = "fail"
+    elif integrity_check is not None and str(integrity_check.get("status") or "") != "ok":
+        overall = "fail"
     elif workspace_state == "partial":
+        overall = "partial"
+    elif stale_artifacts_before and not removed_stale_artifacts:
         overall = "partial"
 
     result: dict[str, object] = {
@@ -2140,6 +2163,12 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
             "runtime_sha256": stored_sha,
             "matches_runtime": current_sha == stored_sha if current_sha and stored_sha else None,
         },
+        "db": {
+            "path": str(paths["db_path"]),
+            "stale_sqlite_artifacts_before": stale_artifacts_before,
+            "removed_stale_sqlite_artifacts": removed_stale_artifacts,
+            "stale_sqlite_artifacts_after": [str(path) for path in stale_sqlite_artifact_paths(paths["db_path"])],
+        },
     }
     if journal_mode is not None:
         result["sqlite_journal_mode"] = journal_mode
@@ -2147,6 +2176,8 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
         result["db_error"] = db_error
     if workspace_inventory is not None:
         result["workspace_inventory"] = workspace_inventory
+    if integrity_check is not None:
+        result["db"]["integrity_check"] = integrity_check
 
     if not quick:
         result["paths"] = {key: str(value) for key, value in paths.items()}

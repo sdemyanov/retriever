@@ -139,6 +139,7 @@ SUBCOMMAND_BLURBS: dict[str, str] = {
     "list-chunks": "list chunk metadata for one document",
     "list-text-revisions": "list stored text revisions for a document",
     "activate-text-revision": "promote a stored text revision to active indexed text",
+    "refresh-text-derived-metadata": "refresh text-derived metadata fields from active text",
     # Catalog & aggregation
     "catalog": "describe searchable, filterable, and aggregatable fields",
     "aggregate": "run bounded metadata aggregations across documents",
@@ -252,6 +253,7 @@ SUBCOMMAND_USE_WHEN: dict[str, str] = {
     "list-chunks": "you need the chunk layout for one document",
     "list-text-revisions": "you need to see all text revisions stored for a document",
     "activate-text-revision": "you need to switch a document's active search text to a specific revision",
+    "refresh-text-derived-metadata": "you need to re-derive author, participants, recipients, or date_created from the active text for one document or a selected scope after OCR/text activation — phrasings like \"refresh metadata from OCR text\", \"re-extract participants from active text\", \"fix author/date from the new OCR\", or \"update email header metadata after activating revisions\"",
     # Catalog & aggregation
     "catalog": "the user asks what fields, columns, or attributes exist or are searchable/filterable/aggregatable — phrasings like \"what fields exist\", \"what can I search on\", \"show me the columns I can filter by\", or \"list available attributes\"",
     "aggregate": "the user asks for counts, sums, distinct values, breakdowns, or groupings across filtered documents or entities — phrasings like \"how many emails per sender\", \"count by dataset\", \"breakdown by content type\", \"group by author\", \"entities by type\", \"entities by origin\", \"entities by status\", \"entities by role\", or \"total size by year\"",
@@ -360,6 +362,7 @@ SUBCOMMAND_GROUPS: dict[str, str] = {
     "list-chunks": "Documents & text",
     "list-text-revisions": "Documents & text",
     "activate-text-revision": "Documents & text",
+    "refresh-text-derived-metadata": "Documents & text",
     "catalog": "Catalog & aggregation",
     "aggregate": "Catalog & aggregation",
     "rebuild-entities": "Entities",

@@ -8654,6 +8654,46 @@ def image_path_data_url(path: Path, *, max_dimension: int | None = None) -> str 
     return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
 
 
+READ_SAFE_VISUAL_SUFFIXES = frozenset(
+    {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".webp",
+    }
+)
+
+
+def ensure_read_safe_visual_artifact_path(root: Path, artifact_path: Path) -> Path:
+    if artifact_path.suffix.lower() in READ_SAFE_VISUAL_SUFFIXES:
+        return artifact_path
+
+    pil_image_module = load_dependency("PilImage")
+    if pil_image_module is None:
+        raise RetrieverError(
+            f"Could not load Pillow to convert unsupported visual artifact {artifact_path.name!r} into a Read-safe PNG."
+        )
+
+    paths = workspace_paths(root)
+    output_dir = Path(paths["tmp_dir"]) / "read-safe-visual-artifacts"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stat_result = artifact_path.stat()
+    fingerprint = hashlib.sha256(
+        f"{artifact_path.resolve()}:{stat_result.st_size}:{stat_result.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:12]
+    target_path = output_dir / f"{artifact_path.stem}-{fingerprint}.png"
+    if target_path.exists():
+        return target_path
+
+    with pil_image_module.open(artifact_path) as source_image:
+        converted = source_image.convert("RGBA" if "A" in source_image.getbands() else "RGB")
+        converted.save(target_path, format="PNG")
+    return target_path
+
+
 def pptx_picture_entry(
     element: ET.Element,
     *,
@@ -26497,7 +26537,7 @@ def workspace_status(root: Path, quick: bool) -> dict[str, object]:
     return result
 
 
-def doctor(root: Path, quick: bool) -> dict[str, object]:
+def doctor(root: Path, quick: bool, *, repair_stale_sidecars: bool = False) -> dict[str, object]:
     set_active_workspace_root(root)
     paths = workspace_paths(root)
     runtime_paths = plugin_runtime_paths(root=root)
@@ -26528,16 +26568,35 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
     processing_providers = probe_processing_providers(None)
     journal_mode = None
     db_error = None
+    integrity_check: dict[str, object] | None = None
+    stale_artifacts_before = [str(path) for path in stale_sqlite_artifact_paths(paths["db_path"])]
+    removed_stale_artifacts: list[str] = []
+
+    if repair_stale_sidecars and stale_artifacts_before:
+        removed_stale_artifacts = remove_stale_sqlite_artifacts(paths["db_path"])
 
     if paths["db_path"].exists():
         try:
             connection = connect_db(paths["db_path"])
             try:
                 journal_mode = current_journal_mode(connection)
-                schema_status = apply_schema(connection, root)
-                registry_status = reconcile_custom_fields_registry(connection, repair=True)
-                workspace_inventory = document_inventory_counts(connection)
-                processing_providers = probe_processing_providers(connection)
+                try:
+                    integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+                    integrity_messages = [str(row[0]) for row in integrity_rows]
+                    integrity_check = {
+                        "status": "ok" if integrity_messages == ["ok"] else "error",
+                        "messages": integrity_messages,
+                    }
+                except Exception as exc:
+                    integrity_check = {
+                        "status": "failed",
+                        "messages": [f"{type(exc).__name__}: {exc}"],
+                    }
+                if integrity_check is None or str(integrity_check.get("status")) == "ok":
+                    schema_status = apply_schema(connection, root)
+                    registry_status = reconcile_custom_fields_registry(connection, repair=True)
+                    workspace_inventory = document_inventory_counts(connection)
+                    processing_providers = probe_processing_providers(connection)
             finally:
                 connection.close()
         except Exception as exc:
@@ -26548,7 +26607,11 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
         overall = "fail"
     elif db_error is not None:
         overall = "fail"
+    elif integrity_check is not None and str(integrity_check.get("status") or "") != "ok":
+        overall = "fail"
     elif workspace_state == "partial":
+        overall = "partial"
+    elif stale_artifacts_before and not removed_stale_artifacts:
         overall = "partial"
 
     result: dict[str, object] = {
@@ -26577,6 +26640,12 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
             "runtime_sha256": stored_sha,
             "matches_runtime": current_sha == stored_sha if current_sha and stored_sha else None,
         },
+        "db": {
+            "path": str(paths["db_path"]),
+            "stale_sqlite_artifacts_before": stale_artifacts_before,
+            "removed_stale_sqlite_artifacts": removed_stale_artifacts,
+            "stale_sqlite_artifacts_after": [str(path) for path in stale_sqlite_artifact_paths(paths["db_path"])],
+        },
     }
     if journal_mode is not None:
         result["sqlite_journal_mode"] = journal_mode
@@ -26584,6 +26653,8 @@ def doctor(root: Path, quick: bool) -> dict[str, object]:
         result["db_error"] = db_error
     if workspace_inventory is not None:
         result["workspace_inventory"] = workspace_inventory
+    if integrity_check is not None:
+        result["db"]["integrity_check"] = integrity_check
 
     if not quick:
         result["paths"] = {key: str(value) for key, value in paths.items()}
@@ -30164,6 +30235,52 @@ def image_description_run_pending_finalization_count(connection: sqlite3.Connect
     return int(row["count"] or 0)
 
 
+RUN_WORKER_HANDOFF_SUFFIX_PATTERN = re.compile(r"^(?P<base>.+?)-handoff(?:-(?P<index>\d+))?$")
+
+
+def handoff_claimed_by_base(run_id: int, claimed_by: str | None) -> str:
+    normalized = normalize_whitespace(claimed_by or "") or f"cowork-run-{int(run_id)}"
+    match = RUN_WORKER_HANDOFF_SUFFIX_PATTERN.fullmatch(normalized)
+    if match is not None:
+        return normalize_whitespace(match.group("base") or "") or normalized
+    return normalized
+
+
+def next_handoff_claimed_by_hint(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    claimed_by: str | None,
+) -> str:
+    base = handoff_claimed_by_base(run_id, claimed_by)
+    existing_claimed_by = {
+        normalize_whitespace(str(row["claimed_by"] or ""))
+        for row in connection.execute(
+            """
+            SELECT claimed_by
+            FROM run_workers
+            WHERE run_id = ?
+              AND claimed_by IS NOT NULL
+            UNION
+            SELECT claimed_by
+            FROM run_items
+            WHERE run_id = ?
+              AND claimed_by IS NOT NULL
+            """,
+            (run_id, run_id),
+        ).fetchall()
+        if normalize_whitespace(str(row["claimed_by"] or ""))
+    }
+    first_candidate = f"{base}-handoff"
+    if first_candidate not in existing_claimed_by:
+        return first_candidate
+    for index in range(2, 1000):
+        candidate = f"{base}-handoff-{index}"
+        if candidate not in existing_claimed_by:
+            return candidate
+    return f"{base}-handoff-{secrets.token_hex(3)}"
+
+
 def build_run_worker_payload(
     connection: sqlite3.Connection,
     run_id: int,
@@ -30227,6 +30344,11 @@ def build_run_worker_payload(
         and worker_batches_prepared >= effective_max_batches
         and pending_count > 0
     )
+    handoff_claimed_by_hint = (
+        next_handoff_claimed_by_hint(connection, run_id=run_id, claimed_by=normalized_claimed_by)
+        if worker_should_handoff
+        else None
+    )
     effective_launch_mode = (
         normalize_run_worker_mode(str(worker_row["launch_mode"]))
         if worker_row is not None and worker_row["launch_mode"] is not None
@@ -30283,6 +30405,13 @@ def build_run_worker_payload(
         "outstanding_items": outstanding_items,
         "needs_ocr_finalization": needs_ocr_finalization,
         "needs_image_description_finalization": needs_image_description_finalization,
+        "handoff_required": worker_should_handoff,
+        "handoff_claimed_by_hint": handoff_claimed_by_hint,
+        "handoff_message": (
+            "This worker reached max_batches_per_worker; finish it and continue with a new --claimed-by identity."
+            if worker_should_handoff
+            else None
+        ),
         "should_exit_after_batch": worker_should_handoff,
         "after_batch_action": "handoff" if worker_should_handoff else None,
         "next_action": next_action,
@@ -30879,29 +31008,62 @@ def run_status_by_id(
 
     active_claim_rows = connection.execute(
         """
-        SELECT claimed_by, COUNT(*) AS count, MAX(last_heartbeat_at) AS last_heartbeat_at
+        SELECT claimed_by, id, document_id, item_kind, page_number, segment_id, last_heartbeat_at
         FROM run_items
         WHERE run_id = ?
           AND status = 'running'
           AND claimed_by IS NOT NULL
-        GROUP BY claimed_by
-        ORDER BY claimed_by ASC
+        ORDER BY claimed_by ASC, id ASC
         """,
         (run_id,),
     ).fetchall()
-    payload["active_claims"] = [
-        {
-            "claimed_by": row["claimed_by"],
-            "count": int(row["count"] or 0),
-            "last_heartbeat_at": row["last_heartbeat_at"],
-            "last_heartbeat_age_seconds": claim_age_seconds(row["last_heartbeat_at"]),
-            "stale": (
-                claim_age_seconds(row["last_heartbeat_at"]) is not None
-                and int(claim_age_seconds(row["last_heartbeat_at"]) or 0) > int(claim_health["stale_after_seconds"])
-            ),
-        }
-        for row in active_claim_rows
-    ]
+    active_claims_by_worker: dict[str, dict[str, object]] = {}
+    for row in active_claim_rows:
+        worker_claimed_by = normalize_whitespace(str(row["claimed_by"] or ""))
+        if not worker_claimed_by:
+            continue
+        claim_payload = active_claims_by_worker.setdefault(
+            worker_claimed_by,
+            {
+                "claimed_by": worker_claimed_by,
+                "count": 0,
+                "run_item_ids": [],
+                "document_ids": [],
+                "page_numbers": [],
+                "segment_ids": [],
+                "last_heartbeat_at": None,
+            },
+        )
+        claim_payload["count"] = int(claim_payload["count"] or 0) + 1
+        claim_payload["run_item_ids"].append(int(row["id"]))
+        document_id = int(row["document_id"])
+        if document_id not in claim_payload["document_ids"]:
+            claim_payload["document_ids"].append(document_id)
+        if row["page_number"] is not None:
+            claim_payload["page_numbers"].append(int(row["page_number"]))
+        if row["segment_id"] is not None and row["segment_id"] not in claim_payload["segment_ids"]:
+            claim_payload["segment_ids"].append(row["segment_id"])
+        candidate_heartbeat = row["last_heartbeat_at"]
+        if candidate_heartbeat is not None and (
+            claim_payload["last_heartbeat_at"] is None
+            or str(candidate_heartbeat) > str(claim_payload["last_heartbeat_at"])
+        ):
+            claim_payload["last_heartbeat_at"] = candidate_heartbeat
+    payload["active_claims"] = []
+    for worker_claim in active_claims_by_worker.values():
+        last_heartbeat_at = worker_claim["last_heartbeat_at"]
+        last_heartbeat_age_seconds = claim_age_seconds(last_heartbeat_at)
+        payload["active_claims"].append(
+            {
+                **worker_claim,
+                "last_heartbeat_at": last_heartbeat_at,
+                "last_heartbeat_age_seconds": last_heartbeat_age_seconds,
+                "stale": (
+                    last_heartbeat_age_seconds is not None
+                    and int(last_heartbeat_age_seconds or 0) > int(claim_health["stale_after_seconds"])
+                ),
+            }
+        )
     payload["claim_health"] = claim_health
     payload["workers"] = list_run_worker_payloads_for_run(connection, run_id)
     payload["worker"] = build_run_worker_payload(
@@ -31096,11 +31258,13 @@ def finalize_ocr_results_for_run(
         finalized_results.append(result_summary_by_id(connection, result_id))
 
     refresh_run_progress(connection, run_id)
+    stale_text_derived_metadata_document_ids = sorted({int(payload["document_id"]) for payload in activations})
     return {
         "status": "ok",
         "run": run_status_by_id(connection, run_id),
         "results": finalized_results,
         "activations": activations,
+        "stale_text_derived_metadata_document_ids": stale_text_derived_metadata_document_ids,
     }
 
 
@@ -32133,6 +32297,11 @@ def build_run_item_context_payload(
         artifact_path = resolve_workspace_artifact_path(root, artifact_rel_path)
         if artifact_path is None or not artifact_path.exists():
             raise RetrieverError(f"Run item {run_item_row['id']} points at a missing OCR artifact: {artifact_rel_path!r}")
+        read_artifact_path = ensure_read_safe_visual_artifact_path(root, artifact_path)
+        try:
+            read_artifact_rel_path = read_artifact_path.relative_to(root).as_posix()
+        except ValueError:
+            read_artifact_rel_path = None
         page_input_kind = (
             "image_description_page_image"
             if normalize_job_kind(str(job_row["job_kind"])) == "image_description"
@@ -32143,6 +32312,8 @@ def build_run_item_context_payload(
             "page_number": int(run_item_row["page_number"] or 0),
             "artifact_rel_path": artifact_rel_path,
             "artifact_path": str(artifact_path),
+            "read_artifact_rel_path": read_artifact_rel_path,
+            "read_artifact_path": str(read_artifact_path),
             "bytes": artifact_path.stat().st_size,
             "text_revision_id": None,
             "inline_text": None,
@@ -42106,6 +42277,7 @@ def ingest_v2_facade(
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
     skip_unchanged_loose_files: bool = True,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     set_active_workspace_root(root)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -42164,6 +42336,8 @@ def ingest_v2_facade(
             for key, value in start_payload.items()
             if key not in {"ok", "created"}
         }
+    if progress_callback is not None and run_to_completion:
+        progress_callback((start_payload if not resumed else run_payload), True)
 
     step_payloads: list[dict[str, object]] = []
     reason = "run_terminal" if str(run_payload.get("status")) in INGEST_V2_TERMINAL_STATUSES else "budget_exhausted"
@@ -42176,10 +42350,12 @@ def ingest_v2_facade(
         step_payloads.append(step_payload)
         run_payload = dict(step_payload["run"])
         reason = str(step_payload.get("reason") or reason)
+        if progress_callback is not None and run_to_completion:
+            progress_callback(step_payload, False)
         if not run_to_completion:
             break
 
-    return ingest_v2_facade_payload(
+    payload = ingest_v2_facade_payload(
         root=root,
         recursive=recursive,
         raw_file_types=raw_file_types,
@@ -42192,6 +42368,9 @@ def ingest_v2_facade(
         reason=reason,
         mode="run_to_completion" if run_to_completion else "bounded",
     )
+    if progress_callback is not None and run_to_completion:
+        progress_callback(payload, True)
+    return payload
 
 
 def ingest_v2_step_not_implemented(
@@ -45664,6 +45843,7 @@ def rebuild_entities(
     *,
     document_ids: list[int] | None = None,
     batch_size: int = 500,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     normalized_batch_size = max(1, min(int(batch_size or 500), 5000))
     paths = workspace_paths(root)
@@ -45674,14 +45854,33 @@ def rebuild_entities(
             apply_schema(connection, root)
             raise_if_ingest_v2_active(connection, root, command_name="rebuild-entities")
             raise_if_entity_rebuild_active(connection, root, command_name="rebuild-entities")
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "running",
+                        "phase": "preparing",
+                        "detail": "selecting documents",
+                    },
+                    True,
+                )
             ids_to_rebuild = entity_rebuild_document_ids(connection, document_ids)
             full_rebuild = not document_ids
+            total_documents = len(ids_to_rebuild)
             reset_counts = {
                 "auto_document_links_deleted": 0,
                 "auto_resolution_keys_deleted": 0,
                 "auto_identifiers_deleted": 0,
                 "auto_entities_deleted": 0,
             }
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "running" if total_documents or full_rebuild else "completed",
+                        "phase": "resetting" if full_rebuild else ("syncing" if total_documents else "completed"),
+                        "detail": f"0/{total_documents} documents",
+                    },
+                    True,
+                )
             if full_rebuild:
                 connection.execute("BEGIN")
                 try:
@@ -45693,6 +45892,16 @@ def rebuild_entities(
 
             documents_synced = 0
             auto_links_created = 0
+            processed_documents = 0
+            if progress_callback is not None and full_rebuild and total_documents:
+                progress_callback(
+                    {
+                        "status": "running",
+                        "phase": "syncing",
+                        "detail": f"0/{total_documents} documents",
+                    },
+                    False,
+                )
             for offset in range(0, len(ids_to_rebuild), normalized_batch_size):
                 batch_document_ids = ids_to_rebuild[offset : offset + normalized_batch_size]
                 connection.execute("BEGIN")
@@ -45711,22 +45920,42 @@ def rebuild_entities(
                                 (document_id,),
                             ).fetchone()
                             auto_links_created += int(row[0] or 0) if row is not None else 0
+                        processed_documents += 1
+                        if progress_callback is not None:
+                            progress_callback(
+                                {
+                                    "status": "running",
+                                    "phase": "syncing",
+                                    "detail": f"{processed_documents}/{total_documents} documents",
+                                },
+                                False,
+                            )
                     connection.commit()
                 except Exception:
                     connection.rollback()
                     raise
 
-            return {
+            payload = {
                 "status": "ok",
                 "session_id": rebuild_session["id"],
                 "mode": "full" if full_rebuild else "selected",
-                "documents_scanned": len(ids_to_rebuild),
+                "documents_scanned": total_documents,
                 "documents_synced": documents_synced,
                 "auto_links_created": auto_links_created,
                 "batch_size": normalized_batch_size,
                 **reset_counts,
                 **entity_graph_counts(connection),
             }
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "completed",
+                        "phase": "completed",
+                        "detail": f"{processed_documents}/{total_documents} documents",
+                    },
+                    True,
+                )
+            return payload
         finally:
             connection.close()
 
@@ -49655,6 +49884,10 @@ def run_job_default_claimed_by(run_id: int) -> str:
     return f"cowork-run-{int(run_id)}"
 
 
+def run_job_effective_claimed_by(run_id: int, claimed_by: str | None = None) -> str:
+    return normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id))
+
+
 def run_job_next_recommended_commands(
     root: Path,
     *,
@@ -49666,17 +49899,33 @@ def run_job_next_recommended_commands(
     root_arg = shlex.quote(str(root))
     run_id_arg = str(run_id)
     budget_arg = str(int(budget_seconds))
-    claimed_by_arg = shlex.quote(normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id)))
+    effective_claimed_by = run_job_effective_claimed_by(run_id, claimed_by)
+    claimed_by_arg = shlex.quote(effective_claimed_by)
     if str(run_payload.get("status") or "") in {"completed", "failed", "canceled"}:
         return [f"run-status {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}"]
 
     worker_payload = dict(run_payload.get("worker") or {})
     next_action = str(worker_payload.get("next_action") or "")
+    handoff_claimed_by_hint = (
+        normalize_whitespace(str(worker_payload.get("handoff_claimed_by_hint") or "")) or None
+    )
     commands: list[str] = []
     if next_action == "finalize_ocr":
         commands.append(f"finalize-ocr-run {root_arg} --run-id {run_id_arg}")
     elif next_action == "finalize_image_description":
         commands.append(f"finalize-image-description-run {root_arg} --run-id {run_id_arg}")
+    elif next_action == "handoff":
+        continuation_claimed_by = handoff_claimed_by_hint or f"{effective_claimed_by}-handoff"
+        continuation_arg = shlex.quote(continuation_claimed_by)
+        commands.extend(
+            [
+                "run-job-step "
+                f"{root_arg} --run-id {run_id_arg} --claimed-by {continuation_arg} --budget-seconds {budget_arg}",
+                "prepare-run-batch "
+                f"{root_arg} --run-id {run_id_arg} --claimed-by {continuation_arg} "
+                f"--budget-seconds {budget_arg} --stale-seconds {DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS}",
+            ]
+        )
     elif next_action in {"claim", "process_batch", "stop"}:
         run_item_counts = dict(run_payload.get("run_item_counts") or {})
         if (
@@ -49689,11 +49938,11 @@ def run_job_next_recommended_commands(
                 f"{root_arg} --run-id {run_id_arg} --claimed-by {claimed_by_arg} "
                 f"--budget-seconds {budget_arg} --stale-seconds {DEFAULT_COWORK_RUN_ITEM_CLAIM_STALE_SECONDS}"
             )
-    if commands:
+    if commands and next_action != "handoff":
         commands.insert(
             0,
             "run-job-step "
-            f"{root_arg} --run-id {run_id_arg} --claimed-by {claimed_by_arg} --budget-seconds {budget_arg}",
+                f"{root_arg} --run-id {run_id_arg} --claimed-by {claimed_by_arg} --budget-seconds {budget_arg}",
         )
     commands.append(f"run-status {root_arg} --run-id {run_id_arg} --budget-seconds {budget_arg}")
     return commands
@@ -49744,7 +49993,7 @@ def run_job_step(
     stale_after_seconds: int | None = None,
 ) -> dict[str, object]:
     budget = normalize_resumable_step_budget(budget_seconds)
-    normalized_claimed_by = normalize_whitespace(claimed_by or run_job_default_claimed_by(run_id))
+    normalized_claimed_by = run_job_effective_claimed_by(run_id, claimed_by)
     if not normalized_claimed_by:
         raise RetrieverError("claimed_by cannot be empty.")
     status_payload = run_status(
@@ -49827,6 +50076,9 @@ def run_job_step(
             budget_seconds=budget,
             claimed_by=normalized_claimed_by,
         )
+        handoff_claimed_by_hint = (
+            normalize_whitespace(str(worker_payload.get("handoff_claimed_by_hint") or "")) or None
+        )
         return {
             "status": "ok",
             "step": "run-job",
@@ -49835,10 +50087,11 @@ def run_job_step(
             "budget_seconds": budget,
             "executed": False,
             "executed_step": None,
-            "reason": next_action or "stop",
+            "reason": "handoff_required" if next_action == "handoff" else (next_action or "stop"),
             "batch": [],
             "step_result": None,
             "run": run_payload,
+            "handoff_claimed_by_hint": handoff_claimed_by_hint,
             "more_work_remaining": bool(run_payload.get("status") not in {"completed", "failed", "canceled"}),
             "next_recommended_commands": run_payload["next_recommended_commands"],
         }
@@ -50000,7 +50253,14 @@ def finish_run_worker(
         connection.close()
 
 
-def finalize_ocr_run(root: Path, *, run_id: int) -> dict[str, object]:
+def finalize_ocr_run(
+    root: Path,
+    *,
+    run_id: int,
+    cascade_metadata: bool = False,
+    metadata_fields: list[str] | None = None,
+) -> dict[str, object]:
+    normalized_metadata_fields = normalize_text_derived_metadata_fields(metadata_fields)
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
@@ -50010,6 +50270,35 @@ def finalize_ocr_run(root: Path, *, run_id: int) -> dict[str, object]:
         try:
             materialize_run_items_for_run(connection, paths, root, run_id)
             payload = finalize_ocr_results_for_run(connection, paths, run_id=run_id)
+            stale_document_ids = sorted(
+                dict.fromkeys(int(document_id) for document_id in payload.get("stale_text_derived_metadata_document_ids") or [])
+            )
+            payload["metadata_cascade_requested"] = bool(cascade_metadata)
+            payload["next_recommended_commands"] = build_refresh_text_derived_metadata_followup_commands(
+                root,
+                stale_document_ids,
+                field_names=normalized_metadata_fields,
+            )
+            if cascade_metadata and stale_document_ids:
+                document_rows = fetch_visible_document_rows_by_ids(connection, stale_document_ids)
+                metadata_payload = refresh_text_derived_metadata_for_document_rows(
+                    connection,
+                    paths,
+                    document_rows=document_rows,
+                    field_names=normalized_metadata_fields,
+                )
+                metadata_payload["selector"] = {
+                    "mode": "document_ids",
+                    "document_ids": [int(row["id"]) for row in document_rows],
+                }
+                metadata_payload["selected_from_scope"] = False
+                metadata_payload["document_ids"] = [int(row["id"]) for row in document_rows]
+                metadata_payload["next_recommended_commands"] = build_rebuild_entities_followup_commands(
+                    root,
+                    list(metadata_payload.get("entity_rebuild_candidate_document_ids") or []),
+                )
+                payload["metadata_refresh"] = metadata_payload
+                payload["next_recommended_commands"] = list(metadata_payload.get("next_recommended_commands") or [])
             connection.commit()
         except Exception:
             connection.rollback()
@@ -52608,6 +52897,376 @@ def set_field(root: Path, document_id_or_ids: int | list[int], field_name: str, 
         }
     finally:
         connection.close()
+
+
+TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN = {
+    "author": "extracted_author",
+    "participants": "extracted_participants",
+    "recipients": "extracted_recipients",
+    "date_created": "extracted_doc_authored_at",
+    "subject": "extracted_subject",
+    "title": "extracted_title",
+}
+DEFAULT_TEXT_DERIVED_METADATA_FIELDS = ("author", "participants", "date_created")
+ENTITY_REBUILD_TEXT_METADATA_FIELDS = frozenset({"author", "participants", "recipients"})
+
+
+def normalize_text_derived_metadata_fields(raw_fields: list[str] | None = None) -> list[str]:
+    normalized_fields: list[str] = []
+    for raw_field in list(raw_fields or DEFAULT_TEXT_DERIVED_METADATA_FIELDS):
+        normalized_field = normalize_whitespace(str(raw_field or "")).lower()
+        if not normalized_field:
+            continue
+        if normalized_field not in TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN:
+            supported = ", ".join(sorted(TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN))
+            raise RetrieverError(
+                f"Unsupported text-derived metadata field {raw_field!r}. Supported values: {supported}."
+            )
+        if normalized_field not in normalized_fields:
+            normalized_fields.append(normalized_field)
+    if not normalized_fields:
+        raise RetrieverError("At least one metadata field must be selected.")
+    return normalized_fields
+
+
+def load_active_text_for_document(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    document_row: sqlite3.Row,
+) -> tuple[str | None, int | None]:
+    revision_id = (
+        int(document_row["active_search_text_revision_id"])
+        if document_row["active_search_text_revision_id"] is not None
+        else (
+            int(document_row["source_text_revision_id"])
+            if document_row["source_text_revision_id"] is not None
+            else None
+        )
+    )
+    if revision_id is not None:
+        revision_row = require_text_revision_row_by_id(connection, revision_id)
+        text_content = read_text_revision_body(paths, revision_row["storage_rel_path"])
+        if text_content is not None:
+            return text_content, revision_id
+    chunk_rows = document_chunk_rows(connection, int(document_row["id"]))
+    if not chunk_rows:
+        return None, revision_id
+    return "\n\n".join(str(chunk_row["text_content"] or "") for chunk_row in chunk_rows), revision_id
+
+
+def derive_text_metadata_from_active_text(text_content: str) -> dict[str, str | None]:
+    metadata = extract_email_like_headers(text_content)
+    if not metadata:
+        return {}
+    chain_participants = extract_email_chain_participants(
+        text_content,
+        [
+            metadata.get("author"),
+            metadata.get("participants"),
+            metadata.get("recipients"),
+        ],
+    )
+    if chain_participants:
+        metadata["participants"] = chain_participants
+    return metadata
+
+
+def build_rebuild_entities_followup_commands(root: Path, document_ids: list[int]) -> list[str]:
+    normalized_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+    if not normalized_document_ids:
+        return []
+    root_arg = shlex.quote(str(root))
+    doc_args = " ".join(f"--doc-id {document_id}" for document_id in normalized_document_ids)
+    return [f"rebuild-entities {root_arg} {doc_args}"]
+
+
+def build_refresh_text_derived_metadata_followup_commands(
+    root: Path,
+    document_ids: list[int],
+    *,
+    field_names: list[str] | None = None,
+) -> list[str]:
+    normalized_document_ids = sorted(dict.fromkeys(int(document_id) for document_id in document_ids))
+    if not normalized_document_ids:
+        return []
+    normalized_fields = normalize_text_derived_metadata_fields(field_names)
+    root_arg = shlex.quote(str(root))
+    doc_args = " ".join(f"--doc-id {document_id}" for document_id in normalized_document_ids)
+    field_args = (
+        " ".join(f"--field {field_name}" for field_name in normalized_fields)
+        if tuple(normalized_fields) != DEFAULT_TEXT_DERIVED_METADATA_FIELDS
+        else ""
+    )
+    args = " ".join(part for part in [field_args, doc_args] if part)
+    return [f"refresh-text-derived-metadata {root_arg} {args}".strip()]
+
+
+def refresh_text_derived_metadata_for_document_rows(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    *,
+    document_rows: list[sqlite3.Row],
+    field_names: list[str],
+) -> dict[str, object]:
+    normalized_field_names = normalize_text_derived_metadata_fields(field_names)
+    updated_documents = 0
+    updated_fields = 0
+    skipped_reasons: dict[str, int] = defaultdict(int)
+    results: list[dict[str, object]] = []
+    entity_rebuild_candidate_document_ids: list[int] = []
+    now = utc_now()
+
+    for document_row in document_rows:
+        document_id = int(document_row["id"])
+        before = {
+            field_name: document_row[field_name]
+            for field_name in TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN
+        }
+        manual_locks = set(normalize_string_list(document_row[MANUAL_FIELD_LOCKS_COLUMN]))
+        text_content, revision_id = load_active_text_for_document(connection, paths, document_row)
+        if not normalize_whitespace(text_content or ""):
+            skipped_reasons["no_active_text"] = skipped_reasons.get("no_active_text", 0) + 1
+            results.append(
+                {
+                    "document_id": document_id,
+                    "status": "skipped",
+                    "reason": "no_active_text",
+                    "active_text_revision_id": revision_id,
+                    "field_names": normalized_field_names,
+                    "before": before,
+                    "after": dict(before),
+                    "updated_fields": [],
+                    "locked_fields": [],
+                    "derived": {},
+                }
+            )
+            continue
+
+        derived = derive_text_metadata_from_active_text(str(text_content or ""))
+        if not derived:
+            skipped_reasons["no_email_headers"] = skipped_reasons.get("no_email_headers", 0) + 1
+            results.append(
+                {
+                    "document_id": document_id,
+                    "status": "skipped",
+                    "reason": "no_email_headers",
+                    "active_text_revision_id": revision_id,
+                    "field_names": normalized_field_names,
+                    "before": before,
+                    "after": dict(before),
+                    "updated_fields": [],
+                    "locked_fields": [],
+                    "derived": {},
+                }
+            )
+            continue
+
+        occurrence_rows = active_occurrence_rows_for_document(connection, document_id)
+        if not occurrence_rows:
+            skipped_reasons["no_active_occurrences"] = skipped_reasons.get("no_active_occurrences", 0) + 1
+            results.append(
+                {
+                    "document_id": document_id,
+                    "status": "skipped",
+                    "reason": "no_active_occurrences",
+                    "active_text_revision_id": revision_id,
+                    "field_names": normalized_field_names,
+                    "before": before,
+                    "after": dict(before),
+                    "updated_fields": [],
+                    "locked_fields": [],
+                    "derived": {
+                        field_name: derived.get(field_name)
+                        for field_name in normalized_field_names
+                        if derived.get(field_name) is not None
+                    },
+                }
+            )
+            continue
+
+        selected_derived_values = {
+            field_name: derived.get(field_name)
+            for field_name in normalized_field_names
+            if derived.get(field_name) is not None
+        }
+        if not selected_derived_values:
+            skipped_reasons["no_selected_fields"] = skipped_reasons.get("no_selected_fields", 0) + 1
+            results.append(
+                {
+                    "document_id": document_id,
+                    "status": "skipped",
+                    "reason": "no_selected_fields",
+                    "active_text_revision_id": revision_id,
+                    "field_names": normalized_field_names,
+                    "before": before,
+                    "after": dict(before),
+                    "updated_fields": [],
+                    "locked_fields": [],
+                    "derived": {},
+                }
+            )
+            continue
+
+        for occurrence_row in occurrence_rows:
+            assignments: list[str] = []
+            params: list[object] = []
+            for field_name, derived_value in selected_derived_values.items():
+                column_name = TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN[field_name]
+                if occurrence_row[column_name] == derived_value:
+                    continue
+                assignments.append(f"{quote_identifier(column_name)} = ?")
+                params.append(derived_value)
+            if not assignments:
+                continue
+            assignments.append("updated_at = ?")
+            params.append(now)
+            params.append(int(occurrence_row["id"]))
+            connection.execute(
+                f"""
+                UPDATE document_occurrences
+                SET {', '.join(assignments)}
+                WHERE id = ?
+                """,
+                params,
+            )
+
+        refresh_document_from_occurrences(connection, document_id)
+        updated_row = connection.execute(
+            f"""
+            SELECT
+              id,
+              {quote_identifier(MANUAL_FIELD_LOCKS_COLUMN)} AS locks_json,
+              {", ".join(quote_identifier(field_name) for field_name in TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN)}
+            FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+        assert updated_row is not None
+        after = {
+            field_name: updated_row[field_name]
+            for field_name in TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN
+        }
+        changed_field_names = [
+            field_name
+            for field_name in normalized_field_names
+            if before.get(field_name) != after.get(field_name)
+        ]
+        locked_fields = [
+            field_name
+            for field_name in normalized_field_names
+            if field_name in manual_locks
+            and selected_derived_values.get(field_name) is not None
+            and before.get(field_name) != selected_derived_values.get(field_name)
+        ]
+        if changed_field_names:
+            updated_documents += 1
+            updated_fields += len(changed_field_names)
+            if set(changed_field_names) & ENTITY_REBUILD_TEXT_METADATA_FIELDS:
+                entity_rebuild_candidate_document_ids.append(document_id)
+        results.append(
+            {
+                "document_id": document_id,
+                "status": "updated" if changed_field_names else "unchanged",
+                "reason": None,
+                "active_text_revision_id": revision_id,
+                "field_names": normalized_field_names,
+                "before": before,
+                "after": after,
+                "updated_fields": changed_field_names,
+                "locked_fields": locked_fields,
+                "derived": selected_derived_values,
+            }
+        )
+
+    return {
+        "status": "ok",
+        "field_names": normalized_field_names,
+        "processed_documents": len(document_rows),
+        "updated_documents": updated_documents,
+        "updated_fields": updated_fields,
+        "skipped_documents": sum(1 for item in results if item["status"] == "skipped"),
+        "skipped_reasons": dict(sorted(skipped_reasons.items())),
+        "results": results,
+        "entity_rebuild_candidate_document_ids": sorted(dict.fromkeys(entity_rebuild_candidate_document_ids)),
+    }
+
+
+def refresh_text_derived_metadata(
+    root: Path,
+    *,
+    document_ids: list[int] | None = None,
+    query: str = "",
+    raw_bates: str | None = None,
+    raw_filters: list[list[str]] | None = None,
+    dataset_names: list[str] | None = None,
+    from_run_id: int | None = None,
+    select_from_scope: bool = False,
+    field_names: list[str] | None = None,
+) -> dict[str, object]:
+    normalized_document_ids = list(dict.fromkeys(int(document_id) for document_id in (document_ids or [])))
+    normalized_field_names = normalize_text_derived_metadata_fields(field_names)
+    selector_inputs_present = bool(query.strip() or raw_bates or raw_filters or dataset_names or from_run_id is not None)
+    if normalized_document_ids and (selector_inputs_present or select_from_scope):
+        raise RetrieverError(
+            "refresh-text-derived-metadata accepts either --doc-id selectors or query/filter/scope selectors, not both."
+        )
+
+    paths = workspace_paths(root)
+    ensure_layout(paths)
+    connection = connect_db(paths["db_path"])
+    try:
+        apply_schema(connection, root)
+        if normalized_document_ids:
+            target_rows = fetch_visible_document_rows_by_ids(connection, normalized_document_ids)
+            selector_payload: dict[str, object] = {
+                "mode": "document_ids",
+                "document_ids": [int(row["id"]) for row in target_rows],
+            }
+            selected_from_scope = False
+        else:
+            selector = build_effective_scope_selector(
+                connection,
+                paths,
+                query=query,
+                raw_bates=raw_bates,
+                raw_filters=raw_filters,
+                dataset_names=dataset_names,
+                from_run_id=from_run_id,
+                select_from_scope=select_from_scope,
+            )
+            if not scope_run_selector_has_inputs(selector):
+                raise RetrieverError(build_no_document_selection_error())
+            target_document_ids, _, _ = resolve_seed_documents_for_scope_selector(connection, selector)
+            target_rows = fetch_visible_document_rows_by_ids(connection, target_document_ids)
+            selector_payload = {
+                "mode": "scope_search",
+                "scope": selector,
+            }
+            selected_from_scope = bool(select_from_scope)
+
+        connection.execute("BEGIN")
+        try:
+            payload = refresh_text_derived_metadata_for_document_rows(
+                connection,
+                paths,
+                document_rows=target_rows,
+                field_names=normalized_field_names,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        payload["selector"] = selector_payload
+        payload["selected_from_scope"] = selected_from_scope
+        payload["document_ids"] = [int(row["id"]) for row in target_rows]
+        payload["next_recommended_commands"] = build_rebuild_entities_followup_commands(
+            root,
+            list(payload.get("entity_rebuild_candidate_document_ids") or []),
+        )
+        return payload
+    finally:
+        connection.close()
 OCCURRENCE_FILTER_FIELDS = {
     "begin_attachment",
     "begin_bates",
@@ -54471,6 +55130,7 @@ def prepare_cli_payload(command: str, payload: dict[str, object], *, verbose: bo
 
 
 CLI_OUTPUT_MODE = "json"
+LONG_TASK_PROGRESS_INTERVAL_SECONDS = 60.0
 
 
 def set_cli_output_mode(mode: str) -> None:
@@ -54535,7 +55195,7 @@ def first_status_detail(status_report: dict[str, object]) -> str | None:
 
 def render_workspace_human_output(payload: dict[str, object]) -> str:
     action = normalize_inline_whitespace(str(payload.get("action") or "status")) or "status"
-    status_report = payload.get("status_report") if isinstance(payload.get("status_report"), dict) else {}
+    status_report = payload.get("status_report") if isinstance(payload.get("status_report"), dict) else payload
     workspace_root = normalize_inline_whitespace(
         str(
             payload.get("workspace_root")
@@ -54579,6 +55239,7 @@ def render_workspace_human_output(payload: dict[str, object]) -> str:
         "init": "Done. Workspace initialized and ready",
         "status": "Workspace ready",
         "update": "Done. Workspace updated and ready",
+        "doctor": "Workspace doctor completed",
     }.get(action, "Workspace ready")
     if ready:
         return (
@@ -54749,6 +55410,70 @@ def render_cli_human_output(command: str, payload: dict[str, object]) -> str | N
     if command == "get-doc":
         return render_get_doc_human_output(payload)
     return None
+
+
+def render_progress_line(command: str, payload: dict[str, object]) -> str | None:
+    rendered = render_cli_human_output(command, payload)
+    if isinstance(rendered, str):
+        lines = [normalize_inline_whitespace(line) for line in rendered.splitlines()]
+        first_line = next((line for line in lines if line), "")
+        if first_line:
+            return first_line
+
+    run = cli_run_payload(payload)
+    status = normalize_inline_whitespace(str(payload.get("status") or run.get("status") or ""))
+    phase = normalize_inline_whitespace(str(payload.get("phase") or run.get("phase") or status))
+    detail = normalize_inline_whitespace(str(payload.get("detail") or ""))
+    run_id = normalize_inline_whitespace(str(payload.get("run_id") or run.get("run_id") or ""))
+    if not status and not phase:
+        return None
+    label = normalize_inline_whitespace(command.replace("-", " "))
+    line = f"{label} {phase or status}".strip()
+    if detail:
+        line += f" — {detail}"
+    if run_id:
+        line += f" (run_id {run_id})"
+    return line or None
+
+
+def progress_payload_signature(command: str, payload: dict[str, object]) -> tuple[str, str, str, str, str]:
+    run = cli_run_payload(payload)
+    status = normalize_inline_whitespace(str(payload.get("status") or run.get("status") or ""))
+    phase = normalize_inline_whitespace(str(payload.get("phase") or run.get("phase") or status))
+    run_id = normalize_inline_whitespace(str(payload.get("run_id") or run.get("run_id") or ""))
+    next_commands = payload.get("next_recommended_commands")
+    if not isinstance(next_commands, list):
+        next_commands = run.get("next_recommended_commands")
+    first_next_command = ""
+    if isinstance(next_commands, list) and next_commands:
+        first_next_command = normalize_inline_whitespace(str(next_commands[0] or ""))
+    return (command, run_id, status, phase, first_next_command)
+
+
+class LongTaskProgressPrinter:
+    def __init__(self, command: str, *, interval_seconds: float = LONG_TASK_PROGRESS_INTERVAL_SECONDS) -> None:
+        self.command = command
+        self.interval_seconds = max(1.0, float(interval_seconds))
+        self.last_emit_at = 0.0
+        self.last_signature: tuple[str, str, str, str, str] | None = None
+
+    def emit(self, payload: dict[str, object], force: bool = False) -> None:
+        line = render_progress_line(self.command, payload)
+        if not line:
+            return
+        signature = progress_payload_signature(self.command, payload)
+        now = time.perf_counter()
+        should_emit = (
+            force
+            or self.last_signature is None
+            or signature != self.last_signature
+            or (now - self.last_emit_at) >= self.interval_seconds
+        )
+        if not should_emit:
+            return
+        print(f"[progress] {line}", file=sys.stderr, flush=True)
+        self.last_emit_at = now
+        self.last_signature = signature
 
 
 def emit_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> int:
@@ -61759,12 +62484,22 @@ def export_csv(
     sort_field: str | None,
     order: str | None,
     select_from_scope: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "running",
+                    "phase": "preparing",
+                    "detail": "selecting documents",
+                },
+                True,
+            )
         field_defs = resolve_export_field_definitions(connection, raw_fields)
         output_path = resolve_export_output_path(paths, raw_output_path)
         rows, selector = resolve_export_csv_selection(
@@ -61781,10 +62516,20 @@ def export_csv(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overwrote_existing_file = output_path.exists()
         context = build_export_context(connection, rows, field_defs)
+        total_rows = len(rows)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "running" if total_rows else "completed",
+                    "phase": "exporting" if total_rows else "completed",
+                    "detail": f"0/{total_rows} rows",
+                },
+                True,
+            )
         with output_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow([field_def["field_name"] for field_def in field_defs])
-            for row in rows:
+            for row_index, row in enumerate(rows, start=1):
                 writer.writerow(
                     [
                         serialize_export_cell_value(
@@ -61794,6 +62539,15 @@ def export_csv(
                         for field_def in field_defs
                     ]
                 )
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "status": "running",
+                            "phase": "exporting",
+                            "detail": f"{row_index}/{total_rows} rows",
+                        },
+                        False,
+                    )
 
         output_rel_path = None
         try:
@@ -61801,17 +62555,27 @@ def export_csv(
         except ValueError:
             output_rel_path = None
 
-        return {
+        payload = {
             "status": "ok",
             "output_path": str(output_path),
             "output_rel_path": output_rel_path,
-            "document_count": len(rows),
+            "document_count": total_rows,
             "field_count": len(field_defs),
             "fields": field_defs,
             "selector": selector,
             "overwrote_existing_file": overwrote_existing_file,
             "file_size": file_size_bytes(output_path),
         }
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "completed",
+                    "phase": "completed",
+                    "detail": f"{total_rows}/{total_rows} rows",
+                },
+                True,
+            )
+        return payload
     finally:
         connection.close()
 
@@ -62526,12 +63290,22 @@ def export_archive(
     family_mode: str = "exact",
     seed_limit: int | None = None,
     portable_workspace: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "running",
+                    "phase": "preparing",
+                    "detail": "selecting documents",
+                },
+                True,
+            )
         selected_documents, selector, normalized_family_mode = resolve_export_archive_selection(
             connection,
             paths,
@@ -62552,9 +63326,19 @@ def export_archive(
         manifest_document_entries: list[dict[str, object]] = []
         warnings: list[str] = []
         created_at = utc_now()
+        total_documents = len(selected_documents)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "running" if total_documents or portable_workspace else "completed",
+                    "phase": "exporting" if total_documents else ("building portable workspace" if portable_workspace else "completed"),
+                    "detail": f"0/{total_documents} documents",
+                },
+                True,
+            )
 
         with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for selected_document in selected_documents:
+            for document_index, selected_document in enumerate(selected_documents, start=1):
                 document_row = selected_document["document_row"]
                 manifest_entry, document_warnings = archive_document_files(
                     archive,
@@ -62577,9 +63361,27 @@ def export_archive(
                     warnings.extend(revision_warnings)
                 manifest_document_entries.append(manifest_entry)
                 warnings.extend(document_warnings)
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "status": "running",
+                            "phase": "exporting",
+                            "detail": f"{document_index}/{total_documents} documents",
+                        },
+                        False,
+                    )
 
             portable_workspace_payload = None
             if portable_workspace:
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "status": "running",
+                            "phase": "building portable workspace",
+                            "detail": f"{total_documents}/{total_documents} documents",
+                        },
+                        False,
+                    )
                 with tempfile.TemporaryDirectory(prefix="retriever-portable-workspace-") as tempdir:
                     portable_root = Path(tempdir) / "workspace"
                     portable_workspace_payload = build_portable_workspace_db(
@@ -62628,12 +63430,12 @@ def export_archive(
         except ValueError:
             output_rel_path = None
 
-        return {
+        payload = {
             "status": "ok",
             "created_at": created_at,
             "output_path": str(output_path),
             "output_rel_path": output_rel_path,
-            "document_count": len(selected_documents),
+            "document_count": total_documents,
             "selector": selector,
             "family_mode": normalized_family_mode,
             "seed_limit": seed_limit,
@@ -62645,6 +63447,16 @@ def export_archive(
             "overwrote_existing_file": overwrote_existing_file,
             "file_size": file_size_bytes(output_path),
         }
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "completed",
+                    "phase": "completed",
+                    "detail": f"{total_documents}/{total_documents} documents",
+                },
+                True,
+            )
+        return payload
     finally:
         connection.close()
 
@@ -62943,6 +63755,7 @@ def export_run_to_completion(
     budget_seconds: int,
     created: bool,
     start_payload: dict[str, object],
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     run_payload = {
         key: value
@@ -62951,6 +63764,8 @@ def export_run_to_completion(
     }
     step_payloads: list[dict[str, object]] = []
     reason = "run_terminal" if str(run_payload.get("status")) in EXPORT_RUN_TERMINAL_STATUSES else "budget_exhausted"
+    if progress_callback is not None:
+        progress_callback(start_payload, True)
     while str(run_payload.get("status")) not in EXPORT_RUN_TERMINAL_STATUSES:
         step_payload = export_run_step(
             root,
@@ -62962,11 +63777,13 @@ def export_run_to_completion(
         if isinstance(step_payload.get("run"), dict):
             run_payload = dict(step_payload["run"])
         reason = str(step_payload.get("reason") or reason)
+        if progress_callback is not None:
+            progress_callback(step_payload, False)
         if not bool(step_payload.get("executed")):
             break
         if reason == "no_runnable_step" and bool(step_payload.get("more_work_remaining")):
             break
-    return export_run_facade_payload(
+    payload = export_run_facade_payload(
         root=root,
         export_kind=export_kind,
         budget_seconds=budget_seconds,
@@ -62976,6 +63793,9 @@ def export_run_to_completion(
         reason=reason,
         mode="run_to_completion",
     )
+    if progress_callback is not None:
+        progress_callback(payload, True)
+    return payload
 
 
 def export_csv_start(
@@ -62990,6 +63810,7 @@ def export_csv_start(
     select_from_scope: bool = False,
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     budget = normalize_resumable_step_budget(budget_seconds)
     paths = workspace_paths(root)
@@ -63090,6 +63911,7 @@ def export_csv_start(
             budget_seconds=budget,
             created=True,
             start_payload=start_payload,
+            progress_callback=progress_callback,
         )
     return start_payload
 
@@ -63110,6 +63932,7 @@ def export_table_csv_start(
     limit: int | None = None,
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     normalized_table_name = normalize_export_table_name(table_name)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -63268,6 +64091,7 @@ def export_table_csv_start(
             budget_seconds=budget,
             created=True,
             start_payload=start_payload,
+            progress_callback=progress_callback,
         )
     return start_payload
 
@@ -63287,6 +64111,7 @@ def export_archive_start(
     portable_workspace: bool = False,
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     budget = normalize_resumable_step_budget(budget_seconds)
     paths = workspace_paths(root)
@@ -63398,6 +64223,7 @@ def export_archive_start(
             budget_seconds=budget,
             created=True,
             start_payload=start_payload,
+            progress_callback=progress_callback,
         )
     return start_payload
 
@@ -65480,6 +66306,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignored compatibility flag retained for older callers",
     )
 
+    workspace_doctor_parser = workspace_subparsers.add_parser(
+        "doctor",
+        help="Run deeper workspace and database diagnostics",
+    )
+    workspace_doctor_parser.add_argument("workspace", help="Workspace root path")
+    workspace_doctor_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Return the compact diagnostic payload",
+    )
+    workspace_doctor_parser.add_argument(
+        "--repair-stale-sidecars",
+        action="store_true",
+        help="Remove stale SQLite sidecars before opening the database",
+    )
+
     ingest_parser = subparsers.add_parser("ingest", help="Index documents in the workspace")
     ingest_parser.add_argument("workspace", help="Workspace root path")
     ingest_parser.add_argument("--recursive", action="store_true", help="Scan directories recursively")
@@ -66535,6 +67377,18 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_ocr_run_parser = subparsers.add_parser("finalize-ocr-run", help="Merge completed OCR page items into document-level OCR results")
     finalize_ocr_run_parser.add_argument("workspace", help="Workspace root path")
     finalize_ocr_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    finalize_ocr_run_parser.add_argument(
+        "--cascade-metadata",
+        action="store_true",
+        help="Immediately refresh text-derived metadata for docs whose active OCR text changed",
+    )
+    finalize_ocr_run_parser.add_argument(
+        "--metadata-field",
+        dest="metadata_fields",
+        action="append",
+        choices=sorted(TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN),
+        help="Metadata field to refresh when --cascade-metadata is used",
+    )
 
     finalize_image_description_run_parser = subparsers.add_parser(
         "finalize-image-description-run",
@@ -66683,6 +67537,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_field_parser.add_argument("--field", required=True, help="Field name")
     set_field_parser.add_argument("--value", help="Field value")
+
+    refresh_text_metadata_parser = subparsers.add_parser(
+        "refresh-text-derived-metadata",
+        help="Re-derive author/participants/date-created metadata from active document text",
+    )
+    refresh_text_metadata_parser.add_argument("workspace", help="Workspace root path")
+    add_scope_run_selector_arguments(refresh_text_metadata_parser)
+    refresh_text_metadata_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to refresh (repeatable)",
+    )
+    refresh_text_metadata_parser.add_argument(
+        "--field",
+        dest="field_names",
+        action="append",
+        choices=sorted(TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN),
+        help="Metadata field to refresh (repeatable; defaults to author, participants, date_created)",
+    )
 
     reconcile_duplicates_parser = subparsers.add_parser(
         "reconcile-duplicates",
@@ -66862,9 +67737,18 @@ def main() -> int:
                 )
                 return emit_cli_payload("workspace", {"action": "update", **update_payload})
 
+            if args.workspace_action == "doctor":
+                doctor_payload = doctor(
+                    root,
+                    bool(getattr(args, "quick", False)),
+                    repair_stale_sidecars=bool(getattr(args, "repair_stale_sidecars", False)),
+                )
+                return emit_cli_payload("workspace", {"action": "doctor", **doctor_payload})
+
         _auto_upgrade_and_maybe_reexec(root, args.command)
 
         if args.command == "ingest":
+            ingest_progress = LongTaskProgressPrinter("ingest") if bool(args.run_to_completion) else None
             return emit_cli_payload(
                 "ingest",
                 ingest_v2_facade(
@@ -66874,6 +67758,7 @@ def main() -> int:
                     raw_paths=args.paths,
                     budget_seconds=args.budget_seconds,
                     run_to_completion=args.run_to_completion,
+                    progress_callback=ingest_progress.emit if ingest_progress is not None else None,
                 ),
             )
 
@@ -66989,26 +67874,29 @@ def main() -> int:
             return emit_cli_payload("catalog", catalog(root))
 
         if args.command == "export-csv":
+            export_csv_progress = LongTaskProgressPrinter("export-csv")
             print(
                 json.dumps(
                     export_csv(
                         root,
                         args.output_path,
                         args.fields,
-                    args.document_ids,
-                    args.query,
-                    args.filters,
-                    args.sort,
-                    args.order,
-                    args.select_from_scope,
-                ),
-                indent=2,
-                sort_keys=True,
-            )
+                        args.document_ids,
+                        args.query,
+                        args.filters,
+                        args.sort,
+                        args.order,
+                        args.select_from_scope,
+                        progress_callback=export_csv_progress.emit,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
             )
             return 0
 
         if args.command == "export-csv-start":
+            export_csv_progress = LongTaskProgressPrinter("export-csv-start") if bool(args.run_to_completion) else None
             return emit_cli_payload(
                 "export-csv-start",
                 export_csv_start(
@@ -67023,6 +67911,7 @@ def main() -> int:
                     args.select_from_scope,
                     budget_seconds=args.budget_seconds,
                     run_to_completion=args.run_to_completion,
+                    progress_callback=export_csv_progress.emit if export_csv_progress is not None else None,
                 ),
             )
 
@@ -67049,6 +67938,7 @@ def main() -> int:
             )
 
         if args.command == "export-archive":
+            export_archive_progress = LongTaskProgressPrinter("export-archive")
             print(
                 json.dumps(
                     export_archive(
@@ -67063,6 +67953,7 @@ def main() -> int:
                         family_mode=args.family_mode,
                         seed_limit=args.seed_limit,
                         portable_workspace=args.portable_workspace,
+                        progress_callback=export_archive_progress.emit,
                     ),
                     indent=2,
                     sort_keys=True,
@@ -67071,6 +67962,7 @@ def main() -> int:
             return 0
 
         if args.command == "export-archive-start":
+            export_archive_progress = LongTaskProgressPrinter("export-archive-start") if bool(args.run_to_completion) else None
             return emit_cli_payload(
                 "export-archive-start",
                 export_archive_start(
@@ -67087,6 +67979,7 @@ def main() -> int:
                     portable_workspace=args.portable_workspace,
                     budget_seconds=args.budget_seconds,
                     run_to_completion=args.run_to_completion,
+                    progress_callback=export_archive_progress.emit if export_archive_progress is not None else None,
                 ),
             )
 
@@ -67222,12 +68115,14 @@ def main() -> int:
             )
 
         if args.command == "rebuild-entities":
+            rebuild_entities_progress = LongTaskProgressPrinter("rebuild-entities")
             return emit_cli_payload(
                 "rebuild-entities",
                 rebuild_entities(
                     root,
                     document_ids=args.document_ids,
                     batch_size=args.batch_size,
+                    progress_callback=rebuild_entities_progress.emit,
                 ),
             )
 
@@ -67698,7 +68593,18 @@ def main() -> int:
             return 0
 
         if args.command == "finalize-ocr-run":
-            print(json.dumps(finalize_ocr_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    finalize_ocr_run(
+                        root,
+                        run_id=args.run_id,
+                        cascade_metadata=bool(args.cascade_metadata),
+                        metadata_fields=args.metadata_fields,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
 
         if args.command == "finalize-image-description-run":
@@ -67827,6 +68733,22 @@ def main() -> int:
 
         if args.command == "set-field":
             return emit_cli_payload("set-field", set_field(root, args.document_ids, args.field, args.value))
+
+        if args.command == "refresh-text-derived-metadata":
+            return emit_cli_payload(
+                "refresh-text-derived-metadata",
+                refresh_text_derived_metadata(
+                    root,
+                    document_ids=args.document_ids,
+                    query=args.query,
+                    raw_bates=args.bates,
+                    raw_filters=args.filters,
+                    dataset_names=args.dataset_names,
+                    from_run_id=args.from_run_id,
+                    select_from_scope=args.select_from_scope,
+                    field_names=args.field_names,
+                ),
+            )
 
         if args.command == "reconcile-duplicates":
             return emit_cli_payload(

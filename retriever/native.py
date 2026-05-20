@@ -29,6 +29,7 @@ CLAUDE_TEXT_MODEL_ENV_VARS = ("RETRIEVER_CLAUDE_TEXT_MODEL", "RETRIEVER_CLAUDE_M
 CLAUDE_VISION_MODEL_ENV_VARS = ("RETRIEVER_CLAUDE_VISION_MODEL", "RETRIEVER_CLAUDE_MODEL", "ANTHROPIC_MODEL")
 DEFAULT_NATIVE_STEP_BUDGET_SECONDS = 35
 DEFAULT_NATIVE_CLAIM_STALE_SECONDS = 300
+NATIVE_PROGRESS_INTERVAL_SECONDS = 60.0
 DEFAULT_CLAUDE_CODE_MAX_TURNS = 6
 SUPPORTED_OPENAI_IMAGE_MIME_TYPES = {
     "image/gif",
@@ -135,6 +136,11 @@ def build_parser(tools: Any) -> argparse.ArgumentParser:
     run_parser.add_argument("--run-id", type=int, required=True, help="Existing run id")
     run_parser.add_argument("--claimed-by", help="Stable worker/session id to use for this runner")
     run_parser.add_argument(
+        "--as-worker",
+        action="store_true",
+        help="Process one native worker session and stop at handoff or terminal state",
+    )
+    run_parser.add_argument(
         "--budget-seconds",
         type=int,
         default=DEFAULT_NATIVE_STEP_BUDGET_SECONDS,
@@ -188,6 +194,11 @@ def build_parser(tools: Any) -> argparse.ArgumentParser:
         default=DEFAULT_NATIVE_CLAIM_STALE_SECONDS,
         help="How long this runner keeps claims alive before another caller can reclaim them",
     )
+    translate_parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Optional maximum number of backend step calls before stopping with an error",
+    )
     add_selector_arguments(translate_parser)
 
     extract_parser = subparsers.add_parser("extract", help="Create a structured extraction run and publish its outputs")
@@ -217,6 +228,11 @@ def build_parser(tools: Any) -> argparse.ArgumentParser:
         default=DEFAULT_NATIVE_CLAIM_STALE_SECONDS,
         help="How long this runner keeps claims alive before another caller can reclaim them",
     )
+    extract_parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Optional maximum number of backend step calls before stopping with an error",
+    )
     add_selector_arguments(extract_parser)
 
     ocr_parser = subparsers.add_parser("ocr", help="Create an OCR run and execute it to completion")
@@ -243,6 +259,11 @@ def build_parser(tools: Any) -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_NATIVE_CLAIM_STALE_SECONDS,
         help="How long this runner keeps claims alive before another caller can reclaim them",
+    )
+    ocr_parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Optional maximum number of backend step calls before stopping with an error",
     )
     add_selector_arguments(ocr_parser)
 
@@ -273,6 +294,11 @@ def build_parser(tools: Any) -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_NATIVE_CLAIM_STALE_SECONDS,
         help="How long this runner keeps claims alive before another caller can reclaim them",
+    )
+    describe_parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Optional maximum number of backend step calls before stopping with an error",
     )
     add_selector_arguments(describe_parser)
 
@@ -1114,24 +1140,16 @@ def maybe_publish_bound_outputs(tools: Any, root: Path, run_payload: dict[str, o
 def pending_finalization_action(run_payload: dict[str, object]) -> str | None:
     worker = dict(run_payload.get("worker") or {})
     next_action = str(worker.get("next_action") or "")
-    if next_action == "finalize_ocr" or bool(worker.get("needs_ocr_finalization")):
-        return "finalize_ocr"
-    if next_action == "finalize_image_description" or bool(worker.get("needs_image_description_finalization")):
-        return "finalize_image_description"
-    supervision = dict(run_payload.get("supervision") or {})
-    if not bool(supervision.get("finalization_pending")):
-        return None
-    if next_action == "finalize_image_description":
-        return "finalize_image_description"
     if next_action == "finalize_ocr":
         return "finalize_ocr"
-    job_version = dict(run_payload.get("job_version") or {})
-    job = dict(job_version.get("job") or {})
-    job_kind = str(job.get("job_kind") or "")
-    if job_kind == "image_description":
+    if next_action == "finalize_image_description":
         return "finalize_image_description"
-    if job_kind == "ocr":
+    supervision = dict(run_payload.get("supervision") or {})
+    recommended_action = str(supervision.get("recommended_action") or "")
+    if recommended_action == "finalize_ocr":
         return "finalize_ocr"
+    if recommended_action == "finalize_image_description":
+        return "finalize_image_description"
     return None
 
 
@@ -1158,21 +1176,152 @@ def finish_worker_best_effort(
         return None
 
 
-def run_to_completion(
+def native_handoff_claimed_by_hint(run_payload: dict[str, object], claimed_by: str) -> str:
+    worker = dict(run_payload.get("worker") or {})
+    hinted = str(worker.get("handoff_claimed_by_hint") or "").strip()
+    if hinted:
+        return hinted
+    return f"{claimed_by}-handoff"
+
+
+def run_status_for_worker(
     tools: Any,
     root: Path,
     *,
     run_id: int,
-    claimed_by: str | None,
+    budget_seconds: int,
+    claimed_by: str,
+) -> dict[str, object]:
+    return tools.run_status(
+        root,
+        run_id=run_id,
+        budget_seconds=budget_seconds,
+        claimed_by=claimed_by,
+    )
+
+
+def should_rotate_native_worker(run_payload: dict[str, object]) -> bool:
+    worker = dict(run_payload.get("worker") or {})
+    next_action = str(worker.get("next_action") or "")
+    if next_action == "handoff" or bool(worker.get("should_exit_after_batch")):
+        return True
+    if next_action != "stop":
+        return False
+
+    supervision = dict(run_payload.get("supervision") or {})
+    if bool(supervision.get("continuation_needed")) or bool(supervision.get("finalization_pending")):
+        return True
+    if int(supervision.get("outstanding_items", 0) or 0) > 0:
+        return True
+    recommended_action = str(supervision.get("recommended_action") or "")
+    return recommended_action in {"spawn_background_worker", "claim_inline"}
+
+
+def native_progress_headline(command_name: str, run_payload: dict[str, object]) -> str:
+    headline_map = {
+        "run": "Processing run",
+        "translate": "Translation",
+        "extract": "Extraction",
+        "ocr": "OCR",
+        "describe-images": "Image description",
+    }
+    if command_name != "run":
+        return headline_map.get(command_name, "Processing run")
+    job_version = dict(run_payload.get("job_version") or {})
+    job = dict(job_version.get("job") or {})
+    job_kind = str(job.get("job_kind") or "")
+    return {
+        "translation": "Translation",
+        "structured_extraction": "Extraction",
+        "ocr": "OCR",
+        "image_description": "Image description",
+    }.get(job_kind, "Processing run")
+
+
+def native_progress_line(command_name: str, run_payload: dict[str, object]) -> str | None:
+    status = str(run_payload.get("status") or "").strip().lower()
+    run_id = run_payload.get("id")
+    completed = int(run_payload.get("completed_count") or 0)
+    planned = int(run_payload.get("planned_count") or 0)
+    failed = int(run_payload.get("failed_count") or 0)
+    skipped = int(run_payload.get("skipped_count") or 0)
+    run_item_counts = dict(run_payload.get("run_item_counts") or {})
+    pending = int(run_item_counts.get("pending", 0) or 0)
+    running = int(run_item_counts.get("running", 0) or 0)
+    worker = dict(run_payload.get("worker") or {})
+    next_action = str(worker.get("next_action") or "").strip()
+    headline = native_progress_headline(command_name, run_payload)
+    if status in {"completed", "failed", "canceled"}:
+        line = f"{headline} {status} — {completed}/{planned} completed, {failed} failed"
+    else:
+        line = (
+            f"{headline} in progress — {completed}/{planned} completed, "
+            f"{pending} pending, {running} running, {failed} failed"
+        )
+    if skipped:
+        line += f", {skipped} skipped"
+    if next_action:
+        line += f", next {next_action}"
+    if run_id is not None:
+        line += f" (run {run_id})"
+    return line
+
+
+def native_progress_signature(command_name: str, run_payload: dict[str, object]) -> tuple[str, str, str, str, str]:
+    worker = dict(run_payload.get("worker") or {})
+    return (
+        command_name,
+        str(run_payload.get("id") or ""),
+        str(run_payload.get("status") or ""),
+        str(worker.get("next_action") or ""),
+        str(run_payload.get("failed_count") or 0),
+    )
+
+
+class NativeProgressPrinter:
+    def __init__(self, command_name: str, *, interval_seconds: float = NATIVE_PROGRESS_INTERVAL_SECONDS) -> None:
+        self.command_name = command_name
+        self.interval_seconds = max(1.0, float(interval_seconds))
+        self.last_emit_at = 0.0
+        self.last_signature: tuple[str, str, str, str, str] | None = None
+
+    def emit(self, run_payload: dict[str, object], *, force: bool = False) -> None:
+        line = native_progress_line(self.command_name, run_payload)
+        if not line:
+            return
+        signature = native_progress_signature(self.command_name, run_payload)
+        now = time.perf_counter()
+        should_emit = (
+            force
+            or self.last_signature is None
+            or signature != self.last_signature
+            or (now - self.last_emit_at) >= self.interval_seconds
+        )
+        if not should_emit:
+            return
+        print(f"[progress] {line}", file=sys.stderr, flush=True)
+        self.last_emit_at = now
+        self.last_signature = signature
+
+
+def run_worker_session(
+    tools: Any,
+    root: Path,
+    *,
+    command_name: str,
+    run_id: int,
+    claimed_by: str,
     budget_seconds: int,
     claim_stale_seconds: int,
     limit: int | None,
     max_steps: int | None,
     publish_bound_outputs: bool,
+    progress: NativeProgressPrinter | None = None,
 ) -> dict[str, object]:
-    normalized_claimed_by = str(claimed_by or f"retriever-run-{run_id}").strip()
+    normalized_claimed_by = str(claimed_by or "").strip()
     if not normalized_claimed_by:
         raise tools.RetrieverError("claimed_by cannot be empty.")
+
     step_calls = 0
     batch_count = 0
     batch_item_count = 0
@@ -1181,10 +1330,22 @@ def run_to_completion(
     processed_items: list[dict[str, object]] = []
     published_payload = None
     publish_error = None
+    results: list[dict[str, object]] = []
     final_run_payload: dict[str, object] | None = None
-    terminal_worker_status = "completed"
+    session_reason = "idle"
+    handoff_claimed_by_hint: str | None = None
+    progress_printer = progress or NativeProgressPrinter(command_name)
 
     try:
+        initial_status_payload = run_status_for_worker(
+            tools,
+            root,
+            run_id=run_id,
+            budget_seconds=budget_seconds,
+            claimed_by=normalized_claimed_by,
+        )
+        final_run_payload = dict(initial_status_payload["run"])
+        progress_printer.emit(final_run_payload, force=True)
         while True:
             if max_steps is not None and step_calls >= max_steps:
                 raise tools.RetrieverError(
@@ -1217,9 +1378,20 @@ def run_to_completion(
                         item_failures += 1
                 tools.heartbeat_run_items(root, run_id=run_id, claimed_by=normalized_claimed_by)
 
-            final_run_payload = dict(step_payload.get("run") or {})
+            status_payload = run_status_for_worker(
+                tools,
+                root,
+                run_id=run_id,
+                budget_seconds=budget_seconds,
+                claimed_by=normalized_claimed_by,
+            )
+            final_run_payload = dict(status_payload["run"])
             finalization_action = pending_finalization_action(final_run_payload)
             if finalization_action == "finalize_ocr":
+                if max_steps is not None and step_calls >= max_steps:
+                    raise tools.RetrieverError(
+                        f"Reached --max-steps={max_steps} before run {run_id} reached a terminal state."
+                    )
                 finalize_payload = tools.finalize_ocr_run(root, run_id=run_id)
                 step_calls += 1
                 step_payloads.append(
@@ -1235,6 +1407,10 @@ def run_to_completion(
                 )
                 final_run_payload = dict(finalize_payload.get("run") or final_run_payload)
             elif finalization_action == "finalize_image_description":
+                if max_steps is not None and step_calls >= max_steps:
+                    raise tools.RetrieverError(
+                        f"Reached --max-steps={max_steps} before run {run_id} reached a terminal state."
+                    )
                 finalize_payload = tools.finalize_image_description_run(root, run_id=run_id)
                 step_calls += 1
                 step_payloads.append(
@@ -1249,53 +1425,84 @@ def run_to_completion(
                     }
                 )
                 final_run_payload = dict(finalize_payload.get("run") or final_run_payload)
+            progress_printer.emit(final_run_payload)
             final_status = str(final_run_payload.get("status") or "")
-            if final_status in {"completed", "failed", "canceled"} and not step_payload.get("more_work_remaining", False):
+            if final_status in {"completed", "failed", "canceled"}:
+                session_reason = "terminal"
                 break
-            if not step_payload.get("more_work_remaining", False):
+            if should_rotate_native_worker(final_run_payload):
+                session_reason = "handoff"
+                handoff_claimed_by_hint = native_handoff_claimed_by_hint(final_run_payload, normalized_claimed_by)
                 break
 
-        final_status_payload = tools.run_status(
-            root,
-            run_id=run_id,
-            budget_seconds=budget_seconds,
-            claimed_by=normalized_claimed_by,
-        )
-        final_run_payload = dict(final_status_payload["run"])
+            worker_payload = dict(final_run_payload.get("worker") or {})
+            next_action = str(worker_payload.get("next_action") or "")
+            if next_action in {"claim", "process_batch"}:
+                continue
+
+            supervision = dict(final_run_payload.get("supervision") or {})
+            if bool(supervision.get("continuation_needed")) or bool(supervision.get("finalization_pending")):
+                continue
+            session_reason = "idle"
+            break
+
+        if session_reason == "terminal":
+            final_status_payload = run_status_for_worker(
+                tools,
+                root,
+                run_id=run_id,
+                budget_seconds=budget_seconds,
+                claimed_by=normalized_claimed_by,
+            )
+            final_run_payload = dict(final_status_payload["run"])
+            final_status = str(final_run_payload.get("status") or "")
+            if final_status == "completed" and publish_bound_outputs:
+                try:
+                    published_payload = maybe_publish_bound_outputs(tools, root, final_run_payload, run_id)
+                except Exception as exc:
+                    publish_error = str(exc)
+                else:
+                    if published_payload is not None:
+                        final_status_payload = run_status_for_worker(
+                            tools,
+                            root,
+                            run_id=run_id,
+                            budget_seconds=budget_seconds,
+                            claimed_by=normalized_claimed_by,
+                        )
+                        final_run_payload = dict(final_status_payload["run"])
+            results_payload = tools.list_results(root, run_id=run_id)
+            results = list(results_payload.get("results") or [])
+
+        assert final_run_payload is not None
+        progress_printer.emit(final_run_payload, force=True)
+        summary = {
+            "step_calls": step_calls,
+            "batch_count": batch_count,
+            "batch_item_count": batch_item_count,
+            "item_failures": item_failures,
+        }
+        if session_reason != "terminal":
+            summary["reason"] = session_reason
+        if handoff_claimed_by_hint:
+            summary["handoff_claimed_by_hint"] = handoff_claimed_by_hint
         final_status = str(final_run_payload.get("status") or "")
-        if final_status == "completed" and publish_bound_outputs:
-            try:
-                published_payload = maybe_publish_bound_outputs(tools, root, final_run_payload, run_id)
-            except Exception as exc:
-                publish_error = str(exc)
+        if session_reason == "terminal":
+            if final_status == "failed":
+                worker_status = "failed"
+            elif final_status == "canceled":
+                worker_status = "canceled"
             else:
-                if published_payload is not None:
-                    final_status_payload = tools.run_status(
-                        root,
-                        run_id=run_id,
-                        budget_seconds=budget_seconds,
-                        claimed_by=normalized_claimed_by,
-                    )
-                    final_run_payload = dict(final_status_payload["run"])
-        if final_status == "failed":
-            terminal_worker_status = "failed"
-        elif final_status == "canceled":
-            terminal_worker_status = "canceled"
+                worker_status = "completed"
         else:
-            terminal_worker_status = "completed"
-        results_payload = tools.list_results(root, run_id=run_id)
+            worker_status = "stopped"
         worker_finish_payload = finish_worker_best_effort(
             tools,
             root,
             run_id=run_id,
             claimed_by=normalized_claimed_by,
-            worker_status=terminal_worker_status,
-            summary={
-                "step_calls": step_calls,
-                "batch_count": batch_count,
-                "batch_item_count": batch_item_count,
-                "item_failures": item_failures,
-            },
+            worker_status=worker_status,
+            summary=summary,
         )
         return {
             "status": "ok",
@@ -1308,10 +1515,12 @@ def run_to_completion(
             "steps": step_payloads,
             "processed_items": processed_items,
             "run": final_run_payload,
-            "results": list(results_payload.get("results") or []),
+            "results": results,
             "publish": published_payload,
             "publish_error": publish_error,
             "worker_finish": worker_finish_payload,
+            "session_reason": session_reason,
+            "handoff_claimed_by_hint": handoff_claimed_by_hint,
         }
     except Exception as exc:
         finish_worker_best_effort(
@@ -1331,6 +1540,97 @@ def run_to_completion(
         raise
 
 
+def run_to_completion(
+    tools: Any,
+    root: Path,
+    *,
+    command_name: str,
+    run_id: int,
+    claimed_by: str | None,
+    budget_seconds: int,
+    claim_stale_seconds: int,
+    limit: int | None,
+    max_steps: int | None,
+    publish_bound_outputs: bool,
+) -> dict[str, object]:
+    base_claimed_by = str(claimed_by or f"retriever-run-{run_id}").strip()
+    if not base_claimed_by:
+        raise tools.RetrieverError("claimed_by cannot be empty.")
+    active_claimed_by = base_claimed_by
+    step_calls = 0
+    batch_count = 0
+    batch_item_count = 0
+    item_failures = 0
+    step_payloads: list[dict[str, object]] = []
+    processed_items: list[dict[str, object]] = []
+    worker_finishes: list[dict[str, object]] = []
+    published_payload = None
+    publish_error = None
+    final_run_payload: dict[str, object] | None = None
+    results: list[dict[str, object]] = []
+    progress = NativeProgressPrinter(command_name)
+    while True:
+        remaining_steps = None if max_steps is None else max_steps - step_calls
+        if remaining_steps is not None and remaining_steps <= 0:
+            raise tools.RetrieverError(
+                f"Reached --max-steps={max_steps} before run {run_id} reached a terminal state."
+            )
+        session_payload = run_worker_session(
+            tools,
+            root,
+            command_name=command_name,
+            run_id=run_id,
+            claimed_by=active_claimed_by,
+            budget_seconds=budget_seconds,
+            claim_stale_seconds=claim_stale_seconds,
+            limit=limit,
+            max_steps=remaining_steps,
+            publish_bound_outputs=publish_bound_outputs,
+            progress=progress,
+        )
+        step_calls += int(session_payload.get("step_calls") or 0)
+        batch_count += int(session_payload.get("batch_count") or 0)
+        batch_item_count += int(session_payload.get("batch_item_count") or 0)
+        item_failures += int(session_payload.get("item_failures") or 0)
+        step_payloads.extend(list(session_payload.get("steps") or []))
+        processed_items.extend(list(session_payload.get("processed_items") or []))
+        final_run_payload = dict(session_payload.get("run") or final_run_payload or {})
+        if session_payload.get("publish") is not None:
+            published_payload = session_payload.get("publish")
+        if session_payload.get("publish_error"):
+            publish_error = str(session_payload["publish_error"])
+        if session_payload.get("results"):
+            results = list(session_payload.get("results") or [])
+        worker_finish_payload = session_payload.get("worker_finish")
+        if isinstance(worker_finish_payload, dict):
+            worker_finishes.append(worker_finish_payload)
+        session_reason = str(session_payload.get("session_reason") or "")
+        if session_reason == "handoff":
+            active_claimed_by = str(
+                session_payload.get("handoff_claimed_by_hint")
+                or native_handoff_claimed_by_hint(final_run_payload, active_claimed_by)
+            )
+            continue
+        break
+    return {
+        "status": "ok",
+        "run_id": run_id,
+        "claimed_by": base_claimed_by,
+        "step_calls": step_calls,
+        "batch_count": batch_count,
+        "batch_item_count": batch_item_count,
+        "item_failures": item_failures,
+        "steps": step_payloads,
+        "processed_items": processed_items,
+        "run": final_run_payload,
+        "results": results,
+        "publish": published_payload,
+        "publish_error": publish_error,
+        "worker_finish": worker_finishes[-1] if worker_finishes else None,
+        "worker_finishes": worker_finishes,
+    }
+
+
 def field_value_type(field_type: str) -> str:
     mapping = {
         "boolean": "boolean",
@@ -1347,11 +1647,30 @@ def field_value_type(field_type: str) -> str:
 
 def handle_run(tools: Any, args: argparse.Namespace) -> dict[str, object]:
     root = Path(args.workspace).expanduser().resolve()
+    if args.as_worker:
+        worker_claimed_by = str(args.claimed_by or f"retriever-run-{int(args.run_id)}").strip()
+        return {
+            "command": "run",
+            "worker_mode": True,
+            **run_worker_session(
+                tools,
+                root,
+                command_name="run",
+                run_id=int(args.run_id),
+                claimed_by=worker_claimed_by,
+                budget_seconds=int(args.budget_seconds),
+                claim_stale_seconds=int(args.claim_stale_seconds),
+                limit=args.limit,
+                max_steps=args.max_steps,
+                publish_bound_outputs=(not args.no_publish),
+            ),
+        }
     return {
         "command": "run",
         **run_to_completion(
             tools,
             root,
+            command_name="run",
             run_id=int(args.run_id),
             claimed_by=args.claimed_by,
             budget_seconds=int(args.budget_seconds),
@@ -1396,12 +1715,13 @@ def handle_translate(tools: Any, args: argparse.Namespace) -> dict[str, object]:
     execution_payload = run_to_completion(
         tools,
         root,
+        command_name="translate",
         run_id=run_id,
         claimed_by=None,
         budget_seconds=int(args.budget_seconds),
         claim_stale_seconds=int(args.claim_stale_seconds),
         limit=None,
-        max_steps=None,
+        max_steps=args.max_steps,
         publish_bound_outputs=False,
     )
     return {
@@ -1467,12 +1787,13 @@ def handle_extract(tools: Any, args: argparse.Namespace) -> dict[str, object]:
     execution_payload = run_to_completion(
         tools,
         root,
+        command_name="extract",
         run_id=run_id,
         claimed_by=None,
         budget_seconds=int(args.budget_seconds),
         claim_stale_seconds=int(args.claim_stale_seconds),
         limit=None,
-        max_steps=None,
+        max_steps=args.max_steps,
         publish_bound_outputs=True,
     )
     return {
@@ -1519,12 +1840,13 @@ def handle_ocr(tools: Any, args: argparse.Namespace) -> dict[str, object]:
     execution_payload = run_to_completion(
         tools,
         root,
+        command_name="ocr",
         run_id=run_id,
         claimed_by=None,
         budget_seconds=int(args.budget_seconds),
         claim_stale_seconds=int(args.claim_stale_seconds),
         limit=None,
-        max_steps=None,
+        max_steps=args.max_steps,
         publish_bound_outputs=False,
     )
     return {
@@ -1575,12 +1897,13 @@ def handle_describe_images(tools: Any, args: argparse.Namespace) -> dict[str, ob
     execution_payload = run_to_completion(
         tools,
         root,
+        command_name="describe-images",
         run_id=run_id,
         claimed_by=None,
         budget_seconds=int(args.budget_seconds),
         claim_stale_seconds=int(args.claim_stale_seconds),
         limit=None,
-        max_steps=None,
+        max_steps=args.max_steps,
         publish_bound_outputs=False,
     )
     return {
@@ -1598,6 +1921,8 @@ def render_human_summary(payload: dict[str, object]) -> str:
     run = dict(payload.get("run") or {})
     run_id = payload.get("run_id") or run.get("id")
     status = str(run.get("status") or payload.get("status") or "ok")
+    worker_mode = bool(payload.get("worker_mode"))
+    session_reason = str(payload.get("session_reason") or "")
     completed = int(run.get("completed_count") or 0)
     failed = int(run.get("failed_count") or 0)
     planned = int(run.get("planned_count") or 0)
@@ -1611,7 +1936,15 @@ def render_human_summary(payload: dict[str, object]) -> str:
         "describe-images": "Image description",
     }
     headline = headline_map.get(command, "Processing run")
-    if status == "completed":
+    if worker_mode and session_reason == "handoff":
+        lines = [
+            f"Stopped. {headline} worker session reached handoff (run {run_id}, {completed}/{planned} completed, {failed} failed)."
+        ]
+    elif worker_mode and session_reason == "idle":
+        lines = [
+            f"Stopped. {headline} worker session paused (run {run_id}, {completed}/{planned} completed, {failed} failed)."
+        ]
+    elif status == "completed":
         lines = [
             f"Done. {headline} completed (run {run_id}, {completed}/{planned} completed, {failed} failed)."
         ]
@@ -1635,6 +1968,11 @@ def render_human_summary(payload: dict[str, object]) -> str:
             notes.append(f"{published} field values published")
     if payload.get("publish_error"):
         notes.append(f"publish warning: {payload['publish_error']}")
+    if worker_mode:
+        notes.append("worker session")
+    handoff_claimed_by_hint = str(payload.get("handoff_claimed_by_hint") or "").strip()
+    if handoff_claimed_by_hint:
+        notes.append(f"next worker `{handoff_claimed_by_hint}`")
     if command == "translate":
         target_language = payload.get("target_language")
         if target_language:

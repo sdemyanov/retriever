@@ -1861,6 +1861,7 @@ def prepare_cli_payload(command: str, payload: dict[str, object], *, verbose: bo
 
 
 CLI_OUTPUT_MODE = "json"
+LONG_TASK_PROGRESS_INTERVAL_SECONDS = 60.0
 
 
 def set_cli_output_mode(mode: str) -> None:
@@ -1925,7 +1926,7 @@ def first_status_detail(status_report: dict[str, object]) -> str | None:
 
 def render_workspace_human_output(payload: dict[str, object]) -> str:
     action = normalize_inline_whitespace(str(payload.get("action") or "status")) or "status"
-    status_report = payload.get("status_report") if isinstance(payload.get("status_report"), dict) else {}
+    status_report = payload.get("status_report") if isinstance(payload.get("status_report"), dict) else payload
     workspace_root = normalize_inline_whitespace(
         str(
             payload.get("workspace_root")
@@ -1969,6 +1970,7 @@ def render_workspace_human_output(payload: dict[str, object]) -> str:
         "init": "Done. Workspace initialized and ready",
         "status": "Workspace ready",
         "update": "Done. Workspace updated and ready",
+        "doctor": "Workspace doctor completed",
     }.get(action, "Workspace ready")
     if ready:
         return (
@@ -2139,6 +2141,70 @@ def render_cli_human_output(command: str, payload: dict[str, object]) -> str | N
     if command == "get-doc":
         return render_get_doc_human_output(payload)
     return None
+
+
+def render_progress_line(command: str, payload: dict[str, object]) -> str | None:
+    rendered = render_cli_human_output(command, payload)
+    if isinstance(rendered, str):
+        lines = [normalize_inline_whitespace(line) for line in rendered.splitlines()]
+        first_line = next((line for line in lines if line), "")
+        if first_line:
+            return first_line
+
+    run = cli_run_payload(payload)
+    status = normalize_inline_whitespace(str(payload.get("status") or run.get("status") or ""))
+    phase = normalize_inline_whitespace(str(payload.get("phase") or run.get("phase") or status))
+    detail = normalize_inline_whitespace(str(payload.get("detail") or ""))
+    run_id = normalize_inline_whitespace(str(payload.get("run_id") or run.get("run_id") or ""))
+    if not status and not phase:
+        return None
+    label = normalize_inline_whitespace(command.replace("-", " "))
+    line = f"{label} {phase or status}".strip()
+    if detail:
+        line += f" — {detail}"
+    if run_id:
+        line += f" (run_id {run_id})"
+    return line or None
+
+
+def progress_payload_signature(command: str, payload: dict[str, object]) -> tuple[str, str, str, str, str]:
+    run = cli_run_payload(payload)
+    status = normalize_inline_whitespace(str(payload.get("status") or run.get("status") or ""))
+    phase = normalize_inline_whitespace(str(payload.get("phase") or run.get("phase") or status))
+    run_id = normalize_inline_whitespace(str(payload.get("run_id") or run.get("run_id") or ""))
+    next_commands = payload.get("next_recommended_commands")
+    if not isinstance(next_commands, list):
+        next_commands = run.get("next_recommended_commands")
+    first_next_command = ""
+    if isinstance(next_commands, list) and next_commands:
+        first_next_command = normalize_inline_whitespace(str(next_commands[0] or ""))
+    return (command, run_id, status, phase, first_next_command)
+
+
+class LongTaskProgressPrinter:
+    def __init__(self, command: str, *, interval_seconds: float = LONG_TASK_PROGRESS_INTERVAL_SECONDS) -> None:
+        self.command = command
+        self.interval_seconds = max(1.0, float(interval_seconds))
+        self.last_emit_at = 0.0
+        self.last_signature: tuple[str, str, str, str, str] | None = None
+
+    def emit(self, payload: dict[str, object], force: bool = False) -> None:
+        line = render_progress_line(self.command, payload)
+        if not line:
+            return
+        signature = progress_payload_signature(self.command, payload)
+        now = time.perf_counter()
+        should_emit = (
+            force
+            or self.last_signature is None
+            or signature != self.last_signature
+            or (now - self.last_emit_at) >= self.interval_seconds
+        )
+        if not should_emit:
+            return
+        print(f"[progress] {line}", file=sys.stderr, flush=True)
+        self.last_emit_at = now
+        self.last_signature = signature
 
 
 def emit_cli_payload(command: str, payload: dict[str, object], *, verbose: bool = False) -> int:
@@ -9149,12 +9215,22 @@ def export_csv(
     sort_field: str | None,
     order: str | None,
     select_from_scope: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "running",
+                    "phase": "preparing",
+                    "detail": "selecting documents",
+                },
+                True,
+            )
         field_defs = resolve_export_field_definitions(connection, raw_fields)
         output_path = resolve_export_output_path(paths, raw_output_path)
         rows, selector = resolve_export_csv_selection(
@@ -9171,10 +9247,20 @@ def export_csv(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overwrote_existing_file = output_path.exists()
         context = build_export_context(connection, rows, field_defs)
+        total_rows = len(rows)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "running" if total_rows else "completed",
+                    "phase": "exporting" if total_rows else "completed",
+                    "detail": f"0/{total_rows} rows",
+                },
+                True,
+            )
         with output_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow([field_def["field_name"] for field_def in field_defs])
-            for row in rows:
+            for row_index, row in enumerate(rows, start=1):
                 writer.writerow(
                     [
                         serialize_export_cell_value(
@@ -9184,6 +9270,15 @@ def export_csv(
                         for field_def in field_defs
                     ]
                 )
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "status": "running",
+                            "phase": "exporting",
+                            "detail": f"{row_index}/{total_rows} rows",
+                        },
+                        False,
+                    )
 
         output_rel_path = None
         try:
@@ -9191,17 +9286,27 @@ def export_csv(
         except ValueError:
             output_rel_path = None
 
-        return {
+        payload = {
             "status": "ok",
             "output_path": str(output_path),
             "output_rel_path": output_rel_path,
-            "document_count": len(rows),
+            "document_count": total_rows,
             "field_count": len(field_defs),
             "fields": field_defs,
             "selector": selector,
             "overwrote_existing_file": overwrote_existing_file,
             "file_size": file_size_bytes(output_path),
         }
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "completed",
+                    "phase": "completed",
+                    "detail": f"{total_rows}/{total_rows} rows",
+                },
+                True,
+            )
+        return payload
     finally:
         connection.close()
 
@@ -9916,12 +10021,22 @@ def export_archive(
     family_mode: str = "exact",
     seed_limit: int | None = None,
     portable_workspace: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     paths = workspace_paths(root)
     ensure_layout(paths)
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "running",
+                    "phase": "preparing",
+                    "detail": "selecting documents",
+                },
+                True,
+            )
         selected_documents, selector, normalized_family_mode = resolve_export_archive_selection(
             connection,
             paths,
@@ -9942,9 +10057,19 @@ def export_archive(
         manifest_document_entries: list[dict[str, object]] = []
         warnings: list[str] = []
         created_at = utc_now()
+        total_documents = len(selected_documents)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "running" if total_documents or portable_workspace else "completed",
+                    "phase": "exporting" if total_documents else ("building portable workspace" if portable_workspace else "completed"),
+                    "detail": f"0/{total_documents} documents",
+                },
+                True,
+            )
 
         with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for selected_document in selected_documents:
+            for document_index, selected_document in enumerate(selected_documents, start=1):
                 document_row = selected_document["document_row"]
                 manifest_entry, document_warnings = archive_document_files(
                     archive,
@@ -9967,9 +10092,27 @@ def export_archive(
                     warnings.extend(revision_warnings)
                 manifest_document_entries.append(manifest_entry)
                 warnings.extend(document_warnings)
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "status": "running",
+                            "phase": "exporting",
+                            "detail": f"{document_index}/{total_documents} documents",
+                        },
+                        False,
+                    )
 
             portable_workspace_payload = None
             if portable_workspace:
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "status": "running",
+                            "phase": "building portable workspace",
+                            "detail": f"{total_documents}/{total_documents} documents",
+                        },
+                        False,
+                    )
                 with tempfile.TemporaryDirectory(prefix="retriever-portable-workspace-") as tempdir:
                     portable_root = Path(tempdir) / "workspace"
                     portable_workspace_payload = build_portable_workspace_db(
@@ -10018,12 +10161,12 @@ def export_archive(
         except ValueError:
             output_rel_path = None
 
-        return {
+        payload = {
             "status": "ok",
             "created_at": created_at,
             "output_path": str(output_path),
             "output_rel_path": output_rel_path,
-            "document_count": len(selected_documents),
+            "document_count": total_documents,
             "selector": selector,
             "family_mode": normalized_family_mode,
             "seed_limit": seed_limit,
@@ -10035,6 +10178,16 @@ def export_archive(
             "overwrote_existing_file": overwrote_existing_file,
             "file_size": file_size_bytes(output_path),
         }
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "completed",
+                    "phase": "completed",
+                    "detail": f"{total_documents}/{total_documents} documents",
+                },
+                True,
+            )
+        return payload
     finally:
         connection.close()
 
@@ -10333,6 +10486,7 @@ def export_run_to_completion(
     budget_seconds: int,
     created: bool,
     start_payload: dict[str, object],
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     run_payload = {
         key: value
@@ -10341,6 +10495,8 @@ def export_run_to_completion(
     }
     step_payloads: list[dict[str, object]] = []
     reason = "run_terminal" if str(run_payload.get("status")) in EXPORT_RUN_TERMINAL_STATUSES else "budget_exhausted"
+    if progress_callback is not None:
+        progress_callback(start_payload, True)
     while str(run_payload.get("status")) not in EXPORT_RUN_TERMINAL_STATUSES:
         step_payload = export_run_step(
             root,
@@ -10352,11 +10508,13 @@ def export_run_to_completion(
         if isinstance(step_payload.get("run"), dict):
             run_payload = dict(step_payload["run"])
         reason = str(step_payload.get("reason") or reason)
+        if progress_callback is not None:
+            progress_callback(step_payload, False)
         if not bool(step_payload.get("executed")):
             break
         if reason == "no_runnable_step" and bool(step_payload.get("more_work_remaining")):
             break
-    return export_run_facade_payload(
+    payload = export_run_facade_payload(
         root=root,
         export_kind=export_kind,
         budget_seconds=budget_seconds,
@@ -10366,6 +10524,9 @@ def export_run_to_completion(
         reason=reason,
         mode="run_to_completion",
     )
+    if progress_callback is not None:
+        progress_callback(payload, True)
+    return payload
 
 
 def export_csv_start(
@@ -10380,6 +10541,7 @@ def export_csv_start(
     select_from_scope: bool = False,
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     budget = normalize_resumable_step_budget(budget_seconds)
     paths = workspace_paths(root)
@@ -10480,6 +10642,7 @@ def export_csv_start(
             budget_seconds=budget,
             created=True,
             start_payload=start_payload,
+            progress_callback=progress_callback,
         )
     return start_payload
 
@@ -10500,6 +10663,7 @@ def export_table_csv_start(
     limit: int | None = None,
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     normalized_table_name = normalize_export_table_name(table_name)
     budget = normalize_resumable_step_budget(budget_seconds)
@@ -10658,6 +10822,7 @@ def export_table_csv_start(
             budget_seconds=budget,
             created=True,
             start_payload=start_payload,
+            progress_callback=progress_callback,
         )
     return start_payload
 
@@ -10677,6 +10842,7 @@ def export_archive_start(
     portable_workspace: bool = False,
     budget_seconds: int | None = None,
     run_to_completion: bool = False,
+    progress_callback: Callable[[dict[str, object], bool], None] | None = None,
 ) -> dict[str, object]:
     budget = normalize_resumable_step_budget(budget_seconds)
     paths = workspace_paths(root)
@@ -10788,6 +10954,7 @@ def export_archive_start(
             budget_seconds=budget,
             created=True,
             start_payload=start_payload,
+            progress_callback=progress_callback,
         )
     return start_payload
 
@@ -12870,6 +13037,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignored compatibility flag retained for older callers",
     )
 
+    workspace_doctor_parser = workspace_subparsers.add_parser(
+        "doctor",
+        help="Run deeper workspace and database diagnostics",
+    )
+    workspace_doctor_parser.add_argument("workspace", help="Workspace root path")
+    workspace_doctor_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Return the compact diagnostic payload",
+    )
+    workspace_doctor_parser.add_argument(
+        "--repair-stale-sidecars",
+        action="store_true",
+        help="Remove stale SQLite sidecars before opening the database",
+    )
+
     ingest_parser = subparsers.add_parser("ingest", help="Index documents in the workspace")
     ingest_parser.add_argument("workspace", help="Workspace root path")
     ingest_parser.add_argument("--recursive", action="store_true", help="Scan directories recursively")
@@ -13925,6 +14108,18 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_ocr_run_parser = subparsers.add_parser("finalize-ocr-run", help="Merge completed OCR page items into document-level OCR results")
     finalize_ocr_run_parser.add_argument("workspace", help="Workspace root path")
     finalize_ocr_run_parser.add_argument("--run-id", type=int, required=True, help="Run id")
+    finalize_ocr_run_parser.add_argument(
+        "--cascade-metadata",
+        action="store_true",
+        help="Immediately refresh text-derived metadata for docs whose active OCR text changed",
+    )
+    finalize_ocr_run_parser.add_argument(
+        "--metadata-field",
+        dest="metadata_fields",
+        action="append",
+        choices=sorted(TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN),
+        help="Metadata field to refresh when --cascade-metadata is used",
+    )
 
     finalize_image_description_run_parser = subparsers.add_parser(
         "finalize-image-description-run",
@@ -14073,6 +14268,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_field_parser.add_argument("--field", required=True, help="Field name")
     set_field_parser.add_argument("--value", help="Field value")
+
+    refresh_text_metadata_parser = subparsers.add_parser(
+        "refresh-text-derived-metadata",
+        help="Re-derive author/participants/date-created metadata from active document text",
+    )
+    refresh_text_metadata_parser.add_argument("workspace", help="Workspace root path")
+    add_scope_run_selector_arguments(refresh_text_metadata_parser)
+    refresh_text_metadata_parser.add_argument(
+        "--doc-id",
+        dest="document_ids",
+        action="append",
+        type=int,
+        help="Document id to refresh (repeatable)",
+    )
+    refresh_text_metadata_parser.add_argument(
+        "--field",
+        dest="field_names",
+        action="append",
+        choices=sorted(TEXT_DERIVED_METADATA_FIELD_TO_OCCURRENCE_COLUMN),
+        help="Metadata field to refresh (repeatable; defaults to author, participants, date_created)",
+    )
 
     reconcile_duplicates_parser = subparsers.add_parser(
         "reconcile-duplicates",
@@ -14252,9 +14468,18 @@ def main() -> int:
                 )
                 return emit_cli_payload("workspace", {"action": "update", **update_payload})
 
+            if args.workspace_action == "doctor":
+                doctor_payload = doctor(
+                    root,
+                    bool(getattr(args, "quick", False)),
+                    repair_stale_sidecars=bool(getattr(args, "repair_stale_sidecars", False)),
+                )
+                return emit_cli_payload("workspace", {"action": "doctor", **doctor_payload})
+
         _auto_upgrade_and_maybe_reexec(root, args.command)
 
         if args.command == "ingest":
+            ingest_progress = LongTaskProgressPrinter("ingest") if bool(args.run_to_completion) else None
             return emit_cli_payload(
                 "ingest",
                 ingest_v2_facade(
@@ -14264,6 +14489,7 @@ def main() -> int:
                     raw_paths=args.paths,
                     budget_seconds=args.budget_seconds,
                     run_to_completion=args.run_to_completion,
+                    progress_callback=ingest_progress.emit if ingest_progress is not None else None,
                 ),
             )
 
@@ -14379,26 +14605,29 @@ def main() -> int:
             return emit_cli_payload("catalog", catalog(root))
 
         if args.command == "export-csv":
+            export_csv_progress = LongTaskProgressPrinter("export-csv")
             print(
                 json.dumps(
                     export_csv(
                         root,
                         args.output_path,
                         args.fields,
-                    args.document_ids,
-                    args.query,
-                    args.filters,
-                    args.sort,
-                    args.order,
-                    args.select_from_scope,
-                ),
-                indent=2,
-                sort_keys=True,
-            )
+                        args.document_ids,
+                        args.query,
+                        args.filters,
+                        args.sort,
+                        args.order,
+                        args.select_from_scope,
+                        progress_callback=export_csv_progress.emit,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
             )
             return 0
 
         if args.command == "export-csv-start":
+            export_csv_progress = LongTaskProgressPrinter("export-csv-start") if bool(args.run_to_completion) else None
             return emit_cli_payload(
                 "export-csv-start",
                 export_csv_start(
@@ -14413,6 +14642,7 @@ def main() -> int:
                     args.select_from_scope,
                     budget_seconds=args.budget_seconds,
                     run_to_completion=args.run_to_completion,
+                    progress_callback=export_csv_progress.emit if export_csv_progress is not None else None,
                 ),
             )
 
@@ -14439,6 +14669,7 @@ def main() -> int:
             )
 
         if args.command == "export-archive":
+            export_archive_progress = LongTaskProgressPrinter("export-archive")
             print(
                 json.dumps(
                     export_archive(
@@ -14453,6 +14684,7 @@ def main() -> int:
                         family_mode=args.family_mode,
                         seed_limit=args.seed_limit,
                         portable_workspace=args.portable_workspace,
+                        progress_callback=export_archive_progress.emit,
                     ),
                     indent=2,
                     sort_keys=True,
@@ -14461,6 +14693,7 @@ def main() -> int:
             return 0
 
         if args.command == "export-archive-start":
+            export_archive_progress = LongTaskProgressPrinter("export-archive-start") if bool(args.run_to_completion) else None
             return emit_cli_payload(
                 "export-archive-start",
                 export_archive_start(
@@ -14477,6 +14710,7 @@ def main() -> int:
                     portable_workspace=args.portable_workspace,
                     budget_seconds=args.budget_seconds,
                     run_to_completion=args.run_to_completion,
+                    progress_callback=export_archive_progress.emit if export_archive_progress is not None else None,
                 ),
             )
 
@@ -14612,12 +14846,14 @@ def main() -> int:
             )
 
         if args.command == "rebuild-entities":
+            rebuild_entities_progress = LongTaskProgressPrinter("rebuild-entities")
             return emit_cli_payload(
                 "rebuild-entities",
                 rebuild_entities(
                     root,
                     document_ids=args.document_ids,
                     batch_size=args.batch_size,
+                    progress_callback=rebuild_entities_progress.emit,
                 ),
             )
 
@@ -15088,7 +15324,18 @@ def main() -> int:
             return 0
 
         if args.command == "finalize-ocr-run":
-            print(json.dumps(finalize_ocr_run(root, run_id=args.run_id), indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    finalize_ocr_run(
+                        root,
+                        run_id=args.run_id,
+                        cascade_metadata=bool(args.cascade_metadata),
+                        metadata_fields=args.metadata_fields,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
 
         if args.command == "finalize-image-description-run":
@@ -15217,6 +15464,22 @@ def main() -> int:
 
         if args.command == "set-field":
             return emit_cli_payload("set-field", set_field(root, args.document_ids, args.field, args.value))
+
+        if args.command == "refresh-text-derived-metadata":
+            return emit_cli_payload(
+                "refresh-text-derived-metadata",
+                refresh_text_derived_metadata(
+                    root,
+                    document_ids=args.document_ids,
+                    query=args.query,
+                    raw_bates=args.bates,
+                    raw_filters=args.filters,
+                    dataset_names=args.dataset_names,
+                    from_run_id=args.from_run_id,
+                    select_from_scope=args.select_from_scope,
+                    field_names=args.field_names,
+                ),
+            )
 
         if args.command == "reconcile-duplicates":
             return emit_cli_payload(

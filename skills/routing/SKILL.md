@@ -252,6 +252,7 @@ The authoritative current list of subcommands is regenerated at build time into 
 - you need full metadata, text, or chunks for one document → `get-doc` — fetch one document with optional summary text or exact chunks
 - you need the chunk layout for one document → `list-chunks` — list chunk metadata for one document
 - you need to see all text revisions stored for a document → `list-text-revisions` — list stored text revisions for a document
+- you need to re-derive author, participants, recipients, or date_created from the active text for one document or a selected scope after OCR/text activation — phrasings like "refresh metadata from OCR text", "re-extract participants from active text", "fix author/date from the new OCR", or "update email header metadata after activating revisions" → `refresh-text-derived-metadata` — refresh text-derived metadata fields from active text
 
 ### Catalog & aggregation
 

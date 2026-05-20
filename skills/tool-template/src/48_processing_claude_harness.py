@@ -259,6 +259,11 @@ def build_run_item_context_payload(
         artifact_path = resolve_workspace_artifact_path(root, artifact_rel_path)
         if artifact_path is None or not artifact_path.exists():
             raise RetrieverError(f"Run item {run_item_row['id']} points at a missing OCR artifact: {artifact_rel_path!r}")
+        read_artifact_path = ensure_read_safe_visual_artifact_path(root, artifact_path)
+        try:
+            read_artifact_rel_path = read_artifact_path.relative_to(root).as_posix()
+        except ValueError:
+            read_artifact_rel_path = None
         page_input_kind = (
             "image_description_page_image"
             if normalize_job_kind(str(job_row["job_kind"])) == "image_description"
@@ -269,6 +274,8 @@ def build_run_item_context_payload(
             "page_number": int(run_item_row["page_number"] or 0),
             "artifact_rel_path": artifact_rel_path,
             "artifact_path": str(artifact_path),
+            "read_artifact_rel_path": read_artifact_rel_path,
+            "read_artifact_path": str(read_artifact_path),
             "bytes": artifact_path.stat().st_size,
             "text_revision_id": None,
             "inline_text": None,

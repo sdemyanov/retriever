@@ -7799,6 +7799,46 @@ def image_path_data_url(path: Path, *, max_dimension: int | None = None) -> str 
     return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
 
 
+READ_SAFE_VISUAL_SUFFIXES = frozenset(
+    {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".webp",
+    }
+)
+
+
+def ensure_read_safe_visual_artifact_path(root: Path, artifact_path: Path) -> Path:
+    if artifact_path.suffix.lower() in READ_SAFE_VISUAL_SUFFIXES:
+        return artifact_path
+
+    pil_image_module = load_dependency("PilImage")
+    if pil_image_module is None:
+        raise RetrieverError(
+            f"Could not load Pillow to convert unsupported visual artifact {artifact_path.name!r} into a Read-safe PNG."
+        )
+
+    paths = workspace_paths(root)
+    output_dir = Path(paths["tmp_dir"]) / "read-safe-visual-artifacts"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stat_result = artifact_path.stat()
+    fingerprint = hashlib.sha256(
+        f"{artifact_path.resolve()}:{stat_result.st_size}:{stat_result.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:12]
+    target_path = output_dir / f"{artifact_path.stem}-{fingerprint}.png"
+    if target_path.exists():
+        return target_path
+
+    with pil_image_module.open(artifact_path) as source_image:
+        converted = source_image.convert("RGBA" if "A" in source_image.getbands() else "RGB")
+        converted.save(target_path, format="PNG")
+    return target_path
+
+
 def pptx_picture_entry(
     element: ET.Element,
     *,

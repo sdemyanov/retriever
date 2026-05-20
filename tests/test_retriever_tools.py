@@ -5905,6 +5905,20 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(len(prepare_payload["batch"]), 1)
 
         batch_entry = prepare_payload["batch"][0]
+        active_status_exit, active_status_payload, _, _ = self.run_cli(
+            "run-status",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+        )
+        self.assertEqual(active_status_exit, 0)
+        self.assertIsNotNone(active_status_payload)
+        active_claims = active_status_payload["run"]["active_claims"]
+        self.assertEqual(len(active_claims), 1)
+        self.assertEqual(active_claims[0]["claimed_by"], "handoff-worker")
+        self.assertEqual(active_claims[0]["run_item_ids"], [int(batch_entry["run_item"]["id"])])
+        self.assertEqual(active_claims[0]["document_ids"], [int(batch_entry["run_item"]["document_id"])])
+
         complete_exit, complete_payload, _, _ = self.run_cli(
             "complete-run-item",
             str(self.root),
@@ -5941,7 +5955,33 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(handoff_payload["batch"], [])
         self.assertEqual(handoff_payload["worker"]["next_action"], "handoff")
         self.assertEqual(handoff_payload["worker"]["stop_reason"], "max_batches_reached")
+        self.assertTrue(handoff_payload["worker"]["handoff_required"])
         self.assertTrue(handoff_payload["worker"]["should_exit_after_batch"])
+        self.assertEqual(handoff_payload["worker"]["handoff_claimed_by_hint"], "handoff-worker-handoff")
+        self.assertIn(
+            "--claimed-by handoff-worker-handoff",
+            handoff_payload["run"]["next_recommended_commands"][0],
+        )
+
+        handoff_step_exit, handoff_step_payload, _, _ = self.run_cli(
+            "run-job-step",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "handoff-worker",
+            "--budget-seconds",
+            "35",
+        )
+        self.assertEqual(handoff_step_exit, 0)
+        self.assertIsNotNone(handoff_step_payload)
+        self.assertFalse(handoff_step_payload["executed"])
+        self.assertEqual(handoff_step_payload["reason"], "handoff_required")
+        self.assertEqual(handoff_step_payload["handoff_claimed_by_hint"], "handoff-worker-handoff")
+        self.assertIn(
+            "--claimed-by handoff-worker-handoff",
+            handoff_step_payload["next_recommended_commands"][0],
+        )
 
         finish_exit, finish_payload, _, _ = self.run_cli(
             "finish-run-worker",
@@ -6413,6 +6453,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(context_payload["context"]["input"]["kind"], "ocr_page_image")
         self.assertEqual(context_payload["context"]["input"]["page_number"], 1)
         self.assertTrue(context_payload["context"]["input"]["artifact_path"].endswith("PDX000005.tif"))
+        self.assertTrue(context_payload["context"]["input"]["read_artifact_path"].endswith(".png"))
+        self.assertTrue(Path(context_payload["context"]["input"]["read_artifact_path"]).exists())
 
         for item in claimed_items:
             page_number = int(item["page_number"])
@@ -6647,10 +6689,203 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         created_revision_id = int(result_payload["created_text_revision_id"])
         self.assertEqual(finalize_payload["activations"][0]["text_revision"]["id"], created_revision_id)
         self.assertEqual(finalize_payload["activations"][0]["activation_policy"], "always")
+        self.assertEqual(finalize_payload["stale_text_derived_metadata_document_ids"], [int(image_only_row["id"])])
+        self.assertIn("refresh-text-derived-metadata", finalize_payload["next_recommended_commands"][0])
+        self.assertIn(f"--doc-id {int(image_only_row['id'])}", finalize_payload["next_recommended_commands"][0])
 
         updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
         self.assertEqual(updated_row["active_search_text_revision_id"], created_revision_id)
         self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+    def test_finalize_ocr_run_can_cascade_text_metadata_refresh(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Queued OCR Cascade Metadata", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "queued_ocr_cascade_metadata",
+            "--instruction",
+            "OCR each page image.",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        job_version_id = int(create_version_payload["job_version"]["id"])
+
+        create_run_exit, create_run_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(job_version_id),
+            "--doc-id",
+            str(image_only_row["id"]),
+            "--activation-policy",
+            "always",
+        )
+        self.assertEqual(create_run_exit, 0)
+        self.assertIsNotNone(create_run_payload)
+        run_id = int(create_run_payload["run"]["id"])
+
+        claim_exit, claim_payload, _, _ = self.run_cli(
+            "claim-run-items",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--claimed-by",
+            "ocr-cascade-worker",
+            "--limit",
+            "10",
+        )
+        self.assertEqual(claim_exit, 0)
+        self.assertIsNotNone(claim_payload)
+        page_texts = {
+            1: (
+                "From: Alice Example <alice@example.com>\n"
+                "Sent: Wednesday, February 25, 2015 11:24 AM\n"
+                "To: Bob Example <bob@example.com>\n"
+                "Subject: Project Update\n\n"
+                "First page body."
+            ),
+            2: (
+                "From: Dave Example <dave@example.com>\n"
+                "To: Eve Example <eve@example.com>\n"
+                "Cc: Carol Example <carol@example.com>\n"
+                "Subject: Older thread\n\n"
+                "Second page body."
+            ),
+        }
+        for item in claim_payload["run_items"]:
+            page_number = int(item["page_number"])
+            complete_exit, complete_payload, _, _ = self.run_cli(
+                "complete-run-item",
+                str(self.root),
+                "--run-item-id",
+                str(item["id"]),
+                "--claimed-by",
+                "ocr-cascade-worker",
+                "--page-text",
+                page_texts[page_number],
+            )
+            self.assertEqual(complete_exit, 0)
+            self.assertIsNotNone(complete_payload)
+
+        finalize_exit, finalize_payload, _, _ = self.run_cli(
+            "finalize-ocr-run",
+            str(self.root),
+            "--run-id",
+            str(run_id),
+            "--cascade-metadata",
+        )
+        self.assertEqual(finalize_exit, 0)
+        self.assertIsNotNone(finalize_payload)
+        self.assertTrue(finalize_payload["metadata_cascade_requested"])
+        metadata_refresh = finalize_payload["metadata_refresh"]
+        self.assertEqual(metadata_refresh["updated_documents"], 1)
+        self.assertEqual(metadata_refresh["updated_fields"], 3)
+        self.assertIn("rebuild-entities", finalize_payload["next_recommended_commands"][0])
+        self.assertIn(f"--doc-id {int(image_only_row['id'])}", finalize_payload["next_recommended_commands"][0])
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["author"], "Alice Example <alice@example.com>")
+        self.assertEqual(updated_row["date_created"], "2015-02-25T11:24:00Z")
+        self.assertIn("Alice Example <alice@example.com>", updated_row["participants"] or "")
+        self.assertIn("Bob Example <bob@example.com>", updated_row["participants"] or "")
+        self.assertIn("Dave Example <dave@example.com>", updated_row["participants"] or "")
+        self.assertIn("Eve Example <eve@example.com>", updated_row["participants"] or "")
+        self.assertIn("Carol Example <carol@example.com>", updated_row["participants"] or "")
+
+    def test_refresh_text_derived_metadata_from_active_text_revision(self) -> None:
+        note_path = self.root / "metadata-refresh.txt"
+        note_path.write_text("Unreadable OCR placeholder.", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 1)
+
+        document_row = self.fetch_document_row("metadata-refresh.txt")
+        source_revision_id = int(document_row["source_text_revision_id"])
+        ocr_revision_id = self.create_text_revision(
+            document_id=int(document_row["id"]),
+            parent_revision_id=source_revision_id,
+            text_content=(
+                "From: Alice Example <alice@example.com>\n"
+                "Sent: Wednesday, February 25, 2015 11:24 AM\n"
+                "To: Bob Example <bob@example.com>\n"
+                "Cc: Carol Example <carol@example.com>\n"
+                "Subject: Project Update\n\n"
+                "Hello from the corrected OCR text."
+            ),
+            revision_kind="ocr",
+        )
+
+        activate_exit, activate_payload, _, _ = self.run_cli(
+            "activate-text-revision",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+            "--text-revision-id",
+            str(ocr_revision_id),
+            "--activation-policy",
+            "manual",
+        )
+        self.assertEqual(activate_exit, 0)
+        self.assertIsNotNone(activate_payload)
+
+        connection = retriever_tools.connect_db(self.paths["db_path"])
+        try:
+            connection.execute("BEGIN")
+            try:
+                connection.execute(
+                    """
+                    UPDATE document_occurrences
+                    SET extracted_author = ?, extracted_participants = ?, extracted_doc_authored_at = ?, updated_at = ?
+                    WHERE document_id = ?
+                    """,
+                    (
+                        "r^ e er K zinarzvk",
+                        "r ona Anotebaum, Ftler Katzmarzyk",
+                        "Tuesday, April 21. 20158:56:45 AM Attachments: ...",
+                        "2026-05-20T00:00:00Z",
+                        int(document_row["id"]),
+                    ),
+                )
+                retriever_tools.refresh_document_from_occurrences(connection, int(document_row["id"]))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        finally:
+            connection.close()
+
+        refresh_exit, refresh_payload, _, _ = self.run_cli(
+            "refresh-text-derived-metadata",
+            str(self.root),
+            "--doc-id",
+            str(document_row["id"]),
+        )
+        self.assertEqual(refresh_exit, 0)
+        self.assertIsNotNone(refresh_payload)
+        self.assertEqual(refresh_payload["updated_documents"], 1)
+        self.assertEqual(refresh_payload["updated_fields"], 3)
+        self.assertEqual(refresh_payload["results"][0]["updated_fields"], ["author", "participants", "date_created"])
+        self.assertIn("rebuild-entities", refresh_payload["next_recommended_commands"][0])
+        self.assertIn(f"--doc-id {int(document_row['id'])}", refresh_payload["next_recommended_commands"][0])
+
+        updated_row = self.fetch_document_by_id(int(document_row["id"]))
+        self.assertEqual(updated_row["author"], "Alice Example <alice@example.com>")
+        self.assertEqual(updated_row["date_created"], "2015-02-25T11:24:00Z")
+        self.assertIn("Alice Example <alice@example.com>", updated_row["participants"] or "")
+        self.assertIn("Bob Example <bob@example.com>", updated_row["participants"] or "")
+        self.assertIn("Carol Example <carol@example.com>", updated_row["participants"] or "")
 
     def test_image_description_page_run_items_finalize_into_document_result(self) -> None:
         production_root = self.write_production_fixture()
@@ -12434,6 +12669,38 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(registry_status["missing_registry"], ["issue_tag"])
+
+    def test_workspace_doctor_cli_reports_db_integrity(self) -> None:
+        retriever_tools.bootstrap(self.root)
+
+        exit_code, payload, _, _ = self.run_cli("workspace", "doctor", str(self.root), "--quick")
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["action"], "doctor")
+        self.assertEqual(payload["db"]["integrity_check"]["status"], "ok")
+
+    def test_workspace_doctor_can_remove_stale_sidecars(self) -> None:
+        wal_path = Path(f"{self.paths['db_path']}-wal")
+        wal_path.write_text("stale wal", encoding="utf-8")
+
+        exit_code, payload, _, _ = self.run_cli(
+            "workspace",
+            "doctor",
+            str(self.root),
+            "--quick",
+            "--repair-stale-sidecars",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["action"], "doctor")
+        stale_before = {str(Path(path).resolve()) for path in payload["db"]["stale_sqlite_artifacts_before"]}
+        removed_paths = {str(Path(path).resolve()) for path in payload["db"]["removed_stale_sqlite_artifacts"]}
+        resolved_wal_path = str(wal_path.resolve())
+        self.assertIn(resolved_wal_path, stale_before)
+        self.assertIn(resolved_wal_path, removed_paths)
+        self.assertFalse(wal_path.exists())
 
     def test_doctor_reports_optional_pst_backend_failure_without_failing_runtime(self) -> None:
         retriever_tools.bootstrap(self.root)
@@ -23310,6 +23577,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(ingest_exit, 0, ingest_stderr)
         self.assertIn("Ingest completed", ingest_stdout)
         self.assertNotIn("{", ingest_stdout)
+        self.assertIn("[progress]", ingest_stderr)
 
         row = self.fetch_document_row("sample.txt")
         get_doc_exit, get_doc_stdout, get_doc_stderr = self.run_cli_raw(
@@ -23339,6 +23607,37 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Table export completed", export_stdout)
         self.assertIn(".retriever/exports/review.csv", export_stdout)
         self.assertNotIn("{", export_stdout)
+        self.assertIn("[progress]", export_stderr)
+
+    def test_cli_progress_lines_for_direct_export_and_entity_rebuild(self) -> None:
+        for index in range(2):
+            document_path = self.root / f"entity-progress-{index}.txt"
+            document_path.write_text(f"Contact {index} <person{index}@example.com>\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 2)
+
+        export_exit, export_stdout, export_stderr = self.run_cli_raw(
+            "export-csv",
+            str(self.root),
+            "progress.csv",
+            "--field",
+            "file_name",
+        )
+        self.assertEqual(export_exit, 0, export_stderr)
+        self.assertIn("[progress]", export_stderr)
+        self.assertIn("\"output_rel_path\"", export_stdout)
+
+        rebuild_exit, rebuild_stdout, rebuild_stderr = self.run_cli_raw(
+            "rebuild-entities",
+            str(self.root),
+            "--batch-size",
+            "1",
+        )
+        self.assertEqual(rebuild_exit, 0, rebuild_stderr)
+        self.assertIn("[progress]", rebuild_stderr)
+        self.assertIn("\"documents_scanned\"", rebuild_stdout)
 
     def test_search_chunks_supports_citations_and_distinct_doc_count_mode(self) -> None:
         (self.root / "nda-one.txt").write_text("Termination notice must be delivered within thirty days.\n", encoding="utf-8")
@@ -24838,6 +25137,176 @@ sys.stdout.write(os.environ.get("FAKE_CLAUDE_OUTPUT", ""))
         updated_row = self.fetch_document_by_id(int(document_row["id"]))
         self.assertEqual(updated_row["counterparty"], "ACME Corp")
 
+    def test_python_m_retriever_run_rotates_workers_for_long_runs(self) -> None:
+        for index in range(16):
+            note_path = self.root / f"long-run-{index:02d}.txt"
+            note_path.write_text(f"Counterparty: ACME Corp #{index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 16)
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Long Run Counterparty", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        add_field_exit, _, _, _ = self.run_cli("add-field", str(self.root), "counterparty", "text")
+        self.assertEqual(add_field_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "long_run_counterparty",
+            "counterparty",
+            "--value-type",
+            "text",
+            "--bind-custom-field",
+            "counterparty",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "long_run_counterparty",
+            "--instruction",
+            "Extract the counterparty.",
+            "--provider",
+            "static_json",
+            "--parameters-json",
+            "{\"output_values\":{\"counterparty\":\"ACME Corp\"}}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        assert create_version_payload is not None
+
+        run_create_exit, run_create_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(create_version_payload["job_version"]["id"]),
+            "--filter",
+            "file_name LIKE 'long-run-%'",
+        )
+        self.assertEqual(run_create_exit, 0)
+        self.assertIsNotNone(run_create_payload)
+        assert run_create_payload is not None
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "run",
+            str(self.root),
+            "--run-id",
+            str(run_create_payload["run"]["id"]),
+            "--max-steps",
+            "40",
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["command"], "run")
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(payload["batch_count"], 4)
+        self.assertIsInstance(payload["publish"], dict)
+        self.assertGreaterEqual(len(payload["run"]["workers"]), 2)
+        self.assertIn("stopped", {worker["status"] for worker in payload["run"]["workers"]})
+        self.assertIn("[progress]", stderr_text)
+
+        first_row = self.fetch_document_row("long-run-00.txt")
+        last_row = self.fetch_document_row("long-run-15.txt")
+        self.assertEqual(first_row["counterparty"], "ACME Corp")
+        self.assertEqual(last_row["counterparty"], "ACME Corp")
+
+    def test_python_m_retriever_run_as_worker_stops_at_handoff_and_can_resume(self) -> None:
+        for index in range(16):
+            note_path = self.root / f"worker-run-{index:02d}.txt"
+            note_path.write_text(f"Counterparty: ACME Corp #{index}\n", encoding="utf-8")
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest(self.root, recursive=True, raw_file_types=None)
+        self.assertEqual(ingest_result["new"], 16)
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Worker Counterparty", "structured_extraction")
+        self.assertEqual(create_job_exit, 0)
+        add_field_exit, _, _, _ = self.run_cli("add-field", str(self.root), "counterparty", "text")
+        self.assertEqual(add_field_exit, 0)
+        add_output_exit, _, _, _ = self.run_cli(
+            "add-job-output",
+            str(self.root),
+            "worker_counterparty",
+            "counterparty",
+            "--value-type",
+            "text",
+            "--bind-custom-field",
+            "counterparty",
+        )
+        self.assertEqual(add_output_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "worker_counterparty",
+            "--instruction",
+            "Extract the counterparty.",
+            "--provider",
+            "static_json",
+            "--parameters-json",
+            "{\"output_values\":{\"counterparty\":\"ACME Corp\"}}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        assert create_version_payload is not None
+
+        run_create_exit, run_create_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(create_version_payload["job_version"]["id"]),
+            "--filter",
+            "file_name LIKE 'worker-run-%'",
+        )
+        self.assertEqual(run_create_exit, 0)
+        self.assertIsNotNone(run_create_payload)
+        assert run_create_payload is not None
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "run",
+            str(self.root),
+            "--run-id",
+            str(run_create_payload["run"]["id"]),
+            "--as-worker",
+            "--claimed-by",
+            "native-worker",
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["command"], "run")
+        self.assertTrue(payload["worker_mode"])
+        self.assertEqual(payload["session_reason"], "handoff")
+        self.assertEqual(payload["batch_count"], 3)
+        self.assertEqual(payload["batch_item_count"], 15)
+        self.assertEqual(payload["run"]["completed_count"], 15)
+        self.assertEqual(payload["handoff_claimed_by_hint"], "native-worker-handoff")
+        self.assertIn("[progress]", stderr_text)
+
+        resume_exit, resume_payload, _, resume_stderr = self.run_package_cli(
+            "run",
+            str(self.root),
+            "--run-id",
+            str(run_create_payload["run"]["id"]),
+            "--as-worker",
+            "--claimed-by",
+            str(payload["handoff_claimed_by_hint"]),
+        )
+        self.assertEqual(resume_exit, 0, resume_stderr)
+        self.assertIsNotNone(resume_payload)
+        assert resume_payload is not None
+        self.assertTrue(resume_payload["worker_mode"])
+        self.assertEqual(resume_payload["session_reason"], "terminal")
+        self.assertEqual(resume_payload["run"]["status"], "completed")
+        self.assertIsInstance(resume_payload["publish"], dict)
+        self.assertIn("[progress]", resume_stderr)
+
+        first_row = self.fetch_document_row("worker-run-00.txt")
+        last_row = self.fetch_document_row("worker-run-15.txt")
+        self.assertEqual(first_row["counterparty"], "ACME Corp")
+        self.assertEqual(last_row["counterparty"], "ACME Corp")
+
     def test_python_m_retriever_translate_runs_to_completion(self) -> None:
         note_path = self.root / "translate.txt"
         note_path.write_text("Original memo text.", encoding="utf-8")
@@ -24958,6 +25427,117 @@ sys.stdout.write(os.environ.get("FAKE_CLAUDE_OUTPUT", ""))
 
         updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
         self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+    def test_python_m_retriever_run_as_worker_executes_existing_ocr_run(self) -> None:
+        production_root = self.write_production_fixture()
+
+        retriever_tools.bootstrap(self.root)
+        ingest_result = retriever_tools.ingest_production(self.root, production_root)
+        self.assertEqual(ingest_result["created"], 4)
+        image_only_row = self.fetch_document_row(
+            f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/Synthetic_Production/documents/PDX000005.logical"
+        )
+
+        create_job_exit, _, _, _ = self.run_cli("create-job", str(self.root), "Worker OCR", "ocr")
+        self.assertEqual(create_job_exit, 0)
+        create_version_exit, create_version_payload, _, _ = self.run_cli(
+            "create-job-version",
+            str(self.root),
+            "worker_ocr",
+            "--instruction",
+            "Transcribe the page.",
+            "--provider",
+            "static_text",
+            "--capability",
+            "vision_ocr",
+            "--input-basis",
+            "source_parts",
+            "--parameters-json",
+            "{\"page_text\":\"OCR page {page_number}\"}",
+        )
+        self.assertEqual(create_version_exit, 0)
+        self.assertIsNotNone(create_version_payload)
+        assert create_version_payload is not None
+
+        run_create_exit, run_create_payload, _, _ = self.run_cli(
+            "create-run",
+            str(self.root),
+            "--job-version-id",
+            str(create_version_payload["job_version"]["id"]),
+            "--activation-policy",
+            "always",
+            "--doc-id",
+            str(image_only_row["id"]),
+        )
+        self.assertEqual(run_create_exit, 0)
+        self.assertIsNotNone(run_create_payload)
+        assert run_create_payload is not None
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(
+            "run",
+            str(self.root),
+            "--run-id",
+            str(run_create_payload["run"]["id"]),
+            "--as-worker",
+        )
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["command"], "run")
+        self.assertTrue(payload["worker_mode"])
+        self.assertEqual(payload["session_reason"], "terminal")
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertIn("[progress]", stderr_text)
+
+        updated_row = self.fetch_document_by_id(int(image_only_row["id"]))
+        self.assertEqual(updated_row["active_text_source_kind"], "ocr")
+
+    def test_python_m_retriever_ocr_rotates_workers_for_long_runs(self) -> None:
+        doc_ids: list[int] = []
+        for index in range(8):
+            production_name = f"Synthetic_Production_{index:02d}"
+            control_prefix = f"Q{index:02d}"
+            production_root = self.write_production_fixture(
+                production_name=production_name,
+                control_prefix=control_prefix,
+            )
+            if index == 0:
+                retriever_tools.bootstrap(self.root)
+            ingest_result = retriever_tools.ingest_production(self.root, production_root)
+            self.assertEqual(ingest_result["created"], 4)
+            image_only_row = self.fetch_document_row(
+                f"{retriever_tools.INTERNAL_REL_PATH_PREFIX}/productions/{production_name}/documents/{control_prefix}000005.logical"
+            )
+            doc_ids.append(int(image_only_row["id"]))
+
+        ocr_args = [
+            "ocr",
+            str(self.root),
+            "--provider",
+            "static_text",
+            "--parameters-json",
+            "{\"page_text\":\"OCR page {page_number}\"}",
+            "--max-steps",
+            "40",
+        ]
+        for document_id in doc_ids:
+            ocr_args.extend(["--doc-id", str(document_id)])
+
+        exit_code, payload, _, stderr_text = self.run_package_cli(*ocr_args)
+        self.assertEqual(exit_code, 0, stderr_text)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["command"], "ocr")
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(payload["batch_count"], 4)
+        self.assertEqual(len(payload["results"]), 8)
+        self.assertGreaterEqual(len(payload["run"]["workers"]), 2)
+        self.assertIn("stopped", {worker["status"] for worker in payload["run"]["workers"]})
+        self.assertIn("[progress]", stderr_text)
+
+        for document_id in doc_ids:
+            updated_row = self.fetch_document_by_id(document_id)
+            self.assertEqual(updated_row["active_text_source_kind"], "ocr")
 
     def test_python_m_retriever_ocr_defaults_to_claude_code_when_available(self) -> None:
         production_root = self.write_production_fixture()

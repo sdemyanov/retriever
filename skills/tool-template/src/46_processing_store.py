@@ -2916,6 +2916,52 @@ def image_description_run_pending_finalization_count(connection: sqlite3.Connect
     return int(row["count"] or 0)
 
 
+RUN_WORKER_HANDOFF_SUFFIX_PATTERN = re.compile(r"^(?P<base>.+?)-handoff(?:-(?P<index>\d+))?$")
+
+
+def handoff_claimed_by_base(run_id: int, claimed_by: str | None) -> str:
+    normalized = normalize_whitespace(claimed_by or "") or f"cowork-run-{int(run_id)}"
+    match = RUN_WORKER_HANDOFF_SUFFIX_PATTERN.fullmatch(normalized)
+    if match is not None:
+        return normalize_whitespace(match.group("base") or "") or normalized
+    return normalized
+
+
+def next_handoff_claimed_by_hint(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    claimed_by: str | None,
+) -> str:
+    base = handoff_claimed_by_base(run_id, claimed_by)
+    existing_claimed_by = {
+        normalize_whitespace(str(row["claimed_by"] or ""))
+        for row in connection.execute(
+            """
+            SELECT claimed_by
+            FROM run_workers
+            WHERE run_id = ?
+              AND claimed_by IS NOT NULL
+            UNION
+            SELECT claimed_by
+            FROM run_items
+            WHERE run_id = ?
+              AND claimed_by IS NOT NULL
+            """,
+            (run_id, run_id),
+        ).fetchall()
+        if normalize_whitespace(str(row["claimed_by"] or ""))
+    }
+    first_candidate = f"{base}-handoff"
+    if first_candidate not in existing_claimed_by:
+        return first_candidate
+    for index in range(2, 1000):
+        candidate = f"{base}-handoff-{index}"
+        if candidate not in existing_claimed_by:
+            return candidate
+    return f"{base}-handoff-{secrets.token_hex(3)}"
+
+
 def build_run_worker_payload(
     connection: sqlite3.Connection,
     run_id: int,
@@ -2979,6 +3025,11 @@ def build_run_worker_payload(
         and worker_batches_prepared >= effective_max_batches
         and pending_count > 0
     )
+    handoff_claimed_by_hint = (
+        next_handoff_claimed_by_hint(connection, run_id=run_id, claimed_by=normalized_claimed_by)
+        if worker_should_handoff
+        else None
+    )
     effective_launch_mode = (
         normalize_run_worker_mode(str(worker_row["launch_mode"]))
         if worker_row is not None and worker_row["launch_mode"] is not None
@@ -3035,6 +3086,13 @@ def build_run_worker_payload(
         "outstanding_items": outstanding_items,
         "needs_ocr_finalization": needs_ocr_finalization,
         "needs_image_description_finalization": needs_image_description_finalization,
+        "handoff_required": worker_should_handoff,
+        "handoff_claimed_by_hint": handoff_claimed_by_hint,
+        "handoff_message": (
+            "This worker reached max_batches_per_worker; finish it and continue with a new --claimed-by identity."
+            if worker_should_handoff
+            else None
+        ),
         "should_exit_after_batch": worker_should_handoff,
         "after_batch_action": "handoff" if worker_should_handoff else None,
         "next_action": next_action,
@@ -3631,29 +3689,62 @@ def run_status_by_id(
 
     active_claim_rows = connection.execute(
         """
-        SELECT claimed_by, COUNT(*) AS count, MAX(last_heartbeat_at) AS last_heartbeat_at
+        SELECT claimed_by, id, document_id, item_kind, page_number, segment_id, last_heartbeat_at
         FROM run_items
         WHERE run_id = ?
           AND status = 'running'
           AND claimed_by IS NOT NULL
-        GROUP BY claimed_by
-        ORDER BY claimed_by ASC
+        ORDER BY claimed_by ASC, id ASC
         """,
         (run_id,),
     ).fetchall()
-    payload["active_claims"] = [
-        {
-            "claimed_by": row["claimed_by"],
-            "count": int(row["count"] or 0),
-            "last_heartbeat_at": row["last_heartbeat_at"],
-            "last_heartbeat_age_seconds": claim_age_seconds(row["last_heartbeat_at"]),
-            "stale": (
-                claim_age_seconds(row["last_heartbeat_at"]) is not None
-                and int(claim_age_seconds(row["last_heartbeat_at"]) or 0) > int(claim_health["stale_after_seconds"])
-            ),
-        }
-        for row in active_claim_rows
-    ]
+    active_claims_by_worker: dict[str, dict[str, object]] = {}
+    for row in active_claim_rows:
+        worker_claimed_by = normalize_whitespace(str(row["claimed_by"] or ""))
+        if not worker_claimed_by:
+            continue
+        claim_payload = active_claims_by_worker.setdefault(
+            worker_claimed_by,
+            {
+                "claimed_by": worker_claimed_by,
+                "count": 0,
+                "run_item_ids": [],
+                "document_ids": [],
+                "page_numbers": [],
+                "segment_ids": [],
+                "last_heartbeat_at": None,
+            },
+        )
+        claim_payload["count"] = int(claim_payload["count"] or 0) + 1
+        claim_payload["run_item_ids"].append(int(row["id"]))
+        document_id = int(row["document_id"])
+        if document_id not in claim_payload["document_ids"]:
+            claim_payload["document_ids"].append(document_id)
+        if row["page_number"] is not None:
+            claim_payload["page_numbers"].append(int(row["page_number"]))
+        if row["segment_id"] is not None and row["segment_id"] not in claim_payload["segment_ids"]:
+            claim_payload["segment_ids"].append(row["segment_id"])
+        candidate_heartbeat = row["last_heartbeat_at"]
+        if candidate_heartbeat is not None and (
+            claim_payload["last_heartbeat_at"] is None
+            or str(candidate_heartbeat) > str(claim_payload["last_heartbeat_at"])
+        ):
+            claim_payload["last_heartbeat_at"] = candidate_heartbeat
+    payload["active_claims"] = []
+    for worker_claim in active_claims_by_worker.values():
+        last_heartbeat_at = worker_claim["last_heartbeat_at"]
+        last_heartbeat_age_seconds = claim_age_seconds(last_heartbeat_at)
+        payload["active_claims"].append(
+            {
+                **worker_claim,
+                "last_heartbeat_at": last_heartbeat_at,
+                "last_heartbeat_age_seconds": last_heartbeat_age_seconds,
+                "stale": (
+                    last_heartbeat_age_seconds is not None
+                    and int(last_heartbeat_age_seconds or 0) > int(claim_health["stale_after_seconds"])
+                ),
+            }
+        )
     payload["claim_health"] = claim_health
     payload["workers"] = list_run_worker_payloads_for_run(connection, run_id)
     payload["worker"] = build_run_worker_payload(
@@ -3848,11 +3939,13 @@ def finalize_ocr_results_for_run(
         finalized_results.append(result_summary_by_id(connection, result_id))
 
     refresh_run_progress(connection, run_id)
+    stale_text_derived_metadata_document_ids = sorted({int(payload["document_id"]) for payload in activations})
     return {
         "status": "ok",
         "run": run_status_by_id(connection, run_id),
         "results": finalized_results,
         "activations": activations,
+        "stale_text_derived_metadata_document_ids": stale_text_derived_metadata_document_ids,
     }
 
 
