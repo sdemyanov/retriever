@@ -61,6 +61,14 @@ Open Claude Code and paste this. Claude does the rest.
 > `if [ -d ~/.claude/skills/retriever/.git ]; then git -C ~/.claude/skills/retriever pull --ff-only origin main; else git clone --single-branch --depth 1 https://github.com/sdemyanov/retriever.git ~/.claude/skills/retriever; fi`.
 > Then run `cd ~/.claude/skills/retriever && ./setup`.
 
+To test Retriever with public sample data, open Claude Code and paste this:
+
+> Set up Retriever sample data: run
+> `if [ -d ~/retriever-data-public/.git ]; then git -C ~/retriever-data-public pull --ff-only origin main; else git clone --single-branch --depth 1 https://github.com/sdemyanov/retriever-data-public.git ~/retriever-data-public; fi`.
+
+Then open Claude Code in `~/retriever-data-public` and run
+`Ingest this folder`.
+
 ## Quick Start
 
 1. Open Claude Code in the local folder for one document collection, matter,
