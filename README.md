@@ -59,7 +59,7 @@ Open Claude Code and paste this. Claude does the rest.
 
 > Install Retriever: run
 > `if [ -d ~/.claude/skills/retriever/.git ]; then git -C ~/.claude/skills/retriever pull --ff-only origin main; else git clone --single-branch --depth 1 https://github.com/sdemyanov/retriever.git ~/.claude/skills/retriever; fi`.
-> Then run this command: `!cd ~/.claude/skills/retriever && ./setup`.
+> Then run `cd ~/.claude/skills/retriever && ./setup`.
 
 ## Quick Start
 
