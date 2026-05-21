@@ -28,18 +28,6 @@ current scope, disabled features, and enablement details.
 - Retriever's shared runtime lives under the plugin directory, not inside the
   user's source folders.
 
-<<<<<<< HEAD
-## Tell the user clearly
-
-- which local workspace or source folder Retriever is using
-- where exported files will be written
-- whether any action changes workspace state or generated outputs
-
-## Good default posture
-
-- prefer local workspaces for repeatable review
-- avoid creating fields or exports the user did not ask for
-=======
 ## Good default posture
 
 - prefer the smallest useful workspace or document set
@@ -48,4 +36,3 @@ current scope, disabled features, and enablement details.
 - be explicit about where exports are written
 - be explicit when processing jobs create new previews, text revisions, fields,
   or exports
->>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)

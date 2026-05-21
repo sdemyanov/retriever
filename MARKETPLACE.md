@@ -6,18 +6,11 @@ Open source document intelligence and review for Claude Code.
 
 ## Medium Description
 
-<<<<<<< HEAD
-Retriever is a local-first document intelligence and review plugin for Claude. It turns a
-folder, production, or mailbox export into a persistent review workspace, helps
-you find key documents and communications, and exports the scoped result as a
-table or archive.
-=======
 Retriever is an open source, local-first document intelligence plugin for
 Claude Code. It turns folders, productions, mailbox exports, and other
 supported document collections into a persistent workspace, helps you search,
 preview, review, enrich, and analyze documents, and exports the current result
 set as a table or archive.
->>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)
 
 ## First Run
 
@@ -54,13 +47,6 @@ Example prompts:
 
 ## Interface
 
-<<<<<<< HEAD
-- `retriever:export` for CSV/archive export flows
-
-## Trust Hook
-
-Local-first by default. Original files stay in place.
-=======
 Users interact with Retriever through Claude Code. Install it once, open
 Claude Code in a target workspace, and use `/retriever:*` commands or
 plain-English requests.
@@ -70,4 +56,3 @@ plain-English requests.
 Open source and local-first by default. Original files stay in place, and the
 workspace state lives alongside the source corpus rather than in a remote
 service.
->>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)

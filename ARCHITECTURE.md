@@ -15,7 +15,7 @@ through Claude Code.
 The repo has to keep four surfaces aligned:
 
 - the authored backend source
-- the generated backend bundle
+- the generated compatibility bundle
 - the native `python3 -m retriever` package surface
 - the Claude-facing slash-command and skill surfaces
 
@@ -25,28 +25,23 @@ of the build, documentation, and testing rules exist to catch that drift early.
 ## Repository Map
 
 - `retriever/`
-  Native Claude Code package surface. Long-running ingest, export, and
+  Native Claude-first package surface. Long-running ingest, export, and
   processing orchestration belongs here even when it reuses lower-level storage
   or runtime helpers.
 - `skills/`
-  Claude-facing command and skill materials, plus the generated backend
+  Claude-facing command and skill materials, plus the compatibility backend
   source tree and generated artifacts.
 - `skills/tool-template/src/`
-  Authored backend source of truth for the generated backend bundle.
+  Authored backend source of truth for the compatibility bundle.
 - `skills/tool-template/tools.py`
-  Generated backend bundle. Treat it as derived output.
+  Generated compatibility artifact. Treat it as derived output until the bundle
+  is retired.
 - `skills/routing/SKILL.md`
   Backend routing and reference material for Claude-facing behavior.
-<<<<<<< HEAD
-- `setup` and `setup-claude-v0`
-  Installer entrypoints for the global Claude Code install flow and the
-  project-local command bridge.
-=======
 - `agents/`
   Optional agent wrappers layered on top of the core Claude Code surface.
 - `setup`
   Installer entrypoint for the global Claude Code install flow.
->>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)
 - `tests/`
   Current regression, installer, package, and repository-integrity tests.
 - `.claude-plugin/plugin.json`
@@ -64,10 +59,10 @@ When a change spans multiple layers, keep this order in mind:
 4. Installer output, skill metadata, routing docs, and tests must stay aligned
    with the current tool and schema versions.
 
-`./build.sh` is the canonical synchronization step. It rebuilds
+`./build.sh` is the canonical synchronization step. It rebundles
 `skills/tool-template/tools.py`, refreshes generated command tables in
 `skills/routing/SKILL.md`, synchronizes version metadata, and rebuilds the
-bundled support artifact.
+legacy compatibility artifact.
 
 ## Workspace And Runtime Model
 
@@ -89,7 +84,7 @@ Retriever currently has three relevant execution surfaces:
 
 - Claude-facing slash commands installed by `./setup`
 - the native package CLI at `python3 -m retriever`
-- the generated backend bundle at `python3 skills/tool-template/tools.py`
+- the compatibility bundle at `python3 skills/tool-template/tools.py`
 
 The intended priority is:
 
@@ -97,8 +92,8 @@ The intended priority is:
    command set.
 2. Use `python3 -m retriever ...` when no slash command fits or when native
    package behavior is the right surface.
-3. Use the generated backend bundle for testing, validation, or lower-level
-   access that is not part of the main Claude Code flow.
+3. Use the compatibility bundle for legacy parity, compatibility testing, or
+   lower-level access that has not yet moved to the native package.
 
 Direct SQLite inspection is a last resort for debugging and verification, not a
 normal user-facing workflow.
@@ -106,7 +101,7 @@ normal user-facing workflow.
 ## Long-Running Jobs
 
 Ingest, export, entity rebuild, and processing flows use resumable backend job
-models. The Claude Code and native package surfaces should usually present
+models. The Claude-first and native package surfaces should usually present
 one-shot commands that drive those backends to a terminal state. Lower-level
 recovery commands such as `...-status` and `...-run-step` should stay available
 for interruption recovery and debugging without becoming the default user path.
