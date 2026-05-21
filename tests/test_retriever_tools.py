@@ -13441,7 +13441,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             day_result["preview_rel_path"],
-            self.preview_target_by_label(day_result["preview_targets"], "conversation")["rel_path"],
+            self.preview_target_by_label(day_result["preview_targets"], "message")["rel_path"],
         )
         self.assertIsNone(day_result["preview_target_fragment"])
 
@@ -13984,11 +13984,11 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             day_one_result["preview_rel_path"],
-            self.preview_target_by_label(day_one_result["preview_targets"], "conversation")["rel_path"],
+            self.preview_target_by_label(day_one_result["preview_targets"], "message")["rel_path"],
         )
         self.assertEqual(
             reply_search["results"][0]["preview_rel_path"],
-            self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "conversation")["rel_path"],
+            self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "message")["rel_path"],
         )
         self.assertIsNone(day_one_result["preview_target_fragment"])
         self.assertIsNone(reply_search["results"][0]["preview_target_fragment"])
@@ -14023,6 +14023,32 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("Following up on kickoff", slack_preview_html)
         self.assertTrue(slack_conversation_preview.exists())
         self.assertTrue(reply_conversation_preview.exists())
+
+        search_exit, search_payload, _, _ = self.run_cli(
+            "search",
+            str(self.root),
+            "Following up on kickoff",
+            "--mode",
+            "view",
+        )
+        self.assertEqual(search_exit, 0)
+        self.assertIsNotNone(search_payload)
+        assert search_payload is not None
+        rendered = str(search_payload["rendered_markdown"])
+        message_preview_name = self.preview_target_file_path(
+            self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "message")
+        ).name
+        conversation_preview_name = self.preview_target_file_path(
+            self.preview_target_by_label(reply_search["results"][0]["preview_targets"], "conversation")
+        ).name
+        self.assertIn(
+            message_preview_name,
+            rendered,
+        )
+        self.assertNotIn(
+            conversation_preview_name,
+            rendered,
+        )
 
         dataset_payload = retriever_tools.list_datasets(self.root)
         slack_dataset = next(
@@ -14278,7 +14304,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         reply_result = next(item for item in search_result["results"] if item["id"] == reply_row["id"])
         self.assertEqual(
             reply_result["preview_rel_path"],
-            self.preview_target_by_label(reply_result["preview_targets"], "segment")["rel_path"],
+            self.preview_target_by_label(reply_result["preview_targets"], "message")["rel_path"],
         )
         self.assertIsNone(reply_result["preview_target_fragment"])
         self.assertEqual(len(reply_result["preview_targets"]), 2)
@@ -14528,7 +14554,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         refreshed_result = next(item for item in refreshed_search["results"] if item["id"] == root_row["id"])
         self.assertEqual(
             refreshed_result["preview_rel_path"],
-            self.preview_target_by_label(refreshed_result["preview_targets"], "segment")["rel_path"],
+            self.preview_target_by_label(refreshed_result["preview_targets"], "message")["rel_path"],
         )
         self.assertEqual(refreshed_result["preview_targets"][0]["label"], "segment")
         self.assertIsNone(refreshed_result["preview_target_fragment"])
@@ -15611,6 +15637,30 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual(rendered, "Sood, Udit<br>usood@cov.com")
+
+    def test_search_cli_view_mode_prefers_message_preview_links_when_available(self) -> None:
+        rendered = retriever_tools.render_search_markdown_cell(
+            {
+                "title": "#ml-tech - Dec 17, 2022",
+                "display_values": {
+                    "title": "#ml-tech - Dec 17, 2022",
+                },
+                "preview_abs_path": "/tmp/conversation.html",
+                "preview_targets": [
+                    {
+                        "label": "conversation",
+                        "abs_path": "/tmp/conversation.html",
+                    },
+                    {
+                        "label": "message",
+                        "abs_path": "/tmp/doc-23.html",
+                    },
+                ],
+            },
+            {"name": "title", "type": "text"},
+        )
+
+        self.assertEqual(rendered, "[#ml-tech - Dec 17, 2022](computer:///tmp/doc-23.html)")
 
     def test_ingest_eml_attachment_without_filename_uses_detected_extension(self) -> None:
         email_path = self.root / "thread.eml"
@@ -20896,7 +20946,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             result["preview_rel_path"],
-            self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
         )
         self.assertIsNone(result["preview_target_fragment"])
         preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
@@ -21011,7 +21061,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             result["preview_rel_path"],
-            self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
         )
         self.assertIsNone(result["preview_target_fragment"])
         self.assertEqual(
@@ -21451,7 +21501,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             result["preview_rel_path"],
-            self.preview_target_by_label(result["preview_targets"], "conversation")["rel_path"],
+            self.preview_target_by_label(result["preview_targets"], "message")["rel_path"],
         )
         self.assertIsNone(result["preview_target_fragment"])
         preview_html = Path(str(result["preview_abs_path"]).split("#", 1)[0]).read_text(encoding="utf-8")
@@ -23963,7 +24013,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("text", verbose_result)
         self.assertIn("preview_targets", verbose_result)
 
-    def test_get_doc_for_conversation_document_uses_conversation_preview_without_anchor(self) -> None:
+    def test_get_doc_for_conversation_document_prefers_message_preview_without_anchor(self) -> None:
         self.write_email_message(
             self.root / "root.eml",
             subject="Anchored Preview",
@@ -23990,7 +24040,8 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(get_exit, 0)
         self.assertIsNotNone(get_payload)
         document_payload = get_payload["document"]
-        self.assertTrue(document_payload["preview_rel_path"].endswith("/conversation.html"))
+        self.assertFalse(document_payload["preview_rel_path"].endswith("/conversation.html"))
+        self.assertTrue(document_payload["preview_rel_path"].endswith(".html"))
         self.assertNotIn("#doc-", document_payload["preview_abs_path"])
 
     def test_cli_human_output_for_workspace_ingest_get_doc_and_export(self) -> None:

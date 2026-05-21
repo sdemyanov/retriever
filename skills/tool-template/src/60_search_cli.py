@@ -1278,9 +1278,25 @@ def document_path_payload(
     *,
     occurrence_row: sqlite3.Row | None = None,
     include_preview_targets: bool = True,
+    prefer_preview_label: str | None = "message",
 ) -> dict[str, object]:
     preview_target = default_preview_target(paths, row, connection)
     effective_rel_path = str(occurrence_row["rel_path"]) if occurrence_row is not None else str(row["rel_path"])
+    preview_targets: list[dict[str, object]] | None = None
+    normalized_preferred_label = normalize_whitespace(str(prefer_preview_label or "")).lower()
+    if include_preview_targets or normalized_preferred_label:
+        preview_targets = collect_preview_targets(paths, int(row["id"]), effective_rel_path, connection)
+    if normalized_preferred_label and preview_targets:
+        preferred_target = next(
+            (
+                target
+                for target in preview_targets
+                if normalize_whitespace(str(target.get("label") or "")).lower() == normalized_preferred_label
+            ),
+            None,
+        )
+        if preferred_target is not None:
+            preview_target = preferred_target
     if (
         occurrence_row is not None
         and str(preview_target.get("preview_type") or "") == "native"
@@ -1304,7 +1320,7 @@ def document_path_payload(
         "preview_target_fragment": preview_target["target_fragment"],
     }
     if include_preview_targets:
-        payload["preview_targets"] = collect_preview_targets(paths, int(row["id"]), effective_rel_path, connection)
+        payload["preview_targets"] = preview_targets or collect_preview_targets(paths, int(row["id"]), effective_rel_path, connection)
     return payload
 
 
@@ -4134,14 +4150,32 @@ def format_search_markdown_date(value: object) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M")
 
 
+def markdown_search_target_from_path(path_value: object) -> str | None:
+    normalized = normalize_inline_whitespace(str(path_value or ""))
+    if not normalized:
+        return None
+    if normalized.startswith("computer://"):
+        return normalized
+    return f"computer://{normalized}"
+
+
 def markdown_search_target(item: dict[str, object]) -> str | None:
+    preview_targets = item.get("preview_targets")
+    if isinstance(preview_targets, list):
+        for preview_target in preview_targets:
+            if not isinstance(preview_target, dict):
+                continue
+            if normalize_inline_whitespace(str(preview_target.get("label") or "")).lower() != "message":
+                continue
+            target = markdown_search_target_from_path(
+                preview_target.get("abs_path") or preview_target.get("file_abs_path")
+            )
+            if target:
+                return target
     for key in ("preview_abs_path", "abs_path"):
-        normalized = normalize_inline_whitespace(str(item.get(key) or ""))
-        if not normalized:
-            continue
-        if normalized.startswith("computer://"):
-            return normalized
-        return f"computer://{normalized}"
+        target = markdown_search_target_from_path(item.get(key))
+        if target:
+            return target
     return None
 
 
@@ -12104,21 +12138,14 @@ def get_doc(
 
         exact_chunks: list[dict[str, object]] = []
         total_text_chars = 0
-        preview_target = default_preview_target(paths, row, connection)
-        if (
-            occurrence_row is not None
-            and str(preview_target.get("preview_type") or "") == "native"
-            and str(preview_target.get("rel_path") or "") == str(row["rel_path"])
-        ):
-            preview_target = build_preview_target_payload(
-                rel_path=str(occurrence_row["rel_path"]),
-                abs_path=str(document_absolute_path(paths, str(occurrence_row["rel_path"]))),
-                preview_type="native",
-                label=None,
-                ordinal=0,
-            )
-        preview_rel_path = str(preview_target["rel_path"])
-        preview_abs_path = str(preview_target["abs_path"])
+        document_payload = document_overview_payload(
+            paths,
+            connection,
+            row,
+            occurrence_row=occurrence_row,
+        )
+        preview_rel_path = str(document_payload["preview_rel_path"])
+        preview_abs_path = str(document_payload["preview_abs_path"])
         for chunk_index in requested_chunk_indexes:
             chunk_row = chunk_rows_by_index[chunk_index]
             text_content = str(chunk_row["text_content"] or "")
@@ -12156,7 +12183,7 @@ def get_doc(
 
         return {
             "status": "ok",
-            "document": document_overview_payload(paths, connection, row, occurrence_row=occurrence_row),
+            "document": document_payload,
             "chunk_count": len(chunk_rows),
             "include_text": normalized_include_text,
             "text_summary": text_summary,
@@ -12430,27 +12457,20 @@ def search_chunks(
         )
         for row in returned_rows:
             occurrence_row = preferred_occurrences.get(int(row["id"]))
-            preview_target = default_preview_target(paths, row, connection)
-            if (
-                occurrence_row is not None
-                and str(preview_target.get("preview_type") or "") == "native"
-                and str(preview_target.get("rel_path") or "") == str(row["rel_path"])
-            ):
-                preview_target = build_preview_target_payload(
-                    rel_path=str(occurrence_row["rel_path"]),
-                    abs_path=str(document_absolute_path(paths, str(occurrence_row["rel_path"]))),
-                    preview_type="native",
-                    label=None,
-                    ordinal=0,
-                )
-            preview_rel_path = str(preview_target["rel_path"])
-            preview_abs_path = str(preview_target["abs_path"])
+            path_payload = document_path_payload(
+                paths,
+                connection,
+                row,
+                occurrence_row=occurrence_row,
+            )
+            preview_rel_path = str(path_payload["preview_rel_path"])
+            preview_abs_path = str(path_payload["preview_abs_path"])
             snippet = make_snippet(str(row["text_content"] or ""), query)
             source_row = occurrence_row or row
             custodian_values = document_custodian_values_from_row(row)
             custodian_text = ", ".join(custodian_values) if custodian_values else None
             result = {
-                **document_path_payload(paths, connection, row, occurrence_row=occurrence_row),
+                **path_payload,
                 "document_id": int(row["id"]),
                 "control_number": row["control_number"],
                 "file_name": source_row["file_name"],
