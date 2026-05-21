@@ -13,7 +13,9 @@ __pycache__/
 
 /backups/
 /data/
-/data-public/
+/data-public/.claude/
+/data-public/.retriever/
+/data-public/CLAUDE.md
 /DEMO.md
 /oleg/
 /plans/
