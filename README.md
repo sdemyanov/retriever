@@ -85,7 +85,7 @@ Common use cases:
 - Preview-first review. Search results render as a standard table with clickable titles. Native preview files are used when possible; Retriever generates HTML or CSV previews when needed.
 - Stable document identity. Documents receive stable `control_number` values for review and export. Production documents use produced Bates values as the control number.
 - Dataset-aware workflows. Documents can belong to one or more datasets, and datasets can be source-backed or manually curated.
-- Exports. Retriever can export selected rows to CSV, generate HTML preview bundles, or build zip archives containing source files, previews, and an optional portable workspace subset.
+- Exports. Retriever can export selected rows to CSV, generate HTML preview bundles, or build zip archives containing root `metadata.csv`, `manifest.json`, `README.txt`, `checksums.csv`, normalized `previews.csv` and `source_parts.csv`, extracted text under `text/`, legal-style `loadfile.dat` and `image_loadfile.opt`, a root `previews/` tree, source files in their ingested paths, and an optional portable workspace subset.
 - Metadata enrichment. You can add custom fields, set values manually, and run structured processing jobs that operate on frozen run snapshots.
 - Long-running processing. Translation, structured extraction, OCR, and image-description runs now have first-class Claude Code commands and native `python3 -m retriever` entrypoints that drive the resumable backend to a terminal state.
 
@@ -494,7 +494,7 @@ Use cases:
 
 - CSV for downstream review or QC
 - preview bundles for sharing HTML previews outside the main workspace
-- zip archives when you want source files, previews, and a portable subset together
+- zip archives when you want source files, previews, metadata tables, extracted text, loadfiles, and a portable subset together
 
 ### 7. Add fields and enrich metadata
 

@@ -62104,6 +62104,805 @@ def resolve_export_field_definitions(
     return resolved_fields
 
 
+ARCHIVE_MANIFEST_REL_PATH = ".retriever/export-manifest.json"
+ARCHIVE_ROOT_MANIFEST_REL_PATH = "manifest.json"
+ARCHIVE_METADATA_REL_PATH = "metadata.csv"
+ARCHIVE_ROOT_README_REL_PATH = "README.txt"
+ARCHIVE_PREVIEW_ROOT_REL_PATH = "previews"
+ARCHIVE_PREVIEWS_INDEX_REL_PATH = "previews.csv"
+ARCHIVE_SOURCE_PARTS_REL_PATH = "source_parts.csv"
+ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH = "extracted_text.csv"
+ARCHIVE_TEXT_ROOT_REL_PATH = "text"
+ARCHIVE_CHECKSUMS_REL_PATH = "checksums.csv"
+ARCHIVE_LOADFILE_REL_PATH = "loadfile.dat"
+ARCHIVE_IMAGE_LOADFILE_REL_PATH = "image_loadfile.opt"
+ARCHIVE_LOADFILE_DEFAULT_VOLUME_NAME = "EXPORT"
+ARCHIVE_IMAGE_MEMBER_SUFFIXES = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+ARCHIVE_METADATA_BASE_FIELD_NAMES = (
+    "control_number",
+    "title",
+    "subject",
+    "file_name",
+    "content_type",
+    "author",
+    "recipients",
+    "participants",
+    "date_created",
+    "date_modified",
+    "dataset_name",
+    "production_name",
+    "custodian",
+    "page_count",
+    "rel_path",
+    "source_kind",
+    "source_rel_path",
+    "source_folder_path",
+    "conversation_id",
+    "parent_document_id",
+    "child_document_kind",
+    "is_attachment",
+    "has_attachments",
+    "begin_bates",
+    "end_bates",
+    "begin_attachment",
+    "end_attachment",
+    "updated_at",
+)
+ARCHIVE_METADATA_EXTRA_FIELD_DEFS = (
+    {"field_name": "document_id", "field_type": "integer", "source": "archive"},
+    {"field_name": "document_entry_kind", "field_type": "text", "source": "archive"},
+    {"field_name": "preview_primary_rel_path", "field_type": "text", "source": "archive"},
+    {"field_name": "preview_rel_paths", "field_type": "text", "source": "archive"},
+    {"field_name": "native_source_rel_paths", "field_type": "text", "source": "archive"},
+    {"field_name": "text_source_rel_paths", "field_type": "text", "source": "archive"},
+    {"field_name": "image_source_rel_paths", "field_type": "text", "source": "archive"},
+    {"field_name": "source_part_rel_paths", "field_type": "text", "source": "archive"},
+)
+
+
+def archive_metadata_custom_field_names(connection: sqlite3.Connection) -> list[str]:
+    if not table_exists(connection, "custom_fields_registry"):
+        return []
+    document_columns = set(table_columns(connection, "documents"))
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in connection.execute(
+        """
+        SELECT field_name
+        FROM custom_fields_registry
+        ORDER BY field_name ASC
+        """
+    ).fetchall():
+        field_name = normalize_inline_whitespace(str(row["field_name"] or ""))
+        if not field_name or field_name in seen or field_name not in document_columns:
+            continue
+        seen.add(field_name)
+        names.append(field_name)
+    return names
+
+
+def resolve_archive_metadata_field_definitions(connection: sqlite3.Connection) -> list[dict[str, str]]:
+    base_field_defs = resolve_export_field_definitions(
+        connection,
+        [*ARCHIVE_METADATA_BASE_FIELD_NAMES, *archive_metadata_custom_field_names(connection)],
+    )
+    return [
+        dict(ARCHIVE_METADATA_EXTRA_FIELD_DEFS[0]),
+        *base_field_defs,
+        *[dict(field_def) for field_def in ARCHIVE_METADATA_EXTRA_FIELD_DEFS[1:]],
+    ]
+
+
+def archive_source_part_archive_rel_path(source_part_entry: dict[str, object]) -> str:
+    return normalize_whitespace(
+        str(source_part_entry.get("archive_rel_path") or source_part_entry.get("rel_path") or "")
+    )
+
+
+def archive_metadata_field_value(
+    row: sqlite3.Row,
+    field_def: dict[str, str],
+    context: dict[str, object],
+    manifest_entry: dict[str, object],
+) -> object:
+    field_name = str(field_def["field_name"])
+    if str(field_def.get("source") or "") != "archive":
+        return export_field_value(row, field_def, context)
+    preview_rel_paths = [
+        normalize_whitespace(str(path or ""))
+        for path in list(manifest_entry.get("preview_rel_paths") or [])
+        if normalize_whitespace(str(path or ""))
+    ]
+    source_part_entries = [
+        dict(entry)
+        for entry in list(manifest_entry.get("source_part_entries") or [])
+        if isinstance(entry, dict)
+    ]
+    source_part_rel_paths = [
+        rel_path
+        for rel_path in (archive_source_part_archive_rel_path(entry) for entry in source_part_entries)
+        if rel_path
+    ]
+    native_source_rel_paths = [
+        rel_path
+        for rel_path in (
+            archive_source_part_archive_rel_path(entry)
+            for entry in source_part_entries
+            if normalize_whitespace(str(entry.get("part_kind") or "")).lower() == "native"
+        )
+        if rel_path
+    ]
+    text_source_rel_paths = [
+        rel_path
+        for rel_path in (
+            archive_source_part_archive_rel_path(entry)
+            for entry in source_part_entries
+            if normalize_whitespace(str(entry.get("part_kind") or "")).lower() == "text"
+        )
+        if rel_path
+    ]
+    image_source_rel_paths = [
+        rel_path
+        for rel_path in (
+            archive_source_part_archive_rel_path(entry)
+            for entry in source_part_entries
+            if normalize_whitespace(str(entry.get("part_kind") or "")).lower() == "image"
+        )
+        if rel_path
+    ]
+    if field_name == "document_id":
+        return int(manifest_entry.get("document_id") or row["id"])
+    if field_name == "document_entry_kind":
+        return manifest_entry.get("document_entry_kind")
+    if field_name == "preview_primary_rel_path":
+        return preview_rel_paths[0] if preview_rel_paths else None
+    if field_name == "preview_rel_paths":
+        return preview_rel_paths
+    if field_name == "native_source_rel_paths":
+        return native_source_rel_paths
+    if field_name == "text_source_rel_paths":
+        return text_source_rel_paths
+    if field_name == "image_source_rel_paths":
+        return image_source_rel_paths
+    if field_name == "source_part_rel_paths":
+        return source_part_rel_paths
+    raise RetrieverError(f"Unknown archive metadata field: {field_name}")
+
+
+def build_archive_metadata_csv_bytes(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    manifest_entries: list[dict[str, object]],
+    field_defs: list[dict[str, str]],
+) -> bytes:
+    rows_by_id = {int(row["id"]): row for row in rows}
+    context = build_export_context(connection, rows, field_defs)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([field_def["field_name"] for field_def in field_defs])
+    for manifest_entry in manifest_entries:
+        try:
+            document_id = int(manifest_entry["document_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        row = rows_by_id.get(document_id)
+        if row is None:
+            continue
+        writer.writerow(
+            [
+                serialize_export_cell_value(
+                    archive_metadata_field_value(row, field_def, context, manifest_entry),
+                    str(field_def["field_type"]),
+                )
+                for field_def in field_defs
+            ]
+        )
+    return buffer.getvalue().encode("utf-8")
+
+
+def serialize_archive_csv_cell_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return "; ".join(str(item) for item in value if item is not None)
+    return str(value)
+
+
+def build_archive_csv_bytes(field_names: list[str], row_dicts: list[dict[str, object]]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(field_names)
+    for row_dict in row_dicts:
+        writer.writerow([serialize_archive_csv_cell_value(row_dict.get(field_name)) for field_name in field_names])
+    return buffer.getvalue().encode("utf-8")
+
+
+def archive_safe_token(raw_value: object, *, default: str) -> str:
+    normalized = normalize_whitespace(str(raw_value or ""))
+    if not normalized:
+        return default
+    candidate = re.sub(r"[^A-Za-z0-9._-]+", "-", normalized).strip("-._")
+    return candidate or default
+
+
+def archive_loadfile_volume_name(output_path: Path) -> str:
+    return archive_safe_token(output_path.stem, default=ARCHIVE_LOADFILE_DEFAULT_VOLUME_NAME)
+
+
+def archive_windows_loadfile_path(raw_rel_path: str) -> str:
+    return ".\\" + normalize_archive_member_path(raw_rel_path).replace("/", "\\")
+
+
+def archive_text_document_rel_path(document_id: int, control_number: object) -> str:
+    default_stem = f"document-{int(document_id):08d}"
+    stem = archive_safe_token(control_number, default=default_stem)
+    if stem == default_stem:
+        file_name = f"{stem}.txt"
+    else:
+        file_name = f"{stem}-{int(document_id):08d}.txt"
+    return normalize_archive_member_path(str(Path(ARCHIVE_TEXT_ROOT_REL_PATH) / file_name))
+
+
+def archive_rel_path_is_image(rel_path: str, *, preview_type: str = "") -> bool:
+    if normalize_whitespace(preview_type).lower() == "image":
+        return True
+    if Path(rel_path).suffix.lower() in ARCHIVE_IMAGE_MEMBER_SUFFIXES:
+        return True
+    mime_type, _ = mimetypes.guess_type(rel_path)
+    return bool(mime_type and mime_type.startswith("image/"))
+
+
+def archive_opt_page_identifier(
+    control_number: object,
+    document_id: int,
+    image_rel_path: str,
+    page_index: int,
+) -> str:
+    stem = normalize_whitespace(Path(image_rel_path).stem)
+    if stem and not stem.lower().startswith("page-"):
+        return stem
+    return f"{archive_safe_token(control_number, default=f'document-{int(document_id):08d}')}-{int(page_index):04d}"
+
+
+def build_archive_dat_line(fields: list[object]) -> bytes:
+    delimiter = b"\x14"
+    quote = b"\xfe"
+    return delimiter.join(quote + str(field or "").encode("utf-8") + quote for field in fields) + b"\r\n"
+
+
+def prepare_archive_sidecar_entries(
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    rows: list[sqlite3.Row],
+    manifest_entries: list[dict[str, object]],
+    *,
+    loadfile_volume_name: str,
+) -> dict[str, object]:
+    rows_by_id = {int(row["id"]): row for row in rows}
+    preview_index_rows: list[dict[str, object]] = []
+    source_part_index_rows: list[dict[str, object]] = []
+    extracted_text_index_rows: list[dict[str, object]] = []
+    text_file_entries: list[dict[str, object]] = []
+    loadfile_rows: list[list[object]] = []
+    image_loadfile_lines: list[str] = []
+    counts = {
+        "documents_with_text": 0,
+        "image_loadfile_rows": 0,
+        "missing_preview_entries": 0,
+        "missing_source_part_entries": 0,
+        "preview_entries": 0,
+        "source_part_entries": 0,
+        "synthetic_documents": 0,
+    }
+
+    for manifest_entry in manifest_entries:
+        try:
+            document_id = int(manifest_entry["document_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        row = rows_by_id.get(document_id)
+        if row is None:
+            continue
+
+        control_number = row["control_number"]
+        document_rel_path = normalize_archive_member_path(
+            str(manifest_entry.get("rel_path") or row["rel_path"]),
+            label=f"Archive rel_path for document {document_id}",
+        )
+        document_entry_kind = normalize_whitespace(str(manifest_entry.get("document_entry_kind") or ""))
+        if document_entry_kind == "synthetic":
+            counts["synthetic_documents"] += 1
+
+        exported_preview_paths = {
+            normalize_archive_member_path(str(path), label=f"Preview path for document {document_id}")
+            for path in list(manifest_entry.get("preview_rel_paths") or [])
+            if normalize_whitespace(str(path or ""))
+        }
+        preview_image_paths: list[str] = []
+        for preview_row in document_preview_rows(connection, document_id):
+            preview_rel_path = normalize_archive_member_path(
+                str(preview_row["rel_preview_path"]),
+                label=f"Preview path for document {document_id}",
+            )
+            is_missing = preview_rel_path not in exported_preview_paths
+            preview_index_rows.append(
+                {
+                    "document_id": document_id,
+                    "control_number": control_number,
+                    "document_rel_path": document_rel_path,
+                    "preview_type": preview_row["preview_type"],
+                    "ordinal": int(preview_row["ordinal"] or 0),
+                    "label": preview_row["label"],
+                    "rel_path": preview_rel_path,
+                    "is_missing": is_missing,
+                }
+            )
+            counts["preview_entries"] += 1
+            if is_missing:
+                counts["missing_preview_entries"] += 1
+                continue
+            if archive_rel_path_is_image(preview_rel_path, preview_type=str(preview_row["preview_type"] or "")):
+                preview_image_paths.append(preview_rel_path)
+
+        native_rel_path = ""
+        image_source_part_paths: list[str] = []
+        for source_part_entry in list(manifest_entry.get("source_part_entries") or []):
+            if not isinstance(source_part_entry, dict):
+                continue
+            rel_path = archive_source_part_archive_rel_path(source_part_entry)
+            if not rel_path:
+                continue
+            part_kind = normalize_whitespace(str(source_part_entry.get("part_kind") or ""))
+            is_missing = bool(source_part_entry.get("missing"))
+            source_part_index_rows.append(
+                {
+                    "document_id": document_id,
+                    "control_number": control_number,
+                    "document_rel_path": document_rel_path,
+                    "part_kind": part_kind,
+                    "ordinal": int(source_part_entry.get("ordinal") or 0),
+                    "label": source_part_entry.get("label"),
+                    "rel_path": rel_path,
+                    "is_missing": is_missing,
+                }
+            )
+            counts["source_part_entries"] += 1
+            if is_missing:
+                counts["missing_source_part_entries"] += 1
+                continue
+            if part_kind.lower() == "native" and not native_rel_path:
+                native_rel_path = rel_path
+            if part_kind.lower() == "image":
+                image_source_part_paths.append(rel_path)
+
+        text_content = document_source_text_body(connection, paths, row)
+        text_rel_path = ""
+        text_char_count = 0
+        text_line_count = 0
+        if text_content:
+            text_rel_path = archive_text_document_rel_path(document_id, control_number)
+            text_char_count = len(text_content)
+            text_line_count = text_content.count("\n") + 1
+            text_file_entries.append(
+                {
+                    "document_id": document_id,
+                    "control_number": control_number,
+                    "rel_path": text_rel_path,
+                    "payload_bytes": text_content.encode("utf-8"),
+                }
+            )
+            counts["documents_with_text"] += 1
+            manifest_entry["text_rel_path"] = text_rel_path
+        else:
+            manifest_entry["text_rel_path"] = None
+        extracted_text_index_rows.append(
+            {
+                "document_id": document_id,
+                "control_number": control_number,
+                "document_rel_path": document_rel_path,
+                "text_rel_path": text_rel_path,
+                "char_count": text_char_count,
+                "line_count": text_line_count,
+                "has_text": bool(text_rel_path),
+            }
+        )
+
+        primary_document_rel_path = document_rel_path if document_entry_kind == "copied" else ""
+        if not native_rel_path:
+            native_rel_path = primary_document_rel_path
+        loadfile_rows.append(
+            [
+                row["begin_bates"] or row["control_number"] or "",
+                row["end_bates"] or row["control_number"] or "",
+                row["begin_attachment"] or "",
+                row["end_attachment"] or "",
+                document_id,
+                row["control_number"] or "",
+                row["file_name"] or "",
+                row["title"] or "",
+                row["subject"] or "",
+                row["author"] or "",
+                row["date_created"] or "",
+                row["date_modified"] or "",
+                document_custodian_display_text_from_row(row),
+                archive_windows_loadfile_path(text_rel_path) if text_rel_path else "",
+                archive_windows_loadfile_path(native_rel_path) if native_rel_path else "",
+                archive_windows_loadfile_path(primary_document_rel_path) if primary_document_rel_path else "",
+            ]
+        )
+
+        image_loadfile_paths = image_source_part_paths or preview_image_paths
+        page_count = len(image_loadfile_paths)
+        for page_index, image_rel_path in enumerate(image_loadfile_paths, start=1):
+            image_loadfile_lines.append(
+                ",".join(
+                    [
+                        archive_opt_page_identifier(control_number, document_id, image_rel_path, page_index),
+                        loadfile_volume_name,
+                        archive_windows_loadfile_path(image_rel_path),
+                        "Y" if page_index == 1 else "",
+                        "",
+                        "",
+                        str(page_count) if page_index == 1 else "",
+                    ]
+                )
+            )
+            counts["image_loadfile_rows"] += 1
+
+    source_parts_payload = build_archive_csv_bytes(
+        [
+            "document_id",
+            "control_number",
+            "document_rel_path",
+            "part_kind",
+            "ordinal",
+            "label",
+            "rel_path",
+            "is_missing",
+        ],
+        source_part_index_rows,
+    )
+    previews_payload = build_archive_csv_bytes(
+        [
+            "document_id",
+            "control_number",
+            "document_rel_path",
+            "preview_type",
+            "ordinal",
+            "label",
+            "rel_path",
+            "is_missing",
+        ],
+        preview_index_rows,
+    )
+    extracted_text_payload = build_archive_csv_bytes(
+        [
+            "document_id",
+            "control_number",
+            "document_rel_path",
+            "text_rel_path",
+            "char_count",
+            "line_count",
+            "has_text",
+        ],
+        extracted_text_index_rows,
+    )
+    loadfile_headers = [
+        "BEGBATES",
+        "ENDBATES",
+        "BEGATTACH",
+        "ENDATTACH",
+        "DOCID",
+        "CONTROL_NUMBER",
+        "FILE_NAME",
+        "TITLE",
+        "SUBJECT",
+        "AUTHOR",
+        "DATE_CREATED",
+        "DATE_MODIFIED",
+        "CUSTODIAN",
+        "TEXT_PATH",
+        "NATIVE_PATH",
+        "DOCUMENT_PATH",
+    ]
+    loadfile_payload = build_archive_dat_line(loadfile_headers) + b"".join(
+        build_archive_dat_line(loadfile_row) for loadfile_row in loadfile_rows
+    )
+    image_loadfile_payload = ("\n".join(image_loadfile_lines) + ("\n" if image_loadfile_lines else "")).encode("utf-8")
+    return {
+        "counts": counts,
+        "extracted_text_index_payload": extracted_text_payload,
+        "image_loadfile_payload": image_loadfile_payload,
+        "loadfile_payload": loadfile_payload,
+        "loadfile_volume_name": loadfile_volume_name,
+        "preview_index_payload": previews_payload,
+        "source_part_index_payload": source_parts_payload,
+        "text_file_entries": text_file_entries,
+    }
+
+
+def build_archive_root_manifest_payload(
+    *,
+    created_at: str,
+    selector: dict[str, object],
+    family_mode: str | None,
+    seed_limit: int | None,
+    portable_workspace: bool,
+    portable_workspace_payload: dict[str, object] | None,
+    document_count: int,
+    failed_count: int,
+    warning_count: int,
+    sidecar_counts: dict[str, object],
+    loadfile_volume_name: str,
+) -> dict[str, object]:
+    return {
+        "format": "retriever-archive",
+        "version": 2,
+        "status": "ok" if failed_count == 0 else "failed",
+        "created_at": created_at,
+        "selector": selector,
+        "family_mode": family_mode,
+        "seed_limit": seed_limit,
+        "portable_workspace": portable_workspace,
+        "loadfile_volume_name": loadfile_volume_name,
+        "files": {
+            "metadata_rel_path": ARCHIVE_METADATA_REL_PATH,
+            "preview_root_rel_path": ARCHIVE_PREVIEW_ROOT_REL_PATH,
+            "previews_index_rel_path": ARCHIVE_PREVIEWS_INDEX_REL_PATH,
+            "source_parts_rel_path": ARCHIVE_SOURCE_PARTS_REL_PATH,
+            "extracted_text_index_rel_path": ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH,
+            "text_root_rel_path": ARCHIVE_TEXT_ROOT_REL_PATH,
+            "loadfile_rel_path": ARCHIVE_LOADFILE_REL_PATH,
+            "image_loadfile_rel_path": ARCHIVE_IMAGE_LOADFILE_REL_PATH,
+            "checksums_rel_path": ARCHIVE_CHECKSUMS_REL_PATH,
+            "readme_rel_path": ARCHIVE_ROOT_README_REL_PATH,
+            "internal_manifest_rel_path": ARCHIVE_MANIFEST_REL_PATH,
+            "portable_workspace_db_rel_path": ".retriever/retriever.db" if portable_workspace else None,
+        },
+        "counts": {
+            "document_count": document_count,
+            "documents_with_text": int(sidecar_counts.get("documents_with_text") or 0),
+            "image_loadfile_rows": int(sidecar_counts.get("image_loadfile_rows") or 0),
+            "preview_entries": int(sidecar_counts.get("preview_entries") or 0),
+            "source_part_entries": int(sidecar_counts.get("source_part_entries") or 0),
+            "synthetic_documents": int(sidecar_counts.get("synthetic_documents") or 0),
+            "warning_count": warning_count,
+            "failed_item_count": failed_count,
+        },
+        "portable_workspace_document_ids": (
+            portable_workspace_payload.get("selected_document_ids")
+            if isinstance(portable_workspace_payload, dict)
+            else []
+        ),
+        "portable_workspace_stub_document_ids": (
+            portable_workspace_payload.get("stub_document_ids")
+            if isinstance(portable_workspace_payload, dict)
+            else []
+        ),
+    }
+
+
+def build_archive_readme_bytes(root_manifest_payload: dict[str, object]) -> bytes:
+    counts = root_manifest_payload.get("counts") if isinstance(root_manifest_payload, dict) else {}
+    if not isinstance(counts, dict):
+        counts = {}
+    lines = [
+        "Retriever Archive Export",
+        "",
+        f"Created: {root_manifest_payload.get('created_at') or ''}",
+        f"Documents: {int(counts.get('document_count') or 0)}",
+        f"Warnings: {int(counts.get('warning_count') or 0)}",
+        "",
+        "Contents:",
+        f"- {ARCHIVE_METADATA_REL_PATH}: one row per logical document with core metadata and archive paths.",
+        f"- {ARCHIVE_ROOT_MANIFEST_REL_PATH}: importer-facing archive summary and sidecar locations.",
+        f"- {ARCHIVE_ROOT_README_REL_PATH}: this guide.",
+        f"- {ARCHIVE_PREVIEW_ROOT_REL_PATH}/: exported preview artifacts for human review.",
+        f"- {ARCHIVE_PREVIEWS_INDEX_REL_PATH}: normalized preview rows with preview types and paths.",
+        f"- {ARCHIVE_SOURCE_PARTS_REL_PATH}: normalized source/native/image part rows.",
+        f"- {ARCHIVE_TEXT_ROOT_REL_PATH}/: UTF-8 extracted text files when text is available.",
+        f"- {ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH}: per-document extracted text paths and counts.",
+        f"- {ARCHIVE_LOADFILE_REL_PATH}: Concordance-style DAT with text/native/document paths.",
+        f"- {ARCHIVE_IMAGE_LOADFILE_REL_PATH}: OPT image loadfile for page image previews when available.",
+        f"- {ARCHIVE_CHECKSUMS_REL_PATH}: SHA-256 and byte size for every archive member except {ARCHIVE_CHECKSUMS_REL_PATH}.",
+        f"- {ARCHIVE_MANIFEST_REL_PATH}: Retriever-specific lossless manifest with full document details.",
+        "",
+        "Notes:",
+        "- Source and native artifacts stay at the same relative paths they had when Retriever ingested them.",
+        "- Synthetic .logical entries may appear when one review document is composed from multiple underlying parts.",
+        "- If a portable workspace was requested, .retriever/retriever.db contains a searchable metadata subset for the selected documents.",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def write_archive_sidecars(
+    archive: zipfile.ZipFile,
+    written_member_paths: set[str],
+    connection: sqlite3.Connection,
+    paths: dict[str, Path],
+    rows: list[sqlite3.Row],
+    manifest_document_entries: list[dict[str, object]],
+    *,
+    metadata_payload: bytes,
+    created_at: str,
+    selector: dict[str, object],
+    family_mode: str | None,
+    seed_limit: int | None,
+    portable_workspace: bool,
+    portable_workspace_payload: dict[str, object] | None,
+    warnings: list[str],
+    failed_count: int,
+    loadfile_volume_name: str,
+) -> dict[str, object]:
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        metadata_payload,
+        ARCHIVE_METADATA_REL_PATH,
+    )
+    sidecar_state = prepare_archive_sidecar_entries(
+        connection,
+        paths,
+        rows,
+        manifest_document_entries,
+        loadfile_volume_name=loadfile_volume_name,
+    )
+    for text_file_entry in sidecar_state["text_file_entries"]:
+        add_archive_bytes_once(
+            archive,
+            written_member_paths,
+            bytes(text_file_entry["payload_bytes"]),
+            str(text_file_entry["rel_path"]),
+        )
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        sidecar_state["preview_index_payload"],
+        ARCHIVE_PREVIEWS_INDEX_REL_PATH,
+    )
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        sidecar_state["source_part_index_payload"],
+        ARCHIVE_SOURCE_PARTS_REL_PATH,
+    )
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        sidecar_state["extracted_text_index_payload"],
+        ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH,
+    )
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        sidecar_state["loadfile_payload"],
+        ARCHIVE_LOADFILE_REL_PATH,
+    )
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        sidecar_state["image_loadfile_payload"],
+        ARCHIVE_IMAGE_LOADFILE_REL_PATH,
+    )
+    root_manifest_payload = build_archive_root_manifest_payload(
+        created_at=created_at,
+        selector=selector,
+        family_mode=family_mode,
+        seed_limit=seed_limit,
+        portable_workspace=portable_workspace,
+        portable_workspace_payload=portable_workspace_payload,
+        document_count=len(manifest_document_entries),
+        failed_count=failed_count,
+        warning_count=len(warnings),
+        sidecar_counts=dict(sidecar_state["counts"]),
+        loadfile_volume_name=str(sidecar_state["loadfile_volume_name"]),
+    )
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        (json.dumps(root_manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        ARCHIVE_ROOT_MANIFEST_REL_PATH,
+    )
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        build_archive_readme_bytes(root_manifest_payload),
+        ARCHIVE_ROOT_README_REL_PATH,
+    )
+    internal_manifest_payload = {
+        "status": "ok" if failed_count == 0 else "failed",
+        "created_at": created_at,
+        "selector": selector,
+        "family_mode": family_mode,
+        "seed_limit": seed_limit,
+        "document_count": len(manifest_document_entries),
+        "portable_workspace": portable_workspace,
+        "metadata_rel_path": ARCHIVE_METADATA_REL_PATH,
+        "preview_root_rel_path": ARCHIVE_PREVIEW_ROOT_REL_PATH,
+        "root_manifest_rel_path": ARCHIVE_ROOT_MANIFEST_REL_PATH,
+        "readme_rel_path": ARCHIVE_ROOT_README_REL_PATH,
+        "previews_index_rel_path": ARCHIVE_PREVIEWS_INDEX_REL_PATH,
+        "source_parts_rel_path": ARCHIVE_SOURCE_PARTS_REL_PATH,
+        "extracted_text_index_rel_path": ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH,
+        "text_root_rel_path": ARCHIVE_TEXT_ROOT_REL_PATH,
+        "checksums_rel_path": ARCHIVE_CHECKSUMS_REL_PATH,
+        "loadfile_rel_path": ARCHIVE_LOADFILE_REL_PATH,
+        "image_loadfile_rel_path": ARCHIVE_IMAGE_LOADFILE_REL_PATH,
+        "loadfile_volume_name": str(sidecar_state["loadfile_volume_name"]),
+        "portable_workspace_document_ids": (
+            portable_workspace_payload["selected_document_ids"]
+            if portable_workspace_payload is not None
+            else []
+        ),
+        "portable_workspace_stub_document_ids": (
+            portable_workspace_payload["stub_document_ids"]
+            if portable_workspace_payload is not None
+            else []
+        ),
+        "counts": dict(sidecar_state["counts"]),
+        "documents": manifest_document_entries,
+        "warnings": warnings,
+        "failed_items": failed_count,
+    }
+    add_archive_bytes_once(
+        archive,
+        written_member_paths,
+        (json.dumps(internal_manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        ARCHIVE_MANIFEST_REL_PATH,
+    )
+    return {
+        "internal_manifest_payload": internal_manifest_payload,
+        "loadfile_volume_name": str(sidecar_state["loadfile_volume_name"]),
+        "root_manifest_payload": root_manifest_payload,
+        "sidecar_counts": dict(sidecar_state["counts"]),
+    }
+
+
+def build_archive_checksums_csv_bytes(archive: zipfile.ZipFile, member_paths: list[str]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["rel_path", "file_size_bytes", "sha256"])
+    for member_path in member_paths:
+        info = archive.getinfo(member_path)
+        digest = hashlib.sha256()
+        with archive.open(member_path, "r") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        writer.writerow([member_path, int(info.file_size), digest.hexdigest()])
+    return buffer.getvalue().encode("utf-8")
+
+
+def ensure_archive_checksums_file(archive_path: Path) -> dict[str, int]:
+    with zipfile.ZipFile(archive_path, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+        member_paths = sorted(set(archive.namelist()))
+        if ARCHIVE_CHECKSUMS_REL_PATH not in member_paths:
+            checksummed_member_paths = [member_path for member_path in member_paths if member_path != ARCHIVE_CHECKSUMS_REL_PATH]
+            archive.writestr(
+                ARCHIVE_CHECKSUMS_REL_PATH,
+                build_archive_checksums_csv_bytes(archive, checksummed_member_paths),
+            )
+            member_paths = checksummed_member_paths + [ARCHIVE_CHECKSUMS_REL_PATH]
+        checksummed_count = len([member_path for member_path in member_paths if member_path != ARCHIVE_CHECKSUMS_REL_PATH])
+        return {
+            "archive_member_count": len(member_paths),
+            "checksummed_member_count": checksummed_count,
+        }
+
+
 def resolve_table_export_field_definitions(
     connection: sqlite3.Connection,
     table_name: str,
@@ -63235,7 +64034,10 @@ def build_synthetic_document_export_payload(
             "updated_at": row["updated_at"],
         },
         "preview_rel_paths": [
-            str(Path(".retriever") / str(preview_row["rel_preview_path"]))
+            normalize_archive_member_path(
+                str(preview_row["rel_preview_path"]),
+                label=f"Preview path for document {int(row['id'])}",
+            )
             for preview_row in preview_rows
         ],
         "source_part_rel_paths": [
@@ -63285,7 +64087,7 @@ def archive_document_files(
     for preview_row in preview_rows:
         preview_source_path = paths["state_dir"] / str(preview_row["rel_preview_path"])
         archive_rel_path = normalize_archive_member_path(
-            str(Path(".retriever") / str(preview_row["rel_preview_path"])),
+            str(preview_row["rel_preview_path"]),
             label=f"Preview path for document {document_id}",
         )
         if not preview_source_path.exists():
@@ -63810,15 +64612,7 @@ def export_archive(
     connection = connect_db(paths["db_path"])
     try:
         apply_schema(connection, root)
-        if progress_callback is not None:
-            progress_callback(
-                {
-                    "status": "running",
-                    "phase": "preparing",
-                    "detail": "selecting documents",
-                },
-                True,
-            )
+        metadata_field_defs = resolve_archive_metadata_field_definitions(connection)
         selected_documents, selector, normalized_family_mode = resolve_export_archive_selection(
             connection,
             paths,
@@ -63832,6 +64626,7 @@ def export_archive(
             seed_limit=seed_limit,
         )
         output_path = resolve_export_output_path(paths, raw_output_path)
+        loadfile_volume_name = archive_loadfile_volume_name(output_path)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overwrote_existing_file = output_path.exists()
@@ -63909,33 +64704,41 @@ def export_archive(
                         ".retriever/retriever.db",
                     )
 
-            manifest_payload = {
-                "status": "ok",
-                "created_at": created_at,
-                "selector": selector,
-                "family_mode": normalized_family_mode,
-                "seed_limit": seed_limit,
-                "document_count": len(selected_documents),
-                "portable_workspace": portable_workspace,
-                "portable_workspace_document_ids": (
-                    portable_workspace_payload["selected_document_ids"]
-                    if portable_workspace_payload is not None
-                    else []
-                ),
-                "portable_workspace_stub_document_ids": (
-                    portable_workspace_payload["stub_document_ids"]
-                    if portable_workspace_payload is not None
-                    else []
-                ),
-                "documents": manifest_document_entries,
-                "warnings": warnings,
-            }
-            add_archive_bytes_once(
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "status": "running",
+                        "phase": "finalizing",
+                        "detail": f"{total_documents}/{total_documents} documents",
+                    },
+                    False,
+                )
+
+            selected_rows = [selected_document["document_row"] for selected_document in selected_documents]
+            sidecar_payload = write_archive_sidecars(
                 archive,
                 written_member_paths,
-                (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-                ".retriever/export-manifest.json",
+                connection,
+                paths,
+                selected_rows,
+                manifest_document_entries,
+                metadata_payload=build_archive_metadata_csv_bytes(
+                    connection,
+                    selected_rows,
+                    manifest_document_entries,
+                    metadata_field_defs,
+                ),
+                created_at=created_at,
+                selector=selector,
+                family_mode=normalized_family_mode,
+                seed_limit=seed_limit,
+                portable_workspace=portable_workspace,
+                portable_workspace_payload=portable_workspace_payload,
+                warnings=warnings,
+                failed_count=0,
+                loadfile_volume_name=loadfile_volume_name,
             )
+        checksum_payload = ensure_archive_checksums_file(output_path)
 
         output_rel_path = None
         try:
@@ -63953,9 +64756,22 @@ def export_archive(
             "family_mode": normalized_family_mode,
             "seed_limit": seed_limit,
             "portable_workspace": portable_workspace,
-            "manifest_rel_path": ".retriever/export-manifest.json",
-            "archive_member_count": len(written_member_paths),
+            "manifest_rel_path": ARCHIVE_MANIFEST_REL_PATH,
+            "root_manifest_rel_path": ARCHIVE_ROOT_MANIFEST_REL_PATH,
+            "metadata_rel_path": ARCHIVE_METADATA_REL_PATH,
+            "readme_rel_path": ARCHIVE_ROOT_README_REL_PATH,
+            "preview_root_rel_path": ARCHIVE_PREVIEW_ROOT_REL_PATH,
+            "previews_index_rel_path": ARCHIVE_PREVIEWS_INDEX_REL_PATH,
+            "source_parts_rel_path": ARCHIVE_SOURCE_PARTS_REL_PATH,
+            "extracted_text_index_rel_path": ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH,
+            "text_root_rel_path": ARCHIVE_TEXT_ROOT_REL_PATH,
+            "checksums_rel_path": ARCHIVE_CHECKSUMS_REL_PATH,
+            "loadfile_rel_path": ARCHIVE_LOADFILE_REL_PATH,
+            "image_loadfile_rel_path": ARCHIVE_IMAGE_LOADFILE_REL_PATH,
+            "loadfile_volume_name": loadfile_volume_name,
+            "archive_member_count": int(checksum_payload["archive_member_count"]),
             "documents": manifest_document_entries,
+            "counts": sidecar_payload["sidecar_counts"],
             "warnings": warnings,
             "overwrote_existing_file": overwrote_existing_file,
             "file_size": file_size_bytes(output_path),
@@ -64637,6 +65453,7 @@ def export_archive_start(
         active_row = active_export_run_row(connection, export_kind="archive")
         if active_row is not None:
             raise RetrieverError(f"Archive export run {active_row['run_id']} is already active.")
+        metadata_field_defs = resolve_archive_metadata_field_definitions(connection)
         selected_documents, selector, normalized_family_mode = resolve_export_archive_selection(
             connection,
             paths,
@@ -64650,6 +65467,7 @@ def export_archive_start(
             seed_limit=seed_limit,
         )
         output_path = resolve_export_output_path(paths, raw_output_path)
+        loadfile_volume_name = archive_loadfile_volume_name(output_path)
         run_id = new_ingest_v2_run_id()
         now = utc_now()
         output_rel_path = export_run_output_rel_path(root, output_path)
@@ -64659,13 +65477,27 @@ def export_archive_start(
             "seed_limit": seed_limit,
             "portable_workspace": bool(portable_workspace),
             "overwrote_existing_file": output_path.exists(),
-            "manifest_rel_path": ".retriever/export-manifest.json",
+            "manifest_rel_path": ARCHIVE_MANIFEST_REL_PATH,
+            "root_manifest_rel_path": ARCHIVE_ROOT_MANIFEST_REL_PATH,
+            "metadata_rel_path": ARCHIVE_METADATA_REL_PATH,
+            "readme_rel_path": ARCHIVE_ROOT_README_REL_PATH,
+            "preview_root_rel_path": ARCHIVE_PREVIEW_ROOT_REL_PATH,
+            "previews_index_rel_path": ARCHIVE_PREVIEWS_INDEX_REL_PATH,
+            "source_parts_rel_path": ARCHIVE_SOURCE_PARTS_REL_PATH,
+            "extracted_text_index_rel_path": ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH,
+            "text_root_rel_path": ARCHIVE_TEXT_ROOT_REL_PATH,
+            "checksums_rel_path": ARCHIVE_CHECKSUMS_REL_PATH,
+            "loadfile_rel_path": ARCHIVE_LOADFILE_REL_PATH,
+            "image_loadfile_rel_path": ARCHIVE_IMAGE_LOADFILE_REL_PATH,
+            "loadfile_volume_name": loadfile_volume_name,
+            "metadata_fields": metadata_field_defs,
         }
         cursor = {
             "created_at": now,
             "partial_rel_path": str(Path("tmp") / "exports" / run_id / "output.partial.zip"),
             "portable_workspace_added": False,
             "manifest_added": False,
+            "metadata_added": False,
         }
         export_run_temp_dir(paths, run_id).mkdir(parents=True, exist_ok=True)
         connection.execute("BEGIN")
@@ -65420,6 +66252,7 @@ def export_archive_finalize_step(
     config = decode_json_text(row["config_json"], default={}) or {}
     cursor = decode_json_text(row["cursor_json"], default={}) or {}
     selector = decode_json_text(row["selector_json"], default={}) or {}
+    metadata_field_defs = list(config.get("metadata_fields") or [])
     partial_path = export_run_partial_archive_path(paths, run_id)
     partial_path.parent.mkdir(parents=True, exist_ok=True)
     output_path = export_run_current_output_path(paths["root"], row)
@@ -65464,36 +66297,33 @@ def export_archive_finalize_step(
         else:
             portable_workspace_payload = cursor.get("portable_workspace_payload")
 
-        manifest_payload = {
-            "status": "ok" if failed_count == 0 else "failed",
-            "created_at": cursor.get("created_at") or row["created_at"],
-            "selector": selector,
-            "family_mode": config.get("family_mode"),
-            "seed_limit": config.get("seed_limit"),
-            "document_count": len(manifest_document_entries),
-            "portable_workspace": bool(config.get("portable_workspace")),
-            "portable_workspace_document_ids": (
-                portable_workspace_payload.get("selected_document_ids")
-                if isinstance(portable_workspace_payload, dict)
-                else []
+        selected_rows = fetch_visible_document_rows_by_ids(connection, selected_document_ids)
+        sidecar_payload = write_archive_sidecars(
+            archive,
+            written_member_paths,
+            connection,
+            paths,
+            selected_rows,
+            manifest_document_entries,
+            metadata_payload=build_archive_metadata_csv_bytes(
+                connection,
+                selected_rows,
+                manifest_document_entries,
+                metadata_field_defs or resolve_archive_metadata_field_definitions(connection),
             ),
-            "portable_workspace_stub_document_ids": (
-                portable_workspace_payload.get("stub_document_ids")
-                if isinstance(portable_workspace_payload, dict)
-                else []
-            ),
-            "documents": manifest_document_entries,
-            "warnings": warnings,
-            "failed_items": failed_count,
-        }
-        if ".retriever/export-manifest.json" not in written_member_paths:
-            add_archive_bytes_once(
-                archive,
-                written_member_paths,
-                (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-                ".retriever/export-manifest.json",
-            )
+            created_at=str(cursor.get("created_at") or row["created_at"]),
+            selector=selector,
+            family_mode=str(config.get("family_mode") or ""),
+            seed_limit=int(config["seed_limit"]) if config.get("seed_limit") is not None else None,
+            portable_workspace=bool(config.get("portable_workspace")),
+            portable_workspace_payload=portable_workspace_payload if isinstance(portable_workspace_payload, dict) else None,
+            warnings=warnings,
+            failed_count=failed_count,
+            loadfile_volume_name=str(config.get("loadfile_volume_name") or archive_loadfile_volume_name(output_path)),
+        )
+        cursor["metadata_added"] = True
         cursor["manifest_added"] = True
+    checksum_payload = ensure_archive_checksums_file(partial_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     os.replace(partial_path, output_path)
     now = utc_now()
@@ -65515,7 +66345,9 @@ def export_archive_finalize_step(
     connection.commit()
     return {
         "finalized": True,
+        "archive_member_count": int(checksum_payload["archive_member_count"]),
         "document_count": len(manifest_document_entries),
+        "counts": sidecar_payload["sidecar_counts"],
         "warnings": len(warnings),
         "failed": failed_count,
     }

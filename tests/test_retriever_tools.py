@@ -23509,7 +23509,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         finally:
             connection.close()
         self.assertGreaterEqual(len(parent_preview_rows), 1)
-        parent_preview_archive_path = str(Path(".retriever") / str(parent_preview_rows[0]["rel_preview_path"]))
+        parent_preview_archive_path = str(parent_preview_rows[0]["rel_preview_path"])
 
         export_path = self.root / ".retriever" / "exports" / "family.zip"
         exit_code, payload, _, _ = self.run_cli(
@@ -23531,23 +23531,76 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["family_mode"], "with_family")
         self.assertFalse(payload["portable_workspace"])
         self.assertEqual(payload["selector"]["keyword"], "confidential")
+        self.assertEqual(payload["metadata_rel_path"], "metadata.csv")
+        self.assertEqual(payload["root_manifest_rel_path"], "manifest.json")
 
         with zipfile.ZipFile(export_path, "r") as archive:
             names = set(archive.namelist())
             manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+            root_manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            metadata_rows = list(csv.DictReader(io.StringIO(archive.read("metadata.csv").decode("utf-8"))))
+            preview_rows = list(csv.DictReader(io.StringIO(archive.read("previews.csv").decode("utf-8"))))
+            source_part_rows = list(csv.DictReader(io.StringIO(archive.read("source_parts.csv").decode("utf-8"))))
+            text_rows = list(csv.DictReader(io.StringIO(archive.read("extracted_text.csv").decode("utf-8"))))
+            checksum_rows = list(csv.DictReader(io.StringIO(archive.read("checksums.csv").decode("utf-8"))))
+            readme_text = archive.read("README.txt").decode("utf-8")
+            loadfile_bytes = archive.read("loadfile.dat")
 
         self.assertIn("thread.eml", names)
         self.assertIn(child_row["rel_path"], names)
+        self.assertIn("metadata.csv", names)
+        self.assertIn("manifest.json", names)
+        self.assertIn("README.txt", names)
+        self.assertIn("checksums.csv", names)
+        self.assertIn("previews.csv", names)
+        self.assertIn("source_parts.csv", names)
+        self.assertIn("extracted_text.csv", names)
+        self.assertIn("loadfile.dat", names)
+        self.assertIn("image_loadfile.opt", names)
         self.assertIn(parent_preview_archive_path, names)
         self.assertEqual(manifest["document_count"], 2)
         self.assertEqual(manifest["family_mode"], "with_family")
+        self.assertEqual(manifest["metadata_rel_path"], "metadata.csv")
+        self.assertEqual(manifest["preview_root_rel_path"], "previews")
+        self.assertEqual(manifest["root_manifest_rel_path"], "manifest.json")
+        self.assertEqual(manifest["checksums_rel_path"], "checksums.csv")
         self.assertEqual(manifest["warnings"], [])
+        self.assertEqual(root_manifest["files"]["metadata_rel_path"], "metadata.csv")
+        self.assertEqual(root_manifest["files"]["preview_root_rel_path"], "previews")
+        self.assertEqual(root_manifest["files"]["source_parts_rel_path"], "source_parts.csv")
+        self.assertEqual(root_manifest["files"]["previews_index_rel_path"], "previews.csv")
+        self.assertEqual(root_manifest["files"]["loadfile_rel_path"], "loadfile.dat")
+        self.assertEqual(root_manifest["counts"]["document_count"], 2)
+        self.assertIn("Retriever Archive Export", readme_text)
+        self.assertTrue(any(row["rel_path"] == "metadata.csv" for row in checksum_rows))
+        self.assertTrue(any(row["rel_path"] == "manifest.json" for row in checksum_rows))
+        self.assertFalse(any(row["rel_path"] == "checksums.csv" for row in checksum_rows))
+        self.assertGreaterEqual(len(preview_rows), 1)
+        self.assertEqual(source_part_rows, [])
+        self.assertEqual(len(text_rows), 2)
+        self.assertTrue(all(row["has_text"] == "true" for row in text_rows))
+        self.assertTrue(all(row["text_rel_path"] in names for row in text_rows))
+        self.assertIn(parent_row["control_number"].encode("utf-8"), loadfile_bytes)
+        self.assertIn(b".\\thread.eml", loadfile_bytes)
 
         manifest_by_document_id = {
             int(item["document_id"]): item
             for item in manifest["documents"]
         }
+        metadata_by_document_id = {
+            int(item["document_id"]): item
+            for item in metadata_rows
+        }
         self.assertEqual(set(manifest_by_document_id), {int(parent_row["id"]), int(child_row["id"])})
+        self.assertEqual(set(metadata_by_document_id), {int(parent_row["id"]), int(child_row["id"])})
+        self.assertEqual(
+            metadata_by_document_id[int(parent_row["id"])]["preview_primary_rel_path"],
+            parent_preview_archive_path,
+        )
+        self.assertIn(
+            parent_preview_archive_path,
+            metadata_by_document_id[int(parent_row["id"])]["preview_rel_paths"],
+        )
         self.assertEqual(
             manifest_by_document_id[int(child_row["id"])]["inclusion_reason"]["direct_reasons"][0]["type"],
             "keyword",
@@ -23587,6 +23640,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
 
         self.assertIn("alpha.txt", names)
+        self.assertIn("metadata.csv", names)
         self.assertNotIn("beta.txt", names)
         self.assertEqual(manifest["document_count"], 1)
         self.assertEqual(manifest["selector"]["keyword"], "alpha")
@@ -23633,6 +23687,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
 
         self.assertIn("alpha.txt", names)
+        self.assertIn("metadata.csv", names)
         self.assertNotIn("beta.txt", names)
         self.assertEqual(manifest["document_count"], 1)
         self.assertEqual(manifest["selector"]["filter"], "(file_name = 'alpha.txt')")
@@ -23687,6 +23742,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
 
         self.assertIn("alpha.txt", names)
+        self.assertIn("metadata.csv", names)
         self.assertNotIn("beta.txt", names)
         self.assertEqual(manifest["document_count"], 1)
         self.assertEqual(manifest["selector"]["keyword"], "alpha")
@@ -23748,6 +23804,15 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
 
         self.assertIn("thread.eml", names)
         self.assertIn(child_row["rel_path"], names)
+        self.assertIn("metadata.csv", names)
+        self.assertIn("manifest.json", names)
+        self.assertIn("README.txt", names)
+        self.assertIn("checksums.csv", names)
+        self.assertIn("previews.csv", names)
+        self.assertIn("source_parts.csv", names)
+        self.assertIn("extracted_text.csv", names)
+        self.assertIn("loadfile.dat", names)
+        self.assertIn("image_loadfile.opt", names)
         self.assertEqual(manifest["document_count"], 2)
         self.assertEqual(manifest["family_mode"], "with_family")
         self.assertEqual(
@@ -23795,6 +23860,7 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
             names = set(archive.namelist())
             manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
             self.assertIn(".retriever/retriever.db", names)
+            self.assertIn("metadata.csv", names)
             self.assertIn(child_row["rel_path"], names)
 
             with tempfile.TemporaryDirectory(prefix="retriever-portable-archive-") as extract_dir:
@@ -23880,15 +23946,46 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         with zipfile.ZipFile(export_path, "r") as archive:
             names = set(archive.namelist())
             manifest = json.loads(archive.read(".retriever/export-manifest.json").decode("utf-8"))
+            root_manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
             descriptor_payload = json.loads(archive.read(native_row["rel_path"]).decode("utf-8"))
+            metadata_rows = list(csv.DictReader(io.StringIO(archive.read("metadata.csv").decode("utf-8"))))
+            source_part_index_rows = list(csv.DictReader(io.StringIO(archive.read("source_parts.csv").decode("utf-8"))))
+            text_rows = list(csv.DictReader(io.StringIO(archive.read("extracted_text.csv").decode("utf-8"))))
+            checksum_rows = list(csv.DictReader(io.StringIO(archive.read("checksums.csv").decode("utf-8"))))
+            loadfile_bytes = archive.read("loadfile.dat")
 
         self.assertIn(native_row["rel_path"], names)
+        self.assertIn("metadata.csv", names)
+        self.assertIn("manifest.json", names)
+        self.assertIn("README.txt", names)
+        self.assertIn("checksums.csv", names)
+        self.assertIn("previews.csv", names)
+        self.assertIn("source_parts.csv", names)
+        self.assertIn("extracted_text.csv", names)
+        self.assertIn("loadfile.dat", names)
+        self.assertIn("image_loadfile.opt", names)
         self.assertTrue(all(row["rel_source_path"] in names for row in source_part_rows))
         self.assertEqual(manifest["warnings"], [])
+        self.assertEqual(root_manifest["files"]["loadfile_rel_path"], "loadfile.dat")
+        self.assertEqual(root_manifest["counts"]["document_count"], 1)
         self.assertEqual(manifest["documents"][0]["document_entry_kind"], "synthetic")
         self.assertTrue(any(part["part_kind"] == "native" for part in manifest["documents"][0]["source_part_entries"]))
         self.assertEqual(descriptor_payload["document_id"], native_row["id"])
         self.assertEqual(descriptor_payload["control_number"], native_row["control_number"])
+        self.assertTrue(any(row["part_kind"] == "native" for row in source_part_index_rows))
+        self.assertEqual(len(text_rows), 1)
+        self.assertEqual(text_rows[0]["has_text"], "true")
+        self.assertIn(text_rows[0]["text_rel_path"], names)
+        self.assertTrue(any(row["rel_path"] == "loadfile.dat" for row in checksum_rows))
+        self.assertIn(str(native_row["control_number"]).encode("utf-8"), loadfile_bytes)
+        metadata_row = next(item for item in metadata_rows if int(item["document_id"]) == int(native_row["id"]))
+        self.assertEqual(metadata_row["document_entry_kind"], "synthetic")
+        self.assertTrue(
+            all(row["rel_source_path"] in metadata_row["source_part_rel_paths"] for row in source_part_rows)
+        )
+        self.assertTrue(
+            any(row["rel_source_path"] in metadata_row["native_source_rel_paths"] for row in source_part_rows)
+        )
 
     def test_slash_export_previews_is_deferred(self) -> None:
         exit_code, payload, _, _ = self.run_cli(
