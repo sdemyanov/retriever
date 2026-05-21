@@ -23,7 +23,7 @@ Use `python3 skills/tool-template/tools.py --help` as the authoritative command 
 - jobs and runs: `list-jobs`, `create-job`, `add-job-output`, `list-job-versions`, `create-job-version`, `list-runs`, `get-run`, `create-run`, `run-status`, `run-job-step`, `cancel-run`, `publish-run-results`, `list-results`, `list-text-revisions`, `activate-text-revision`
 - low-level worker protocol: `claim-run-items`, `prepare-run-batch`, `get-run-item-context`, `heartbeat-run-items`, `finish-run-worker`, `complete-run-item`, `fail-run-item`
 
-For Cowork-agent execution, prefer the bounded run step:
+For Claude Code execution, prefer the bounded run step:
 
 - `run-job-step`
 
@@ -40,7 +40,7 @@ For low-level worker protocol work, use:
 - `search`, `get-doc`, and `search-chunks` return compact JSON by default to keep model context small.
 - Add `--verbose` when you need full document/source metadata, preview target variants, attachment-child payloads, or raw chunk text.
 - `export-previews` writes HTML under `.retriever/exports/` and returns a manifest describing the generated index, unit files, and per-document anchor targets.
-- For Cowork-safe large exports, prefer `/export table documents|entities|conversations`, `/export archive`, and `/export status` from the slash surface, or the lower-level `export-csv-start` + `export-csv-run-step` + `export-csv-status` / `export-archive-start` + `export-archive-run-step` + `export-archive-status` commands. The direct `export-csv` and `export-archive` commands remain useful for tiny exports, deterministic tests, and parity checks. `/export previews` is deferred until preview export is resumable; use direct `export-previews` only for small/debug exports.
+- For large bounded exports in Claude Code, prefer `/export table documents|entities|conversations`, `/export archive`, and `/export status` from the slash surface, or the lower-level `export-csv-start` + `export-csv-run-step` + `export-csv-status` / `export-archive-start` + `export-archive-run-step` + `export-archive-status` commands. The direct `export-csv` and `export-archive` commands remain useful for tiny exports, deterministic tests, and parity checks. `/export previews` is deferred until preview export is resumable; use direct `export-previews` only for small/debug exports.
 - Export preview ownership is shared by the most inclusive useful unit:
   - email export units expand to the full conversation chain
   - chat export units merge contiguous selected documents inside the conversation timeline

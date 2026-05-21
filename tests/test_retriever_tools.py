@@ -36,7 +36,6 @@ BUNDLER_PATH = REPO_ROOT / "skills" / "tool-template" / "bundle_retriever_tools.
 TOOL_TEMPLATE_PATH = REPO_ROOT / "skills" / "tool-template" / "tool-template.md"
 SOURCE_HEADER_PATH = REPO_ROOT / "skills" / "tool-template" / "src" / "00_header.py"
 SETUP_PATH = REPO_ROOT / "setup"
-CLAUDE_V0_SETUP_PATH = REPO_ROOT / "setup-claude-v0"
 PLUGIN_MANIFEST_PATH = REPO_ROOT / ".claude-plugin" / "plugin.json"
 PING_SKILL_PATH = REPO_ROOT / "skills" / "ping" / "SKILL.md"
 SKILL_ROOT = REPO_ROOT / "skills"
@@ -168,8 +167,6 @@ def assert_version_metadata_current() -> None:
             f"Missing Retriever package entrypoint at {RETRIEVER_PACKAGE_MAIN_PATH}."
         )
 
-    if not CLAUDE_V0_SETUP_PATH.exists():
-        raise AssertionError(f"Missing Claude v0 installer at {CLAUDE_V0_SETUP_PATH}.")
     if not SETUP_PATH.exists():
         raise AssertionError(f"Missing Claude installer at {SETUP_PATH}.")
 
@@ -25330,78 +25327,6 @@ class AttachmentResolutionTests(unittest.TestCase):
             "Mcneill, Walter.pdf",
         )
         self.assertEqual(retriever_tools.pst_attachment_content_type(attachment), "application/pdf")
-
-
-class ClaudeV0InstallerTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="retriever-claude-v0-")
-        self.addCleanup(self.tempdir.cleanup)
-        self.workspace = Path(self.tempdir.name) / "workspace"
-        self.workspace.mkdir()
-
-    def run_installer(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(CLAUDE_V0_SETUP_PATH), str(self.workspace), *args],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-
-    def test_installer_writes_expected_commands_and_manifest(self) -> None:
-        result = self.run_installer()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        resolved_workspace = self.workspace.resolve()
-
-        commands_dir = self.workspace / ".claude" / "commands"
-        self.assertTrue(commands_dir.is_dir())
-
-        search_path = commands_dir / "search.md"
-        workspace_status_path = commands_dir / "workspace-status.md"
-        ingest_path = commands_dir / "ingest.md"
-        show_doc_path = commands_dir / "show-doc.md"
-        run_status_path = commands_dir / "run-status.md"
-        self.assertTrue(search_path.exists())
-        self.assertTrue(workspace_status_path.exists())
-        self.assertTrue(ingest_path.exists())
-        self.assertTrue(show_doc_path.exists())
-        self.assertTrue(run_status_path.exists())
-
-        search_text = search_path.read_text(encoding="utf-8")
-        self.assertIn("Managed by Retriever setup-claude-v0", search_text)
-        self.assertIn("tools.py --human slash", search_text)
-        self.assertIn(str(self.workspace), search_text)
-        self.assertIn(str(REPO_ROOT), search_text)
-
-        workspace_status_text = workspace_status_path.read_text(encoding="utf-8")
-        self.assertIn("workspace status", workspace_status_text)
-        self.assertIn(str(self.workspace), workspace_status_text)
-        self.assertIn("tools.py --human workspace status", workspace_status_text)
-        self.assertIn("Return stdout exactly as the entire response.", workspace_status_text)
-
-        ingest_text = ingest_path.read_text(encoding="utf-8")
-        self.assertIn("tools.py --human ingest", ingest_text)
-        self.assertIn("Always include these arguments: `--run-to-completion`", ingest_text)
-        self.assertIn("default arguments instead: `--recursive`", ingest_text)
-        self.assertIn("Return stdout exactly as the entire response.", ingest_text)
-
-        show_doc_text = show_doc_path.read_text(encoding="utf-8")
-        self.assertIn("tools.py --human get-doc", show_doc_text)
-        self.assertIn("Always include these arguments: `--include-text summary`", show_doc_text)
-
-        manifest = json.loads((self.workspace / ".claude" / "retriever-v0-manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["workspace_root"], str(resolved_workspace))
-        self.assertEqual(manifest["repo_root"], str(REPO_ROOT))
-        self.assertIn(".claude/commands/search.md", manifest["files"])
-
-    def test_installer_refuses_unprefixed_name_collisions(self) -> None:
-        commands_dir = self.workspace / ".claude" / "commands"
-        commands_dir.mkdir(parents=True)
-        (commands_dir / "search.md").write_text("---\ndescription: existing\n---\n", encoding="utf-8")
-
-        result = self.run_installer()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("already exist", result.stderr)
-        self.assertIn("--prefix retriever-", result.stderr)
 
 
 class ClaudeGlobalInstallerTests(unittest.TestCase):

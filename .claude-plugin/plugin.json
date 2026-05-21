@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "retriever",
   "version": "1.1.17",
-  "description": "Build a review workspace, find the documents that matter, and export a shareable review set.",
+  "description": "Open source document intelligence and review plugin for Claude Code: ingest, search, review, enrich, and export local document workspaces.",
   "author": {
     "name": "Sergey Demyanov",
     "url": "https://github.com/sdemyanov"
@@ -12,11 +12,15 @@
   "license": "Elastic-2.0",
   "keywords": [
     "retriever",
-    "review",
+    "claude-code",
     "documents",
+    "document-intelligence",
+    "review",
     "legal",
     "investigations",
-    "diligence",
+    "search",
+    "ocr",
+    "extraction",
     "export"
   ]
 }

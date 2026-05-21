@@ -41,15 +41,15 @@ Use this skill when the user says things like:
 - Do not conclude the workspace is unsupported from `df`, `mount`, or host filesystem labels alone.
 - Existing DB writes do not prove fresh bootstrap will succeed; distinguish existing-DB behavior from fresh-create behavior on the exact target `.retriever/retriever.db` path.
 - Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, user-modified tool protection, and mounted-path bootstrap troubleshooting without changing the chosen ingest intent.
-- Prefer plain `ingest` for normal Cowork indexing and refresh tasks. It is the bounded V2 facade by default.
+- Prefer plain `ingest` for normal Claude Code indexing and refresh tasks. It is the bounded V2 facade by default.
 - Use plain one-shot ingest for normal local work:
   `python3 skills/tool-template/tools.py ingest <workspace> --recursive`
 - Do not use background jobs or shell loops for ingest. Do not manually call `ingest-start` / `ingest-run-step` unless you need to inspect or recover a specific active run.
 - If an active ingest run already exists, `ingest` will fail with `active_ingest_run`; resume or cancel that run intentionally instead of starting another one.
 - For `.pst` sources, use regular `ingest`, not `ingest-production`.
 - If `workspace status` reports `pst_backend.status == fail`, explain that PST ingest needs the required `libpff-python` / `pypff` backend installed.
-- If the user target is a processed production root during normal Cowork work, prefer plain ingest with `--path <production-root-relative-path>` and no `--file-types`; it will auto-route the production.
-- Use `ingest-production` only when the user explicitly asks for that command, when running a targeted script outside the Cowork time limit, or when debugging parity with the production-only path.
+- If the user target is a processed production root during normal Claude Code use, prefer plain ingest with `--path <production-root-relative-path>` and no `--file-types`; it will auto-route the production.
+- Use `ingest-production` only when the user explicitly asks for that command, when running a targeted script outside the normal bounded Claude Code command window, or when debugging parity with the production-only path.
 - Treat `DAT` + companion `TEXT/`, `IMAGES/`, and optional `NATIVES/` folders as a production signature, not as loose files.
 - Run plain `ingest` with `--recursive` when the user wants the whole tree scanned.
 - When the user asks to reingest only a subtree or file inside the workspace, keep the positional workspace root unchanged and pass one or more `--path <relative-path>` flags.

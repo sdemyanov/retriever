@@ -10,7 +10,8 @@ layout and the planned split of the consolidated regression file, see
 
 ## Core Idea
 
-Retriever is a local-first review workspace for Claude-driven document review.
+Retriever is an open source, local-first document intelligence plugin used
+through Claude Code.
 The repo has to keep four surfaces aligned:
 
 - the authored backend source
@@ -36,9 +37,16 @@ of the build, documentation, and testing rules exist to catch that drift early.
   Generated backend bundle. Treat it as derived output.
 - `skills/routing/SKILL.md`
   Backend routing and reference material for Claude-facing behavior.
+<<<<<<< HEAD
 - `setup` and `setup-claude-v0`
   Installer entrypoints for the global Claude Code install flow and the
   project-local command bridge.
+=======
+- `agents/`
+  Optional agent wrappers layered on top of the core Claude Code surface.
+- `setup`
+  Installer entrypoint for the global Claude Code install flow.
+>>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)
 - `tests/`
   Current regression, installer, package, and repository-integrity tests.
 - `.claude-plugin/plugin.json`
@@ -63,14 +71,15 @@ bundled support artifact.
 
 ## Workspace And Runtime Model
 
-Retriever treats the selected review folder as the workspace root. Persistent
+Retriever treats the selected workspace folder or document corpus as the
+workspace root. Persistent
 workspace state lives under `.retriever/` in that root, while heavyweight parser
 dependencies live in the shared repo runtime under
 `.retriever-plugin-runtime/`.
 
 That split is intentional:
 
-- the workspace keeps review state, previews, logs, jobs, and runtime metadata
+- the workspace keeps search state, previews, logs, jobs, and runtime metadata
 - the shared runtime keeps parser dependencies out of each workspace
 - multiple workspaces on one machine can share the same parser installation
 
@@ -108,8 +117,8 @@ Keep repository docs separated by audience and purpose:
 
 - `README.md`: product story, install paths, supported workflows, and first-use
   guidance
-- `docs/browse-reference.md`: slash-command reference, `/search` and `/filter`
-  syntax, display tips, and CLI quick reference
+- `docs/browse-reference.md`: slash-command reference, `/retriever:search` and
+  `/retriever:filter` syntax, display tips, and CLI quick reference
 - `CLAUDE.md`: short repository prompt for coding agents working in this repo
 - `CONTRIBUTING.md`: contributor workflow and build/test expectations
 - `TESTING.md`: test-suite shape, invariants, and the planned test-file split

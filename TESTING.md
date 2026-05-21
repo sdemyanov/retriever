@@ -25,7 +25,11 @@ Retriever currently keeps most of its tests in one large module:
 That file mixes several different responsibilities:
 
 - repository-integrity checks for generated artifacts and version metadata
+<<<<<<< HEAD
 - installer coverage for `setup` and the `setup-claude-v0` project-local bridge
+=======
+- installer coverage for `setup`
+>>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)
 - native package entrypoint and processing tests
 - broad regression coverage for ingest, search, browse, export, metadata, and
   structured processing behavior
@@ -69,7 +73,7 @@ Suggested structure:
   Generated bundle freshness, checksum enforcement, version-metadata sync, and
   documentation/install-surface sync checks.
 - `tests/test_installers.py`
-  `ClaudeV0InstallerTests` and `ClaudeGlobalInstallerTests`.
+  `ClaudeGlobalInstallerTests`.
 - `tests/test_package_entrypoint.py`
   `RetrieverPackageEntrypointTests` and native package smoke coverage.
 - `tests/test_processing_commands.py`

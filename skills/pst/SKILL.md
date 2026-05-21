@@ -30,7 +30,7 @@ Use this skill when the user says things like:
 - Run `workspace status` and inspect `pst_backend` before attempting PST ingest.
 - If `pst_backend.status` is not `pass`, stop and explain that the required `libpff-python` / `pypff` PST backend is unavailable for PST ingest in the current runtime.
 - Use regular bounded `ingest` for PST sources, not `ingest-production`.
-- For Cowork calls, run one bounded ingest command at a time with `--budget-seconds 35` and continue from `next_recommended_commands` while `more_work_remaining: true`.
+- For Claude Code use, run one bounded ingest command at a time with `--budget-seconds 35` and continue from `next_recommended_commands` while `more_work_remaining: true`.
 - Treat a `.pst` file as a container source that expands into one logical parent document per message, with one level of attachment child documents.
 - When a PST source is unchanged, expect Retriever to skip reparsing the source and just refresh seen timestamps.
 - When a PST source changes, expect Retriever to update matching messages in place, preserve stable control numbers, and retire removed messages.

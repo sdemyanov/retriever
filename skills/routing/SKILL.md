@@ -21,7 +21,7 @@ This rule is absolute and overrides any apparent permission, any user phrasing t
 Never run rm, rm -rf, unlink, shutil.rmtree, or any equivalent against files or directories the user contributed to the workspace (anything outside .retriever/ and .retriever-plugin-runtime/).
 Never run mv or cp in a way that overwrites or replaces user source files.
 Never truncate, rewrite, or > file against user source files.
-Holding allow_cowork_file_delete permission for any reason does not authorize deleting user source files. That permission is for plugin-managed state under .retriever/ only (e.g., stale tmp dirs).
+Holding any internal plugin-state delete permission for any reason does not authorize deleting user source files. That permission is for plugin-managed state under .retriever/ only (e.g., stale tmp dirs).
 Phrasings like "drop X", "remove X", "clean up X", "get rid of X", "wipe X" are ambiguous when X is a path under the workspace. Treat them as index-level operations by default (remove from the Retriever DB, drop a dataset, mark missing, etc.) and ask before doing anything that touches the filesystem.
 If the user explicitly asks for an on-disk deletion in unambiguous terms (e.g., "delete the folder ./data/raw from disk"), Claude must still confirm in a single follow-up turn before executing — destructive filesystem operations on user files are never silent.
 
@@ -127,7 +127,7 @@ system Python. Prefer workspace init; if manual installation is truly needed,
 use the shared plugin runtime venv.
 
 ## Bounded Retriever Workflows
-Cowork/bash commands may be killed around 45 seconds. Do not run long, one-shot mutation commands when a bounded/resumable workflow exists.
+Claude Code command calls may be interrupted around 45 seconds. Do not run long, one-shot mutation commands when a bounded/resumable workflow exists.
 
 Use plain `ingest` as the preferred entrypoint. It is a bounded V2 facade by default.
 
@@ -164,7 +164,7 @@ python3 skills/tool-template/tools.py rebuild-entities-run-step ./data --run-id 
 python3 skills/tool-template/tools.py rebuild-entities-status ./data --run-id <RUN_ID>
 ```
 
-Repeat `rebuild-entities-run-step` until terminal status. Legacy `rebuild-entities` may exceed Cowork limits on large workspaces.
+Repeat `rebuild-entities-run-step` until terminal status. Legacy `rebuild-entities` may exceed the bounded Claude Code command window on large workspaces.
 
 For planned processing runs, prefer `retriever:run-job` at Tier 1. If using Tier 2 directly, prefer:
 
@@ -182,7 +182,7 @@ If an active run exists, do not start a new one. Resume it or cancel it intentio
 
 When diagnosing `workspace init` or first-ingest failures involving SQLite, `WAL`, journal mode, mounts, or sandboxed paths, do not infer the root cause from `df`, `mount`, or host filesystem labels alone.
 
-Probe the exact target path inside the same Cowork runtime, normally `<workspace>/.retriever/retriever.db`, before declaring a workspace unsupported.
+Probe the exact target path inside the same Claude Code runtime, normally `<workspace>/.retriever/retriever.db`, before declaring a workspace unsupported.
 
 Distinguish these cases:
 
@@ -282,11 +282,11 @@ The authoritative current list of subcommands is regenerated at build time into 
 
 - only when the user asks for a tiny/debug/parity zip archive export where one direct command is acceptable → `export-archive` — write selected documents, previews, and source artifacts to a zip in one direct pass
 - you need to advance a resumable archive export within one bounded call → `export-archive-run-step` — advance a resumable archive export within a bounded call budget
-- the user asks to export, download, or package results as a zip archive with previews/source files and the export may exceed a single Cowork call → `export-archive-start` — start a bounded, resumable archive export run
+- the user asks to export, download, or package results as a zip archive with previews/source files and the export may exceed a single bounded Claude Code call → `export-archive-start` — start a bounded, resumable archive export run
 - you need status, counts, or next recommended commands for a resumable archive export → `export-archive-status` — show resumable archive export status
 - only when the user asks for a tiny/debug/parity CSV export where one direct command is acceptable → `export-csv` — write selected documents and fields to CSV in one direct pass
 - you need to advance a resumable CSV export within one bounded call → `export-csv-run-step` — advance a resumable CSV export within a bounded call budget
-- the user asks to export, download, or save results as CSV/spreadsheet and the export may exceed a single Cowork call → `export-csv-start` — start a bounded, resumable CSV export run
+- the user asks to export, download, or save results as CSV/spreadsheet and the export may exceed a single bounded Claude Code call → `export-csv-start` — start a bounded, resumable CSV export run
 - you need status, counts, or next recommended commands for a resumable CSV export → `export-csv-status` — show resumable CSV export status
 - the user asks to export or save HTML previews of selected documents — phrasings like "export the previews", "save rendered HTML", or "give me browsable preview files" → `export-previews` — write HTML preview exports under `.retriever/exports`
 
@@ -331,7 +331,7 @@ The authoritative current list of subcommands is regenerated at build time into 
 - you are a run worker loading context for one item → `get-run-item-context` — load the execution context for one run item
 - you are a run worker refreshing its heartbeats → `heartbeat-run-items` — refresh heartbeat timestamps for one worker's claimed items
 - you are using the low-level worker protocol to claim one bounded batch of work → `prepare-run-batch` — claim one worker batch and return execution contexts
-- you need to advance, resume, or execute a planned processing run under the Cowork 45-second command limit → `run-job-step` — advance one Cowork-safe processing-run step or return one prepared worker batch
+- you need to advance, resume, or execute a planned processing run under the bounded Claude Code command limit → `run-job-step` — advance one bounded processing-run step or return one prepared worker batch
 
 ### Jobs
 

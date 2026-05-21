@@ -74,8 +74,8 @@ python3 skills/tool-template/tools.py workspace init <workspace>
 
 Notes:
 
-- The seeded-from-`/tmp` recovery is empirical: it was observed to help in the current Cowork sandbox when fresh-create failed on the mounted target path.
-- Use seeded-copy only when the fresh-create probe fails on the target path. If a future sandbox bridge supports fresh-create correctly, do not seed by default.
+- The seeded-from-`/tmp` recovery is empirical: it was observed to help in the current Claude Code sandbox when fresh-create failed on the mounted target path.
+- Use seeded-copy only when the fresh-create probe fails on the target path. If a future Claude Code sandbox bridge supports fresh-create correctly, do not seed by default.
 - Existing DB writes do not prove fresh bootstrap will succeed.
 - Probe artifacts inside `.retriever/` are plugin-managed state and may be removed after diagnosis.
 - Never use this workaround to replace user source files.
@@ -162,4 +162,4 @@ If bootstrap cannot complete:
 ## Current scope note
 
 - Ingest and entity rebuild have bounded/resumable workflows. Prefer the facade commands (`ingest`, `rebuild-entities-run-step`) over long one-shot commands.
-- Planned processing runs should use `run-job-step` for Cowork-safe execution.
+- Planned processing runs should use `run-job-step` for bounded Claude Code execution.

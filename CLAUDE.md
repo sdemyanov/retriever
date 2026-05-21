@@ -1,6 +1,12 @@
 # Retriever
 
+<<<<<<< HEAD
 Retriever is designed for Claude Code. When working in this repository, keep Claude-facing behavior and Retriever backend behavior aligned.
+=======
+Retriever is an open source document intelligence plugin for Claude Code. When
+working in this repository, keep the Claude Code user experience and Retriever
+backend behavior aligned.
+>>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)
 
 ## Priority Order
 
@@ -25,7 +31,11 @@ Use the highest-level Retriever surface that can answer the request:
 ## Long-Running Work
 
 - Keep the resumable backend for ingest, export, entity rebuild, and processing jobs.
+<<<<<<< HEAD
 - Default processing commands to the Claude Code provider when the `claude` CLI is installed. Treat `claude_code` and `cowork_agent` as the same Claude-backed execution path.
+=======
+- Default processing commands to the Claude Code provider when the `claude` CLI is installed. Treat older provider aliases as the same Claude-backed execution path.
+>>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)
 - Prefer one-shot Claude-facing commands that run to a terminal state: `/retriever:ingest`, `/retriever:run`, `/retriever:translate`, `/retriever:extract`, `/retriever:ocr`, `/retriever:describe-images`, and `/retriever:export`.
 - Only surface `...-status`, `...-run-step`, or lower-level recovery commands when the original command was interrupted or the user explicitly wants stepwise control.
 

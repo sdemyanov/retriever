@@ -2,49 +2,72 @@
 
 ## Short Description
 
-Build a review workspace, find the documents that matter, and export a
-shareable review set.
+Open source document intelligence and review for Claude Code.
 
 ## Medium Description
 
+<<<<<<< HEAD
 Retriever is a local-first document intelligence and review plugin for Claude. It turns a
 folder, production, or mailbox export into a persistent review workspace, helps
 you find key documents and communications, and exports the scoped result as a
 table or archive.
+=======
+Retriever is an open source, local-first document intelligence plugin for
+Claude Code. It turns folders, productions, mailbox exports, and other
+supported document collections into a persistent workspace, helps you search,
+preview, review, enrich, and analyze documents, and exports the current result
+set as a table or archive.
+>>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)
 
 ## First Run
 
-Put the documents for one matter or review into a single folder, ask Retriever
-to ingest that folder, then ask what you want next.
+Open Claude Code in the target folder, ask Retriever to ingest it, then ask
+what you want next.
 
 Example prompts:
 
-- `Ingest /path/to/folder`
+- `/retriever:ingest`
+- `Find documents mentioning indemnification`
 - `Review this folder for hot docs`
-- `Export the current review set`
+- `Extract counterparties from the current contracts`
+- `Export the current results`
 
-## The Three Jobs
+## What Retriever Does
 
-1. Build a review workspace
+1. Build a document workspace
    Ingest local files, processed productions, PST/MBOX mailboxes, and similar
-   review sets into a workspace-local Retriever index.
-2. Find the documents that matter
-   Search, filter, page, sort, save scope, and triage hot docs, key emails,
-   privilege candidates, and contract-risk material.
-3. Export a review set
-   Save the current scope as a CSV table or portable archive for handoff, QA, or
-   downstream loading.
+   document collections into a workspace-local Retriever index.
+2. Search, review, enrich, and analyze documents
+   Search, filter, page, sort, save scope, preview files, run first-pass
+   review and triage, add metadata, and run OCR or extraction over selected
+   result sets.
+3. Export results and handoff artifacts
+   Save the current scope as a CSV table, preview bundle, or portable archive
+   for handoff, QA, or downstream loading.
 
 ## Best Fit
 
-- Legal review and litigation support
-- Investigations and compliance
+- Legal, investigations, and compliance
 - Diligence and internal document analysis
+- Document review, triage, and evidence workflows
+- Knowledge work that starts from messy local document collections
 
-## Guided Surfaces
+## Interface
 
+<<<<<<< HEAD
 - `retriever:export` for CSV/archive export flows
 
 ## Trust Hook
 
 Local-first by default. Original files stay in place.
+=======
+Users interact with Retriever through Claude Code. Install it once, open
+Claude Code in a target workspace, and use `/retriever:*` commands or
+plain-English requests.
+
+## Trust Hook
+
+Open source and local-first by default. Original files stay in place, and the
+workspace state lives alongside the source corpus rather than in a remote
+service.
+>>>>>>> 1629fd2 (Refresh Claude Code docs and remove old setup bridge)

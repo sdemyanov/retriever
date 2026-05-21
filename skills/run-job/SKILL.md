@@ -84,9 +84,10 @@ When to stop it:
 
 Do not build a second supervisor inside Python. The heartbeat is the wake mechanism; the skill remains the orchestrator.
 
-## Cowork-safe execution
+## Bounded Claude Code Execution
 
-Cowork/bash commands may be killed around 45 seconds. Prefer the bounded facade:
+Claude Code command calls may be interrupted around 45 seconds. Prefer the
+bounded facade:
 
 ```bash
 python3 skills/tool-template/tools.py run-job-step <workspace> --run-id <RUN_ID> --budget-seconds 35
@@ -96,7 +97,7 @@ python3 skills/tool-template/tools.py run-job-step <workspace> --run-id <RUN_ID>
 
 - it finalizes OCR/image-description runs when the run is ready for finalization
 - otherwise it claims one prepared batch and returns the item contexts for the agent/provider to process
-- it uses the Cowork stale-claim window by default, so abandoned inline claims can be picked up by another call after roughly 45 seconds
+- it uses the default stale-claim window, so abandoned inline claims can be picked up by another call after roughly 45 seconds
 - it returns `next_recommended_commands` for the next bounded action
 
 If the result contains a non-empty `batch`, process those items and call `complete-run-item` or `fail-run-item` for each one. Then call `run-job-step` again if the run still needs work.

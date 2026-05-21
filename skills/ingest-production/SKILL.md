@@ -35,10 +35,10 @@ Use this skill when the user says things like:
 - Existing DB writes do not prove fresh bootstrap will succeed; distinguish existing-DB behavior from fresh-create behavior on the exact target `.retriever/retriever.db` path.
 - Follow the shared ingest preflight in [../workspace/workspace.md](../workspace/workspace.md) before running workspace-local commands. That contract handles missing tools, clean-but-stale auto-upgrades, user-modified tool protection, and mounted-path bootstrap troubleshooting without changing the chosen production-ingest intent.
 - Validate that the target looks like a supported processed production root, not just a loose folder of files.
-- For normal Cowork execution, prefer the bounded plain ingest facade and pass the production root as a scoped path:
+- For normal Claude Code use, prefer the bounded plain ingest facade and pass the production root as a scoped path:
   `python3 skills/tool-template/tools.py ingest <workspace> --recursive --path <production-root-relative-path> --budget-seconds 35`
 - Continue with `next_recommended_commands` while `more_work_remaining: true`; stop only on `completed`, `failed`, or `canceled`.
-- Run `ingest-production` only when the user explicitly asks for that command, when running outside the Cowork time limit, or when debugging production-only parity.
+- Run `ingest-production` only when the user explicitly asks for that command, when running outside the normal bounded Claude Code command window, or when debugging production-only parity.
 - Do not fall back to loose-file-only ingest. Plain `ingest` without `--file-types` should detect and route the production through the production pipeline.
 - Summarize created, updated, unchanged, and retired logical documents.
 - Call out family reconstruction, linked page images, docs missing linked text, docs missing linked images, and docs missing linked natives.

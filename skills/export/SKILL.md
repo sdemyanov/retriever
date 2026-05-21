@@ -1,9 +1,10 @@
 ---
 name: export
 description: >
-  Use this skill when the user wants to export the current review scope as a
-  CSV table or archive, inspect export progress, or otherwise "save", "download",
-  "bundle", or "hand off" Retriever results — or when the user types "/export".
+  Use this skill when the user wants to export the current active scope or
+  result set as a CSV table or archive, inspect export progress, or otherwise
+  "save", "download", "bundle", or "hand off" Retriever results — or when the
+  user types "/export".
 metadata:
   version: "1.1.17"
 ---
@@ -15,7 +16,7 @@ metadata:
 Use this skill for `/export table ...`, `/export archive ...`, `/export status ...`,
 and natural-language requests like:
 
-- "export this review set to CSV"
+- "export this result set to CSV"
 - "make a spreadsheet of the current results"
 - "build a zip I can share"
 - "is the export still running?"
