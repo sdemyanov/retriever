@@ -30,7 +30,6 @@ selected set, and CSV or archive export for handoff.
 
 Project docs:
 
-- [MARKETPLACE.md](MARKETPLACE.md)
 - [PRIVACY.md](PRIVACY.md)
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [TESTING.md](TESTING.md)

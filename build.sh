@@ -178,7 +178,6 @@ include_roots = [
     "agents",
     "skills",
     "README.md",
-    "MARKETPLACE.md",
     "PRIVACY.md",
     "LICENSE",
 ]
