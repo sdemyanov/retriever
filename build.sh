@@ -179,7 +179,6 @@ include_roots = [
     "skills",
     "README.md",
     "MARKETPLACE.md",
-    "CONNECTORS.md",
     "PRIVACY.md",
     "LICENSE",
 ]

@@ -7,9 +7,9 @@ use Retriever to do three jobs well.
 ## The three jobs
 
 1. Build a review workspace
-   Turn a local folder, processed production, PST/MBOX archive, or bounded
-   Google Drive set into a Retriever workspace that keeps search state, saved
-   scopes, previews, and exports together.
+   Turn a local folder, processed production, or PST/MBOX archive into a
+   Retriever workspace that keeps search state, saved scopes, previews, and
+   exports together.
 2. Find the documents that matter
    Ask for hot docs, key communications, contract-risk terms, privilege
    candidates, or specific Bates ranges without rebuilding the review context
@@ -18,19 +18,9 @@ use Retriever to do three jobs well.
    Once the scope is right, export a shareable table or archive for handoff,
    QA, or downstream loading.
 
-## Guided surfaces
-
-- `retriever-legal` agent: persona-first wrapper for first-pass legal review,
-  diligence, privilege sweeps, and hot-doc workflows
-- `retriever:export` skill: user-facing CSV/archive export wrapper
-
-Google Drive remains supported as an intake/source option, but not as a
-separate top-level Retriever capability.
-
 Submission and trust docs:
 
 - [MARKETPLACE.md](MARKETPLACE.md)
-- [CONNECTORS.md](CONNECTORS.md)
 - [PRIVACY.md](PRIVACY.md)
 
 Repository docs:
@@ -54,9 +44,8 @@ Example prompts:
 - `Show emails from Alice in 2023`
 - `Export the current review set`
 
-If your source starts as a processed production, PST/MBOX archive, or bounded
-Google Drive set, first turn it into a local Retriever workspace, then continue
-the same way.
+If your source starts as a processed production or PST/MBOX archive, first turn
+it into a local Retriever workspace, then continue the same way.
 
 ## What Retriever is for
 
@@ -85,9 +74,9 @@ Common use cases:
 - Preview-first review. Search results render as a standard table with clickable titles. Native preview files are used when possible; Retriever generates HTML or CSV previews when needed.
 - Stable document identity. Documents receive stable `control_number` values for review and export. Production documents use produced Bates values as the control number.
 - Dataset-aware workflows. Documents can belong to one or more datasets, and datasets can be source-backed or manually curated.
-- Exports. Retriever can export selected rows to CSV, generate HTML preview bundles, or build zip archives containing root `metadata.csv`, `manifest.json`, `README.txt`, `checksums.csv`, normalized `previews.csv` and `source_parts.csv`, extracted text under `text/`, `loadfile.dat`, a root `previews/` tree, source files in their ingested paths, and an optional portable workspace subset.
+- Exports. Retriever can export selected rows to CSV, generate HTML preview bundles, or build zip archives containing root `metadata.csv`, `manifest.json`, `README.txt`, `checksums.csv`, normalized `previews.csv` and `source_parts.csv`, extracted text under `text/`, legal-style `loadfile.dat` and `image_loadfile.opt`, a root `previews/` tree, source files in their ingested paths, and an optional portable workspace subset.
 - Metadata enrichment. You can add custom fields, set values manually, and run structured processing jobs that operate on frozen run snapshots.
-- Long-running processing. Translation, structured extraction, OCR, and image-description runs now have first-class Claude Code commands and native `python3 -m retriever` entrypoints that drive the resumable backend to a terminal state.
+- Long-running processing. Translation, structured extraction, OCR, and image-description runs have first-class Claude Code commands and native `python3 -m retriever` entrypoints that drive the resumable backend to a terminal state.
 
 ## How Retriever works
 
@@ -111,7 +100,7 @@ Important consequences:
 - your original documents stay in place and are not rewritten
 - document paths in the database are workspace-relative
 - the workspace carries its own Retriever state, so browsing, datasets, and exports stay tied to that folder
-- the workspace records which canonical Retriever tool build last touched it, so the native package surface and compatibility bundle stay aligned
+- the workspace records which canonical Retriever tool build last touched it, so the native package surface and generated backend bundle stay aligned
 - heavy parser dependencies live in the shared Retriever runtime (`<repo-root>/.retriever-plugin-runtime/...`), not under `.retriever/`; see *Runtime and dependencies* for details
 
 ### Document model
@@ -198,11 +187,11 @@ Consequences:
 - first use of a new parser type (for example, the first PST ingest) can briefly block while the dependency installs; `workspace status` will report the runtime state and warn if something needed is missing
 - the runtime is advisory — if you prefer to manage Python yourself, the tool still falls back to whatever is importable in the active interpreter
 
-The on-disk directory name still uses `.retriever-plugin-runtime/` for compatibility with older workspaces and generated tooling, but Claude Code is now the primary surface.
+Retriever uses the on-disk shared runtime directory name `.retriever-plugin-runtime/` for parser dependencies and generated tooling.
 
 ## Loading Retriever
 
-For Claude Code, the primary install flow is a one-time global command install:
+Install Retriever for Claude Code with a one-time global command install:
 
 ```bash
 git clone --single-branch --depth 1 https://github.com/sdemyanov/retriever.git ~/.claude/skills/retriever
@@ -230,7 +219,7 @@ After running `./setup`:
 
 - open Claude Code in the Retriever workspace root you want to work in
 - run `/help` to confirm the new namespaced commands are present
-- `python3 -m retriever --help` now works from any directory that uses the same
+- `python3 -m retriever --help` works from any directory that uses the same
   Python interpreter as the installer
 - use `/retriever:init`, `/retriever:status`, `/retriever:ingest`,
   `/retriever:run`, `/retriever:translate`, `/retriever:extract`,
@@ -251,7 +240,7 @@ After running `./setup`:
   reaches a terminal state
 - `/retriever:export table ...` and `/retriever:export archive ...` also append
   hidden `--run-to-completion`, so exports default to a one-shot user flow
-- `python3 -m retriever` now defaults to human-readable output, so installed
+- `python3 -m retriever` defaults to human-readable output, so installed
   commands come back as short summaries instead of raw JSON where Retriever
   supports it
 - if a long-running command is interrupted, use `python3 -m retriever ...`
@@ -259,25 +248,25 @@ After running `./setup`:
   directly instead of expecting those lower-level verbs in the normal slash
   surface
 
-`skills/tool-template/tools.py` still works as a compatibility path and keeps
-JSON as its default output mode, but `python3 -m retriever ...` is now the
-primary CLI entrypoint and defaults to human-readable output.
+`python3 -m retriever ...` is the main CLI entrypoint and defaults to
+human-readable output. `skills/tool-template/tools.py` is the generated backend
+bundle and uses JSON as its default output mode.
 
-### Legacy compatibility paths
+### Additional install and test modes
 
-For legacy compatibility testing, you can still load the bundled plugin:
+For direct bundled-plugin testing, load the plugin with:
 
 ```bash
 claude --plugin-dir /path/to/retriever-plugin
 ```
 
-For project-local Claude Code testing without the global install, you can still
-use the workspace bridge below.
+For project-local Claude Code testing without the global install, use the
+workspace bridge below.
 
-### Claude Code v0 command bridge
+### Project-local command bridge (`setup-claude-v0`)
 
 If you want to test Retriever in Claude Code without using the global install,
-install a small project-local command bridge into the target workspace:
+install the project-local command bridge into the target workspace:
 
 ```bash
 ./setup-claude-v0 /path/to/workspace
@@ -305,11 +294,11 @@ After running the installer:
   `/workspace-status`, `/init-workspace`, `/update-workspace`, `/ingest`,
   `/ingest-status`, `/ingest-run-step`, `/ingest-cancel`,
   `/ingest-production`, `/run-status`, `/run-job-step`, and `/cancel-run`
-- if you run `/ingest` with no arguments, the v0 bridge defaults to
+- if you run `/ingest` with no arguments, the bridge defaults to
   `--recursive`
-- the v0 `/ingest` command always includes `--run-to-completion`, so it keeps
+- the bridge `/ingest` command always includes `--run-to-completion`, so it keeps
   advancing the resumable ingest backend until the run reaches a terminal state
-- the v0 `/export table ...` and `/export archive ...` commands append hidden
+- the bridge `/export table ...` and `/export archive ...` commands append hidden
   `--run-to-completion`, so exports also default to one-shot completion
 - the generated commands call Retriever with `--human`, so workspace, ingest,
   export, and `show-doc` return concise human output directly from Retriever
@@ -346,7 +335,7 @@ The `workspace` command groups runtime and schema maintenance into subcommands:
 
 - `workspace init` prepares or repairs `.retriever/` state and runtime metadata for a folder.
 - `workspace status` reports runtime readiness and schema state without rewriting anything.
-- `workspace update` refreshes runtime metadata from the canonical `tools.py` compatibility bundle after a tool update.
+- `workspace update` refreshes runtime metadata from the canonical generated backend bundle after a tool update.
 
 Use `ingest-production` when you want to target a processed production root explicitly:
 
@@ -562,13 +551,13 @@ Notes:
 - job display names are normalized to handles such as `issue_tags`
 <!-- Use run-job-step as the documented path because Cowork/bash calls may be killed around 45 seconds; the bounded step returns next_recommended_commands so agents can resume safely. -->
 - `run-job-step` is the normal Cowork-safe executor. If it returns `more_work_remaining: true`, continue with `next_recommended_commands`.
-- `execute-run` is the legacy direct executor for debugging, deterministic tests, or parity checks.
+- `execute-run` is the direct executor for debugging, deterministic tests, or parity checks.
 
 ## Browse And CLI Reference
 
 The detailed slash-command reference, `/search` and `/filter` syntax,
 field/column discovery notes, display and paging tips, and advanced CLI quick
-reference now live in [docs/browse-reference.md](docs/browse-reference.md).
+reference live in [docs/browse-reference.md](docs/browse-reference.md).
 
 ## Important details to remember
 

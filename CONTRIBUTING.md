@@ -1,6 +1,6 @@
 # Contributing
 
-Retriever's shared Claude Code operating rules now live in the repo-root
+Retriever's shared Claude Code operating rules live in the repo-root
 `CLAUDE.md`. Keep user-facing Claude guidance there, and keep Retriever's
 backend routing/reference material in `skills/routing/SKILL.md`.
 
@@ -20,7 +20,7 @@ python3 -m pytest tests/test_retriever_tools.py
 
 `./build.sh` is the canonical sync step. It synchronizes version metadata,
 rebundles `skills/tool-template/tools.py`, refreshes the generated command
-tables in `skills/routing/SKILL.md`, and rebuilds the legacy compatibility
+tables in `skills/routing/SKILL.md`, and rebuilds the bundled support
 artifact `retriever.plugin`.
 
 ## Day-To-Day Workflow
@@ -39,10 +39,10 @@ Use this loop for normal development:
 
 Keep these boundaries in mind:
 
-- `skills/tool-template/src/` is the authored compatibility-backend source of
+- `skills/tool-template/src/` is the authored generated-backend source of
   truth
 - `skills/tool-template/tools.py` is generated output
-- `retriever/` is the native Claude-first package surface
+- `retriever/` is the native Claude Code package surface
 - installer output, version metadata, and tests should stay aligned with both
 
 Avoid making hand edits to generated artifacts without also updating the source

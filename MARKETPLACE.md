@@ -8,9 +8,9 @@ shareable review set.
 ## Medium Description
 
 Retriever is a local-first document intelligence and review plugin for Claude. It turns a
-folder, production, mailbox export, or bounded Google Drive set into a
-persistent review workspace, helps you find key documents and communications,
-and exports the scoped result as a table or archive.
+folder, production, or mailbox export into a persistent review workspace, helps
+you find key documents and communications, and exports the scoped result as a
+table or archive.
 
 ## First Run
 
@@ -43,10 +43,8 @@ Example prompts:
 
 ## Guided Surfaces
 
-- `retriever-legal` agent for first-pass legal review
 - `retriever:export` for CSV/archive export flows
 
 ## Trust Hook
 
-Local-first by default. Original files stay in place. Optional Google Drive
-connector use is user-directed rather than automatic mirroring.
+Local-first by default. Original files stay in place.

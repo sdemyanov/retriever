@@ -25,7 +25,7 @@ Retriever currently keeps most of its tests in one large module:
 That file mixes several different responsibilities:
 
 - repository-integrity checks for generated artifacts and version metadata
-- installer coverage for `setup` and `setup-claude-v0`
+- installer coverage for `setup` and the `setup-claude-v0` project-local bridge
 - native package entrypoint and processing tests
 - broad regression coverage for ingest, search, browse, export, metadata, and
   structured processing behavior
@@ -74,7 +74,7 @@ Suggested structure:
   `RetrieverPackageEntrypointTests` and native package smoke coverage.
 - `tests/test_processing_commands.py`
   Native package processing flows and long-running command behavior that belongs
-  to the Claude-first package surface.
+  to the Claude Code package surface.
 - `tests/test_search_and_browse.py`
   Search, filter, Bates, paging, columns, sort, scope, and browse-state
   behavior.
@@ -84,7 +84,7 @@ Suggested structure:
 - `tests/test_export.py`
   CSV, preview, and archive export behavior.
 - `tests/test_ingest_v1.py`
-  Legacy or compatibility ingest paths that are still intentionally supported.
+  Additional ingest paths that are intentionally supported.
 - `tests/test_ingest_v2.py`
   Resumable V2 planning, preparation, commit, finalize, worker events, and
   recovery behavior.
