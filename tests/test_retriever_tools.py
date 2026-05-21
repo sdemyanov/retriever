@@ -23556,7 +23556,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("source_parts.csv", names)
         self.assertIn("extracted_text.csv", names)
         self.assertIn("loadfile.dat", names)
-        self.assertIn("image_loadfile.opt", names)
         self.assertIn(parent_preview_archive_path, names)
         self.assertEqual(manifest["document_count"], 2)
         self.assertEqual(manifest["family_mode"], "with_family")
@@ -23812,7 +23811,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("source_parts.csv", names)
         self.assertIn("extracted_text.csv", names)
         self.assertIn("loadfile.dat", names)
-        self.assertIn("image_loadfile.opt", names)
         self.assertEqual(manifest["document_count"], 2)
         self.assertEqual(manifest["family_mode"], "with_family")
         self.assertEqual(
@@ -23963,7 +23961,6 @@ class RetrieverToolsRegressionTests(unittest.TestCase):
         self.assertIn("source_parts.csv", names)
         self.assertIn("extracted_text.csv", names)
         self.assertIn("loadfile.dat", names)
-        self.assertIn("image_loadfile.opt", names)
         self.assertTrue(all(row["rel_source_path"] in names for row in source_part_rows))
         self.assertEqual(manifest["warnings"], [])
         self.assertEqual(root_manifest["files"]["loadfile_rel_path"], "loadfile.dat")

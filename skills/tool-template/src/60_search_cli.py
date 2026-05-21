@@ -8367,18 +8367,6 @@ ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH = "extracted_text.csv"
 ARCHIVE_TEXT_ROOT_REL_PATH = "text"
 ARCHIVE_CHECKSUMS_REL_PATH = "checksums.csv"
 ARCHIVE_LOADFILE_REL_PATH = "loadfile.dat"
-ARCHIVE_IMAGE_LOADFILE_REL_PATH = "image_loadfile.opt"
-ARCHIVE_LOADFILE_DEFAULT_VOLUME_NAME = "EXPORT"
-ARCHIVE_IMAGE_MEMBER_SUFFIXES = {
-    ".bmp",
-    ".gif",
-    ".jpeg",
-    ".jpg",
-    ".png",
-    ".tif",
-    ".tiff",
-    ".webp",
-}
 ARCHIVE_METADATA_BASE_FIELD_NAMES = (
     "control_number",
     "title",
@@ -8588,10 +8576,6 @@ def archive_safe_token(raw_value: object, *, default: str) -> str:
     return candidate or default
 
 
-def archive_loadfile_volume_name(output_path: Path) -> str:
-    return archive_safe_token(output_path.stem, default=ARCHIVE_LOADFILE_DEFAULT_VOLUME_NAME)
-
-
 def archive_windows_loadfile_path(raw_rel_path: str) -> str:
     return ".\\" + normalize_archive_member_path(raw_rel_path).replace("/", "\\")
 
@@ -8606,27 +8590,6 @@ def archive_text_document_rel_path(document_id: int, control_number: object) -> 
     return normalize_archive_member_path(str(Path(ARCHIVE_TEXT_ROOT_REL_PATH) / file_name))
 
 
-def archive_rel_path_is_image(rel_path: str, *, preview_type: str = "") -> bool:
-    if normalize_whitespace(preview_type).lower() == "image":
-        return True
-    if Path(rel_path).suffix.lower() in ARCHIVE_IMAGE_MEMBER_SUFFIXES:
-        return True
-    mime_type, _ = mimetypes.guess_type(rel_path)
-    return bool(mime_type and mime_type.startswith("image/"))
-
-
-def archive_opt_page_identifier(
-    control_number: object,
-    document_id: int,
-    image_rel_path: str,
-    page_index: int,
-) -> str:
-    stem = normalize_whitespace(Path(image_rel_path).stem)
-    if stem and not stem.lower().startswith("page-"):
-        return stem
-    return f"{archive_safe_token(control_number, default=f'document-{int(document_id):08d}')}-{int(page_index):04d}"
-
-
 def build_archive_dat_line(fields: list[object]) -> bytes:
     delimiter = b"\x14"
     quote = b"\xfe"
@@ -8638,8 +8601,6 @@ def prepare_archive_sidecar_entries(
     paths: dict[str, Path],
     rows: list[sqlite3.Row],
     manifest_entries: list[dict[str, object]],
-    *,
-    loadfile_volume_name: str,
 ) -> dict[str, object]:
     rows_by_id = {int(row["id"]): row for row in rows}
     preview_index_rows: list[dict[str, object]] = []
@@ -8647,10 +8608,8 @@ def prepare_archive_sidecar_entries(
     extracted_text_index_rows: list[dict[str, object]] = []
     text_file_entries: list[dict[str, object]] = []
     loadfile_rows: list[list[object]] = []
-    image_loadfile_lines: list[str] = []
     counts = {
         "documents_with_text": 0,
-        "image_loadfile_rows": 0,
         "missing_preview_entries": 0,
         "missing_source_part_entries": 0,
         "preview_entries": 0,
@@ -8681,7 +8640,6 @@ def prepare_archive_sidecar_entries(
             for path in list(manifest_entry.get("preview_rel_paths") or [])
             if normalize_whitespace(str(path or ""))
         }
-        preview_image_paths: list[str] = []
         for preview_row in document_preview_rows(connection, document_id):
             preview_rel_path = normalize_archive_member_path(
                 str(preview_row["rel_preview_path"]),
@@ -8703,12 +8661,8 @@ def prepare_archive_sidecar_entries(
             counts["preview_entries"] += 1
             if is_missing:
                 counts["missing_preview_entries"] += 1
-                continue
-            if archive_rel_path_is_image(preview_rel_path, preview_type=str(preview_row["preview_type"] or "")):
-                preview_image_paths.append(preview_rel_path)
 
         native_rel_path = ""
-        image_source_part_paths: list[str] = []
         for source_part_entry in list(manifest_entry.get("source_part_entries") or []):
             if not isinstance(source_part_entry, dict):
                 continue
@@ -8735,8 +8689,6 @@ def prepare_archive_sidecar_entries(
                 continue
             if part_kind.lower() == "native" and not native_rel_path:
                 native_rel_path = rel_path
-            if part_kind.lower() == "image":
-                image_source_part_paths.append(rel_path)
 
         text_content = document_source_text_body(connection, paths, row)
         text_rel_path = ""
@@ -8793,24 +8745,6 @@ def prepare_archive_sidecar_entries(
                 archive_windows_loadfile_path(primary_document_rel_path) if primary_document_rel_path else "",
             ]
         )
-
-        image_loadfile_paths = image_source_part_paths or preview_image_paths
-        page_count = len(image_loadfile_paths)
-        for page_index, image_rel_path in enumerate(image_loadfile_paths, start=1):
-            image_loadfile_lines.append(
-                ",".join(
-                    [
-                        archive_opt_page_identifier(control_number, document_id, image_rel_path, page_index),
-                        loadfile_volume_name,
-                        archive_windows_loadfile_path(image_rel_path),
-                        "Y" if page_index == 1 else "",
-                        "",
-                        "",
-                        str(page_count) if page_index == 1 else "",
-                    ]
-                )
-            )
-            counts["image_loadfile_rows"] += 1
 
     source_parts_payload = build_archive_csv_bytes(
         [
@@ -8871,13 +8805,10 @@ def prepare_archive_sidecar_entries(
     loadfile_payload = build_archive_dat_line(loadfile_headers) + b"".join(
         build_archive_dat_line(loadfile_row) for loadfile_row in loadfile_rows
     )
-    image_loadfile_payload = ("\n".join(image_loadfile_lines) + ("\n" if image_loadfile_lines else "")).encode("utf-8")
     return {
         "counts": counts,
         "extracted_text_index_payload": extracted_text_payload,
-        "image_loadfile_payload": image_loadfile_payload,
         "loadfile_payload": loadfile_payload,
-        "loadfile_volume_name": loadfile_volume_name,
         "preview_index_payload": previews_payload,
         "source_part_index_payload": source_parts_payload,
         "text_file_entries": text_file_entries,
@@ -8896,7 +8827,6 @@ def build_archive_root_manifest_payload(
     failed_count: int,
     warning_count: int,
     sidecar_counts: dict[str, object],
-    loadfile_volume_name: str,
 ) -> dict[str, object]:
     return {
         "format": "retriever-archive",
@@ -8907,7 +8837,6 @@ def build_archive_root_manifest_payload(
         "family_mode": family_mode,
         "seed_limit": seed_limit,
         "portable_workspace": portable_workspace,
-        "loadfile_volume_name": loadfile_volume_name,
         "files": {
             "metadata_rel_path": ARCHIVE_METADATA_REL_PATH,
             "preview_root_rel_path": ARCHIVE_PREVIEW_ROOT_REL_PATH,
@@ -8916,7 +8845,6 @@ def build_archive_root_manifest_payload(
             "extracted_text_index_rel_path": ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH,
             "text_root_rel_path": ARCHIVE_TEXT_ROOT_REL_PATH,
             "loadfile_rel_path": ARCHIVE_LOADFILE_REL_PATH,
-            "image_loadfile_rel_path": ARCHIVE_IMAGE_LOADFILE_REL_PATH,
             "checksums_rel_path": ARCHIVE_CHECKSUMS_REL_PATH,
             "readme_rel_path": ARCHIVE_ROOT_README_REL_PATH,
             "internal_manifest_rel_path": ARCHIVE_MANIFEST_REL_PATH,
@@ -8925,7 +8853,6 @@ def build_archive_root_manifest_payload(
         "counts": {
             "document_count": document_count,
             "documents_with_text": int(sidecar_counts.get("documents_with_text") or 0),
-            "image_loadfile_rows": int(sidecar_counts.get("image_loadfile_rows") or 0),
             "preview_entries": int(sidecar_counts.get("preview_entries") or 0),
             "source_part_entries": int(sidecar_counts.get("source_part_entries") or 0),
             "synthetic_documents": int(sidecar_counts.get("synthetic_documents") or 0),
@@ -8966,7 +8893,6 @@ def build_archive_readme_bytes(root_manifest_payload: dict[str, object]) -> byte
         f"- {ARCHIVE_TEXT_ROOT_REL_PATH}/: UTF-8 extracted text files when text is available.",
         f"- {ARCHIVE_EXTRACTED_TEXT_INDEX_REL_PATH}: per-document extracted text paths and counts.",
         f"- {ARCHIVE_LOADFILE_REL_PATH}: Concordance-style DAT with text/native/document paths.",
-        f"- {ARCHIVE_IMAGE_LOADFILE_REL_PATH}: OPT image loadfile for page image previews when available.",
         f"- {ARCHIVE_CHECKSUMS_REL_PATH}: SHA-256 and byte size for every archive member except {ARCHIVE_CHECKSUMS_REL_PATH}.",
         f"- {ARCHIVE_MANIFEST_REL_PATH}: Retriever-specific lossless manifest with full document details.",
         "",
@@ -8995,7 +8921,6 @@ def write_archive_sidecars(
     portable_workspace_payload: dict[str, object] | None,
     warnings: list[str],
     failed_count: int,
-    loadfile_volume_name: str,
 ) -> dict[str, object]:
     add_archive_bytes_once(
         archive,
@@ -9008,7 +8933,6 @@ def write_archive_sidecars(
         paths,
         rows,
         manifest_document_entries,
-        loadfile_volume_name=loadfile_volume_name,
     )
     for text_file_entry in sidecar_state["text_file_entries"]:
         add_archive_bytes_once(
@@ -9041,12 +8965,6 @@ def write_archive_sidecars(
         sidecar_state["loadfile_payload"],
         ARCHIVE_LOADFILE_REL_PATH,
     )
-    add_archive_bytes_once(
-        archive,
-        written_member_paths,
-        sidecar_state["image_loadfile_payload"],
-        ARCHIVE_IMAGE_LOADFILE_REL_PATH,
-    )
     root_manifest_payload = build_archive_root_manifest_payload(
         created_at=created_at,
         selector=selector,
@@ -9058,7 +8976,6 @@ def write_archive_sidecars(
         failed_count=failed_count,
         warning_count=len(warnings),
         sidecar_counts=dict(sidecar_state["counts"]),
-        loadfile_volume_name=str(sidecar_state["loadfile_volume_name"]),
     )
     add_archive_bytes_once(
         archive,
@@ -9090,8 +9007,6 @@ def write_archive_sidecars(
         "text_root_rel_path": ARCHIVE_TEXT_ROOT_REL_PATH,
         "checksums_rel_path": ARCHIVE_CHECKSUMS_REL_PATH,
         "loadfile_rel_path": ARCHIVE_LOADFILE_REL_PATH,
-        "image_loadfile_rel_path": ARCHIVE_IMAGE_LOADFILE_REL_PATH,
-        "loadfile_volume_name": str(sidecar_state["loadfile_volume_name"]),
         "portable_workspace_document_ids": (
             portable_workspace_payload["selected_document_ids"]
             if portable_workspace_payload is not None
@@ -9115,7 +9030,6 @@ def write_archive_sidecars(
     )
     return {
         "internal_manifest_payload": internal_manifest_payload,
-        "loadfile_volume_name": str(sidecar_state["loadfile_volume_name"]),
         "root_manifest_payload": root_manifest_payload,
         "sidecar_counts": dict(sidecar_state["counts"]),
     }
@@ -10878,7 +10792,6 @@ def export_archive(
             seed_limit=seed_limit,
         )
         output_path = resolve_export_output_path(paths, raw_output_path)
-        loadfile_volume_name = archive_loadfile_volume_name(output_path)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         overwrote_existing_file = output_path.exists()
@@ -10988,7 +10901,6 @@ def export_archive(
                 portable_workspace_payload=portable_workspace_payload,
                 warnings=warnings,
                 failed_count=0,
-                loadfile_volume_name=loadfile_volume_name,
             )
         checksum_payload = ensure_archive_checksums_file(output_path)
 
@@ -11019,8 +10931,6 @@ def export_archive(
             "text_root_rel_path": ARCHIVE_TEXT_ROOT_REL_PATH,
             "checksums_rel_path": ARCHIVE_CHECKSUMS_REL_PATH,
             "loadfile_rel_path": ARCHIVE_LOADFILE_REL_PATH,
-            "image_loadfile_rel_path": ARCHIVE_IMAGE_LOADFILE_REL_PATH,
-            "loadfile_volume_name": loadfile_volume_name,
             "archive_member_count": int(checksum_payload["archive_member_count"]),
             "documents": manifest_document_entries,
             "counts": sidecar_payload["sidecar_counts"],
@@ -11719,7 +11629,6 @@ def export_archive_start(
             seed_limit=seed_limit,
         )
         output_path = resolve_export_output_path(paths, raw_output_path)
-        loadfile_volume_name = archive_loadfile_volume_name(output_path)
         run_id = new_ingest_v2_run_id()
         now = utc_now()
         output_rel_path = export_run_output_rel_path(root, output_path)
@@ -11740,8 +11649,6 @@ def export_archive_start(
             "text_root_rel_path": ARCHIVE_TEXT_ROOT_REL_PATH,
             "checksums_rel_path": ARCHIVE_CHECKSUMS_REL_PATH,
             "loadfile_rel_path": ARCHIVE_LOADFILE_REL_PATH,
-            "image_loadfile_rel_path": ARCHIVE_IMAGE_LOADFILE_REL_PATH,
-            "loadfile_volume_name": loadfile_volume_name,
             "metadata_fields": metadata_field_defs,
         }
         cursor = {
@@ -12571,7 +12478,6 @@ def export_archive_finalize_step(
             portable_workspace_payload=portable_workspace_payload if isinstance(portable_workspace_payload, dict) else None,
             warnings=warnings,
             failed_count=failed_count,
-            loadfile_volume_name=str(config.get("loadfile_volume_name") or archive_loadfile_volume_name(output_path)),
         )
         cursor["metadata_added"] = True
         cursor["manifest_added"] = True
